@@ -16,7 +16,6 @@ import { dirname, join } from "node:path";
 
 import {
   BusyStoreError,
-  CorruptDataError,
   MissingRecordError,
   PersistenceError,
   STATUSES,
@@ -229,6 +228,7 @@ class FileStore implements Store {
   private state: State;
   private lockHandle: number | null;
   private closed = false;
+  private released = false;
   private queue: Promise<unknown> = Promise.resolve();
   private tempCounter = 0;
 
@@ -375,9 +375,11 @@ class FileStore implements Store {
 
   async close(): Promise<void> {
     await this.queue.catch(() => undefined);
-    if (this.closed) return;
-    this.releaseLock();
+    // The store is unusable for mutations as soon as close is requested, even
+    // if releasing the lock file fails; a later close retries the release.
     this.closed = true;
+    if (this.released) return;
+    this.releaseLock();
   }
 
   /** Ensure the store is open and serialize the mutation. */
@@ -456,32 +458,34 @@ class FileStore implements Store {
   }
 
   /**
-   * Remove the lock file and close its handle.
+   * Close the lock handle, then remove the lock file.
    *
-   * A missing lock file is fine. Any other failure is reported so `close` does
-   * not claim success while ownership of the directory is still held.
+   * The handle is only forgotten once it has been closed, so a failed close is
+   * retried next time. A missing lock file is fine. Any other failure is
+   * reported so `close` does not claim success while ownership is still held.
    */
   private releaseLock(): void {
-    let unlinkError: unknown = null;
-    try {
-      unlinkSync(this.lockPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") unlinkError = error;
-    }
+    const errors: unknown[] = [];
     if (this.lockHandle !== null) {
       try {
         closeSync(this.lockHandle);
+        this.lockHandle = null;
       } catch (error) {
-        if (!unlinkError) unlinkError = error;
+        errors.push(error);
       }
-      this.lockHandle = null;
     }
-    if (unlinkError) {
-      throw new PersistenceError(
-        `could not release store lock: ${(unlinkError as Error).message}`,
-        { cause: unlinkError },
-      );
+    try {
+      unlinkSync(this.lockPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") errors.push(error);
     }
+    if (errors.length > 0) {
+      const first = errors[0] as Error;
+      throw new PersistenceError(`could not release store lock: ${first.message}`, {
+        cause: first,
+      });
+    }
+    this.released = true;
   }
 }
 
@@ -545,16 +549,16 @@ const loadState = (statePath: string): State => {
   try {
     parsed = JSON.parse(raw);
   } catch (error) {
-    throw new CorruptDataError(`workspace state is corrupt: ${(error as Error).message}`, {
+    throw new PersistenceError(`workspace state is corrupt: ${(error as Error).message}`, {
       cause: error,
     });
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw new CorruptDataError("workspace state is corrupt: not a JSON object");
+    throw new PersistenceError("workspace state is corrupt: not a JSON object");
   }
   const document = parsed as Record<string, unknown>;
   if (document.version !== FORMAT_VERSION) {
-    throw new CorruptDataError(
+    throw new PersistenceError(
       `unsupported workspace state version: ${String(document.version)}`,
     );
   }
@@ -563,7 +567,7 @@ const loadState = (statePath: string): State => {
     !Array.isArray(document.engagements) ||
     !Array.isArray(document.projects)
   ) {
-    throw new CorruptDataError("workspace state is corrupt: missing record collections");
+    throw new PersistenceError("workspace state is corrupt: missing record collections");
   }
   try {
     return validateDocument({
@@ -572,10 +576,7 @@ const loadState = (statePath: string): State => {
       projects: document.projects,
     });
   } catch (error) {
-    if (error instanceof ValidationError || error instanceof MissingRecordError) {
-      throw new CorruptDataError(`workspace state is invalid: ${error.message}`, { cause: error });
-    }
-    throw new CorruptDataError(`workspace state is invalid: ${(error as Error).message}`, {
+    throw new PersistenceError(`workspace state is invalid: ${(error as Error).message}`, {
       cause: error,
     });
   }

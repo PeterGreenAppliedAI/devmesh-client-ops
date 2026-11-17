@@ -120,16 +120,15 @@ export interface WorkspaceSnapshot {
 /**
  * Error kinds callers can distinguish.
  *
- * `corrupt` covers corrupt or unsupported data found when loading, as well as
- * a record on disk that fails validation or references a missing parent.
- * `persistence` covers I/O failures while reading or writing.
+ * `persistence` covers I/O failures while reading or writing, including
+ * existing data that is corrupt, unsupported or invalid: such data is refused
+ * and left untouched rather than reported as a missing record.
  */
 export type StoreErrorKind =
   | "validation"
   | "missing"
   | "busy"
-  | "persistence"
-  | "corrupt";
+  | "persistence";
 
 /** Base class for all store errors; carries a discriminated `kind`. */
 export class StoreError extends Error {
@@ -165,7 +164,12 @@ export class BusyStoreError extends StoreError {
   }
 }
 
-/** Persisting state failed; the previous committed state is retained. */
+/**
+ * Reading or writing state failed; the previous committed state is retained.
+ *
+ * Covers I/O failures and existing data that is corrupt, unsupported or
+ * invalid, which is refused without being overwritten.
+ */
 export class PersistenceError extends StoreError {
   constructor(message: string, options?: { cause?: unknown }) {
     super("persistence", message);
@@ -176,13 +180,3 @@ export class PersistenceError extends StoreError {
   }
 }
 
-/** Existing data is corrupt, unsupported or invalid, and was left untouched. */
-export class CorruptDataError extends StoreError {
-  constructor(message: string, options?: { cause?: unknown }) {
-    super("corrupt", message);
-    this.name = "CorruptDataError";
-    if (options && "cause" in options) {
-      (this as { cause?: unknown }).cause = options.cause;
-    }
-  }
-}

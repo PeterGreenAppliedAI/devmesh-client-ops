@@ -8,7 +8,6 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import { openStore, type Store } from "../src/store.ts";
 import {
   BusyStoreError,
-  CorruptDataError,
   MissingRecordError,
   PersistenceError,
   ValidationError,
@@ -326,7 +325,7 @@ describe("persistence and restart", () => {
     await writeFile(join(directory, "workspace.json"), "{ not json", "utf8");
     await assert.rejects(
       () => openStore(directory),
-      (error: unknown) => error instanceof CorruptDataError && error.kind === "corrupt",
+      (error: unknown) => error instanceof PersistenceError && error.kind === "persistence",
     );
     assert.equal(await readFile(join(directory, "workspace.json"), "utf8"), "{ not json");
     assert.deepEqual(await readdir(directory), ["workspace.json"]);
@@ -343,7 +342,7 @@ describe("persistence and restart", () => {
     await writeFile(join(directory, "workspace.json"), contents, "utf8");
     await assert.rejects(
       () => openStore(directory),
-      (error: unknown) => error instanceof CorruptDataError,
+      (error: unknown) => error instanceof PersistenceError,
     );
     assert.equal(await readFile(join(directory, "workspace.json"), "utf8"), contents);
   });
@@ -359,7 +358,7 @@ describe("persistence and restart", () => {
     await writeFile(join(directory, "workspace.json"), contents, "utf8");
     await assert.rejects(
       () => openStore(directory),
-      (error: unknown) => error instanceof CorruptDataError,
+      (error: unknown) => error instanceof PersistenceError,
     );
     assert.equal(await readFile(join(directory, "workspace.json"), "utf8"), contents);
   });
@@ -374,7 +373,7 @@ describe("persistence and restart", () => {
       await writeFile(join(directory, "workspace.json"), contents, "utf8");
       await assert.rejects(
         () => openStore(directory),
-        (error: unknown) => error instanceof CorruptDataError,
+        (error: unknown) => error instanceof PersistenceError,
       );
       assert.equal(await readFile(join(directory, "workspace.json"), "utf8"), contents);
     }
@@ -391,7 +390,7 @@ describe("persistence and restart", () => {
     await writeFile(join(directory, "workspace.json"), contents, "utf8");
     await assert.rejects(
       () => openStore(directory),
-      (error: unknown) => error instanceof CorruptDataError,
+      (error: unknown) => error instanceof PersistenceError,
     );
     assert.equal(await readFile(join(directory, "workspace.json"), "utf8"), contents);
   });
@@ -437,11 +436,11 @@ describe("concurrency and failure handling", () => {
     const directory = await makeDirectory();
     await writeFile(join(directory, "workspace.json"), "corrupt", "utf8");
     await assert.rejects(() => openStore(directory));
-    // A fresh directory with the same corruption must still report corruption,
-    // not busy: ownership was released by the failed initialization.
+    // The same corruption must still be reported, not busy: ownership was
+    // released by the failed initialization.
     await assert.rejects(
       () => openStore(directory),
-      (error: unknown) => error instanceof CorruptDataError,
+      (error: unknown) => error instanceof PersistenceError && error.kind === "persistence",
     );
   });
 
