@@ -1,0 +1,10 @@
+node_modules/
+dist/
+coverage/
+# Local data stays on this machine: never commit client data, transcripts, credentials or databases.
+data/
+*.db
+*.sqlite
+*.sqlite3
+.env
+.env.*
