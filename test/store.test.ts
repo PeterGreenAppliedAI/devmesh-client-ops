@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chmod } from "node:fs/promises";
+import { closeSync, readdirSync, readlinkSync } from "node:fs";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
 import { openStore, type Store } from "../src/store.ts";
@@ -430,6 +431,51 @@ describe("concurrency and failure handling", () => {
     assert.deepEqual(await readdir(directory), []);
     const reopened = await openStore(directory);
     stores.push(reopened);
+  });
+
+  it("keeps the lock file when closing the handle fails and a retry cannot remove a newer owner's lock", async () => {
+    const directory = await makeDirectory();
+    const store = await openStore(directory);
+    stores.push(store);
+    const lockPath = join(directory, "owner.lock");
+
+    // Close the lock handle out from under the store so its own close fails.
+    let handleClosed = false;
+    for (const name of readdirSync("/proc/self/fd")) {
+      try {
+        if (readlinkSync(`/proc/self/fd/${name}`) === lockPath) {
+          closeSync(Number(name));
+          handleClosed = true;
+        }
+      } catch {
+        // Descriptor entries come and go; ignore races.
+      }
+    }
+    assert.equal(handleClosed, true);
+
+    await assert.rejects(
+      () => store.close(),
+      (error: unknown) => error instanceof PersistenceError && error.kind === "persistence",
+    );
+    // A failed handle close must not remove the lock file, so no new writer can
+    // take ownership in between.
+    assert.deepEqual(readdirSync(directory), ["owner.lock"]);
+    await assert.rejects(
+      () => openStore(directory),
+      (error: unknown) => error instanceof BusyStoreError && error.kind === "busy",
+    );
+
+    // A retried close that still cannot close the handle must keep the lock
+    // file in place rather than unlinking it.
+    await assert.rejects(
+      () => store.close(),
+      (error: unknown) => error instanceof PersistenceError,
+    );
+    assert.deepEqual(readdirSync(directory), ["owner.lock"]);
+    await assert.rejects(
+      () => openStore(directory),
+      (error: unknown) => error instanceof BusyStoreError,
+    );
   });
 
   it("releases ownership after failed initialization", async () => {

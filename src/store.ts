@@ -460,30 +460,37 @@ class FileStore implements Store {
   /**
    * Close the lock handle, then remove the lock file.
    *
-   * The handle is only forgotten once it has been closed, so a failed close is
-   * retried next time. A missing lock file is fine. Any other failure is
-   * reported so `close` does not claim success while ownership is still held.
+   * The lock file is only removed once the handle has actually been closed, so
+   * a failed close leaves ownership intact: the lock file stays in place, which
+   * keeps other writers out, and the handle is kept for a later retry. This
+   * ordering means a retry can never remove a lock file belonging to a newer
+   * owner. A missing lock file is fine. Any failure is reported so `close`
+   * does not claim success while ownership is still held.
    */
   private releaseLock(): void {
-    const errors: unknown[] = [];
     if (this.lockHandle !== null) {
+      let closeError: unknown;
       try {
         closeSync(this.lockHandle);
-        this.lockHandle = null;
       } catch (error) {
-        errors.push(error);
+        closeError = error;
       }
+      if (closeError !== undefined) {
+        const failure = closeError as Error;
+        throw new PersistenceError(`could not release store lock: ${failure.message}`, {
+          cause: failure,
+        });
+      }
+      this.lockHandle = null;
     }
     try {
       unlinkSync(this.lockPath);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") errors.push(error);
-    }
-    if (errors.length > 0) {
-      const first = errors[0] as Error;
-      throw new PersistenceError(`could not release store lock: ${first.message}`, {
-        cause: first,
-      });
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw new PersistenceError(`could not release store lock: ${(error as Error).message}`, {
+          cause: error,
+        });
+      }
     }
     this.released = true;
   }
