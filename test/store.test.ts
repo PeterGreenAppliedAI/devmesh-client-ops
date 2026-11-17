@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { readdirSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
 import { openStore, type Store } from "../src/store.ts";
@@ -16,6 +18,94 @@ import {
 
 let directories: string[] = [];
 let stores: Store[] = [];
+
+/** Repository root, derived from this test file's location. */
+const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+
+/**
+ * Script run in a child process with Node's module-mocking enabled.
+ *
+ * It replaces `node:fs` as seen by the store so that closing the lock handle
+ * fails on demand. The parent test cannot use module mocking itself because
+ * the repository's test runner does not enable it, but a child process can.
+ */
+const lockCloseChildSource = `
+import assert from "node:assert/strict";
+import { readdirSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createRequire } from "node:module";
+import { mock } from "node:test";
+import { pathToFileURL } from "node:url";
+
+const repoRoot = process.argv[2];
+const require = createRequire(import.meta.url);
+const real = require("node:fs");
+const state = { lockHandle: -1, failClose: false };
+const exports = {};
+for (const name of Object.keys(real)) {
+  const descriptor = Object.getOwnPropertyDescriptor(real, name);
+  if (descriptor && (descriptor.configurable || descriptor.writable)) exports[name] = real[name];
+}
+exports.openSync = (...args) => {
+  const fd = real.openSync(...args);
+  if (typeof args[0] === "string" && args[0].endsWith("owner.lock")) state.lockHandle = fd;
+  return fd;
+};
+exports.closeSync = (fd) => {
+  if (state.failClose && fd === state.lockHandle) throw new Error("injected close failure");
+  return real.closeSync(fd);
+};
+mock.module("node:fs", { exports });
+
+const { openStore } = await import(pathToFileURL(join(repoRoot, "src", "store.ts")).href);
+const { BusyStoreError, PersistenceError } = await import(
+  pathToFileURL(join(repoRoot, "src", "model.ts")).href
+);
+
+const directory = await mkdtemp(join(tmpdir(), "workspace-lock-"));
+try {
+  const store = await openStore(directory);
+  assert.notEqual(state.lockHandle, -1, "lock handle was recorded");
+  state.failClose = true;
+
+  // A failed handle close must be reported, not treated as success.
+  await assert.rejects(
+    () => store.close(),
+    (error) => error instanceof PersistenceError && error.kind === "persistence"
+  );
+  // A failed handle close must not remove the lock file...
+  assert.deepEqual(readdirSync(directory), ["owner.lock"]);
+  // ...so no new writer can take ownership.
+  await assert.rejects(
+    () => openStore(directory),
+    (error) => error instanceof BusyStoreError && error.kind === "busy"
+  );
+
+  // A retried close that still cannot close the handle must keep the lock.
+  await assert.rejects(
+    () => store.close(),
+    (error) => error instanceof PersistenceError
+  );
+  assert.deepEqual(readdirSync(directory), ["owner.lock"]);
+  await assert.rejects(
+    () => openStore(directory),
+    (error) => error instanceof BusyStoreError
+  );
+
+  // Once closing the handle succeeds, ownership is released for a new owner.
+  state.failClose = false;
+  await store.close();
+  assert.deepEqual(readdirSync(directory), []);
+  const reopened = await openStore(directory);
+  await reopened.close();
+} finally {
+  state.failClose = false;
+  await rm(directory, { recursive: true, force: true });
+}
+console.log("lock-close-child-ok");
+`;
 
 const makeDirectory = async (): Promise<string> => {
   const directory = await mkdtemp(join(tmpdir(), "workspace-"));
@@ -438,6 +528,29 @@ describe("concurrency and failure handling", () => {
     assert.deepEqual(await readdir(directory), []);
     const reopened = await openStore(directory);
     stores.push(reopened);
+  });
+
+  it("keeps the lock file and refuses new writers when closing the handle fails", async () => {
+    const directory = await makeDirectory();
+    const scriptPath = join(directory, "lock-close-child.test.ts");
+    await writeFile(scriptPath, lockCloseChildSource, "utf8");
+    const child = spawnSync(
+      process.execPath,
+      [
+        "--no-warnings",
+        "--experimental-strip-types",
+        "--experimental-test-module-mocks",
+        scriptPath,
+        repoRoot,
+      ],
+      { encoding: "utf8", cwd: repoRoot },
+    );
+    assert.equal(
+      child.status,
+      0,
+      `child failed (status ${child.status})\nstdout:\n${child.stdout}\nstderr:\n${child.stderr}`,
+    );
+    assert.match(child.stdout, /lock-close-child-ok/);
   });
 
   it("keeps the lock file and refuses new writers when a lock release fails", async () => {
