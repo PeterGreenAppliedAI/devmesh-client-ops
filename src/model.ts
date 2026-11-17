@@ -3,29 +3,10 @@
  *
  * Records are plain data. Fields are documented so callers know what may be
  * empty and what is validated by the store.
+ *
+ * Names must be nonblank. Descriptive fields are text and may be empty.
+ * Parent links are set at creation time and are immutable afterwards.
  */
-
-/** A contact person for a client. */
-export interface Contact {
-  /** Display name. Must be nonblank. */
-  name: string;
-  /** Optional role or title. Text, may be empty. */
-  role: string;
-  /** Optional email address. Text, may be empty. */
-  email: string;
-  /** Optional phone number. Text, may be empty. */
-  phone: string;
-}
-
-/** A stakeholder relationship for a client. */
-export interface Stakeholder {
-  /** Display name. Must be nonblank. */
-  name: string;
-  /** Optional role or interest. Text, may be empty. */
-  role: string;
-  /** Optional notes. Text, may be empty. */
-  notes: string;
-}
 
 /** A client workspace record. */
 export interface Client {
@@ -35,14 +16,14 @@ export interface Client {
   readonly name: string;
   /** Background text. May be empty. */
   readonly background: string;
-  /** Contacts, in insertion order. */
-  readonly contacts: readonly Contact[];
-  /** Stakeholders, in insertion order. */
-  readonly stakeholders: readonly Stakeholder[];
-  /** Requirements, in insertion order. May be empty. */
-  readonly requirements: readonly string[];
-  /** Objectives, in insertion order. May be empty. */
-  readonly objectives: readonly string[];
+  /** Contacts text. May be empty. */
+  readonly contacts: string;
+  /** Stakeholders text. May be empty. */
+  readonly stakeholders: string;
+  /** Requirements text. May be empty. */
+  readonly requirements: string;
+  /** Objectives text. May be empty. */
+  readonly objectives: string;
 }
 
 /** A client engagement record. */
@@ -53,8 +34,8 @@ export interface Engagement {
   readonly clientId: string;
   /** Display name. Must be nonblank. */
   readonly name: string;
-  /** Objectives, in insertion order. May be empty. */
-  readonly objectives: readonly string[];
+  /** Objectives text. May be empty. */
+  readonly objectives: string;
   /** Lifecycle status. */
   readonly status: Status;
 }
@@ -67,8 +48,8 @@ export interface Project {
   readonly engagementId: string;
   /** Display name. Must be nonblank. */
   readonly name: string;
-  /** Objectives, in insertion order. May be empty. */
-  readonly objectives: readonly string[];
+  /** Objectives text. May be empty. */
+  readonly objectives: string;
   /** Lifecycle status. */
   readonly status: Status;
 }
@@ -79,38 +60,38 @@ export type Status = "planned" | "active" | "on_hold" | "completed";
 /** The set of permitted status values. */
 export const STATUSES: readonly Status[] = ["planned", "active", "on_hold", "completed"];
 
-/** Input for creating a client. */
+/** Input for creating a client. Descriptive fields default to empty text. */
 export interface ClientInput {
   name: string;
   background?: string;
-  contacts?: readonly Contact[];
-  stakeholders?: readonly Stakeholder[];
-  requirements?: readonly string[];
-  objectives?: readonly string[];
+  contacts?: string;
+  stakeholders?: string;
+  requirements?: string;
+  objectives?: string;
 }
 
 /** Input for editing a client. The name is optional; omitted fields are kept. */
 export interface ClientUpdate {
   name?: string;
   background?: string;
-  contacts?: readonly Contact[];
-  stakeholders?: readonly Stakeholder[];
-  requirements?: readonly string[];
-  objectives?: readonly string[];
+  contacts?: string;
+  stakeholders?: string;
+  requirements?: string;
+  objectives?: string;
 }
 
 /** Input for creating an engagement. */
 export interface EngagementInput {
   clientId: string;
   name: string;
-  objectives?: readonly string[];
+  objectives?: string;
   status?: Status;
 }
 
-/** Input for editing an engagement. Parent and status are editable; all fields optional. */
+/** Input for editing an engagement. Parent links are immutable; all fields optional. */
 export interface EngagementUpdate {
   name?: string;
-  objectives?: readonly string[];
+  objectives?: string;
   status?: Status;
 }
 
@@ -118,14 +99,14 @@ export interface EngagementUpdate {
 export interface ProjectInput {
   engagementId: string;
   name: string;
-  objectives?: readonly string[];
+  objectives?: string;
   status?: Status;
 }
 
-/** Input for editing a project. All fields optional. */
+/** Input for editing a project. Parent links are immutable; all fields optional. */
 export interface ProjectUpdate {
   name?: string;
-  objectives?: readonly string[];
+  objectives?: string;
   status?: Status;
 }
 
@@ -136,12 +117,19 @@ export interface WorkspaceSnapshot {
   readonly projects: readonly Project[];
 }
 
-/** Error kinds callers can distinguish. */
+/**
+ * Error kinds callers can distinguish.
+ *
+ * `corrupt` covers corrupt or unsupported data found when loading, as well as
+ * a record on disk that fails validation or references a missing parent.
+ * `persistence` covers I/O failures while reading or writing.
+ */
 export type StoreErrorKind =
   | "validation"
   | "missing"
   | "busy"
-  | "persistence";
+  | "persistence"
+  | "corrupt";
 
 /** Base class for all store errors; carries a discriminated `kind`. */
 export class StoreError extends Error {
@@ -153,7 +141,7 @@ export class StoreError extends Error {
   }
 }
 
-/** A record failed validation, or a parent reference is invalid. */
+/** A record or input failed validation, or a parent reference is invalid. */
 export class ValidationError extends StoreError {
   constructor(message: string) {
     super("validation", message);
@@ -177,11 +165,22 @@ export class BusyStoreError extends StoreError {
   }
 }
 
-/** Loading or persisting state failed. */
+/** Persisting state failed; the previous committed state is retained. */
 export class PersistenceError extends StoreError {
   constructor(message: string, options?: { cause?: unknown }) {
     super("persistence", message);
     this.name = "PersistenceError";
+    if (options && "cause" in options) {
+      (this as { cause?: unknown }).cause = options.cause;
+    }
+  }
+}
+
+/** Existing data is corrupt, unsupported or invalid, and was left untouched. */
+export class CorruptDataError extends StoreError {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super("corrupt", message);
+    this.name = "CorruptDataError";
     if (options && "cause" in options) {
       (this as { cause?: unknown }).cause = options.cause;
     }

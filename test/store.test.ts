@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { chmod } from "node:fs/promises";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
 import { openStore, type Store } from "../src/store.ts";
 import {
   BusyStoreError,
+  CorruptDataError,
   MissingRecordError,
   PersistenceError,
   ValidationError,
@@ -53,17 +55,50 @@ describe("client create and edit", () => {
     const client = await store.createClient({
       name: "Acme",
       background: "A background",
-      contacts: [{ name: "Ada", role: "CTO", email: "ada@example.test", phone: "" }],
-      stakeholders: [{ name: "Grace", role: "Sponsor", notes: "" }],
-      requirements: ["Needs speed"],
-      objectives: ["Ship Q1"],
+      contacts: "Ada, CTO",
+      stakeholders: "Grace, sponsor",
+      requirements: "Needs speed",
+      objectives: "Ship Q1",
     });
     assert.ok(client.id.length > 0);
     assert.equal(client.name, "Acme");
-    assert.deepEqual(client.requirements, ["Needs speed"]);
+    assert.equal(client.contacts, "Ada, CTO");
+    assert.equal(client.requirements, "Needs speed");
     const snapshot = store.snapshot();
     assert.equal(snapshot.clients.length, 1);
     assert.equal(snapshot.clients[0]!.id, client.id);
+  });
+
+  it("edits descriptive text fields and keeps omitted fields", async () => {
+    const directory = await makeDirectory();
+    const store = await open(directory);
+    const client = await store.createClient({ name: "Acme" });
+    const edited = await store.updateClient(client.id, {
+      contacts: "Ada",
+      stakeholders: "",
+      requirements: "Faster",
+    });
+    assert.equal(edited.id, client.id);
+    assert.equal(edited.contacts, "Ada");
+    assert.equal(edited.stakeholders, "");
+    assert.equal(edited.requirements, "Faster");
+    assert.equal(edited.background, "");
+    assert.equal(edited.objectives, "");
+  });
+
+  it("rejects non-text descriptive fields", async () => {
+    const directory = await makeDirectory();
+    const store = await open(directory);
+    await assert.rejects(
+      () => store.createClient({ name: "Acme", contacts: ["Ada"] as unknown as string }),
+      (error: unknown) => error instanceof ValidationError,
+    );
+    const client = await store.createClient({ name: "Acme" });
+    await assert.rejects(
+      () => store.updateClient(client.id, { objectives: ["Ship"] as unknown as string }),
+      (error: unknown) => error instanceof ValidationError,
+    );
+    assert.equal(store.snapshot().clients[0]!.objectives, "");
   });
 
   it("edits a client without changing its id", async () => {
@@ -92,7 +127,7 @@ describe("client create and edit", () => {
   it("returns detached snapshots", async () => {
     const directory = await makeDirectory();
     const store = await open(directory);
-    await store.createClient({ name: "Acme", requirements: ["One"] });
+    await store.createClient({ name: "Acme", requirements: "One" });
     const snapshot = store.snapshot();
     assert.throws(() => {
       (snapshot.clients[0] as { name: string }).name = "Mutated";
@@ -217,21 +252,21 @@ describe("persistence and restart", () => {
     const client = await store.createClient({
       name: "Acme",
       background: "Background text",
-      contacts: [{ name: "Ada", role: "CTO", email: "ada@example.test", phone: "555" }],
-      stakeholders: [{ name: "Grace", role: "Sponsor", notes: "note" }],
-      requirements: ["Req one", "Req two"],
-      objectives: ["Obj one"],
+      contacts: "Ada, CTO\nada@example.test",
+      stakeholders: "Grace, sponsor",
+      requirements: "Req one",
+      objectives: "Obj one",
     });
     const engagement = await store.createEngagement({
       clientId: client.id,
       name: "Eng",
-      objectives: ["Eng obj"],
+      objectives: "Eng obj",
       status: "active",
     });
     const project = await store.createProject({
       engagementId: engagement.id,
       name: "Proj",
-      objectives: ["Proj obj"],
+      objectives: "Proj obj",
       status: "completed",
     });
     await store.close();
@@ -245,15 +280,15 @@ describe("persistence and restart", () => {
         id: client.id,
         name: "Acme",
         background: "Background text",
-        contacts: [{ name: "Ada", role: "CTO", email: "ada@example.test", phone: "555" }],
-        stakeholders: [{ name: "Grace", role: "Sponsor", notes: "note" }],
-        requirements: ["Req one", "Req two"],
-        objectives: ["Obj one"],
+        contacts: "Ada, CTO\nada@example.test",
+        stakeholders: "Grace, sponsor",
+        requirements: "Req one",
+        objectives: "Obj one",
       },
     );
     assert.deepEqual(
       snapshot.engagements.find((e) => e.id === engagement.id),
-      { id: engagement.id, clientId: client.id, name: "Eng", objectives: ["Eng obj"], status: "active" },
+      { id: engagement.id, clientId: client.id, name: "Eng", objectives: "Eng obj", status: "active" },
     );
     assert.deepEqual(
       snapshot.projects.find((p) => p.id === project.id),
@@ -261,7 +296,7 @@ describe("persistence and restart", () => {
         id: project.id,
         engagementId: engagement.id,
         name: "Proj",
-        objectives: ["Proj obj"],
+        objectives: "Proj obj",
         status: "completed",
       },
     );
@@ -291,7 +326,7 @@ describe("persistence and restart", () => {
     await writeFile(join(directory, "workspace.json"), "{ not json", "utf8");
     await assert.rejects(
       () => openStore(directory),
-      (error: unknown) => error instanceof PersistenceError && error.kind === "persistence",
+      (error: unknown) => error instanceof CorruptDataError && error.kind === "corrupt",
     );
     assert.equal(await readFile(join(directory, "workspace.json"), "utf8"), "{ not json");
     assert.deepEqual(await readdir(directory), ["workspace.json"]);
@@ -308,7 +343,7 @@ describe("persistence and restart", () => {
     await writeFile(join(directory, "workspace.json"), contents, "utf8");
     await assert.rejects(
       () => openStore(directory),
-      (error: unknown) => error instanceof PersistenceError,
+      (error: unknown) => error instanceof CorruptDataError,
     );
     assert.equal(await readFile(join(directory, "workspace.json"), "utf8"), contents);
   });
@@ -317,14 +352,46 @@ describe("persistence and restart", () => {
     const directory = await makeDirectory();
     const contents = JSON.stringify({
       version: 1,
-      clients: [{ id: "c1", name: "", background: "", contacts: [], stakeholders: [], requirements: [], objectives: [] }],
+      clients: [{ id: "c1", name: "", background: "", contacts: "", stakeholders: "", requirements: "", objectives: "" }],
       engagements: [],
       projects: [],
     });
     await writeFile(join(directory, "workspace.json"), contents, "utf8");
     await assert.rejects(
       () => openStore(directory),
-      (error: unknown) => error instanceof PersistenceError,
+      (error: unknown) => error instanceof CorruptDataError,
+    );
+    assert.equal(await readFile(join(directory, "workspace.json"), "utf8"), contents);
+  });
+
+  it("refuses records with null or missing descriptive text without overwriting them", async () => {
+    const directory = await makeDirectory();
+    for (const client of [
+      { id: "c1", name: "Acme", background: null, contacts: "", stakeholders: "", requirements: "", objectives: "" },
+      { id: "c1", name: "Acme", background: "", contacts: "", stakeholders: "", requirements: "" },
+    ]) {
+      const contents = JSON.stringify({ version: 1, clients: [client], engagements: [], projects: [] });
+      await writeFile(join(directory, "workspace.json"), contents, "utf8");
+      await assert.rejects(
+        () => openStore(directory),
+        (error: unknown) => error instanceof CorruptDataError,
+      );
+      assert.equal(await readFile(join(directory, "workspace.json"), "utf8"), contents);
+    }
+  });
+
+  it("refuses records whose parents are missing", async () => {
+    const directory = await makeDirectory();
+    const contents = JSON.stringify({
+      version: 1,
+      clients: [],
+      engagements: [{ id: "e1", clientId: "gone", name: "Eng", objectives: "", status: "active" }],
+      projects: [],
+    });
+    await writeFile(join(directory, "workspace.json"), contents, "utf8");
+    await assert.rejects(
+      () => openStore(directory),
+      (error: unknown) => error instanceof CorruptDataError,
     );
     assert.equal(await readFile(join(directory, "workspace.json"), "utf8"), contents);
   });
@@ -344,6 +411,28 @@ describe("concurrency and failure handling", () => {
     stores.push(third);
   });
 
+  it("reports a lock release failure and permits a retry on close", async () => {
+    const directory = await makeDirectory();
+    const store = await openStore(directory);
+    stores.push(store);
+    await chmod(directory, 0o500);
+    let failed = false;
+    try {
+      await store.close();
+    } catch (error) {
+      failed = true;
+      assert.ok(error instanceof PersistenceError && error.kind === "persistence");
+    } finally {
+      await chmod(directory, 0o700);
+    }
+    assert.equal(failed, true);
+    assert.deepEqual(await readdir(directory), ["owner.lock"]);
+    await store.close();
+    assert.deepEqual(await readdir(directory), []);
+    const reopened = await openStore(directory);
+    stores.push(reopened);
+  });
+
   it("releases ownership after failed initialization", async () => {
     const directory = await makeDirectory();
     await writeFile(join(directory, "workspace.json"), "corrupt", "utf8");
@@ -352,7 +441,7 @@ describe("concurrency and failure handling", () => {
     // not busy: ownership was released by the failed initialization.
     await assert.rejects(
       () => openStore(directory),
-      (error: unknown) => error instanceof PersistenceError,
+      (error: unknown) => error instanceof CorruptDataError,
     );
   });
 

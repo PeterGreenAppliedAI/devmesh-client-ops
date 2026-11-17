@@ -10,11 +10,13 @@ import {
   statSync,
   unlinkSync,
   writeSync,
+  type Stats,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import {
   BusyStoreError,
+  CorruptDataError,
   MissingRecordError,
   PersistenceError,
   STATUSES,
@@ -22,14 +24,12 @@ import {
   type Client,
   type ClientInput,
   type ClientUpdate,
-  type Contact,
   type Engagement,
   type EngagementInput,
   type EngagementUpdate,
   type Project,
   type ProjectInput,
   type ProjectUpdate,
-  type Stakeholder,
   type Status,
   type WorkspaceSnapshot,
 } from "./model.ts";
@@ -84,46 +84,12 @@ const requireText = (value: unknown, field: string, allowEmpty: boolean): string
   return value;
 };
 
-const requireTextList = (value: unknown, field: string): string[] => {
-  if (!Array.isArray(value)) {
-    throw new ValidationError(`${field} must be an array of strings`);
+/** A descriptive field that must be present as text (empty text is allowed). */
+const requireStoredText = (value: unknown, field: string): string => {
+  if (value === undefined) {
+    throw new ValidationError(`${field} is missing`);
   }
-  return value.map((item, index) => requireText(item, `${field}[${index}]`, true));
-};
-
-const requireContacts = (value: unknown, field: string): Contact[] => {
-  if (!Array.isArray(value)) {
-    throw new ValidationError(`${field} must be an array`);
-  }
-  return value.map((item, index) => {
-    if (typeof item !== "object" || item === null) {
-      throw new ValidationError(`${field}[${index}] must be an object`);
-    }
-    const record = item as Record<string, unknown>;
-    return {
-      name: requireText(record.name, `${field}[${index}].name`, false),
-      role: requireText(record.role ?? "", `${field}[${index}].role`, true),
-      email: requireText(record.email ?? "", `${field}[${index}].email`, true),
-      phone: requireText(record.phone ?? "", `${field}[${index}].phone`, true),
-    };
-  });
-};
-
-const requireStakeholders = (value: unknown, field: string): Stakeholder[] => {
-  if (!Array.isArray(value)) {
-    throw new ValidationError(`${field} must be an array`);
-  }
-  return value.map((item, index) => {
-    if (typeof item !== "object" || item === null) {
-      throw new ValidationError(`${field}[${index}] must be an object`);
-    }
-    const record = item as Record<string, unknown>;
-    return {
-      name: requireText(record.name, `${field}[${index}].name`, false),
-      role: requireText(record.role ?? "", `${field}[${index}].role`, true),
-      notes: requireText(record.notes ?? "", `${field}[${index}].notes`, true),
-    };
-  });
+  return requireText(value, field, true);
 };
 
 const requireStatus = (value: unknown, field: string): Status => {
@@ -131,6 +97,13 @@ const requireStatus = (value: unknown, field: string): Status => {
     throw new ValidationError(`${field} must be one of ${STATUSES.join(", ")}`);
   }
   return value as Status;
+};
+
+const requireRecord = (value: unknown, field: string): Record<string, unknown> => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new ValidationError(`${field} must be an object`);
+  }
+  return value as Record<string, unknown>;
 };
 
 const deepFreeze = <T>(value: T): T => {
@@ -143,31 +116,23 @@ const deepFreeze = <T>(value: T): T => {
   return value;
 };
 
-const cloneClient = (client: Client): Client => ({
-  id: client.id,
-  name: client.name,
-  background: client.background,
-  contacts: client.contacts.map((c) => ({ ...c })),
-  stakeholders: client.stakeholders.map((s) => ({ ...s })),
-  requirements: [...client.requirements],
-  objectives: [...client.objectives],
-});
+const cloneClient = (client: Client): Client => ({ ...client });
+const cloneEngagement = (engagement: Engagement): Engagement => ({ ...engagement });
+const cloneProject = (project: Project): Project => ({ ...project });
 
-const cloneEngagement = (engagement: Engagement): Engagement => ({
-  id: engagement.id,
-  clientId: engagement.clientId,
-  name: engagement.name,
-  objectives: [...engagement.objectives],
-  status: engagement.status,
-});
-
-const cloneProject = (project: Project): Project => ({
-  id: project.id,
-  engagementId: project.engagementId,
-  name: project.name,
-  objectives: [...project.objectives],
-  status: project.status,
-});
+const cloneValue = <T>(value: T): T => {
+  if (Array.isArray(value)) {
+    return value.map((item) => cloneValue(item)) as unknown as T;
+  }
+  if (value !== null && typeof value === "object") {
+    const copy: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value)) {
+      copy[key] = cloneValue(item);
+    }
+    return copy as unknown as T;
+  }
+  return value;
+};
 
 const cloneState = (state: State): State => ({
   clients: state.clients.map(cloneClient),
@@ -175,78 +140,90 @@ const cloneState = (state: State): State => ({
   projects: state.projects.map(cloneProject),
 });
 
+/** Validate one stored client record, returning a clean copy. */
+const readStoredClient = (raw: unknown, field: string): Client => {
+  const record = requireRecord(raw, field);
+  return {
+    id: requireText(record.id, `${field}.id`, false),
+    name: requireText(record.name, `${field}.name`, false),
+    background: requireStoredText(record.background, `${field}.background`),
+    contacts: requireStoredText(record.contacts, `${field}.contacts`),
+    stakeholders: requireStoredText(record.stakeholders, `${field}.stakeholders`),
+    requirements: requireStoredText(record.requirements, `${field}.requirements`),
+    objectives: requireStoredText(record.objectives, `${field}.objectives`),
+  };
+};
+
+/** Validate one stored engagement record, returning a clean copy. */
+const readStoredEngagement = (raw: unknown, field: string): Engagement => {
+  const record = requireRecord(raw, field);
+  return {
+    id: requireText(record.id, `${field}.id`, false),
+    clientId: requireText(record.clientId, `${field}.clientId`, false),
+    name: requireText(record.name, `${field}.name`, false),
+    objectives: requireStoredText(record.objectives, `${field}.objectives`),
+    status: requireStatus(record.status, `${field}.status`),
+  };
+};
+
+/** Validate one stored project record, returning a clean copy. */
+const readStoredProject = (raw: unknown, field: string): Project => {
+  const record = requireRecord(raw, field);
+  return {
+    id: requireText(record.id, `${field}.id`, false),
+    engagementId: requireText(record.engagementId, `${field}.engagementId`, false),
+    name: requireText(record.name, `${field}.name`, false),
+    objectives: requireStoredText(record.objectives, `${field}.objectives`),
+    status: requireStatus(record.status, `${field}.status`),
+  };
+};
+
 /** Validate a parsed document, returning a clean internal state. */
-const validateDocument = (document: PersistedDocument): State => {
+const validateDocument = (document: {
+  clients: unknown[];
+  engagements: unknown[];
+  projects: unknown[];
+}): State => {
   const ids = new Set<string>();
-  const clients = document.clients.map((raw, index) => {
-    if (typeof raw !== "object" || raw === null) {
-      throw new ValidationError(`clients[${index}] must be an object`);
-    }
-    const record = raw as unknown as Record<string, unknown>;
-    const id = requireText(record.id, `clients[${index}].id`, false);
+  const addId = (id: string): void => {
     if (ids.has(id)) throw new ValidationError(`duplicate id ${id}`);
     ids.add(id);
-    return {
-      id,
-      name: requireText(record.name, `clients[${index}].name`, false),
-      background: requireText(record.background ?? "", `clients[${index}].background`, true),
-      contacts: requireContacts(record.contacts ?? [], `clients[${index}].contacts`),
-      stakeholders: requireStakeholders(record.stakeholders ?? [], `clients[${index}].stakeholders`),
-      requirements: requireTextList(record.requirements ?? [], `clients[${index}].requirements`),
-      objectives: requireTextList(record.objectives ?? [], `clients[${index}].objectives`),
-    };
+  };
+
+  const clients = document.clients.map((raw, index) => {
+    const client = readStoredClient(raw, `clients[${index}]`);
+    addId(client.id);
+    return client;
   });
   const clientIds = new Set(clients.map((c) => c.id));
 
-  const engagementIds = new Set<string>();
   const engagements = document.engagements.map((raw, index) => {
-    if (typeof raw !== "object" || raw === null) {
-      throw new ValidationError(`engagements[${index}] must be an object`);
+    const engagement = readStoredEngagement(raw, `engagements[${index}]`);
+    addId(engagement.id);
+    if (!clientIds.has(engagement.clientId)) {
+      throw new MissingRecordError(
+        `engagement ${engagement.id} references missing client ${engagement.clientId}`,
+      );
     }
-    const record = raw as unknown as Record<string, unknown>;
-    const id = requireText(record.id, `engagements[${index}].id`, false);
-    if (ids.has(id)) throw new ValidationError(`duplicate id ${id}`);
-    ids.add(id);
-    engagementIds.add(id);
-    const clientId = requireText(record.clientId, `engagements[${index}].clientId`, false);
-    if (!clientIds.has(clientId)) {
-      throw new MissingRecordError(`engagement ${id} references missing client ${clientId}`);
-    }
-    return {
-      id,
-      clientId,
-      name: requireText(record.name, `engagements[${index}].name`, false),
-      objectives: requireTextList(record.objectives ?? [], `engagements[${index}].objectives`),
-      status: requireStatus(record.status, `engagements[${index}].status`),
-    };
+    return engagement;
   });
+  const engagementIds = new Set(engagements.map((e) => e.id));
 
   const projects = document.projects.map((raw, index) => {
-    if (typeof raw !== "object" || raw === null) {
-      throw new ValidationError(`projects[${index}] must be an object`);
+    const project = readStoredProject(raw, `projects[${index}]`);
+    addId(project.id);
+    if (!engagementIds.has(project.engagementId)) {
+      throw new MissingRecordError(
+        `project ${project.id} references missing engagement ${project.engagementId}`,
+      );
     }
-    const record = raw as unknown as Record<string, unknown>;
-    const id = requireText(record.id, `projects[${index}].id`, false);
-    if (ids.has(id)) throw new ValidationError(`duplicate id ${id}`);
-    ids.add(id);
-    const engagementId = requireText(record.engagementId, `projects[${index}].engagementId`, false);
-    if (!engagementIds.has(engagementId)) {
-      throw new MissingRecordError(`project ${id} references missing engagement ${engagementId}`);
-    }
-    return {
-      id,
-      engagementId,
-      name: requireText(record.name, `projects[${index}].name`, false),
-      objectives: requireTextList(record.objectives ?? [], `projects[${index}].objectives`),
-      status: requireStatus(record.status, `projects[${index}].status`),
-    };
+    return project;
   });
 
   return { clients, engagements, projects };
 };
 
 class FileStore implements Store {
-  private readonly directory: string;
   private readonly statePath: string;
   private readonly lockPath: string;
   private state: State;
@@ -255,10 +232,9 @@ class FileStore implements Store {
   private queue: Promise<unknown> = Promise.resolve();
   private tempCounter = 0;
 
-  constructor(directory: string, state: State, lockHandle: number) {
-    this.directory = directory;
-    this.statePath = join(directory, STATE_FILE);
-    this.lockPath = join(directory, LOCK_FILE);
+  constructor(statePath: string, lockPath: string, state: State, lockHandle: number) {
+    this.statePath = statePath;
+    this.lockPath = lockPath;
     this.state = state;
     this.lockHandle = lockHandle;
   }
@@ -277,10 +253,10 @@ class FileStore implements Store {
         id: this.newId(state),
         name: requireText(input?.name, "name", false),
         background: requireText(input?.background ?? "", "background", true),
-        contacts: requireContacts(input?.contacts ?? [], "contacts"),
-        stakeholders: requireStakeholders(input?.stakeholders ?? [], "stakeholders"),
-        requirements: requireTextList(input?.requirements ?? [], "requirements"),
-        objectives: requireTextList(input?.objectives ?? [], "objectives"),
+        contacts: requireText(input?.contacts ?? "", "contacts", true),
+        stakeholders: requireText(input?.stakeholders ?? "", "stakeholders", true),
+        requirements: requireText(input?.requirements ?? "", "requirements", true),
+        objectives: requireText(input?.objectives ?? "", "objectives", true),
       };
       state.clients.push(client);
       return client;
@@ -300,19 +276,21 @@ class FileStore implements Store {
             ? current.background
             : requireText(update.background, "background", true),
         contacts:
-          update?.contacts === undefined ? current.contacts : requireContacts(update.contacts, "contacts"),
+          update?.contacts === undefined
+            ? current.contacts
+            : requireText(update.contacts, "contacts", true),
         stakeholders:
           update?.stakeholders === undefined
             ? current.stakeholders
-            : requireStakeholders(update.stakeholders, "stakeholders"),
+            : requireText(update.stakeholders, "stakeholders", true),
         requirements:
           update?.requirements === undefined
             ? current.requirements
-            : requireTextList(update.requirements, "requirements"),
+            : requireText(update.requirements, "requirements", true),
         objectives:
           update?.objectives === undefined
             ? current.objectives
-            : requireTextList(update.objectives, "objectives"),
+            : requireText(update.objectives, "objectives", true),
       };
       state.clients[index] = next;
       return next;
@@ -329,7 +307,7 @@ class FileStore implements Store {
         id: this.newId(state),
         clientId,
         name: requireText(input?.name, "name", false),
-        objectives: requireTextList(input?.objectives ?? [], "objectives"),
+        objectives: requireText(input?.objectives ?? "", "objectives", true),
         status: input?.status === undefined ? "planned" : requireStatus(input.status, "status"),
       };
       state.engagements.push(engagement);
@@ -349,7 +327,7 @@ class FileStore implements Store {
         objectives:
           update?.objectives === undefined
             ? current.objectives
-            : requireTextList(update.objectives, "objectives"),
+            : requireText(update.objectives, "objectives", true),
         status: update?.status === undefined ? current.status : requireStatus(update.status, "status"),
       };
       state.engagements[index] = next;
@@ -367,7 +345,7 @@ class FileStore implements Store {
         id: this.newId(state),
         engagementId,
         name: requireText(input?.name, "name", false),
-        objectives: requireTextList(input?.objectives ?? [], "objectives"),
+        objectives: requireText(input?.objectives ?? "", "objectives", true),
         status: input?.status === undefined ? "planned" : requireStatus(input.status, "status"),
       };
       state.projects.push(project);
@@ -387,7 +365,7 @@ class FileStore implements Store {
         objectives:
           update?.objectives === undefined
             ? current.objectives
-            : requireTextList(update.objectives, "objectives"),
+            : requireText(update.objectives, "objectives", true),
         status: update?.status === undefined ? current.status : requireStatus(update.status, "status"),
       };
       state.projects[index] = next;
@@ -396,10 +374,10 @@ class FileStore implements Store {
   }
 
   async close(): Promise<void> {
-    await this.queue;
+    await this.queue.catch(() => undefined);
     if (this.closed) return;
-    this.closed = true;
     this.releaseLock();
+    this.closed = true;
   }
 
   /** Ensure the store is open and serialize the mutation. */
@@ -429,18 +407,26 @@ class FileStore implements Store {
     };
   }
 
-  /** Write to a same-directory temp file, fsync, then atomically rename. */
+  /** Write the complete JSON to a same-directory temp file, fsync, then atomically rename. */
   private persist(document: PersistedDocument): void {
     const json = `${JSON.stringify(document, null, 2)}\n`;
     this.tempCounter += 1;
     const tempPath = join(
-      this.directory,
+      dirname(this.statePath),
       `${STATE_FILE}.${process.pid}.${this.tempCounter}.tmp`,
     );
     try {
+      const buffer = Buffer.from(json, "utf8");
       const fd = openSync(tempPath, "wx");
       try {
-        writeSync(fd, json);
+        let offset = 0;
+        while (offset < buffer.length) {
+          const written = writeSync(fd, buffer, offset, buffer.length - offset);
+          if (!(written > 0)) {
+            throw new Error(`short write: ${written} of ${buffer.length - offset} bytes`);
+          }
+          offset += written;
+        }
         fsyncSync(fd);
       } finally {
         closeSync(fd);
@@ -469,36 +455,35 @@ class FileStore implements Store {
     return id;
   }
 
+  /**
+   * Remove the lock file and close its handle.
+   *
+   * A missing lock file is fine. Any other failure is reported so `close` does
+   * not claim success while ownership of the directory is still held.
+   */
   private releaseLock(): void {
+    let unlinkError: unknown = null;
+    try {
+      unlinkSync(this.lockPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") unlinkError = error;
+    }
     if (this.lockHandle !== null) {
       try {
         closeSync(this.lockHandle);
-      } catch {
-        // Nothing useful to do if the handle is already closed.
+      } catch (error) {
+        if (!unlinkError) unlinkError = error;
       }
       this.lockHandle = null;
     }
-    try {
-      unlinkSync(this.lockPath);
-    } catch {
-      // The lock file may already be gone.
+    if (unlinkError) {
+      throw new PersistenceError(
+        `could not release store lock: ${(unlinkError as Error).message}`,
+        { cause: unlinkError },
+      );
     }
   }
 }
-
-const cloneValue = <T>(value: T): T => {
-  if (Array.isArray(value)) {
-    return value.map((item) => cloneValue(item)) as unknown as T;
-  }
-  if (value !== null && typeof value === "object") {
-    const copy: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value)) {
-      copy[key] = cloneValue(item);
-    }
-    return copy as unknown as T;
-  }
-  return value;
-};
 
 /** Acquire exclusive ownership of a data directory by creating the lock file. */
 const acquireLock = (lockPath: string): number => {
@@ -514,13 +499,23 @@ const acquireLock = (lockPath: string): number => {
     });
   }
   try {
-    writeSync(
-      fd,
+    const contents = Buffer.from(
       JSON.stringify({ pid: process.pid, acquiredAt: new Date().toISOString() }) + "\n",
+      "utf8",
     );
+    let offset = 0;
+    while (offset < contents.length) {
+      const written = writeSync(fd, contents, offset, contents.length - offset);
+      if (!(written > 0)) throw new Error("short write of lock contents");
+      offset += written;
+    }
     fsyncSync(fd);
   } catch (error) {
-    closeSync(fd);
+    try {
+      closeSync(fd);
+    } catch {
+      // Ignore.
+    }
     try {
       unlinkSync(lockPath);
     } catch {
@@ -550,16 +545,16 @@ const loadState = (statePath: string): State => {
   try {
     parsed = JSON.parse(raw);
   } catch (error) {
-    throw new PersistenceError(`workspace state is corrupt: ${(error as Error).message}`, {
+    throw new CorruptDataError(`workspace state is corrupt: ${(error as Error).message}`, {
       cause: error,
     });
   }
-  if (typeof parsed !== "object" || parsed === null) {
-    throw new PersistenceError("workspace state is corrupt: not a JSON object");
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new CorruptDataError("workspace state is corrupt: not a JSON object");
   }
   const document = parsed as Record<string, unknown>;
   if (document.version !== FORMAT_VERSION) {
-    throw new PersistenceError(
+    throw new CorruptDataError(
       `unsupported workspace state version: ${String(document.version)}`,
     );
   }
@@ -568,20 +563,19 @@ const loadState = (statePath: string): State => {
     !Array.isArray(document.engagements) ||
     !Array.isArray(document.projects)
   ) {
-    throw new PersistenceError("workspace state is corrupt: missing record collections");
+    throw new CorruptDataError("workspace state is corrupt: missing record collections");
   }
   try {
     return validateDocument({
-      version: document.version as number,
-      clients: document.clients as Client[],
-      engagements: document.engagements as Engagement[],
-      projects: document.projects as Project[],
+      clients: document.clients,
+      engagements: document.engagements,
+      projects: document.projects,
     });
   } catch (error) {
     if (error instanceof ValidationError || error instanceof MissingRecordError) {
-      throw new PersistenceError(`workspace state is invalid: ${error.message}`, { cause: error });
+      throw new CorruptDataError(`workspace state is invalid: ${error.message}`, { cause: error });
     }
-    throw new PersistenceError(`workspace state is invalid: ${(error as Error).message}`, {
+    throw new CorruptDataError(`workspace state is invalid: ${(error as Error).message}`, {
       cause: error,
     });
   }
@@ -593,25 +587,28 @@ const loadState = (statePath: string): State => {
  * Acquires exclusive ownership, loads and validates any existing state, and
  * returns a store whose reads are detached snapshots and whose writes are
  * serialized, validated and persisted atomically before they are acknowledged.
+ * A failed initialization releases ownership.
  */
 export function openStore(directory: string): Promise<Store> {
   return (async () => {
+    let stats: Stats;
     try {
       mkdirSync(directory, { recursive: true });
-      if (!statSync(directory).isDirectory()) {
-        throw new PersistenceError(`not a directory: ${directory}`);
-      }
+      stats = statSync(directory);
     } catch (error) {
-      if (error instanceof PersistenceError) throw error;
       throw new PersistenceError(`could not prepare data directory: ${(error as Error).message}`, {
         cause: error,
       });
     }
+    if (!stats.isDirectory()) {
+      throw new PersistenceError(`not a directory: ${directory}`);
+    }
+    const statePath = join(directory, STATE_FILE);
     const lockPath = join(directory, LOCK_FILE);
     const lockHandle = acquireLock(lockPath);
     try {
-      const state = loadState(join(directory, STATE_FILE));
-      return new FileStore(directory, state, lockHandle);
+      const state = loadState(statePath);
+      return new FileStore(statePath, lockPath, state, lockHandle);
     } catch (error) {
       try {
         closeSync(lockHandle);
@@ -632,14 +629,12 @@ export type {
   Client,
   ClientInput,
   ClientUpdate,
-  Contact,
   Engagement,
   EngagementInput,
   EngagementUpdate,
   Project,
   ProjectInput,
   ProjectUpdate,
-  Stakeholder,
   Status,
   WorkspaceSnapshot,
 };
