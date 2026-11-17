@@ -1,0 +1,32 @@
+# Reviewed DevMesh Factory workflow (node-npm profile). Pull requests only: every change reaches main through a reviewed PR.
+name: CI
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  verify:
+    name: verify (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: ['22', '24']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: ${{ matrix.node }}
+      - name: install
+        run: npm ci --ignore-scripts
+      - name: verify-installed
+        run: node scripts/verify-installed.mjs
+      - name: test
+        run: npm test
+      - name: build
+        run: npm run build
+      - name: typecheck
+        run: npm run typecheck
