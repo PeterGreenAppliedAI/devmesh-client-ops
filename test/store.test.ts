@@ -2,8 +2,7 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { chmod } from "node:fs/promises";
-import { closeSync, readdirSync, readlinkSync } from "node:fs";
+import { readdirSync } from "node:fs";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
 import { openStore, type Store } from "../src/store.ts";
@@ -415,58 +414,54 @@ describe("concurrency and failure handling", () => {
     const directory = await makeDirectory();
     const store = await openStore(directory);
     stores.push(store);
-    await chmod(directory, 0o500);
+    const lockPath = join(directory, "owner.lock");
+
+    // Replace the lock file with a directory so removing it fails, on every
+    // platform and for every user (including root).
+    await rm(lockPath);
+    await mkdir(lockPath);
     let failed = false;
     try {
       await store.close();
     } catch (error) {
       failed = true;
       assert.ok(error instanceof PersistenceError && error.kind === "persistence");
-    } finally {
-      await chmod(directory, 0o700);
     }
     assert.equal(failed, true);
     assert.deepEqual(await readdir(directory), ["owner.lock"]);
+
+    // Clear the obstruction; the retried close removes the lock and frees the
+    // directory for a new owner.
+    await rm(lockPath, { recursive: true, force: true });
+    await writeFile(lockPath, "", "utf8");
     await store.close();
     assert.deepEqual(await readdir(directory), []);
     const reopened = await openStore(directory);
     stores.push(reopened);
   });
 
-  it("keeps the lock file when closing the handle fails and a retry cannot remove a newer owner's lock", async () => {
+  it("keeps the lock file and refuses new writers when a lock release fails", async () => {
     const directory = await makeDirectory();
     const store = await openStore(directory);
     stores.push(store);
     const lockPath = join(directory, "owner.lock");
 
-    // Close the lock handle out from under the store so its own close fails.
-    let handleClosed = false;
-    for (const name of readdirSync("/proc/self/fd")) {
-      try {
-        if (readlinkSync(`/proc/self/fd/${name}`) === lockPath) {
-          closeSync(Number(name));
-          handleClosed = true;
-        }
-      } catch {
-        // Descriptor entries come and go; ignore races.
-      }
-    }
-    assert.equal(handleClosed, true);
-
+    await rm(lockPath);
+    await mkdir(lockPath);
     await assert.rejects(
       () => store.close(),
       (error: unknown) => error instanceof PersistenceError && error.kind === "persistence",
     );
-    // A failed handle close must not remove the lock file, so no new writer can
-    // take ownership in between.
+    // A failed release must not remove the lock file, so no new writer can
+    // take ownership while the first store still holds it.
     assert.deepEqual(readdirSync(directory), ["owner.lock"]);
     await assert.rejects(
       () => openStore(directory),
       (error: unknown) => error instanceof BusyStoreError && error.kind === "busy",
     );
 
-    // A retried close that still cannot close the handle must keep the lock
-    // file in place rather than unlinking it.
+    // A retried close that still cannot remove the lock must keep it in place
+    // rather than reporting success.
     await assert.rejects(
       () => store.close(),
       (error: unknown) => error instanceof PersistenceError,
@@ -476,6 +471,14 @@ describe("concurrency and failure handling", () => {
       () => openStore(directory),
       (error: unknown) => error instanceof BusyStoreError,
     );
+
+    // Once the obstruction clears, close succeeds and ownership is released.
+    await rm(lockPath, { recursive: true, force: true });
+    await writeFile(lockPath, "", "utf8");
+    await store.close();
+    assert.deepEqual(readdirSync(directory), []);
+    const reopened = await openStore(directory);
+    stores.push(reopened);
   });
 
   it("releases ownership after failed initialization", async () => {
