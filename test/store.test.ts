@@ -93,8 +93,6 @@ function failingFs(failOn: FailOn) {
     existsSync(path: string): boolean;
     mkdirSync(path: string, options: { recursive: true }): void;
     openSync(path: string, flags: "wx" | "r"): number;
-    /** Open a directory handle for the store's directory flush. */
-    openDirectorySync?(path: string): number;
     writeSync(fd: number, data: Uint8Array): number;
     fsyncSync(fd: number): void;
     closeSync(fd: number): void;
@@ -1161,8 +1159,8 @@ describe("failures", () => {
 
   /**
    * Observe the store's directory flush through the injected adapter. The flush
-   * goes through the adapter's own openDirectorySync, fsyncSync and closeSync on
-   * the directory handle, so these counts show exactly what the store did.
+   * goes through the adapter's own openSync, fsyncSync and closeSync on the
+   * directory handle, so these counts show exactly what the store did.
    *
    * A path with no file extension is the data directory itself. Opening that
    * path never reaches the real file system: the observer hands out a synthetic
@@ -1197,30 +1195,34 @@ describe("failures", () => {
     // on every named failure persists, as a genuine operation failure would.
     let failedOpen = false;
     const isDirectoryPath = (path: string) => !path.split(/[\\/]/).at(-1)!.includes(".");
+    // The classification comes from the path the handle was opened for: a
+    // handle opened for a directory path is the directory's, whatever its
+    // number. A directory handle is opened through a synthetic negative
+    // descriptor, but an operating system may reuse a file's descriptor number
+    // for a different open file, so the number alone is not trusted.
     const classify = (fd: number): "directory" | "file" | "unknown" => {
-      if (directories.has(fd)) return "directory";
-      if (opened.has(fd)) return "file";
-      return "unknown";
+      const path = directories.get(fd) ?? opened.get(fd);
+      if (path === undefined) return "unknown";
+      return isDirectoryPath(path) ? "directory" : "file";
     };
-    // The store requests its directory handle through openDirectorySync, so the
-    // observer counts and simulates that operation; a file is opened through
-    // openSync and never reaches the real file system for a directory path.
+    // The store requests its directory handle with openSync(path, "r"), so the
+    // observer simulates that operation for a directory path; a file is opened
+    // through openSync with the "wx" flag and is delegated to the real file
+    // system as before.
     adapter.openSync = (path: string, flags: "wx" | "r") => {
-      if (flags === "r" && isDirectoryPath(path)) return adapter.openDirectorySync!(path);
+      if (flags === "r" && isDirectoryPath(path)) {
+        ops.open += 1;
+        if (failOn.directoryOpenCode && !failedOpen) {
+          failedOpen = true;
+          throw fsError(failOn.directoryOpenCode);
+        }
+        const fd = nextSyntheticFd;
+        nextSyntheticFd -= 1;
+        directories.set(fd, path);
+        return fd;
+      }
       const fd = openNormally(path, flags);
       opened.set(fd, path);
-      return fd;
-    };
-    adapter.openDirectorySync = (path: string) => {
-      if (!isDirectoryPath(path)) return openNormally(path, "r");
-      ops.open += 1;
-      if (failOn.directoryOpenCode && !failedOpen) {
-        failedOpen = true;
-        throw fsError(failOn.directoryOpenCode);
-      }
-      const fd = nextSyntheticFd;
-      nextSyntheticFd -= 1;
-      directories.set(fd, path);
       return fd;
     };
     adapter.fsyncSync = (fd: number) => {
@@ -1254,11 +1256,38 @@ describe("failures", () => {
     };
   }
 
+  /**
+   * Fail the next `times` directory flushes of the observed adapter through a
+   * test's own wrapper of this adapter's fsyncSync, then delegate normally. The
+   * wrapper asks the observer whether the handle is the directory's, so a
+   * descriptor for a file is never failed, and keeps its own count so the
+   * failure really does end after `times` calls.
+   */
+  function failDirectoryFlushes(
+    observer: DirectoryObserver,
+    adapter: ReturnType<typeof failingFs>,
+    code: string,
+    times: number,
+  ): void {
+    const fsyncNormally = adapter.fsyncSync;
+    let remaining = times;
+    adapter.fsyncSync = (fd: number) => {
+      // The wrapper asks the observer whether the handle is the directory's, so
+      // a descriptor for a file is never failed.
+      if (observer.isDirectoryFd(fd) && remaining > 0) {
+        remaining -= 1;
+        throw fsError(code);
+      }
+      return fsyncNormally(fd);
+    };
+  }
+
   interface CommittedDirectory {
     dir: string;
     committed: string;
     adapter: ReturnType<typeof failingFs>;
     ops: DirectoryOps;
+    observer: DirectoryObserver;
     store: Store;
   }
 
@@ -1269,9 +1298,9 @@ describe("failures", () => {
    *
    * The platform is injected as "linux", so the store takes its POSIX
    * directory-flush branch and attempts the directory operations. The observer
-   * simulates the directory handle, so those operations are reached and
-   * exercised on every operating system, Windows included, where a real
-   * directory handle could not be opened or flushed.
+   * simulates the directory handle through the adapter's own openSync, so those
+   * operations are reached and exercised on every operating system, Windows
+   * included, where a real directory handle could not be opened or flushed.
    *
    * A named failure is injected only once during the store's opening; from then
    * on it persists, so the save under test fails at that operation and the
@@ -1300,7 +1329,7 @@ describe("failures", () => {
     // Reset the counts so they cover only the save under test; opening a store
     // performs no save of its own.
     Object.assign(ops, { open: 0, fsync: 0, close: 0, fileFsync: 0 });
-    return { dir, committed, adapter, ops, store };
+    return { dir, committed, adapter, ops, observer, store };
   }
 
   /**
@@ -1329,11 +1358,11 @@ describe("failures", () => {
   it("rejects when opening the directory for the flush fails", async () => {
     // A genuine failure to open the directory is reported, never treated as an
     // unsupported operation. The store's directory flush opens the directory
-    // through the adapter's own openDirectorySync, so the injected open failure
-    // is the store's own operation: the rejected save's directory is never
-    // flushed or closed, and the store then rewrites the previous committed
-    // file, whose directory open now succeeds. Memory and the store file keep
-    // the previously committed state, and the store is not blocked.
+    // through the adapter's own openSync with the "r" flag, so the injected
+    // open failure is the store's own operation: the rejected save's directory
+    // is never flushed or closed, and the store then rewrites the previous
+    // committed file, whose directory open now succeeds. Memory and the store
+    // file keep the previously committed state, and the store is not blocked.
     for (const code of ["EIO", "ENOENT", "EINVAL"]) {
       const opened = await openCommittedDirectory({ directoryOpenCode: code });
       await assertDirectoryFailureRetainsState(opened, code);
@@ -1415,6 +1444,62 @@ describe("failures", () => {
     // The store file still holds the committed state on disk as well.
     assert.equal(readFileSync(storePath(opened.dir), "utf8"), opened.committed);
     await opened.store.close();
+  });
+
+  it("reports a directory flush failure for every error code on POSIX and recovers", async () => {
+    // The store's directory flush classifies no error code as unsupported:
+    // every failure, including the codes some kernels use for an unsupported
+    // operation, is a genuine persistence failure. Only the first directory
+    // flush of the save fails; the flush that makes the restored previous state
+    // durable then succeeds, so the store stays usable for later saves.
+    // The platform is injected as "linux" and the observer simulates the
+    // directory handle, so this runs on every operating system.
+    for (const code of ["EIO", "EINVAL", "ENOTSUP", "EOPNOTSUPP", "EISDIR"]) {
+      const dir = tempDir();
+      // The store starts with an empty directory: the first flush fails and the
+      // restore has no previous file to write back, only the directory to flush.
+      const adapter = failingFs({});
+      // The store's directory flush opens the directory through the adapter's
+      // own openSync(path, "r"), which the observer answers with a simulated
+      // handle and counts. The store is opened first, then the wrapper is
+      // installed for the save under test, so only the first directory flush of
+      // the save fails; its own count then stops it, so the store's attempt to
+      // make the previous state durable flushes successfully and the store is
+      // not blocked. Opening a store flushes no directory, so installing the
+      // wrapper around the opening does not consume its one failure.
+      const observer = observeDirectoryOps(adapter);
+      failDirectoryFlushes(observer, adapter, code, 1);
+      const store = await openStore(dir, { fs: adapter, platform: "linux" });
+      try {
+        await assert.rejects(store.createClient({ name: "Acme" }), (error: unknown) => {
+          // The failure is reported as a PersistenceError whose cause is the
+          // failed directory flush with the injected code. With an empty store
+          // there is no previous file to write back, so the store's attempt to
+          // make the committed state durable only flushes the directory, and
+          // that flush succeeds because the failure was injected once.
+          assert.ok(error instanceof PersistenceError, code);
+          const cause = (error as { cause?: NodeJS.ErrnoException }).cause;
+          assert.equal(cause?.code, code);
+          return true;
+        });
+        assert.equal(store.snapshot().clients.length, 0);
+        // The failed flush is never followed by another failed one for this
+        // first save, so the store is not blocked; a later save is acknowledged.
+        const created = await store.createClient({ name: "Acme" });
+        assert.equal(created.name, "Acme");
+        assert.deepEqual(store.snapshot().clients.map((client) => client.name), ["Acme"]);
+      } finally {
+        await store.close();
+      }
+      // The later save reached the store file on disk.
+      assert.equal(readFileSync(storePath(dir), "utf8").includes("Acme"), true);
+      const reopened = await openStore(dir);
+      try {
+        assert.deepEqual(reopened.snapshot().clients.map((client) => client.name), ["Acme"]);
+      } finally {
+        await reopened.close();
+      }
+    }
   });
 
   it("opens the directory flush through the adapter's own operations on POSIX", async () => {
