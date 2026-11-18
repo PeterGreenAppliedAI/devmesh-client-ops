@@ -14,7 +14,7 @@ import {
   writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { after, describe, it } from "node:test";
 import {
   BusyStoreError,
@@ -22,6 +22,7 @@ import {
   openStore,
   PersistenceError,
   ValidationError,
+  type FileSystem,
   type Store,
 } from "../src/store.ts";
 
@@ -66,6 +67,13 @@ interface FailOn {
   unlinkSync?: (path: string) => boolean;
   mkdirSync?: (path: string) => boolean;
   fsyncDirectorySync?: (path: string) => boolean;
+  /**
+   * Fail opening the directory for the flush with this error code. The
+   * directory flush then fails at its open step, before any flush is made.
+   */
+  directoryOpenCode?: string;
+  /** Fail flushing the opened directory with this error code. */
+  directoryFsyncCode?: string;
 }
 
 /**
@@ -154,6 +162,63 @@ function failingFs(failOn: FailOn) {
 }
 
 const alwaysMissing = () => true;
+const FLUSH_DIRECTORY = "directory";
+
+/**
+ * An in-memory adapter for the store's own files. It exists so a test can drive
+ * the default adapter's directory flush through its real open, fsync and close
+ * steps with a chosen error code, on every platform, without touching the file
+ * system or depending on the current process's platform.
+ */
+function inMemoryFs(
+  directory: string,
+  options: {
+    openCode?: string;
+    fsyncCode?: string;
+  },
+): {
+  fs: FileSystem;
+  events: string[];
+} {
+  const events: string[] = [];
+  // The store passes the directory path unchanged to the flush.
+  const isDirectory = (path: string) => path === directory;
+  let nextFd = 10;
+  const fs: FileSystem = {
+    existsSync: (path: string) => path.endsWith(".lock") || path.endsWith(".tmp"),
+    mkdirSync: () => undefined,
+    readFileSync: (path: string) => {
+      if (path.endsWith(".lock")) return JSON.stringify({ pid: process.pid });
+      throw fsError("ENOENT");
+    },
+    openSync: (path: string) => {
+      events.push("open-directory-check");
+      if (isDirectory(path)) {
+        events.push("open-directory");
+        if (options.openCode) throw fsError(options.openCode);
+        return 7;
+      }
+      events.push("open");
+      nextFd += 1;
+      return nextFd;
+    },
+    writeSync: () => 1,
+    fsyncSync: (fd: number) => {
+      if (fd === 7) {
+        events.push("fsync-directory");
+        if (options.fsyncCode) throw fsError(options.fsyncCode);
+        return;
+      }
+      events.push("fsync");
+    },
+    closeSync: (fd: number) => {
+      if (fd === 7) events.push("close-directory");
+    },
+    renameSync: () => undefined,
+    unlinkSync: () => undefined,
+  };
+  return { fs, events };
+}
 
 function lockPath(dir: string): string {
   return join(dir, "workspace.lock");
@@ -161,6 +226,46 @@ function lockPath(dir: string): string {
 
 function storePath(dir: string): string {
   return join(dir, "workspace.json");
+}
+
+/**
+ * Open a store over an in-memory adapter for the directory. The default
+ * adapter's real directory flush is used unchanged, with this adapter's
+ * open/fsync/close underneath it, so the flush's own platform check and
+ * per-operation classification are exercised on every platform.
+ */
+async function openMemoryStore(options: {
+  openCode?: string;
+  fsyncCode?: string;
+}): Promise<{ store: Store; events: string[] }> {
+  const { fs, events } = inMemoryFs(FLUSH_DIRECTORY, options);
+  // No file operations are replaced: the store and the default adapter both use
+  // the in-memory adapter, so the flush's real open, flush and close steps run
+  // over it. The directory flush is left to the default adapter.
+  const store = await openStore(FLUSH_DIRECTORY, { fs });
+  return { store, events };
+}
+
+/**
+ * Save a client over the in-memory adapter with the given directory operations
+ * failing, and report whether the save was acknowledged, the error raised and
+ * the directory operations attempted.
+ */
+async function saveWithDirectory(
+  options: { openCode?: string; fsyncCode?: string },
+  save: (store: Store) => Promise<unknown>,
+): Promise<{ acknowledged: boolean; error: unknown; events: string[] }> {
+  const { store, events } = await openMemoryStore(options);
+  let acknowledged = false;
+  let error: unknown;
+  try {
+    await save(store);
+    acknowledged = true;
+  } catch (cause) {
+    error = cause;
+  }
+  await store.close().catch(() => undefined);
+  return { acknowledged, error, events };
 }
 
 describe("client creation and editing", () => {
@@ -1074,6 +1179,71 @@ describe("failures", () => {
       assert.equal(created.name, "Acme");
     } finally {
       await failing.unlinkSync(lockPath(dir));
+    }
+  });
+
+  it("suppresses only a directory open that means the platform cannot open a directory", async () => {
+    // Opening and flushing the directory have separate classifications. Only
+    // EISDIR at open means the platform cannot open a directory for flushing;
+    // every other open error, such as a missing directory, is genuine.
+    for (const code of ["ENOENT", "EACCES", "EMFILE", "EIO", "EINVAL", "EBADF"]) {
+      const genuine = await saveWithDirectory({ openCode: code }, (store) =>
+        store.createClient({ name: "Acme" }),
+      );
+      assert.equal(genuine.acknowledged, false);
+      assert.ok(genuine.error instanceof PersistenceError);
+      assert.equal(
+        ((genuine.error.cause as { cleanupCause?: NodeJS.ErrnoException }).cleanupCause ??
+          (genuine.error.cause as NodeJS.ErrnoException)).code,
+        code,
+      );
+    }
+  });
+
+  it("classifies directory flush errors separately from directory open errors", async () => {
+    // At the flush step only EINVAL/ENOTSUP/EOPNOTSUPP mean the file system
+    // cannot flush a directory descriptor. Every other code, including an
+    // unknown one, is a genuine failure that is reported.
+    for (const code of ["EIO", "ENOENT", "EACCES", "EPERM", "EBADF", "EUNKNOWN"]) {
+      const genuine = await saveWithDirectory({ fsyncCode: code }, (store) =>
+        store.createClient({ name: "Acme" }),
+      );
+      assert.equal(genuine.acknowledged, false);
+      assert.ok(genuine.error instanceof PersistenceError);
+      assert.equal(
+        ((genuine.error.cause as { cleanupCause?: NodeJS.ErrnoException }).cleanupCause ??
+          (genuine.error.cause as NodeJS.ErrnoException)).code,
+        code,
+      );
+    }
+  });
+
+  it("tolerates only unsupported directory open and flush operations", async () => {
+    // On this platform the flush must open the directory and make one flush
+    // call, close the descriptor it opened, and tolerate only an unsupported
+    // open (EISDIR) or an unsupported flush code (EINVAL/ENOTSUP/EOPNOTSUPP).
+    for (const options of [
+      { openCode: "EISDIR" },
+      { fsyncCode: "EINVAL" },
+      { fsyncCode: "ENOTSUP" },
+      { fsyncCode: "EOPNOTSUPP" },
+    ]) {
+      const tolerated = await saveWithDirectory(options, (store) =>
+        store.createClient({ name: "Acme" }),
+      );
+      assert.equal(tolerated.acknowledged, true, JSON.stringify(options));
+      if (options.openCode) {
+        // An unsupported open stops before any flush, but any descriptor the
+        // adapter returned must still be absent from the event trail.
+        assert.deepEqual(tolerated.events, ["open", "open-directory"]);
+      } else {
+        assert.deepEqual(tolerated.events, [
+          "open",
+          "open-directory",
+          "fsync-directory",
+          "close-directory",
+        ]);
+      }
     }
   });
 

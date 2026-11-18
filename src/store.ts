@@ -160,16 +160,24 @@ interface State {
 }
 
 /**
- * Error codes that mean the POSIX kernel or file system does not support
- * flushing a directory descriptor. These are treated as "unsupported" rather
- * than as a failed save. Every other error from opening or flushing the
- * directory is a genuine failure and is reported.
+ * Directory durability is handled per platform and per operation. On Windows a
+ * directory cannot be opened or flushed as a directory handle, so the rename is
+ * the durability point and the step is skipped; that decision is made by
+ * checking the platform, never by catching errors. On POSIX the directory is
+ * opened for reading and then flushed, and each step has its own handling:
+ * - open: only EISDIR means this platform cannot open a directory for the
+ *   flush, so the step is a no-op. Every other open error is genuine (ENOENT,
+ *   EACCES, EMFILE, ...) and is reported.
+ * - fsync: only EINVAL and ENOTSUP/EOPNOTSUPP mean this file system cannot
+ *   flush a directory descriptor. Every other flush error is genuine and is
+ *   reported.
+ * - close: always a genuine failure if it fails after a successful open.
  */
-const UNSUPPORTED_POSIX_DIRECTORY_CODES = new Set([
+const UNSUPPORTED_POSIX_DIRECTORY_OPEN_CODES = new Set(["EISDIR"]);
+const UNSUPPORTED_POSIX_DIRECTORY_FLUSH_CODES = new Set([
   "EINVAL",
   "ENOTSUP",
   "EOPNOTSUPP",
-  "EISDIR",
 ]);
 
 function defaultFileSystem(): FileSystem {
@@ -184,37 +192,31 @@ function defaultFileSystem(): FileSystem {
     renameSync: (oldPath, newPath) => renameSync(oldPath, newPath),
     unlinkSync: (path) => unlinkSync(path),
     fsyncDirectorySync: (path) => {
-      // Windows cannot fsync a directory; there the rename is the durability
-      // point, so this step is skipped by platform rather than by catching
-      // errors. On POSIX platforms, only the kernel's "unsupported" codes are
-      // tolerated, never a genuine open, flush or close failure. A descriptor
-      // that did open is always closed, and a real close failure is reported.
+      // Windows cannot fsync a directory: skip the open and the flush there by
+      // checking the platform, leaving the rename as the durability point.
       if (process.platform === "win32") return;
+      // Open: only EISDIR means a directory cannot be opened for flushing here.
       let fd: number;
       try {
         fd = openSync(path, "r");
       } catch (cause) {
-        if (UNSUPPORTED_POSIX_DIRECTORY_CODES.has(errorCode(cause) ?? "")) return;
+        if (UNSUPPORTED_POSIX_DIRECTORY_OPEN_CODES.has(errorCode(cause) ?? "")) return;
         throw cause;
       }
-      let failed = false;
-      let failure: unknown;
+      // Flush: only EINVAL/ENOTSUP/EOPNOTSUPP mean the file system cannot flush
+      // a directory descriptor. Anything else, including an unknown code, is a
+      // genuine failure.
+      let failure: { failed: boolean; cause?: unknown } = { failed: false };
       try {
-        try {
-          fsyncSync(fd);
-        } catch (cause) {
-          if (!UNSUPPORTED_POSIX_DIRECTORY_CODES.has(errorCode(cause) ?? "")) {
-            failed = true;
-            failure = cause;
-          }
-        }
+        fsyncSync(fd);
       } catch (cause) {
-        failed = true;
-        failure = cause;
+        if (!UNSUPPORTED_POSIX_DIRECTORY_FLUSH_CODES.has(errorCode(cause) ?? "")) {
+          failure = { failed: true, cause };
+        }
       } finally {
         closeSync(fd);
       }
-      if (failed) throw failure;
+      if (failure.failed) throw failure.cause;
     },
   };
 }
@@ -951,4 +953,13 @@ export async function openStore(
     }
     throw error;
   }
+}
+
+/**
+ * Internal factory for the default file-system adapter. It is exported only so
+ * tests can run the adapter's own directory durability handling (its platform
+ * check and per-operation classification) over in-memory operations.
+ */
+export function defaultFileSystemForTests(): FileSystem {
+  return defaultFileSystem();
 }
