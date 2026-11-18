@@ -93,6 +93,8 @@ function failingFs(failOn: FailOn) {
     existsSync(path: string): boolean;
     mkdirSync(path: string, options: { recursive: true }): void;
     openSync(path: string, flags: "wx" | "r"): number;
+    /** Open a directory handle for the store's directory flush. */
+    openDirectorySync?(path: string): number;
     writeSync(fd: number, data: Uint8Array): number;
     fsyncSync(fd: number): void;
     closeSync(fd: number): void;
@@ -922,14 +924,19 @@ describe("failures", () => {
     // the flush of the previous committed state must succeed, or the store is
     // blocked.
     const flushFailing = failingFs({});
+    // The observer's adapter simulates the directory handle on every operating
+    // system, so this flush is reached even where a real directory flush is
+    // unsupported; its classification is independent of descriptor numbers.
+    const observed = observeDirectoryOps(flushFailing);
     const fsyncNormally = flushFailing.fsyncSync;
     let directoryFlushes = 0;
     flushFailing.fsyncSync = (fd: number) => {
-      if (flushFailing.isDirectoryFd(fd)) {
-        directoryFlushes += 1;
-        if (directoryFlushes === 1) throw fsError("EIO");
-      }
-      fsyncNormally(fd);
+      if (!observed.isDirectoryFd(fd)) return fsyncNormally(fd);
+      directoryFlushes += 1;
+      // Only the first directory flush fails; the flush of the previous
+      // committed state must succeed, so the store is not left blocked.
+      if (directoryFlushes === 1) throw fsError("EIO");
+      return fsyncNormally(fd);
     };
     const second = await openStore(dir, { fs: flushFailing, platform: "linux" });
     try {
@@ -1018,20 +1025,23 @@ describe("failures", () => {
     // flushes of the directory descriptor and count them.
     let directoryFlushes = 0;
     const failing = failingFs({});
+    // The observer's adapter simulates the directory handle on every operating
+    // system, so these flushes are reached even where a real directory flush is
+    // unsupported; its classification is independent of descriptor numbers.
+    const observed = observeDirectoryOps(failing);
     const fsyncNormally = failing.fsyncSync;
     failing.fsyncSync = (fd: number) => {
-      if (failing.isDirectoryFd(fd)) {
-        directoryFlushes += 1;
-        // Fail the flush of the rejected replacement, and the flush of the
-        // restored file too once the store file holds the committed state again.
-        if (
-          directoryFlushes === 1 ||
-          readFileSync(storePath(dir), "utf8") === committed
-        ) {
-          throw fsError("EIO");
-        }
+      if (!observed.isDirectoryFd(fd)) return fsyncNormally(fd);
+      directoryFlushes += 1;
+      // Fail the flush of the rejected replacement, and the flush of the
+      // restored file too once the store file holds the committed state again.
+      if (
+        directoryFlushes === 1 ||
+        readFileSync(storePath(dir), "utf8") === committed
+      ) {
+        throw fsError("EIO");
       }
-      fsyncNormally(fd);
+      return fsyncNormally(fd);
     };
     const store = await openStore(dir, { fs: failing, platform: "linux" });
     directoryFlushes = 0;
@@ -1122,48 +1132,126 @@ describe("failures", () => {
     fileFsync: number;
   }
 
-  /** The counts of directory operations plus the observer's descriptor record. */
+  /**
+   * Operations for the observer to fail. These apply to the simulated directory
+   * handle only, so a test can fail the directory's open, flush or close on the
+   * simulated handle without any real directory operation.
+   */
+  interface DirectoryFailures {
+    directoryOpenCode?: string;
+    directoryFsyncCode?: string;
+    directoryCloseCode?: string;
+  }
+
   interface DirectoryObserver {
     ops: DirectoryOps;
     /**
-     * Whether the observer opened this descriptor with the "r" flag, so it
-     * belongs to a file rather than to the directory the store flushes. The
-     * store opens its temporary and lock files with "wx" and opens a file for
-     * reading only when it flushes the store file before a restore.
+     * The descriptors the observer opened, mapped to the path they were opened
+     * for, so a test can tell a file operation from a directory operation by
+     * the path alone. This never relies on forwarding a directory open to the
+     * real file system: every directory handle is simulated with a synthetic
+     * descriptor.
      */
-    isFileFd(fd: number): boolean;
+    opened: Map<number, string>;
+    /** Simulated directory handles, mapped to their path. */
+    directories: Map<number, string>;
+    /** Whether the observer opened this descriptor for a directory. */
+    isDirectoryFd(fd: number): boolean;
   }
 
   /**
    * Observe the store's directory flush through the injected adapter. The flush
-   * goes through the adapter's own openSync ("r"), fsyncSync and closeSync on
-   * the directory descriptor, so these counts show exactly what the store did.
+   * goes through the adapter's own openDirectorySync, fsyncSync and closeSync on
+   * the directory handle, so these counts show exactly what the store did.
+   *
+   * A path with no file extension is the data directory itself. Opening that
+   * path never reaches the real file system: the observer hands out a synthetic
+   * descriptor, and flushes and closes of such a handle are performed by the
+   * adapter itself. That lets the store's POSIX directory flush be exercised on
+   * every operating system, Windows included, where opening or flushing a real
+   * directory handle is unsupported. File operations are delegated to the real
+   * file system as before.
+   *
+   * Each file descriptor is remembered with the path it was opened for, so a
+   * later flush or close is classified by the handle's path rather than by the
+   * descriptor number, which an operating system may reuse for a different open
+   * file after the observer closes one.
    */
-  function observeDirectoryOps(adapter: ReturnType<typeof failingFs>): DirectoryObserver {
+  function observeDirectoryOps(
+    adapter: ReturnType<typeof failingFs>,
+    failOn: DirectoryFailures = {},
+  ): DirectoryObserver {
     const ops: DirectoryOps = { open: 0, fsync: 0, close: 0, fileFsync: 0 };
     const openNormally = adapter.openSync;
     const fsyncNormally = adapter.fsyncSync;
     const closeNormally = adapter.closeSync;
-    /** Descriptors this observer knows belong to a file, not a directory. */
-    const fileFds = new Set<number>();
-    // A descriptor opened with the "r" flag belongs to a file; every other
-    // descriptor is the store's temporary file or lock file.
+    /** Every file descriptor the observer opened, with the path it was opened for. */
+    const opened = new Map<number, string>();
+    /** Simulated directory handles, with their paths. */
+    const directories = new Map<number, string>();
+    // A negative descriptor is never a real file descriptor, so a synthetic
+    // directory handle can never be mistaken for a file's descriptor.
+    let nextSyntheticFd = -1;
+    // A named failure is injected only once during the store's opening, so a
+    // test can open the store while its save failures are in force. From then
+    // on every named failure persists, as a genuine operation failure would.
+    let failedOpen = false;
+    const isDirectoryPath = (path: string) => !path.split(/[\\/]/).at(-1)!.includes(".");
+    const classify = (fd: number): "directory" | "file" | "unknown" => {
+      if (directories.has(fd)) return "directory";
+      if (opened.has(fd)) return "file";
+      return "unknown";
+    };
+    // The store requests its directory handle through openDirectorySync, so the
+    // observer counts and simulates that operation; a file is opened through
+    // openSync and never reaches the real file system for a directory path.
     adapter.openSync = (path: string, flags: "wx" | "r") => {
-      if (flags === "r") ops.open += 1;
+      if (flags === "r" && isDirectoryPath(path)) return adapter.openDirectorySync!(path);
       const fd = openNormally(path, flags);
-      fileFds.add(fd);
+      opened.set(fd, path);
+      return fd;
+    };
+    adapter.openDirectorySync = (path: string) => {
+      if (!isDirectoryPath(path)) return openNormally(path, "r");
+      ops.open += 1;
+      if (failOn.directoryOpenCode && !failedOpen) {
+        failedOpen = true;
+        throw fsError(failOn.directoryOpenCode);
+      }
+      const fd = nextSyntheticFd;
+      nextSyntheticFd -= 1;
+      directories.set(fd, path);
       return fd;
     };
     adapter.fsyncSync = (fd: number) => {
-      if (adapter.isDirectoryFd(fd)) ops.fsync += 1;
-      else ops.fileFsync += 1;
-      return fsyncNormally(fd);
+      if (classify(fd) !== "directory") {
+        ops.fileFsync += 1;
+        return fsyncNormally(fd);
+      }
+      ops.fsync += 1;
+      // A simulated directory handle is flushed by the adapter itself: there
+      // is no real descriptor, and a real directory flush is not portable.
+      if (failOn.directoryFsyncCode) throw fsError(failOn.directoryFsyncCode);
     };
     adapter.closeSync = (fd: number) => {
-      if (adapter.isDirectoryFd(fd)) ops.close += 1;
-      return closeNormally(fd);
+      if (classify(fd) !== "directory") {
+        const result = closeNormally(fd);
+        opened.delete(fd);
+        return result;
+      }
+      ops.close += 1;
+      // A simulated directory handle is closed by the adapter itself: there is
+      // no real descriptor to close. It is released before the simulated close
+      // failure is reported, so the test leaves no handle behind.
+      directories.delete(fd);
+      if (failOn.directoryCloseCode) throw fsError(failOn.directoryCloseCode);
     };
-    return { ops, isFileFd: (fd: number) => fileFds.has(fd) };
+    return {
+      ops,
+      opened,
+      directories,
+      isDirectoryFd: (fd: number) => classify(fd) === "directory",
+    };
   }
 
   interface CommittedDirectory {
@@ -1180,16 +1268,17 @@ describe("failures", () => {
    * named failures are injected.
    *
    * The platform is injected as "linux", so the store takes its POSIX
-   * directory-flush branch and actually attempts the directory operations. Any
-   * failure those operations report is then reached and exercised on every
-   * operating system, instead of being skipped on Windows.
+   * directory-flush branch and attempts the directory operations. The observer
+   * simulates the directory handle, so those operations are reached and
+   * exercised on every operating system, Windows included, where a real
+   * directory handle could not be opened or flushed.
    *
-   * Each named operation fails only once, and never during the store's opening:
-   * the save under test fails at that operation and the store's next attempt,
-   * which rewrites the previous committed state, succeeds, so the failure is
-   * reached exactly as a transient file-operation failure would be. Which
-   * descriptor is the directory is taken from the observer's record, so a
-   * descriptor number the operating system reuses is never mistaken for one.
+   * A named failure is injected only once during the store's opening; from then
+   * on it persists, so the save under test fails at that operation and the
+   * store's attempt to rewrite the previous committed state fails at it too.
+   * The observer classifies an operation as the directory's or a file's through
+   * the handle's path, so a descriptor number the operating system reuses is
+   * never mistaken for the directory.
    */
   async function openCommittedDirectory(failOn: FailOn): Promise<CommittedDirectory> {
     const dir = tempDir();
@@ -1200,43 +1289,13 @@ describe("failures", () => {
       await setup.close();
     }
     const committed = readFileSync(storePath(dir), "utf8");
-    const adapter = failingFs(failOn);
-    const observer = observeDirectoryOps(adapter);
+    // The observer counts every operation the store makes after opening and
+    // fails the named directory operations. It classifies an operation as the
+    // directory's or a file's through the handle's path, so the store's
+    // temporary file and lock file are never mistaken for the directory.
+    const adapter = failingFs({});
+    const observer = observeDirectoryOps(adapter, failOn);
     const { ops } = observer;
-    const openNormally = adapter.openSync;
-    const fsyncNormally = adapter.fsyncSync;
-    const closeNormally = adapter.closeSync;
-    let failedOpen = false;
-    let failedFsync = false;
-    let failedClose = false;
-    adapter.openSync = (path: string, flags: "wx" | "r") => {
-      if (flags === "r" && failOn.directoryOpenCode && !failedOpen) {
-        failedOpen = true;
-        throw fsError(failOn.directoryOpenCode);
-      }
-      return openNormally(path, flags);
-    };
-    adapter.fsyncSync = (fd: number) => {
-      // The save flushes its temporary file first, then the directory.
-      if (failOn.directoryFsyncCode && !failedFsync) {
-        if (observer.isFileFd(fd)) return fsyncNormally(fd);
-        failedFsync = true;
-        throw fsError(failOn.directoryFsyncCode);
-      }
-      return fsyncNormally(fd);
-    };
-    adapter.closeSync = (fd: number) => {
-      // The save closes its temporary file first, then the directory.
-      if (failOn.directoryCloseCode && !failedClose) {
-        if (observer.isFileFd(fd)) return closeNormally(fd);
-        // The directory is really closed before the simulated close failure is
-        // reported, so the test leaves no descriptor open.
-        failedClose = true;
-        closeNormally(fd);
-        throw fsError(failOn.directoryCloseCode);
-      }
-      return closeNormally(fd);
-    };
     const store = await openStore(dir, { fs: adapter, platform: "linux" });
     // Reset the counts so they cover only the save under test; opening a store
     // performs no save of its own.
@@ -1269,21 +1328,21 @@ describe("failures", () => {
 
   it("rejects when opening the directory for the flush fails", async () => {
     // A genuine failure to open the directory is reported, never treated as an
-    // unsupported operation. The store's directory flush uses the adapter's own
-    // openSync, so the injected open failure is the store's own operation: the
-    // rejected save's directory is never flushed or closed, and the store then
-    // rewrites the previous committed file, whose directory open succeeds.
-    // Memory and the store file keep the previously committed state.
+    // unsupported operation. The store's directory flush opens the directory
+    // through the adapter's own openDirectorySync, so the injected open failure
+    // is the store's own operation: the rejected save's directory is never
+    // flushed or closed, and the store then rewrites the previous committed
+    // file, whose directory open now succeeds. Memory and the store file keep
+    // the previously committed state, and the store is not blocked.
     for (const code of ["EIO", "ENOENT", "EINVAL"]) {
       const opened = await openCommittedDirectory({ directoryOpenCode: code });
       await assertDirectoryFailureRetainsState(opened, code);
-      // The rejected save failed to open the directory and so has no descriptor
-      // to flush or close. The restore writes, flushes and closes the store file
-      // and then opens the directory, whose flush and close are then refused
-      // because that operation also fails: only the first failure is injected,
-      // so this save fails again while restoring. Memory and the store file
-      // still hold the previous committed state.
-      assert.deepEqual(opened.ops, { open: 1, fsync: 0, close: 0, fileFsync: 2 });
+      // The rejected save failed to open the directory and so had no handle to
+      // flush or close. The restore writes and flushes the store file, then
+      // opens, flushes and closes the directory once: the failure was injected
+      // only once, so the restored state is made durable and the store accepts
+      // later saves.
+      assert.deepEqual(opened.ops, { open: 2, fsync: 1, close: 1, fileFsync: 2 });
     }
   });
 
@@ -1311,11 +1370,10 @@ describe("failures", () => {
   });
 
   it("reports the fsync error when flushing and closing the directory both fail", async () => {
-    // Both the directory flush and its close fail on the first directory
-    // operation the save makes. The flush error is the one reported, with the
-    // close error kept as context on it; the close error never replaces it.
-    // The restore then repeats both operations, and they fail again because
-    // only each operation's first failure is injected, so the store ends up
+    // Both the directory flush and its close fail on every directory operation
+    // the save makes. The flush error is the one reported, with the close error
+    // kept as context on it; the close error never replaces it. The restore then
+    // repeats both operations, and they fail again, so the store ends up
     // blocked; memory and the store file keep the committed state.
     const opened = await openCommittedDirectory({
       directoryFsyncCode: "EIO",
@@ -1342,8 +1400,8 @@ describe("failures", () => {
     assert.deepEqual(readdirSync(opened.dir).filter((name) => name.endsWith(".tmp")), []);
     // The rejected save's directory flush and close both failed. The restore
     // writes and flushes the store file, then opens the directory; its flush
-    // and close are refused once more, because only the first failure of each
-    // operation is injected. The store is blocked and never publishes.
+    // and close fail once more, because those failures persist. The store is
+    // blocked and never publishes.
     assert.deepEqual(opened.ops, { open: 2, fsync: 2, close: 2, fileFsync: 2 });
     // The failed flush of the restore means the store cannot make the previous
     // committed file's directory entry durable. It refuses further mutations and

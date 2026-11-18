@@ -106,6 +106,11 @@ export interface FileSystem {
    * It also opens a directory for reading when flushing it, with the "r" flag.
    */
   openSync(path: string, flags: "wx" | "r"): number;
+  /**
+   * Open a directory handle for the directory flush. When absent, the store
+   * opens the directory through `openSync` with the "r" flag instead.
+   */
+  openDirectorySync?(path: string): number;
   /** Write bytes at the descriptor's current position; returns bytes written. */
   writeSync(fd: number, data: Uint8Array): number;
   fsyncSync(fd: number): void;
@@ -116,9 +121,10 @@ export interface FileSystem {
    * Flush a directory entry. The adapter itself decides whether the platform
    * supports this: it returns normally when unsupported, and throws only for a
    * genuine failure. The store never suppresses a throw from this operation.
-   * It performs the directory's open, flush and close through this adapter's
-   * own openSync, fsyncSync and closeSync, in that order, so each of those
-   * operations can be observed and can fail on its own.
+   * It obtains the directory's handle from `openDirectorySync` (or, when the
+   * adapter has none, from `openSync` with the "r" flag), then flushes and
+   * closes it through this adapter's own `fsyncSync` and `closeSync`, in that
+   * order, so each of those operations can be observed and can fail on its own.
    */
   fsyncDirectorySync?(path: string): void;
 }
@@ -179,16 +185,20 @@ interface State {
  * directory cannot be opened or flushed as a directory handle, so the step is
  * skipped by checking the platform before any operation, leaving the rename as
  * the durability point. That decision is never made by catching errors. On
- * every other platform the directory is opened for reading, flushed and
- * closed, and a failure at any of those steps is a genuine persistence failure
- * that is reported; if the flush fails and the close then fails too, the flush
- * error is the one reported, with the close error attached as context.
+ * every other platform a directory handle is requested from the adapter,
+ * then flushed and closed through it, and a failure at any of those steps is a
+ * genuine persistence failure that is reported; if the flush fails and the
+ * close then fails too, the flush error is the one reported, with the close
+ * error attached as context. A directory handle is requested with
+ * `openDirectorySync` when the adapter has one, so a test adapter can supply a
+ * simulated handle on any operating system; otherwise `openSync(path, "r")`
+ * opens the real directory.
  *
  * The platform is the store's configured one, never read from process here.
  */
 function flushDirectorySync(fs: FileSystem, path: string, platform: string): void {
   if (platform === "win32") return;
-  const fd = fs.openSync(path, "r");
+  const fd = fs.openDirectorySync ? fs.openDirectorySync(path) : fs.openSync(path, "r");
   let flushFailure: unknown;
   try {
     fs.fsyncSync(fd);
@@ -215,6 +225,7 @@ function defaultFileSystem(platform: string): FileSystem {
     mkdirSync: (path, options) => mkdirSync(path, options),
     readFileSync: (path, encoding) => readFileSync(path, encoding),
     openSync: (path, flags) => openSync(path, flags),
+    openDirectorySync: (path) => openSync(path, "r"),
     writeSync: (fd, data) => writeSync(fd, data),
     fsyncSync: (fd) => fsyncSync(fd),
     closeSync: (fd) => closeSync(fd),
