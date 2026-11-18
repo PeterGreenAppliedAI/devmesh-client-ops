@@ -12,6 +12,7 @@ import {
   renameSync,
   unlinkSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { join } from "node:path";
 import {
@@ -25,24 +26,18 @@ import {
   PersistenceError,
   ValidationError,
   type Client,
-  type Contact,
   type Engagement,
   type EngagementStatus,
-  type Objective,
   type Project,
   type ProjectStatus,
-  type Stakeholder,
 } from "./model.ts";
 
 export type {
   Client,
-  Contact,
   Engagement,
   EngagementStatus,
-  Objective,
   Project,
   ProjectStatus,
-  Stakeholder,
 } from "./model.ts";
 export {
   BusyStoreError,
@@ -54,15 +49,16 @@ export {
 const SCHEMA_VERSION = 1;
 const STORE_FILE = "workspace.json";
 const LOCK_FILE = "workspace.lock";
+const STATE_KEYS = ["schemaVersion", "clients", "engagements", "projects", "nextIds"] as const;
 
 /** Input fields accepted when creating a client. */
 export interface ClientCreate {
   name: string;
   background?: string;
-  contacts?: Contact[];
-  stakeholders?: Stakeholder[];
+  contacts?: string[];
+  stakeholders?: string[];
   requirements?: string[];
-  objectives?: Objective[];
+  objectives?: string[];
 }
 
 /** Partial update of a client; omitted fields keep their current value. */
@@ -72,7 +68,7 @@ export type ClientEdit = Partial<ClientCreate>;
 export interface EngagementCreate {
   clientId: string;
   name: string;
-  objectives?: Objective[];
+  objectives?: string[];
   status?: EngagementStatus;
 }
 
@@ -85,7 +81,7 @@ export type EngagementEdit = Partial<
 export interface ProjectCreate {
   engagementId: string;
   name: string;
-  objectives?: Objective[];
+  objectives?: string[];
   status?: ProjectStatus;
 }
 
@@ -107,8 +103,13 @@ export interface FileSystem {
   mkdirSync(path: string, options: { recursive: true }): void;
   readFileSync(path: string, encoding: "utf8"): string;
   writeFileSync(path: string, data: string, options: { encoding: "utf8"; flag?: string }): void;
+  openSync(path: string, flags: "wx"): number;
+  writeSync(fd: number, data: string): void;
+  fsyncSync(fd: number): void;
+  closeSync(fd: number): void;
   renameSync(oldPath: string, newPath: string): void;
   unlinkSync(path: string): void;
+  /** Flush a directory entry; may throw ENOTSUP/EINVAL where unsupported. */
   fsyncDirectorySync?(path: string): void;
 }
 
@@ -119,16 +120,33 @@ export interface StoreOptions {
 
 /** A collection of records that a store persists. */
 interface Collection<T extends { id: string }> {
-  readonly key: string;
-  readonly kind: string;
+  readonly key: "clients" | "engagements" | "projects";
+  readonly kind: "client" | "engagement" | "project";
   parse(value: unknown, what: string): T;
 }
 
 const collections = {
-  clients: { key: "clients", kind: "client", parse: parseClient },
-  engagements: { key: "engagements", kind: "engagement", parse: parseEngagement },
-  projects: { key: "projects", kind: "project", parse: parseProject },
+  clients: {
+    key: "clients",
+    kind: "client",
+    parse: parseClient,
+  },
+  engagements: {
+    key: "engagements",
+    kind: "engagement",
+    parse: parseEngagement,
+  },
+  projects: {
+    key: "projects",
+    kind: "project",
+    parse: parseProject,
+  },
 } satisfies Record<string, Collection<{ id: string }>>;
+
+type CollectionKey = keyof typeof collections;
+type Kind = (typeof collections)[CollectionKey]["kind"];
+type CounterKey = (typeof collections)[CollectionKey]["key"];
+const COLLECTION_KEYS = ["clients", "engagements", "projects"] as const;
 
 interface State {
   clients: Client[];
@@ -137,24 +155,37 @@ interface State {
   nextIds: Record<string, number>;
 }
 
+/** Error codes that mean directory synchronization is not supported here. */
+const UNSUPPORTED_DIRECTORY_FSYNC_CODES = new Set([
+  "EINVAL",
+  "ENOTSUP",
+  "EOPNOTSUPP",
+  "EPERM",
+  "EISDIR",
+  "EBADF",
+  "EACCES",
+]);
+
 function defaultFileSystem(): FileSystem {
   return {
     existsSync,
     mkdirSync: (path, options) => mkdirSync(path, options),
     readFileSync: (path, encoding) => readFileSync(path, encoding),
     writeFileSync: (path, data, options) => writeFileSync(path, data, options),
+    openSync: (path, flags) => openSync(path, flags),
+    writeSync: (fd, data) => {
+      writeSync(fd, data);
+    },
+    fsyncSync: (fd) => fsyncSync(fd),
+    closeSync: (fd) => closeSync(fd),
     renameSync: (oldPath, newPath) => renameSync(oldPath, newPath),
     unlinkSync: (path) => unlinkSync(path),
     fsyncDirectorySync: (path) => {
+      const fd = openSync(path, "r");
       try {
-        const fd = openSync(path, "r");
-        try {
-          fsyncSync(fd);
-        } finally {
-          closeSync(fd);
-        }
-      } catch {
-        // Directory fsync is best-effort and unsupported on some platforms.
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
       }
     },
   };
@@ -175,6 +206,15 @@ function emptyState(): State {
   return { clients: [], engagements: [], projects: [], nextIds: {} };
 }
 
+function idSuffix(kind: Kind, id: string): number | null {
+  const prefix = `${kind}-`;
+  if (!id.startsWith(prefix)) return null;
+  const suffix = id.slice(prefix.length);
+  if (!/^[1-9][0-9]*$/.test(suffix)) return null;
+  const value = Number(suffix);
+  return Number.isSafeInteger(value) ? value : null;
+}
+
 function parseState(text: string): State {
   let raw: unknown;
   try {
@@ -186,6 +226,11 @@ function parseState(text: string): State {
     throw new PersistenceError("Stored data must be a JSON object");
   }
   const record = raw as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    if (!(STATE_KEYS as readonly string[]).includes(key)) {
+      throw new PersistenceError(`Stored data has unsupported field ${JSON.stringify(key)}`);
+    }
+  }
   const version = record.schemaVersion;
   if (version !== SCHEMA_VERSION) {
     throw new PersistenceError(
@@ -193,14 +238,16 @@ function parseState(text: string): State {
     );
   }
   const state = emptyState();
-  for (const key of ["clients", "engagements", "projects"] as const) {
+  const highest: Record<string, number> = {};
+  for (const key of COLLECTION_KEYS) {
     const collection = collections[key];
     const values = record[key];
     if (!Array.isArray(values)) {
       throw new PersistenceError(`Stored ${key} must be an array`);
     }
-    for (const [index, value] of values.entries()) {
-      let parsed;
+    const seen = new Set<string>();
+    const parsedItems = values.map((value, index) => {
+      let parsed: { id: string };
       try {
         parsed = collection.parse(value, `${key}[${index}]`);
       } catch (cause) {
@@ -209,18 +256,50 @@ function parseState(text: string): State {
           { cause },
         );
       }
-      (state[key] as { id: string }[]).push(parsed);
-    }
+      if (seen.has(parsed.id)) {
+        throw new PersistenceError(
+          `Stored ${key} contains duplicate id ${JSON.stringify(parsed.id)}`,
+        );
+      }
+      seen.add(parsed.id);
+      const suffix = idSuffix(collection.kind, parsed.id);
+      if (suffix === null) {
+        throw new PersistenceError(
+          `Stored ${collection.kind} id ${JSON.stringify(parsed.id)} is not a stable generated id`,
+        );
+      }
+      highest[key] = Math.max(highest[key] ?? 0, suffix);
+      return parsed;
+    });
+    (state[key] as unknown[]).push(...parsedItems);
   }
   const nextIds = record.nextIds;
   if (typeof nextIds !== "object" || nextIds === null || Array.isArray(nextIds)) {
     throw new PersistenceError("Stored nextIds must be an object");
   }
   for (const [key, value] of Object.entries(nextIds)) {
-    if (!Number.isInteger(value) || (value as number) < 1) {
-      throw new PersistenceError(`Stored nextIds.${key} must be a positive integer`);
+    if (!(COLLECTION_KEYS as readonly string[]).includes(key)) {
+      throw new PersistenceError(`Stored nextIds has unsupported field ${JSON.stringify(key)}`);
+    }
+    if (!Number.isSafeInteger(value) || (value as number) < 1) {
+      throw new PersistenceError(`Stored nextIds.${key} must be a positive safe integer`);
+    }
+    const used = highest[key] ?? 0;
+    if ((value as number) <= used) {
+      throw new PersistenceError(
+        `Stored nextIds.${key} cannot safely advance past existing id ${collections[key as CounterKey].kind}-${used}`,
+      );
     }
     state.nextIds[key] = value as number;
+  }
+  // Every collection with records must have a counter that advances past them.
+  for (const key of COLLECTION_KEYS) {
+    const used = highest[key] ?? 0;
+    if (used > 0 && (state.nextIds[key] === undefined || state.nextIds[key] <= used)) {
+      throw new PersistenceError(
+        `Stored nextIds.${key} is missing or cannot advance past existing id ${collections[key].kind}-${used}`,
+      );
+    }
   }
   // Referential integrity must hold when loading.
   for (const engagement of state.engagements) {
@@ -256,6 +335,33 @@ function findRecord<T extends { id: string }>(
   const found = items.find((item) => item.id === id);
   if (!found) throw new MissingRecordError(`No ${kind} with id ${JSON.stringify(id)}`);
   return found;
+}
+
+/** Copy the fields the caller supplied; omitted fields are absent. */
+function supplied<T extends object>(input: T, keys: readonly (keyof T)[]): Partial<T> {
+  const result: Partial<T> = {};
+  for (const key of keys) {
+    if (input[key] !== undefined) result[key] = input[key];
+  }
+  return result;
+}
+
+/** Validate a supplied parent link value before checking that it exists. */
+function requireParentId(value: unknown, field: string, kind: string): string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new ValidationError(`${field} must be a nonblank ${kind} id`);
+  }
+  return value;
+}
+
+function errorCode(cause: unknown): string | undefined {
+  if (typeof cause !== "object" || cause === null) return undefined;
+  const code = (cause as { code?: unknown }).code;
+  return typeof code === "string" ? code : undefined;
+}
+
+function isMissing(cause: unknown): boolean {
+  return errorCode(cause) === "ENOENT";
 }
 
 export interface Store {
@@ -305,32 +411,70 @@ class StoreImpl implements Store {
     return run;
   }
 
-  private nextId(draft: State, kind: string): string {
-    const next = draft.nextIds[kind] ?? 1;
-    draft.nextIds[kind] = next + 1;
-    return `${kind}-${next}`;
+  private nextId(draft: State, key: CounterKey): string {
+    const next = draft.nextIds[key] ?? 1;
+    draft.nextIds[key] = next + 1;
+    return `${collections[key].kind}-${next}`;
   }
 
+  /**
+   * Write the draft to a same-directory temporary file, flush it, replace the
+   * store file atomically, then advance the in-memory state. Nothing is
+   * acknowledged until every step has succeeded.
+   */
   private async persist(next: State): Promise<void> {
     const tempPath = `${this.storePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
-    let tempCreated = false;
+    let fd: number | null = null;
+    let renamed = false;
+    let failure: unknown;
     try {
-      this.fs.writeFileSync(tempPath, toJson(next), { encoding: "utf8", flag: "wx" });
-      tempCreated = true;
+      fd = this.fs.openSync(tempPath, "wx");
+      this.fs.writeSync(fd, toJson(next));
+      this.fs.fsyncSync(fd);
+      const openFd = fd;
+      fd = null;
+      this.fs.closeSync(openFd);
       this.fs.renameSync(tempPath, this.storePath);
-      tempCreated = false;
+      renamed = true;
     } catch (cause) {
-      if (tempCreated) {
+      failure = cause;
+    }
+
+    if (failure !== undefined) {
+      let cleanupFailed: unknown;
+      if (fd !== null) {
         try {
-          this.fs.unlinkSync(tempPath);
+          this.fs.closeSync(fd);
         } catch {
-          // Best-effort cleanup of the orphaned temporary file.
+          // The descriptor may already be unusable; cleanup continues below.
         }
       }
-      throw new PersistenceError("Failed to persist workspace data", { cause });
+      try {
+        this.fs.unlinkSync(tempPath);
+      } catch (cause) {
+        if (!isMissing(cause)) cleanupFailed = cause;
+      }
+      if (cleanupFailed !== undefined) {
+        throw new PersistenceError(
+          "Failed to persist workspace data and could not remove the temporary file",
+          { cause: failure },
+        );
+      }
+      throw new PersistenceError("Failed to persist workspace data", { cause: failure });
     }
-    this.fs.fsyncDirectorySync?.(this.directory);
+
+    // The replacement has happened, so the committed state is the draft even
+    // if flushing the directory entry then fails.
     this.state = next;
+    if (renamed && this.fs.fsyncDirectorySync) {
+      try {
+        this.fs.fsyncDirectorySync(this.directory);
+      } catch (cause) {
+        if (!UNSUPPORTED_DIRECTORY_FSYNC_CODES.has(errorCode(cause) ?? "")) {
+          throw new PersistenceError("Failed to flush the store directory", { cause });
+        }
+      }
+    }
   }
 
   private commit<T>(mutate: (draft: State) => T): Promise<T> {
@@ -343,7 +487,7 @@ class StoreImpl implements Store {
     return this.enqueue(() =>
       this.commit((draft) => {
         const client = parseClient({
-          id: this.nextId(draft, "client"),
+          id: this.nextId(draft, "clients"),
           name: input.name,
           background: input.background ?? "",
           contacts: input.contacts ?? [],
@@ -361,15 +505,15 @@ class StoreImpl implements Store {
     return this.enqueue(() =>
       this.commit((draft) => {
         const current = findRecord(draft.clients, id, "client");
-        const updated = parseClient({
-          id: current.id,
-          name: edit.name ?? current.name,
-          background: edit.background ?? current.background,
-          contacts: edit.contacts ?? current.contacts,
-          stakeholders: edit.stakeholders ?? current.stakeholders,
-          requirements: edit.requirements ?? current.requirements,
-          objectives: edit.objectives ?? current.objectives,
-        });
+        const changes = supplied(edit, [
+          "name",
+          "background",
+          "contacts",
+          "stakeholders",
+          "requirements",
+          "objectives",
+        ]);
+        const updated = parseClient({ ...current, ...changes });
         draft.clients = draft.clients.map((c) => (c.id === id ? updated : c));
         return updated;
       }),
@@ -379,10 +523,11 @@ class StoreImpl implements Store {
   createEngagement(input: EngagementCreate): Promise<Engagement> {
     return this.enqueue(() =>
       this.commit((draft) => {
-        findRecord(draft.clients, input.clientId, "client");
+        const clientId = requireParentId(input.clientId, "clientId", "client");
+        findRecord(draft.clients, clientId, "client");
         const engagement = parseEngagement({
-          id: this.nextId(draft, "engagement"),
-          clientId: input.clientId,
+          id: this.nextId(draft, "engagements"),
+          clientId,
           name: input.name,
           objectives: input.objectives ?? [],
           status: input.status ?? "planned",
@@ -397,13 +542,8 @@ class StoreImpl implements Store {
     return this.enqueue(() =>
       this.commit((draft) => {
         const current = findRecord(draft.engagements, id, "engagement");
-        const updated = parseEngagement({
-          id: current.id,
-          clientId: current.clientId,
-          name: edit.name ?? current.name,
-          objectives: edit.objectives ?? current.objectives,
-          status: edit.status ?? current.status,
-        });
+        const changes = supplied(edit, ["name", "objectives", "status"]);
+        const updated = parseEngagement({ ...current, ...changes });
         draft.engagements = draft.engagements.map((e) => (e.id === id ? updated : e));
         return updated;
       }),
@@ -413,10 +553,11 @@ class StoreImpl implements Store {
   createProject(input: ProjectCreate): Promise<Project> {
     return this.enqueue(() =>
       this.commit((draft) => {
-        findRecord(draft.engagements, input.engagementId, "engagement");
+        const engagementId = requireParentId(input.engagementId, "engagementId", "engagement");
+        findRecord(draft.engagements, engagementId, "engagement");
         const project = parseProject({
-          id: this.nextId(draft, "project"),
-          engagementId: input.engagementId,
+          id: this.nextId(draft, "projects"),
+          engagementId,
           name: input.name,
           objectives: input.objectives ?? [],
           status: input.status ?? "planned",
@@ -431,13 +572,8 @@ class StoreImpl implements Store {
     return this.enqueue(() =>
       this.commit((draft) => {
         const current = findRecord(draft.projects, id, "project");
-        const updated = parseProject({
-          id: current.id,
-          engagementId: current.engagementId,
-          name: edit.name ?? current.name,
-          objectives: edit.objectives ?? current.objectives,
-          status: edit.status ?? current.status,
-        });
+        const changes = supplied(edit, ["name", "objectives", "status"]);
+        const updated = parseProject({ ...current, ...changes });
         draft.projects = draft.projects.map((p) => (p.id === id ? updated : p));
         return updated;
       }),
@@ -452,9 +588,8 @@ class StoreImpl implements Store {
     );
     if (this.lockReleased) return;
     try {
-      let text: string | null = null;
       try {
-        text = this.fs.readFileSync(this.lockPath, "utf8");
+        this.fs.readFileSync(this.lockPath, "utf8");
       } catch (cause) {
         if (isMissing(cause)) {
           this.lockReleased = true;
@@ -462,26 +597,16 @@ class StoreImpl implements Store {
         }
         throw cause;
       }
-      if (text !== null) {
-        try {
-          this.fs.unlinkSync(this.lockPath);
-        } catch (cause) {
-          if (!isMissing(cause)) throw cause;
-        }
+      try {
+        this.fs.unlinkSync(this.lockPath);
+      } catch (cause) {
+        if (!isMissing(cause)) throw cause;
       }
       this.lockReleased = true;
     } catch (cause) {
       throw new PersistenceError("Failed to release store ownership", { cause });
     }
   }
-}
-
-function isMissing(cause: unknown): boolean {
-  return (
-    typeof cause === "object" &&
-    cause !== null &&
-    (cause as { code?: unknown }).code === "ENOENT"
-  );
 }
 
 export async function openStore(
@@ -493,8 +618,12 @@ export async function openStore(
   const storePath = join(directory, STORE_FILE);
   let lockCreated = false;
   try {
-    fs.mkdirSync(directory, { recursive: true });
-    const lockExistedBefore = fs.existsSync(lockPath);
+    try {
+      fs.mkdirSync(directory, { recursive: true });
+    } catch (cause) {
+      throw new PersistenceError("Failed to create the store directory", { cause });
+    }
+
     try {
       fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid }), {
         encoding: "utf8",
@@ -502,17 +631,24 @@ export async function openStore(
       });
       lockCreated = true;
     } catch (cause) {
-      // A failed exclusive create may still have left a partial lock file; if
-      // the lock did not exist before the attempt, remove what we created.
-      if (!lockExistedBefore) {
-        try {
-          fs.unlinkSync(lockPath);
-        } catch {
-          // Best-effort: the acquisition is already failing.
-        }
+      // EEXIST means the exclusive create never opened the file: another writer
+      // owns the lock, and we must never remove it.
+      if (errorCode(cause) === "EEXIST") {
+        throw new BusyStoreError(
+          `Store directory ${JSON.stringify(directory)} is owned by another writer`,
+        );
       }
-      if (typeof cause === "object" && cause !== null && (cause as { code?: unknown }).code === "EEXIST") {
-        throw new BusyStoreError(`Store directory ${JSON.stringify(directory)} is owned by another writer`);
+      // Any other failure happened after the exclusive open succeeded, so the
+      // lock file is ours (possibly partial) and must be removed before failing.
+      try {
+        fs.unlinkSync(lockPath);
+      } catch (cleanupCause) {
+        if (!isMissing(cleanupCause)) {
+          throw new PersistenceError(
+            "Failed to acquire store ownership and could not remove the partial lock",
+            { cause },
+          );
+        }
       }
       throw new PersistenceError("Failed to acquire store ownership", { cause });
     }
@@ -532,8 +668,13 @@ export async function openStore(
     if (lockCreated) {
       try {
         fs.unlinkSync(lockPath);
-      } catch {
-        // Best-effort: the initialization itself is already failing.
+      } catch (cleanupCause) {
+        if (!isMissing(cleanupCause)) {
+          throw new PersistenceError(
+            "Store initialization failed and its lock could not be released",
+            { cause: error },
+          );
+        }
       }
     }
     throw error;

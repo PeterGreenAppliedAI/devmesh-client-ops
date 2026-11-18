@@ -10,40 +10,21 @@ export const ENGAGEMENT_STATUSES: readonly EngagementStatus[] = [
   "completed",
 ];
 
-export interface Contact {
-  name: string;
-  email: string;
-  phone: string;
-  role: string;
-}
-
-export interface Stakeholder {
-  name: string;
-  role: string;
-  influence: string;
-  notes: string;
-}
-
-export interface Objective {
-  title: string;
-  description: string;
-}
-
 export interface Client {
   id: string;
   name: string;
   background: string;
-  contacts: Contact[];
-  stakeholders: Stakeholder[];
+  contacts: string[];
+  stakeholders: string[];
   requirements: string[];
-  objectives: Objective[];
+  objectives: string[];
 }
 
 export interface Engagement {
   id: string;
   clientId: string;
   name: string;
-  objectives: Objective[];
+  objectives: string[];
   status: EngagementStatus;
 }
 
@@ -51,7 +32,7 @@ export interface Project {
   id: string;
   engagementId: string;
   name: string;
-  objectives: Objective[];
+  objectives: string[];
   status: ProjectStatus;
 }
 
@@ -94,6 +75,18 @@ function requireObject(value: unknown, what: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+function requireExactKeys(
+  record: Record<string, unknown>,
+  keys: readonly string[],
+  what: string,
+): void {
+  for (const key of Object.keys(record)) {
+    if (!keys.includes(key)) {
+      throw new ValidationError(`${what} has unsupported field ${JSON.stringify(key)}`);
+    }
+  }
+}
+
 function requireText(value: unknown, what: string): string {
   if (typeof value !== "string") {
     throw new ValidationError(`${what} must be a string`);
@@ -118,102 +111,59 @@ function requireStatus(value: unknown, what: string): EngagementStatus {
   return value as EngagementStatus;
 }
 
-function requireArray(value: unknown, what: string): unknown[] {
+function requireTextArray(value: unknown, what: string): string[] {
   if (!Array.isArray(value)) {
     throw new ValidationError(`${what} must be an array`);
   }
-  return value;
+  return value.map((item, index) => requireText(item, `${what}[${index}]`));
 }
 
-function parseContact(value: unknown, what: string): Contact {
-  const record = requireObject(value, what);
-  return {
-    name: requireName(record.name, `${what}.name`),
-    email: requireText(record.email, `${what}.email`),
-    phone: requireText(record.phone, `${what}.phone`),
-    role: requireText(record.role, `${what}.role`),
-  };
-}
-
-function parseStakeholder(value: unknown, what: string): Stakeholder {
-  const record = requireObject(value, what);
-  return {
-    name: requireName(record.name, `${what}.name`),
-    role: requireText(record.role, `${what}.role`),
-    influence: requireText(record.influence, `${what}.influence`),
-    notes: requireText(record.notes, `${what}.notes`),
-  };
-}
-
-function parseObjective(value: unknown, what: string): Objective {
-  const record = requireObject(value, what);
-  return {
-    title: requireName(record.title, `${what}.title`),
-    description: requireText(record.description, `${what}.description`),
-  };
-}
-
-function parseArray<T>(
-  value: unknown,
-  what: string,
-  parseItem: (item: unknown, itemWhat: string) => T,
-): T[] {
-  return requireArray(value, what).map((item, index) =>
-    parseItem(item, `${what}[${index}]`),
-  );
-}
+const CLIENT_KEYS = [
+  "id",
+  "name",
+  "background",
+  "contacts",
+  "stakeholders",
+  "requirements",
+  "objectives",
+] as const;
+const ENGAGEMENT_KEYS = ["id", "clientId", "name", "objectives", "status"] as const;
+const PROJECT_KEYS = ["id", "engagementId", "name", "objectives", "status"] as const;
 
 export function parseClient(value: unknown, what = "client"): Client {
   const record = requireObject(value, what);
+  requireExactKeys(record, CLIENT_KEYS, what);
   return {
     id: requireName(record.id, `${what}.id`),
     name: requireName(record.name, `${what}.name`),
     background: requireText(record.background, `${what}.background`),
-    contacts: parseArray(record.contacts, `${what}.contacts`, parseContact),
-    stakeholders: parseArray(
-      record.stakeholders,
-      `${what}.stakeholders`,
-      parseStakeholder,
-    ),
-    requirements: parseArray(
-      record.requirements,
-      `${what}.requirements`,
-      (item, itemWhat) => requireText(item, itemWhat),
-    ),
-    objectives: parseArray(
-      record.objectives,
-      `${what}.objectives`,
-      parseObjective,
-    ),
+    contacts: requireTextArray(record.contacts, `${what}.contacts`),
+    stakeholders: requireTextArray(record.stakeholders, `${what}.stakeholders`),
+    requirements: requireTextArray(record.requirements, `${what}.requirements`),
+    objectives: requireTextArray(record.objectives, `${what}.objectives`),
   };
 }
 
 export function parseEngagement(value: unknown, what = "engagement"): Engagement {
   const record = requireObject(value, what);
+  requireExactKeys(record, ENGAGEMENT_KEYS, what);
   return {
     id: requireName(record.id, `${what}.id`),
     clientId: requireName(record.clientId, `${what}.clientId`),
     name: requireName(record.name, `${what}.name`),
-    objectives: parseArray(
-      record.objectives,
-      `${what}.objectives`,
-      parseObjective,
-    ),
+    objectives: requireTextArray(record.objectives, `${what}.objectives`),
     status: requireStatus(record.status, `${what}.status`),
   };
 }
 
 export function parseProject(value: unknown, what = "project"): Project {
   const record = requireObject(value, what);
+  requireExactKeys(record, PROJECT_KEYS, what);
   return {
     id: requireName(record.id, `${what}.id`),
     engagementId: requireName(record.engagementId, `${what}.engagementId`),
     name: requireName(record.name, `${what}.name`),
-    objectives: parseArray(
-      record.objectives,
-      `${what}.objectives`,
-      parseObjective,
-    ),
+    objectives: requireTextArray(record.objectives, `${what}.objectives`),
     status: requireStatus(record.status, `${what}.status`),
   };
 }
