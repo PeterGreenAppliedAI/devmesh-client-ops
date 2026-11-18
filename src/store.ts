@@ -191,6 +191,7 @@ function flushDirectorySync(fs: FileSystem, path: string): void {
     fs.closeSync(fd);
   } catch (closeCause) {
     if (flushFailure !== undefined) {
+      // A close error never replaces the flush error; it is kept as context.
       throw new PersistenceError("Failed to flush the store directory and could not close it", {
         cause: failureOr(flushFailure, closeCause),
       });
@@ -852,7 +853,15 @@ export async function openStore(
   directory: string,
   options: StoreOptions = {},
 ): Promise<Store> {
-  const fs = { ...defaultFileSystem(), ...options.fs };
+  // The default adapter's directory flush calls back into the adapter it was
+  // built for, so merge the injected operations onto that one instead of onto a
+  // copy: an injected open, flush or close is then the operation the flush uses.
+  const fs = defaultFileSystem();
+  Object.assign(fs, options.fs);
+  if (options.fs?.fsyncDirectorySync === undefined) {
+    // A copy without an injected directory flush still reaches the merged adapter.
+    fs.fsyncDirectorySync = (path) => flushDirectorySync(fs, path);
+  }
   const lockPath = join(directory, LOCK_FILE);
   const storePath = join(directory, STORE_FILE);
   let lockCreated = false;
