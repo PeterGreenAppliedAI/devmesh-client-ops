@@ -104,7 +104,8 @@ export interface FileSystem {
   readFileSync(path: string, encoding: "utf8"): string;
   writeFileSync(path: string, data: string, options: { encoding: "utf8"; flag?: string }): void;
   openSync(path: string, flags: "wx"): number;
-  writeSync(fd: number, data: string): void;
+  /** Write bytes at the descriptor's current position; returns bytes written. */
+  writeSync(fd: number, data: Uint8Array): number;
   fsyncSync(fd: number): void;
   closeSync(fd: number): void;
   renameSync(oldPath: string, newPath: string): void;
@@ -173,9 +174,7 @@ function defaultFileSystem(): FileSystem {
     readFileSync: (path, encoding) => readFileSync(path, encoding),
     writeFileSync: (path, data, options) => writeFileSync(path, data, options),
     openSync: (path, flags) => openSync(path, flags),
-    writeSync: (fd, data) => {
-      writeSync(fd, data);
-    },
+    writeSync: (fd, data) => writeSync(fd, data),
     fsyncSync: (fd) => fsyncSync(fd),
     closeSync: (fd) => closeSync(fd),
     renameSync: (oldPath, newPath) => renameSync(oldPath, newPath),
@@ -364,6 +363,32 @@ function isMissing(cause: unknown): boolean {
   return errorCode(cause) === "ENOENT";
 }
 
+/** Write all of `data`, honoring Node's byte offset when a write is short. */
+function writeFully(fs: FileSystem, fd: number, data: string): void {
+  const buffer = Buffer.from(data, "utf8");
+  let offset = 0;
+  while (offset < buffer.length) {
+    const written = fs.writeSync(fd, buffer.subarray(offset));
+    if (!Number.isInteger(written) || written <= 0 || written > buffer.length - offset) {
+      throw new PersistenceError("Failed to write the temporary store file");
+    }
+    offset += written;
+  }
+}
+
+/** Keep the operation failure as cause, attaching a cleanup failure to it. */
+function failureOr(cause: unknown, cleanup: unknown): unknown {
+  if (cause instanceof PersistenceError) return cause;
+  if (cause instanceof Error) {
+    try {
+      (cause as Error & { cleanupCause?: unknown }).cleanupCause = cleanup;
+    } catch {
+      // The cause may not accept extra properties; it is still reported.
+    }
+  }
+  return cause;
+}
+
 export interface Store {
   /** Detached, read-only snapshot of the committed state. */
   snapshot(): Snapshot;
@@ -419,54 +444,35 @@ class StoreImpl implements Store {
 
   /**
    * Write the draft to a same-directory temporary file, flush it, replace the
-   * store file atomically, then advance the in-memory state. Nothing is
-   * acknowledged until every step has succeeded.
+   * store file atomically, then sync the directory entry. Nothing is published
+   * or acknowledged until every step has succeeded; on any failure the
+   * previously committed state remains in effect and the operation fails.
    */
   private async persist(next: State): Promise<void> {
     const tempPath = `${this.storePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
     let fd: number | null = null;
-    let renamed = false;
-    let failure: unknown;
+    let tempCreated = false;
     try {
       fd = this.fs.openSync(tempPath, "wx");
-      this.fs.writeSync(fd, toJson(next));
+      tempCreated = true;
+      writeFully(this.fs, fd, toJson(next));
       this.fs.fsyncSync(fd);
       const openFd = fd;
       fd = null;
       this.fs.closeSync(openFd);
       this.fs.renameSync(tempPath, this.storePath);
-      renamed = true;
     } catch (cause) {
-      failure = cause;
-    }
-
-    if (failure !== undefined) {
-      let cleanupFailed: unknown;
-      if (fd !== null) {
-        try {
-          this.fs.closeSync(fd);
-        } catch {
-          // The descriptor may already be unusable; cleanup continues below.
-        }
-      }
-      try {
-        this.fs.unlinkSync(tempPath);
-      } catch (cause) {
-        if (!isMissing(cause)) cleanupFailed = cause;
-      }
-      if (cleanupFailed !== undefined) {
+      const cleanupFailure = this.discardTemp(tempPath, fd, tempCreated);
+      if (cleanupFailure !== undefined) {
         throw new PersistenceError(
           "Failed to persist workspace data and could not remove the temporary file",
-          { cause: failure },
+          { cause: failureOr(cause, cleanupFailure) },
         );
       }
-      throw new PersistenceError("Failed to persist workspace data", { cause: failure });
+      throw new PersistenceError("Failed to persist workspace data", { cause });
     }
 
-    // The replacement has happened, so the committed state is the draft even
-    // if flushing the directory entry then fails.
-    this.state = next;
-    if (renamed && this.fs.fsyncDirectorySync) {
+    if (this.fs.fsyncDirectorySync) {
       try {
         this.fs.fsyncDirectorySync(this.directory);
       } catch (cause) {
@@ -475,6 +481,37 @@ class StoreImpl implements Store {
         }
       }
     }
+
+    // Only now, after the file is safely in place, publish the new state.
+    this.state = next;
+  }
+
+  /**
+   * Remove resources left behind by a failed write: close a descriptor we still
+   * own and remove the temporary file only when we created it. Returns the
+   * cleanup error, if any, so the caller can report it.
+   */
+  private discardTemp(
+    tempPath: string,
+    fd: number | null,
+    tempCreated: boolean,
+  ): unknown {
+    let cleanupFailure: unknown;
+    if (fd !== null) {
+      try {
+        this.fs.closeSync(fd);
+      } catch (cause) {
+        cleanupFailure = cause;
+      }
+    }
+    if (tempCreated) {
+      try {
+        this.fs.unlinkSync(tempPath);
+      } catch (cause) {
+        if (!isMissing(cause) && cleanupFailure === undefined) cleanupFailure = cause;
+      }
+    }
+    return cleanupFailure;
   }
 
   private commit<T>(mutate: (draft: State) => T): Promise<T> {

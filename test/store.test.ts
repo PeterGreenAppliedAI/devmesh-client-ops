@@ -66,6 +66,8 @@ interface FailOn {
  */
 function failingFs(failOn: FailOn) {
   const descriptors = new Map<number, string>();
+  /** Bytes acknowledged by earlier writes on each descriptor. */
+  const written = new Map<number, number>();
   const isTemp = (fd: number) => (descriptors.get(fd) ?? "").endsWith(".tmp");
   return {
     existsSync: (path: string) => existsSync(path),
@@ -81,18 +83,26 @@ function failingFs(failOn: FailOn) {
       if (mode === "after") throw fsError("EIO");
       return fd;
     },
-    writeSync: (fd: number, data: string) => {
+    writeSync: (fd: number, data: Uint8Array) => {
       if (failOn.writeSync?.(fd, isTemp(fd))) throw fsError("EIO");
-      writeSync(fd, data);
+      // Track the descriptor's position so writes honor the store's byte offset.
+      const offset = written.get(fd) ?? 0;
+      const bytes = writeSync(fd, data, 0, data.length, null);
+      written.set(fd, offset + bytes);
+      return bytes;
     },
     fsyncSync: (fd: number) => {
       if (failOn.fsyncSync?.(fd, isTemp(fd))) throw fsError("EIO");
       fsyncSync(fd);
     },
     closeSync: (fd: number) => {
-      if (failOn.closeSync?.(fd, isTemp(fd))) throw fsError("EIO");
+      // The descriptor is always really closed, so a simulated close failure
+      // never leaves it open; the caller sees the failure all the same.
+      const shouldFail = failOn.closeSync?.(fd, isTemp(fd)) ?? false;
       closeSync(fd);
       descriptors.delete(fd);
+      written.delete(fd);
+      if (shouldFail) throw fsError("EIO");
     },
     writeFileSync: (path: string, data: string, options: { encoding: "utf8"; flag?: string }) => {
       if (failOn.createThenFailWriteFileSync?.(path)) {
@@ -237,6 +247,7 @@ describe("client creation and editing", () => {
         (snapshot.clients[0] as { name: string }).name = "Mutated";
       });
       created.name = "Local change";
+      assert.equal(snapshot.clients[0].name, "Acme");
       assert.equal(store.snapshot().clients[0].name, "Acme");
     } finally {
       await store.close();
@@ -750,14 +761,17 @@ describe("failures", () => {
       await openStore(dir).then((s) => s.close());
     }
 
-    // A real directory flush failure is reported, and the in-memory state stays
-    // consistent with the already-replaced file.
+    // A real directory flush failure is reported, and nothing is published:
+    // the in-memory state still holds the previous committed value.
     const flushFailing = failingFs({ fsyncDirectorySync: () => true });
     const second = await openStore(dir, { fs: flushFailing });
     try {
       await assert.rejects(second.updateClient(clientId, { name: "Flushed" }), PersistenceError);
-      assert.equal(second.snapshot().clients[0].name, "Flushed");
+      assert.equal(second.snapshot().clients[0].name, "Acme");
+      // The replaced file already holds the rejected value; a writer that saw
+      // the failure keeps building on the state it acknowledged last.
       assert.equal(readFileSync(storePath(dir), "utf8").includes("Flushed"), true);
+      await assert.rejects(second.updateClient(clientId, { name: "AfterFlush" }), PersistenceError);
     } finally {
       await flushFailing.unlinkSync(lockPath(dir));
       await openStore(dir).then((s) => s.close());
@@ -783,12 +797,20 @@ describe("failures", () => {
       await assert.rejects(store.createClient({ name: "Acme" }), PersistenceError);
       assert.equal(store.snapshot().clients.length, 0);
       assert.deepEqual(readdirSync(dir).filter((n) => n.endsWith(".tmp")), []);
+
+      // The failed close is retried during cleanup, so a later save succeeds.
+      failClose = false;
+      const created = await store.createClient({ name: "Acme" });
+      assert.equal(created.name, "Acme");
+      assert.deepEqual(readdirSync(dir).filter((n) => n.endsWith(".tmp")), []);
     } finally {
       await store.close();
     }
+    // The save that followed the failed close was persisted.
     const reopened = await openStore(dir);
     try {
-      assert.equal(reopened.snapshot().clients.length, 0);
+      assert.equal(reopened.snapshot().clients.length, 1);
+      assert.equal(reopened.snapshot().clients[0].name, "Acme");
     } finally {
       await reopened.close();
     }
@@ -925,6 +947,69 @@ describe("failures", () => {
     assert.equal(existsSync(lockPath(dir)), false);
     const reopened = await openStore(dir);
     await reopened.close();
+  });
+
+  it("completes short writes before replacing the store file", async () => {
+    const dir = tempDir();
+    let truncateWrites = true;
+    // A real adapter that only ever accepts part of each write.
+    const shortWriting = {
+      ...failingFs({}),
+      writeSync: (fd: number, data: Uint8Array) => {
+        const slice = truncateWrites ? data.subarray(0, Math.max(1, Math.floor(data.length / 2))) : data;
+        return writeSync(fd, slice);
+      },
+    };
+    const store = await openStore(dir, { fs: shortWriting });
+    let clientId: string;
+    try {
+      clientId = (await store.createClient({
+        name: "Acme",
+        background: "A long background so the document spans several short writes.",
+        contacts: Array.from({ length: 20 }, (_, i) => `Contact ${i} with a reasonably long line`),
+      })).id;
+    } finally {
+      await store.close();
+    }
+    const onDisk = JSON.parse(readFileSync(storePath(dir), "utf8"));
+    assert.equal(onDisk.clients[0].id, clientId);
+    assert.equal(onDisk.clients[0].contacts.length, 20);
+
+    truncateWrites = false;
+    const reopened = await openStore(dir);
+    try {
+      assert.equal(reopened.snapshot().clients[0].background.length > 20, true);
+      assert.equal(reopened.snapshot().clients[0].contacts.length, 20);
+    } finally {
+      await reopened.close();
+    }
+  });
+
+  it("leaves a colliding temporary file alone when exclusive creation fails", async () => {
+    const dir = tempDir();
+    const colliding = failingFs({ openSync: (path) => (path.endsWith(".tmp") ? "before" : false) });
+    const store = await openStore(dir, { fs: colliding });
+    try {
+      await assert.rejects(store.createClient({ name: "Acme" }), PersistenceError);
+      assert.equal(store.snapshot().clients.length, 0);
+      assert.deepEqual(readdirSync(dir).filter((n) => n.endsWith(".tmp")), []);
+    } finally {
+      await store.close();
+    }
+
+    // A pre-existing file at the temporary path is never removed by a failed save.
+    const blocked = failingFs({
+      openSync: (path) => (path.endsWith(".tmp") ? "before" : false),
+    });
+    const blockedStore = await openStore(dir, { fs: blocked });
+    try {
+      const foreign = join(dir, "foreign.tmp");
+      writeFileSync(foreign, "not ours", "utf8");
+      await assert.rejects(blockedStore.createClient({ name: "Acme" }), PersistenceError);
+      assert.equal(readFileSync(foreign, "utf8"), "not ours");
+    } finally {
+      await blockedStore.close();
+    }
   });
 
   it("reports a lock cleanup failure when initialization fails later", async () => {
