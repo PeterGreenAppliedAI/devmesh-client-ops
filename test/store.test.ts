@@ -53,6 +53,7 @@ interface FailOn {
   openSync?: (path: string) => "before" | "collide" | "after" | false;
   writeSync?: (fd: number, isTemp: boolean, path: string) => boolean;
   fsyncSync?: (fd: number, isTemp: boolean) => boolean;
+  /** Fail the close, reporting EBADF as if the descriptor were already gone. */
   closeSync?: (fd: number, isTemp: boolean) => boolean;
   /** Fail the write after the exclusive create has already produced a file. */
   createThenFailWriteLock?: (path: string) => boolean;
@@ -120,7 +121,7 @@ function failingFs(failOn: FailOn) {
       closeSync(fd);
       descriptors.delete(fd);
       written.delete(fd);
-      if (shouldFail) throw fsError("EIO");
+      if (shouldFail) throw fsError("EBADF");
     },
     renameSync: (oldPath: string, newPath: string) => {
       if (failOn.renameSync?.(oldPath)) throw fsError("EIO");
@@ -729,6 +730,45 @@ describe("persistence", () => {
     assert.equal(existsSync(lockPath(dir)), false);
   });
 
+  it("persists a counter the loader accepts after allocating at the boundary", async () => {
+    const dir = tempDir();
+    const content = JSON.stringify({
+      schemaVersion: 1,
+      clients: [],
+      engagements: [],
+      projects: [],
+      nextIds: { clients: Number.MAX_SAFE_INTEGER - 1 },
+    });
+    writeFileSync(storePath(dir), content, "utf8");
+    const store = await openStore(dir);
+    let createdId: string;
+    try {
+      // The highest allocatable id is one below the ceiling.
+      const created = await store.createClient({ name: "Last" });
+      createdId = created.id;
+      assert.equal(created.id, `client-${Number.MAX_SAFE_INTEGER - 1}`);
+    } finally {
+      await store.close();
+    }
+    // The save succeeded, so the loader must accept what was persisted.
+    const reopened = await openStore(dir);
+    try {
+      assert.equal(reopened.snapshot().clients[0].id, createdId);
+      // No further client can be allocated without producing a duplicate id.
+      await assert.rejects(reopened.createClient({ name: "Overflow" }), PersistenceError);
+      assert.equal(reopened.snapshot().clients.length, 1);
+    } finally {
+      await reopened.close();
+    }
+    // The refused allocation did not corrupt the persisted document.
+    const again = await openStore(dir);
+    try {
+      assert.equal(again.snapshot().clients[0].id, createdId);
+    } finally {
+      await again.close();
+    }
+  });
+
   it("refuses a second writer and permits reopening after close", async () => {
     const dir = tempDir();
     const first = await openStore(dir);
@@ -795,7 +835,7 @@ describe("failures", () => {
     }
   });
 
-  it("retains the previous committed state when rename or flush fails", async () => {
+  it("retains the previous committed state when rename fails", async () => {
     const dir = tempDir();
     const store = await openStore(dir);
     let clientId: string;
@@ -806,7 +846,8 @@ describe("failures", () => {
     }
     const committed = readFileSync(storePath(dir), "utf8");
 
-    const renameFailing = failingFs({ renameSync: () => true });
+    let failRename = true;
+    const renameFailing = failingFs({ renameSync: () => failRename });
     const first = await openStore(dir, { fs: renameFailing });
     try {
       await assert.rejects(first.updateClient(clientId, { name: "Renamed" }), PersistenceError);
@@ -814,20 +855,24 @@ describe("failures", () => {
       assert.equal(readFileSync(storePath(dir), "utf8"), committed);
       assert.deepEqual(readdirSync(dir).filter((n) => n.endsWith(".tmp")), []);
     } finally {
+      failRename = false;
       await renameFailing.unlinkSync(lockPath(dir));
       await openStore(dir).then((s) => s.close());
     }
 
-    // A real directory flush failure is reported after the rename. The store
-    // file already holds the new value, so memory is reconciled to the file:
-    // the snapshot matches disk and later writes never build on stale state.
+    // A directory flush failure is reported after the rename has already
+    // replaced the store file. The rejected mutation is not published, and the
+    // store writes the previously committed state back, so both the snapshot
+    // and the file keep the last acknowledged value; a later write builds on it.
     let failFlush = true;
     const flushFailing = failingFs({ fsyncDirectorySync: () => failFlush });
     const second = await openStore(dir, { fs: flushFailing });
     try {
+      const before = second.snapshot().clients[0].name;
       await assert.rejects(second.updateClient(clientId, { name: "Flushed" }), PersistenceError);
-      assert.equal(second.snapshot().clients[0].name, "Flushed");
-      assert.equal(readFileSync(storePath(dir), "utf8").includes("Flushed"), true);
+      assert.equal(second.snapshot().clients[0].name, before);
+      assert.equal(readFileSync(storePath(dir), "utf8").includes("Flushed"), false);
+      assert.equal(readFileSync(storePath(dir), "utf8").includes(before), true);
       failFlush = false;
       const persisted = await second.updateClient(clientId, { name: "AfterFlush" });
       assert.equal(persisted.name, "AfterFlush");
@@ -953,6 +998,49 @@ describe("failures", () => {
     } finally {
       await owner.close();
     }
+  });
+
+  it("reports an initial temporary-file close failure instead of acknowledging a save", async () => {
+    const dir = tempDir();
+    let failInitialClose = true;
+    // The adapter really closes the descriptor but reports EBADF, as if the
+    // descriptor were already gone. On the successful persistence path this is
+    // a genuine failure that must be reported, not treated as released.
+    const failing = failingFs({
+      closeSync: (_fd, temp) => failInitialClose && temp,
+    });
+    const store = await openStore(dir, { fs: failing });
+    try {
+      await assert.rejects(store.createClient({ name: "Acme" }), PersistenceError);
+      assert.equal(store.snapshot().clients.length, 0);
+      assert.equal(existsSync(storePath(dir)), false);
+      assert.deepEqual(readdirSync(dir).filter((n) => n.endsWith(".tmp")), []);
+      failInitialClose = false;
+      const created = await store.createClient({ name: "Acme" });
+      assert.equal(created.name, "Acme");
+    } finally {
+      await store.close();
+    }
+    const reopened = await openStore(dir);
+    try {
+      assert.equal(reopened.snapshot().clients.length, 1);
+    } finally {
+      await reopened.close();
+    }
+  });
+
+  it("fails initialization when closing the acquired lock descriptor fails", async () => {
+    const dir = tempDir();
+    // Closing the lock descriptor on the successful acquisition path reports
+    // EBADF; initialization must fail and release the lock rather than treating
+    // the descriptor as already closed.
+    const failing = failingFs({
+      closeSync: (_fd, temp) => !temp,
+    });
+    await assert.rejects(openStore(dir, { fs: failing }), PersistenceError);
+    assert.equal(existsSync(lockPath(dir)), false);
+    const store = await openStore(dir);
+    await store.close();
   });
 
   it("reports a lock release failure on close and allows retrying close", async () => {

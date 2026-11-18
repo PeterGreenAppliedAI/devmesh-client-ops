@@ -160,15 +160,14 @@ interface State {
 }
 
 /**
- * Error codes that mean a platform cannot open or flush a directory entry at
- * all; the default adapter treats them as "unsupported" rather than failures.
+ * Error codes that mean a platform cannot perform a directory flush at all;
+ * the default adapter treats only these as "unsupported". Permission errors
+ * such as EPERM or EACCES are genuine failures and are always reported.
  */
 const UNSUPPORTED_DIRECTORY_CODES = new Set([
   "EINVAL",
   "ENOTSUP",
   "EOPNOTSUPP",
-  "EPERM",
-  "EACCES",
   "EISDIR",
 ]);
 
@@ -184,9 +183,10 @@ function defaultFileSystem(): FileSystem {
     renameSync: (oldPath, newPath) => renameSync(oldPath, newPath),
     unlinkSync: (path) => unlinkSync(path),
     fsyncDirectorySync: (path) => {
-      // Some platforms cannot open a directory descriptor this way; that is
-      // "unsupported", not a failure of the data write. A descriptor that did
-      // open is always closed, and a real close failure is reported.
+      // Some platforms cannot open or flush a directory descriptor at all; only
+      // that is "unsupported", not a failure of the data write. Permission and
+      // descriptor failures are reported. A descriptor that did open is always
+      // closed, and a real close failure is reported.
       let fd: number;
       try {
         fd = openSync(path, "r");
@@ -194,15 +194,21 @@ function defaultFileSystem(): FileSystem {
         if (UNSUPPORTED_DIRECTORY_CODES.has(errorCode(cause) ?? "")) return;
         throw cause;
       }
+      let failed = false;
+      let failure: unknown;
       try {
         try {
           fsyncSync(fd);
         } catch (cause) {
-          if (!UNSUPPORTED_DIRECTORY_CODES.has(errorCode(cause) ?? "")) throw cause;
+          if (!UNSUPPORTED_DIRECTORY_CODES.has(errorCode(cause) ?? "")) {
+            failed = true;
+            failure = cause;
+          }
         }
       } finally {
         closeSync(fd);
       }
+      if (failed) throw failure;
     },
   };
 }
@@ -213,9 +219,22 @@ function toJson(state: State): string {
     clients: state.clients,
     engagements: state.engagements,
     projects: state.projects,
-    nextIds: state.nextIds,
+    // A stored counter is the next id to allocate. It must therefore stay below
+    // the safe-integer ceiling so the loader accepts it and allocation can
+    // still advance: when the highest allocated id is one less than the
+    // ceiling, the stored counter equals that highest id, which the loader
+    // accepts as "cannot advance" and the next allocation refuses.
+    nextIds: countersOf(state),
   };
   return `${JSON.stringify(document, null, 2)}\n`;
+}
+
+function countersOf(state: State): Record<string, number> {
+  const nextIds: Record<string, number> = {};
+  for (const [key, value] of Object.entries(state.nextIds)) {
+    nextIds[key] = Math.min(value, Number.MAX_SAFE_INTEGER - 1);
+  }
+  return nextIds;
 }
 
 function emptyState(): State {
@@ -309,19 +328,27 @@ function parseState(text: string): State {
       );
     }
     const used = highest[key] ?? 0;
-    if ((value as number) <= used) {
+    // The counter may equal the highest allocated id only when that id is the
+    // last one that can be allocated safely: the collection is then exhausted
+    // and allocation is refused rather than producing a duplicate or an unsafe
+    // counter. A counter below the highest id would reproduce an existing id,
+    // so it is refused.
+    if (
+      (value as number) < used ||
+      ((value as number) === used && used !== Number.MAX_SAFE_INTEGER - 1)
+    ) {
       throw new PersistenceError(
         `Stored nextIds.${key} cannot safely advance past existing id ${collections[key as CounterKey].kind}-${used}`,
-      );
+      )
     }
     state.nextIds[key] = value as number;
   }
-  // Every collection with records must have a counter that advances past them.
+  // Every collection with records must have a counter that covers them.
   for (const key of COLLECTION_KEYS) {
     const used = highest[key] ?? 0;
-    if (used > 0 && (state.nextIds[key] === undefined || state.nextIds[key] <= used)) {
+    if (used > 0 && state.nextIds[key] === undefined) {
       throw new PersistenceError(
-        `Stored nextIds.${key} is missing or cannot advance past existing id ${collections[key].kind}-${used}`,
+        `Stored nextIds.${key} is missing while id ${collections[key].kind}-${used} exists`,
       );
     }
   }
@@ -399,6 +426,16 @@ function writeFully(fs: FileSystem, fd: number, data: string): void {
     }
     offset += written;
   }
+}
+
+/**
+ * Close a descriptor on an initial (non-cleanup) path. Any failure, including
+ * one that resembles an already-closed descriptor, is an operation failure that
+ * must be reported; only cleanup after a reported failure may treat EBADF as
+ * released.
+ */
+function closeInitialDescriptorSync(fs: FileSystem, fd: number): void {
+  fs.closeSync(fd);
 }
 
 /**
@@ -480,13 +517,23 @@ class StoreImpl implements Store {
 
   private nextId(draft: State, key: CounterKey): string {
     const next = draft.nextIds[key] ?? 1;
+    const items = draft[key] as readonly { id: string }[];
+    const kind = collections[key].kind;
     if (!Number.isSafeInteger(next) || next < 1 || next >= Number.MAX_SAFE_INTEGER) {
       throw new PersistenceError(
-        `Cannot allocate a new ${collections[key].kind}: the id counter cannot advance safely`,
+        `Cannot allocate a new ${kind}: the id counter cannot advance safely`,
+      );
+    }
+    // A counter that equals an existing id would reproduce it. The loader only
+    // accepts such a counter when the collection is exhausted at the safe-integer
+    // boundary, and allocation there must be refused.
+    if (items.some((item) => idSuffix(kind, item.id) === next)) {
+      throw new PersistenceError(
+        `Cannot allocate a new ${kind}: the id counter cannot advance safely`,
       );
     }
     draft.nextIds[key] = next + 1;
-    return `${collections[key].kind}-${next}`;
+    return `${kind}-${next}`;
   }
 
   /**
@@ -494,24 +541,62 @@ class StoreImpl implements Store {
    * store file atomically, then sync the directory entry.
    *
    * Failures before the rename leave the previous store file untouched, so the
-   * previously committed state stays in effect and nothing is published. Once
-   * the rename has happened the new bytes are the store file; a later directory
-   * flush failure is reported, but memory is reconciled to the file so a writer
-   * never builds succeeding mutations on stale state. Only a fully successful
-   * write is acknowledged.
+   * previously committed state stays in effect and nothing is published. If the
+   * directory flush after the rename fails, the new bytes are already in the
+   * store file, so the previous committed state is written back and the
+   * operation is rejected: both disk and memory then hold the previously
+   * committed state, and later writes never build on stale state. Only a fully
+   * successful write is acknowledged and published.
    */
   private async persist(next: State): Promise<void> {
+    try {
+      this.replaceFile(next);
+    } catch (cause) {
+      // A cleanup failure already has a specific persistence message; keep it.
+      if (cause instanceof PersistenceError) throw cause;
+      throw new PersistenceError("Failed to persist workspace data", { cause });
+    }
+
+    if (this.fs.fsyncDirectorySync) {
+      try {
+        this.fs.fsyncDirectorySync(this.directory);
+      } catch (cause) {
+        // The replacement already happened, so the store file now holds `next`
+        // even though the change was not acknowledged. Write the previously
+        // committed state back so disk and memory agree on it, then reject.
+        let restoreFailure: unknown;
+        try {
+          this.replaceFile(this.state);
+        } catch (restoreCause) {
+          restoreFailure = restoreCause;
+        }
+        throw new PersistenceError("Failed to flush the store directory", {
+          cause: restoreFailure === undefined ? cause : failureOr(cause, restoreFailure),
+        });
+      }
+    }
+
+    // Only now, after the file is safely in place, acknowledge the new state.
+    this.state = next;
+  }
+
+  /**
+   * Replace the store file with `state` through a flushed temporary file in the
+   * same directory. The previous file is left alone if anything fails before
+   * the rename, and the temporary file is only removed once it is closed.
+   */
+  private replaceFile(state: State): void {
     const tempPath = `${this.storePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
     let fd: number | null = null;
     let tempCreated = false;
     try {
       fd = this.fs.openSync(tempPath, "wx");
       tempCreated = true;
-      writeFully(this.fs, fd, toJson(next));
+      writeFully(this.fs, fd, toJson(state));
       this.fs.fsyncSync(fd);
       // Clear ownership only after close returns; a close that reports failure
       // might have left the descriptor open, and cleanup must close it again.
-      const closed = this.closeDescriptor(fd);
+      const closed = this.closeInitialDescriptor(fd);
       if (!closed.closed) throw closed.failure;
       fd = null;
       this.fs.renameSync(tempPath, this.storePath);
@@ -523,22 +608,8 @@ class StoreImpl implements Store {
           { cause: failureOr(cause, cleanupFailure) },
         );
       }
-      throw new PersistenceError("Failed to persist workspace data", { cause });
+      throw cause;
     }
-
-    if (this.fs.fsyncDirectorySync) {
-      try {
-        this.fs.fsyncDirectorySync(this.directory);
-      } catch (cause) {
-        // The replacement already happened, so the file holds `next`. Keep
-        // memory identical to the file before rejecting the acknowledgement.
-        this.state = next;
-        throw new PersistenceError("Failed to flush the store directory", { cause });
-      }
-    }
-
-    // Only now, after the file is safely in place, acknowledge the new state.
-    this.state = next;
   }
 
   /**
@@ -548,6 +619,20 @@ class StoreImpl implements Store {
    */
   private closeDescriptor(fd: number): { closed: boolean; failure?: unknown } {
     return closeDescriptorSync(this.fs, fd);
+  }
+
+  /**
+   * Close a descriptor on the successful persistence path. There is no failure
+   * to clean up here, so an EBADF is a genuine failure to report, not a
+   * descriptor that may be considered released.
+   */
+  private closeInitialDescriptor(fd: number): { closed: boolean; failure?: unknown } {
+    try {
+      closeInitialDescriptorSync(this.fs, fd);
+      return { closed: true };
+    } catch (failure) {
+      return { closed: false, failure };
+    }
   }
 
   /**
@@ -754,10 +839,15 @@ export async function openStore(
     lockCreated = true;
     try {
       writeFully(fs, lockFd, JSON.stringify({ pid: process.pid }));
-      const closed = closeDescriptorSync(fs, lockFd);
+      let lockClosed = false;
+      try {
+        closeInitialDescriptorSync(fs, lockFd);
+        lockClosed = true;
+      } catch (failure) {
+        throw failure;
+      }
       // Keep ownership until close is confirmed; cleanup closes it again if not.
-      if (closed.closed) lockFd = null;
-      else throw closed.failure;
+      if (lockClosed) lockFd = null;
     } catch (cause) {
       // The exclusive create succeeded, so this partial lock is ours and must be
       // removed before failing. Close any descriptor we still own only once its
@@ -765,8 +855,10 @@ export async function openStore(
       let cleanupFailure: unknown;
       if (lockFd !== null) {
         const result = closeDescriptorSync(fs, lockFd);
-        if (!result.closed) cleanupFailure = result.failure;
-        else lockFd = null;
+        // An EBADF after a reported close failure means cleanup already closed
+        // it; otherwise the descriptor may still be open and the file is kept.
+        if (result.closed) lockFd = null;
+        else cleanupFailure = result.failure;
       }
       if (lockFd === null) {
         try {
