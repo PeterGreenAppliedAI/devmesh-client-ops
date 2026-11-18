@@ -55,6 +55,10 @@ interface FailOn {
   fsyncSync?: (fd: number, isTemp: boolean) => boolean;
   /** Fail the close, reporting EBADF as if the descriptor were already gone. */
   closeSync?: (fd: number, isTemp: boolean) => boolean;
+  /** Error code reported when `closeSync` fails; defaults to EBADF. */
+  closeSyncCode?: string;
+  /** Count every directory flush call made through the adapter. */
+  fsyncDirectorySyncAfter?: { call: number };
   /** Fail the write after the exclusive create has already produced a file. */
   createThenFailWriteLock?: (path: string) => boolean;
   renameSync?: (path: string) => boolean;
@@ -121,7 +125,7 @@ function failingFs(failOn: FailOn) {
       closeSync(fd);
       descriptors.delete(fd);
       written.delete(fd);
-      if (shouldFail) throw fsError("EBADF");
+      if (shouldFail) throw fsError(failOn.closeSyncCode ?? "EBADF");
     },
     renameSync: (oldPath: string, newPath: string) => {
       if (failOn.renameSync?.(oldPath)) throw fsError("EIO");
@@ -139,6 +143,8 @@ function failingFs(failOn: FailOn) {
       rmSync(path, { force: true });
     },
     fsyncDirectorySync: (path: string) => {
+      const counter = failOn.fsyncDirectorySyncAfter;
+      if (counter) counter.call += 1;
       if (failOn.fsyncDirectorySync?.(path)) throw fsError("EIO");
       // Simulated directory flush: this adapter reports success unless a test
       // injects a failure, and the store treats any throw as a real failure.
@@ -864,8 +870,17 @@ describe("failures", () => {
     // replaced the store file. The rejected mutation is not published, and the
     // store writes the previously committed state back, so both the snapshot
     // and the file keep the last acknowledged value; a later write builds on it.
+    let flushCalls = 0;
     let failFlush = true;
-    const flushFailing = failingFs({ fsyncDirectorySync: () => failFlush });
+    // Fail only the first flush, which belongs to the rejected save; the flush
+    // of the restored previous state must succeed, or the store is blocked.
+    const flushFailing = failingFs({
+      fsyncDirectorySync: () => {
+        if (!failFlush) return false;
+        flushCalls += 1;
+        return flushCalls === 1;
+      },
+    });
     const second = await openStore(dir, { fs: flushFailing });
     try {
       const before = second.snapshot().clients[0].name;
@@ -883,6 +898,135 @@ describe("failures", () => {
         assert.equal(s.snapshot().clients[0].name, "AfterFlush");
         await s.close();
       });
+    }
+  });
+
+  it("reports a close failure with EIO and retains the previous committed state", async () => {
+    const dir = tempDir();
+    const setup = await openStore(dir);
+    let clientId: string;
+    try {
+      clientId = (await setup.createClient({ name: "Acme" })).id;
+    } finally {
+      await setup.close();
+    }
+    const committed = readFileSync(storePath(dir), "utf8");
+
+    let failClose = true;
+    // A close that really closes the descriptor but reports EIO (not EBADF) is
+    // a genuine operation failure on the save path and must be reported; the
+    // save must not be acknowledged.
+    const failing = failingFs({
+      closeSync: (_fd, temp) => failClose && temp,
+      closeSyncCode: "EIO",
+    });
+    const store = await openStore(dir, { fs: failing });
+    try {
+      await assert.rejects(
+        store.updateClient(clientId, { name: "Rejected" }),
+        (error: unknown) => {
+          assert.ok(error instanceof PersistenceError);
+          assert.equal((error.cause as NodeJS.ErrnoException).code, "EIO");
+          return true;
+        },
+      );
+      assert.equal(store.snapshot().clients[0].name, "Acme");
+      assert.equal(readFileSync(storePath(dir), "utf8"), committed);
+      assert.deepEqual(readdirSync(dir).filter((n) => n.endsWith(".tmp")), []);
+
+      // A later save is still acknowledged once the close succeeds.
+      failClose = false;
+      const saved = await store.updateClient(clientId, { name: "Saved" });
+      assert.equal(saved.name, "Saved");
+    } finally {
+      failClose = false;
+      await store.close();
+    }
+    const reopened = await openStore(dir);
+    try {
+      assert.equal(reopened.snapshot().clients[0].name, "Saved");
+    } finally {
+      await reopened.close();
+    }
+  });
+
+  it("blocks further mutations when the committed state cannot be restored", async () => {
+    const dir = tempDir();
+    const setup = await openStore(dir);
+    let clientId: string;
+    try {
+      clientId = (await setup.createClient({ name: "Acme" })).id;
+    } finally {
+      await setup.close();
+    }
+    const committed = readFileSync(storePath(dir), "utf8");
+
+    // The first directory flush (after the replacement) fails, and the flush
+    // that would make the restored previous state durable fails too.
+    const after = { call: 0 };
+    let flushes = 0;
+    const failing = failingFs({
+      fsyncDirectorySyncAfter: after,
+      // Fail the flush of the rejected replacement, and the flush of the
+      // restored file too once the store file holds the committed state again.
+      fsyncDirectorySync: () => {
+        flushes += 1;
+        return flushes === 1 || readFileSync(storePath(dir), "utf8") === committed;
+      },
+    });
+    const store = await openStore(dir, { fs: failing });
+    // Count only the flush calls made by this save and its restore.
+    after.call = 0;
+    try {
+      await assert.rejects(store.updateClient(clientId, { name: "Rejected" }), (error: unknown) => {
+        assert.ok(error instanceof PersistenceError);
+        assert.match(error.message, /could not restore the previous state/i);
+        return true;
+      });
+      assert.equal(after.call, 2);
+      // The rejected mutation is never published in memory.
+      assert.equal(store.snapshot().clients[0].name, "Acme");
+      // Every later mutation is refused instead of building on stale state.
+      await assert.rejects(store.updateClient(clientId, { name: "Later" }), PersistenceError);
+      await assert.rejects(store.createClient({ name: "Later" }), PersistenceError);
+      assert.equal(store.snapshot().clients[0].name, "Acme");
+    } finally {
+      // A blocked store can still release its ownership so it can be reopened.
+      await store.close();
+      assert.equal(existsSync(lockPath(dir)), false);
+    }
+
+    // Reopening reads whatever the disk holds; the restored previous state was
+    // written back even though its flush failed, so it is the committed one.
+    assert.equal(readFileSync(storePath(dir), "utf8"), committed);
+    const reopened = await openStore(dir);
+    try {
+      assert.equal(reopened.snapshot().clients[0].name, "Acme");
+      const saved = await reopened.createClient({ name: "Fresh" });
+      assert.equal(saved.name, "Fresh");
+    } finally {
+      await reopened.close();
+    }
+  });
+
+  it("saves through the default directory flush on the current platform", async () => {
+    const dir = tempDir();
+    // No adapter is injected, so the default adapter performs its real
+    // directory flush and classifies the platform's errors itself. A save must
+    // be acknowledged on every supported platform (Linux and Windows).
+    const store = await openStore(dir);
+    try {
+      const client = await store.createClient({ name: "Acme" });
+      assert.equal(client.name, "Acme");
+      assert.equal(store.snapshot().clients.length, 1);
+    } finally {
+      await store.close();
+    }
+    const reopened = await openStore(dir);
+    try {
+      assert.equal(reopened.snapshot().clients.length, 1);
+    } finally {
+      await reopened.close();
     }
   });
 

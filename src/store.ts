@@ -160,9 +160,8 @@ interface State {
 }
 
 /**
- * Error codes that mean a platform cannot perform a directory flush at all;
- * the default adapter treats only these as "unsupported". Permission errors
- * such as EPERM or EACCES are genuine failures and are always reported.
+ * Error codes that mean a platform cannot flush the contents of a directory at
+ * all. These are treated as "unsupported" rather than as a failed save.
  */
 const UNSUPPORTED_DIRECTORY_CODES = new Set([
   "EINVAL",
@@ -170,6 +169,18 @@ const UNSUPPORTED_DIRECTORY_CODES = new Set([
   "EOPNOTSUPP",
   "EISDIR",
 ]);
+
+/**
+ * Error codes a platform may report for a directory flush that it does not
+ * support. On Windows, opening a directory can report EPERM/EACCES and
+ * flushing its handle can report EPERM, EBADF, EISDIR or ENOENT depending on
+ * the file system and Node version. Genuine failures of the same operations are
+ * still reported for every other error code.
+ */
+const UNSUPPORTED_DIRECTORY_FLUSH_CODES: ReadonlySet<string> =
+  process.platform === "win32"
+    ? new Set([...UNSUPPORTED_DIRECTORY_CODES, "EPERM", "EACCES", "EBADF", "ENOENT"])
+    : UNSUPPORTED_DIRECTORY_CODES;
 
 function defaultFileSystem(): FileSystem {
   return {
@@ -184,14 +195,15 @@ function defaultFileSystem(): FileSystem {
     unlinkSync: (path) => unlinkSync(path),
     fsyncDirectorySync: (path) => {
       // Some platforms cannot open or flush a directory descriptor at all; only
-      // that is "unsupported", not a failure of the data write. Permission and
-      // descriptor failures are reported. A descriptor that did open is always
-      // closed, and a real close failure is reported.
+      // those platform-specific codes are "unsupported", not a failure of the
+      // data write. Other open, flush and close failures are reported. A
+      // descriptor that did open is always closed, and a real close failure is
+      // reported.
       let fd: number;
       try {
         fd = openSync(path, "r");
       } catch (cause) {
-        if (UNSUPPORTED_DIRECTORY_CODES.has(errorCode(cause) ?? "")) return;
+        if (UNSUPPORTED_DIRECTORY_FLUSH_CODES.has(errorCode(cause) ?? "")) return;
         throw cause;
       }
       let failed = false;
@@ -200,11 +212,14 @@ function defaultFileSystem(): FileSystem {
         try {
           fsyncSync(fd);
         } catch (cause) {
-          if (!UNSUPPORTED_DIRECTORY_CODES.has(errorCode(cause) ?? "")) {
+          if (!UNSUPPORTED_DIRECTORY_FLUSH_CODES.has(errorCode(cause) ?? "")) {
             failed = true;
             failure = cause;
           }
         }
+      } catch (cause) {
+        failed = true;
+        failure = cause;
       } finally {
         closeSync(fd);
       }
@@ -490,6 +505,13 @@ class StoreImpl implements Store {
   private queue: Promise<unknown> = Promise.resolve();
   private closed = false;
   private lockReleased = false;
+  /**
+   * Set when a failed save could not restore the committed file and the store
+   * therefore cannot tell whether disk and memory agree. All further mutations
+   * are refused until the store is closed and reopened; memory is never
+   * published from a failed save.
+   */
+  private blocked: PersistenceError | null = null;
 
   constructor(state: State, fs: FileSystem, directory: string) {
     this.state = state;
@@ -506,6 +528,17 @@ class StoreImpl implements Store {
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {
     if (this.closed) {
       return Promise.reject(new PersistenceError("Store is closed"));
+    }
+    if (this.blocked) {
+      // A failed save could not restore the committed file, so disk and memory
+      // may disagree. Refuse to build a new write on state that is not known to
+      // be committed; the store must be closed and reopened.
+      return Promise.reject(
+        new PersistenceError(
+          "The store cannot accept further mutations until it is reopened",
+          { cause: this.blocked },
+        ),
+      );
     }
     const run = this.queue.then(operation);
     this.queue = run.then(
@@ -543,36 +576,42 @@ class StoreImpl implements Store {
    * Failures before the rename leave the previous store file untouched, so the
    * previously committed state stays in effect and nothing is published. If the
    * directory flush after the rename fails, the new bytes are already in the
-   * store file, so the previous committed state is written back and the
-   * operation is rejected: both disk and memory then hold the previously
-   * committed state, and later writes never build on stale state. Only a fully
-   * successful write is acknowledged and published.
+   * store file, so the previous committed state is written back, flushed and
+   * the operation is rejected: both disk and memory then hold the previously
+   * committed state, and later writes never build on stale state. If that
+   * restore fails too, the store is blocked: it never publishes the failed
+   * mutation, and refuses every further mutation until it is reopened. Only a
+   * fully successful write is acknowledged and published.
    */
   private async persist(next: State): Promise<void> {
+    let replaced = false;
     try {
-      this.replaceFile(next);
+      replaced = this.replaceFile(next);
     } catch (cause) {
       // A cleanup failure already has a specific persistence message; keep it.
       if (cause instanceof PersistenceError) throw cause;
       throw new PersistenceError("Failed to persist workspace data", { cause });
     }
 
-    if (this.fs.fsyncDirectorySync) {
+    if (replaced && this.fs.fsyncDirectorySync) {
       try {
         this.fs.fsyncDirectorySync(this.directory);
       } catch (cause) {
         // The replacement already happened, so the store file now holds `next`
         // even though the change was not acknowledged. Write the previously
-        // committed state back so disk and memory agree on it, then reject.
-        let restoreFailure: unknown;
+        // committed state back, including its own directory flush, so disk and
+        // memory agree before any later write; then reject without publishing.
         try {
           this.replaceFile(this.state);
+          this.fs.fsyncDirectorySync(this.directory);
         } catch (restoreCause) {
-          restoreFailure = restoreCause;
+          this.blocked = new PersistenceError(
+            "Failed to flush the store directory and could not restore the previous state",
+            { cause: failureOr(cause, restoreCause) },
+          );
+          throw this.blocked;
         }
-        throw new PersistenceError("Failed to flush the store directory", {
-          cause: restoreFailure === undefined ? cause : failureOr(cause, restoreFailure),
-        });
+        throw new PersistenceError("Failed to flush the store directory", { cause });
       }
     }
 
@@ -584,8 +623,10 @@ class StoreImpl implements Store {
    * Replace the store file with `state` through a flushed temporary file in the
    * same directory. The previous file is left alone if anything fails before
    * the rename, and the temporary file is only removed once it is closed.
+   * Returns true when the rename has happened, so the caller knows the store
+   * file now holds `state` even if a later directory flush fails.
    */
-  private replaceFile(state: State): void {
+  private replaceFile(state: State): boolean {
     const tempPath = `${this.storePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
     let fd: number | null = null;
     let tempCreated = false;
@@ -600,6 +641,7 @@ class StoreImpl implements Store {
       if (!closed.closed) throw closed.failure;
       fd = null;
       this.fs.renameSync(tempPath, this.storePath);
+      return true;
     } catch (cause) {
       const cleanupFailure = this.discardTemp(tempPath, fd, tempCreated);
       if (cleanupFailure !== undefined) {
@@ -663,10 +705,18 @@ class StoreImpl implements Store {
     return cleanupFailure;
   }
 
-  private commit<T>(mutate: (draft: State) => T): Promise<T> {
+  private async commit<T>(mutate: (draft: State) => T): Promise<T> {
+    // An earlier operation may have failed recovery while this one waited.
+    if (this.blocked) {
+      throw new PersistenceError(
+        "The store cannot accept further mutations until it is reopened",
+        { cause: this.blocked },
+      );
+    }
     const draft: State = clone(this.state);
     const result = mutate(draft);
-    return this.persist(draft).then(() => clone(result));
+    await this.persist(draft);
+    return clone(result);
   }
 
   createClient(input: ClientCreate): Promise<Client> {
@@ -780,7 +830,10 @@ class StoreImpl implements Store {
 
   async close(): Promise<void> {
     this.closed = true;
-    await this.queue.then(
+    const pending = this.queue;
+    // Wait for queued mutations that were accepted before close. A failure in
+    // any of them is the caller's error, reported by that operation.
+    await pending.then(
       () => undefined,
       () => undefined,
     );
