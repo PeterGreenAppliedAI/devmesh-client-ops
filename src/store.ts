@@ -126,6 +126,12 @@ export interface FileSystem {
 /** Internal options accepted by openStore; only tests pass them. */
 export interface StoreOptions {
   fs?: Partial<FileSystem>;
+  /**
+   * The platform whose directory-durability rules apply; defaults to
+   * `process.platform`. Only tests pass it, so they can exercise either the
+   * Windows skip or the POSIX directory flush on any operating system.
+   */
+  platform?: string;
 }
 
 /** A collection of records that a store persists. */
@@ -177,9 +183,11 @@ interface State {
  * closed, and a failure at any of those steps is a genuine persistence failure
  * that is reported; if the flush fails and the close then fails too, the flush
  * error is the one reported, with the close error attached as context.
+ *
+ * The platform is the store's configured one, never read from process here.
  */
-function flushDirectorySync(fs: FileSystem, path: string): void {
-  if (process.platform === "win32") return;
+function flushDirectorySync(fs: FileSystem, path: string, platform: string): void {
+  if (platform === "win32") return;
   const fd = fs.openSync(path, "r");
   let flushFailure: unknown;
   try {
@@ -201,7 +209,7 @@ function flushDirectorySync(fs: FileSystem, path: string): void {
   if (flushFailure !== undefined) throw flushFailure;
 }
 
-function defaultFileSystem(): FileSystem {
+function defaultFileSystem(platform: string): FileSystem {
   const fs: FileSystem = {
     existsSync,
     mkdirSync: (path, options) => mkdirSync(path, options),
@@ -212,7 +220,7 @@ function defaultFileSystem(): FileSystem {
     closeSync: (fd) => closeSync(fd),
     renameSync: (oldPath, newPath) => renameSync(oldPath, newPath),
     unlinkSync: (path) => unlinkSync(path),
-    fsyncDirectorySync: (path) => flushDirectorySync(fs, path),
+    fsyncDirectorySync: (path) => flushDirectorySync(fs, path, platform),
   };
   return fs;
 }
@@ -856,11 +864,12 @@ export async function openStore(
   // The default adapter's directory flush calls back into the adapter it was
   // built for, so merge the injected operations onto that one instead of onto a
   // copy: an injected open, flush or close is then the operation the flush uses.
-  const fs = defaultFileSystem();
+  const platform = options.platform ?? process.platform;
+  const fs = defaultFileSystem(platform);
   Object.assign(fs, options.fs);
   if (options.fs?.fsyncDirectorySync === undefined) {
     // A copy without an injected directory flush still reaches the merged adapter.
-    fs.fsyncDirectorySync = (path) => flushDirectorySync(fs, path);
+    fs.fsyncDirectorySync = (path) => flushDirectorySync(fs, path, platform);
   }
   const lockPath = join(directory, LOCK_FILE);
   const storePath = join(directory, STORE_FILE);
