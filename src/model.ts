@@ -14,17 +14,17 @@ export interface Client {
   id: string;
   name: string;
   background: string;
-  contacts: string[];
-  stakeholders: string[];
-  requirements: string[];
-  objectives: string[];
+  contacts: string;
+  stakeholders: string;
+  requirements: string;
+  objectives: string;
 }
 
 export interface Engagement {
   id: string;
   clientId: string;
   name: string;
-  objectives: string[];
+  objectives: string;
   status: EngagementStatus;
 }
 
@@ -32,7 +32,7 @@ export interface Project {
   id: string;
   engagementId: string;
   name: string;
-  objectives: string[];
+  objectives: string;
   status: ProjectStatus;
 }
 
@@ -111,13 +111,6 @@ function requireStatus(value: unknown, what: string): EngagementStatus {
   return value as EngagementStatus;
 }
 
-function requireTextArray(value: unknown, what: string): string[] {
-  if (!Array.isArray(value)) {
-    throw new ValidationError(`${what} must be an array`);
-  }
-  return value.map((item, index) => requireText(item, `${what}[${index}]`));
-}
-
 const CLIENT_KEYS = [
   "id",
   "name",
@@ -137,10 +130,10 @@ export function parseClient(value: unknown, what = "client"): Client {
     id: requireName(record.id, `${what}.id`),
     name: requireName(record.name, `${what}.name`),
     background: requireText(record.background, `${what}.background`),
-    contacts: requireTextArray(record.contacts, `${what}.contacts`),
-    stakeholders: requireTextArray(record.stakeholders, `${what}.stakeholders`),
-    requirements: requireTextArray(record.requirements, `${what}.requirements`),
-    objectives: requireTextArray(record.objectives, `${what}.objectives`),
+    contacts: requireText(record.contacts, `${what}.contacts`),
+    stakeholders: requireText(record.stakeholders, `${what}.stakeholders`),
+    requirements: requireText(record.requirements, `${what}.requirements`),
+    objectives: requireText(record.objectives, `${what}.objectives`),
   };
 }
 
@@ -151,7 +144,7 @@ export function parseEngagement(value: unknown, what = "engagement"): Engagement
     id: requireName(record.id, `${what}.id`),
     clientId: requireName(record.clientId, `${what}.clientId`),
     name: requireName(record.name, `${what}.name`),
-    objectives: requireTextArray(record.objectives, `${what}.objectives`),
+    objectives: requireText(record.objectives, `${what}.objectives`),
     status: requireStatus(record.status, `${what}.status`),
   };
 }
@@ -163,7 +156,7 @@ export function parseProject(value: unknown, what = "project"): Project {
     id: requireName(record.id, `${what}.id`),
     engagementId: requireName(record.engagementId, `${what}.engagementId`),
     name: requireName(record.name, `${what}.name`),
-    objectives: requireTextArray(record.objectives, `${what}.objectives`),
+    objectives: requireText(record.objectives, `${what}.objectives`),
     status: requireStatus(record.status, `${what}.status`),
   };
 }

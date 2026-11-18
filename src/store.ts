@@ -11,7 +11,6 @@ import {
   readFileSync,
   renameSync,
   unlinkSync,
-  writeFileSync,
   writeSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -55,10 +54,10 @@ const STATE_KEYS = ["schemaVersion", "clients", "engagements", "projects", "next
 export interface ClientCreate {
   name: string;
   background?: string;
-  contacts?: string[];
-  stakeholders?: string[];
-  requirements?: string[];
-  objectives?: string[];
+  contacts?: string;
+  stakeholders?: string;
+  requirements?: string;
+  objectives?: string;
 }
 
 /** Partial update of a client; omitted fields keep their current value. */
@@ -68,7 +67,7 @@ export type ClientEdit = Partial<ClientCreate>;
 export interface EngagementCreate {
   clientId: string;
   name: string;
-  objectives?: string[];
+  objectives?: string;
   status?: EngagementStatus;
 }
 
@@ -81,7 +80,7 @@ export type EngagementEdit = Partial<
 export interface ProjectCreate {
   engagementId: string;
   name: string;
-  objectives?: string[];
+  objectives?: string;
   status?: ProjectStatus;
 }
 
@@ -102,7 +101,7 @@ export interface FileSystem {
   existsSync(path: string): boolean;
   mkdirSync(path: string, options: { recursive: true }): void;
   readFileSync(path: string, encoding: "utf8"): string;
-  writeFileSync(path: string, data: string, options: { encoding: "utf8"; flag?: string }): void;
+  /** Open a file for exclusive creation; fails with EEXIST if it already exists. */
   openSync(path: string, flags: "wx"): number;
   /** Write bytes at the descriptor's current position; returns bytes written. */
   writeSync(fd: number, data: Uint8Array): number;
@@ -110,7 +109,11 @@ export interface FileSystem {
   closeSync(fd: number): void;
   renameSync(oldPath: string, newPath: string): void;
   unlinkSync(path: string): void;
-  /** Flush a directory entry; may throw ENOTSUP/EINVAL where unsupported. */
+  /**
+   * Flush a directory entry. The adapter itself decides whether the platform
+   * supports this: it returns normally when unsupported, and throws only for a
+   * genuine failure. The store never suppresses a throw from this operation.
+   */
   fsyncDirectorySync?(path: string): void;
 }
 
@@ -156,15 +159,17 @@ interface State {
   nextIds: Record<string, number>;
 }
 
-/** Error codes that mean directory synchronization is not supported here. */
-const UNSUPPORTED_DIRECTORY_FSYNC_CODES = new Set([
+/**
+ * Error codes that mean a platform cannot open or flush a directory entry at
+ * all; the default adapter treats them as "unsupported" rather than failures.
+ */
+const UNSUPPORTED_DIRECTORY_CODES = new Set([
   "EINVAL",
   "ENOTSUP",
   "EOPNOTSUPP",
   "EPERM",
-  "EISDIR",
-  "EBADF",
   "EACCES",
+  "EISDIR",
 ]);
 
 function defaultFileSystem(): FileSystem {
@@ -172,7 +177,6 @@ function defaultFileSystem(): FileSystem {
     existsSync,
     mkdirSync: (path, options) => mkdirSync(path, options),
     readFileSync: (path, encoding) => readFileSync(path, encoding),
-    writeFileSync: (path, data, options) => writeFileSync(path, data, options),
     openSync: (path, flags) => openSync(path, flags),
     writeSync: (fd, data) => writeSync(fd, data),
     fsyncSync: (fd) => fsyncSync(fd),
@@ -180,9 +184,22 @@ function defaultFileSystem(): FileSystem {
     renameSync: (oldPath, newPath) => renameSync(oldPath, newPath),
     unlinkSync: (path) => unlinkSync(path),
     fsyncDirectorySync: (path) => {
-      const fd = openSync(path, "r");
+      // Some platforms cannot open a directory descriptor this way; that is
+      // "unsupported", not a failure of the data write. A descriptor that did
+      // open is always closed, and a real close failure is reported.
+      let fd: number;
       try {
-        fsyncSync(fd);
+        fd = openSync(path, "r");
+      } catch (cause) {
+        if (UNSUPPORTED_DIRECTORY_CODES.has(errorCode(cause) ?? "")) return;
+        throw cause;
+      }
+      try {
+        try {
+          fsyncSync(fd);
+        } catch (cause) {
+          if (!UNSUPPORTED_DIRECTORY_CODES.has(errorCode(cause) ?? "")) throw cause;
+        }
       } finally {
         closeSync(fd);
       }
@@ -280,8 +297,16 @@ function parseState(text: string): State {
     if (!(COLLECTION_KEYS as readonly string[]).includes(key)) {
       throw new PersistenceError(`Stored nextIds has unsupported field ${JSON.stringify(key)}`);
     }
-    if (!Number.isSafeInteger(value) || (value as number) < 1) {
-      throw new PersistenceError(`Stored nextIds.${key} must be a positive safe integer`);
+    if (
+      !Number.isSafeInteger(value) ||
+      (value as number) < 1 ||
+      (value as number) >= Number.MAX_SAFE_INTEGER
+    ) {
+      // A counter at the safe-integer ceiling would produce a duplicate id on
+      // the next allocation, so it is refused rather than accepted.
+      throw new PersistenceError(
+        `Stored nextIds.${key} must be a positive safe integer that can still advance`,
+      );
     }
     const used = highest[key] ?? 0;
     if ((value as number) <= used) {
@@ -376,6 +401,23 @@ function writeFully(fs: FileSystem, fd: number, data: string): void {
   }
 }
 
+/**
+ * Close a descriptor owned during lock acquisition. EBADF means it is already
+ * closed; any other failure leaves it possibly open.
+ */
+function closeDescriptorSync(
+  fs: FileSystem,
+  fd: number,
+): { closed: boolean; failure?: unknown } {
+  try {
+    fs.closeSync(fd);
+    return { closed: true };
+  } catch (cause) {
+    if (errorCode(cause) === "EBADF") return { closed: true };
+    return { closed: false, failure: cause };
+  }
+}
+
 /** Keep the operation failure as cause, attaching a cleanup failure to it. */
 function failureOr(cause: unknown, cleanup: unknown): unknown {
   if (cause instanceof PersistenceError) return cause;
@@ -438,15 +480,25 @@ class StoreImpl implements Store {
 
   private nextId(draft: State, key: CounterKey): string {
     const next = draft.nextIds[key] ?? 1;
+    if (!Number.isSafeInteger(next) || next < 1 || next >= Number.MAX_SAFE_INTEGER) {
+      throw new PersistenceError(
+        `Cannot allocate a new ${collections[key].kind}: the id counter cannot advance safely`,
+      );
+    }
     draft.nextIds[key] = next + 1;
     return `${collections[key].kind}-${next}`;
   }
 
   /**
    * Write the draft to a same-directory temporary file, flush it, replace the
-   * store file atomically, then sync the directory entry. Nothing is published
-   * or acknowledged until every step has succeeded; on any failure the
-   * previously committed state remains in effect and the operation fails.
+   * store file atomically, then sync the directory entry.
+   *
+   * Failures before the rename leave the previous store file untouched, so the
+   * previously committed state stays in effect and nothing is published. Once
+   * the rename has happened the new bytes are the store file; a later directory
+   * flush failure is reported, but memory is reconciled to the file so a writer
+   * never builds succeeding mutations on stale state. Only a fully successful
+   * write is acknowledged.
    */
   private async persist(next: State): Promise<void> {
     const tempPath = `${this.storePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
@@ -457,9 +509,11 @@ class StoreImpl implements Store {
       tempCreated = true;
       writeFully(this.fs, fd, toJson(next));
       this.fs.fsyncSync(fd);
-      const openFd = fd;
+      // Clear ownership only after close returns; a close that reports failure
+      // might have left the descriptor open, and cleanup must close it again.
+      const closed = this.closeDescriptor(fd);
+      if (!closed.closed) throw closed.failure;
       fd = null;
-      this.fs.closeSync(openFd);
       this.fs.renameSync(tempPath, this.storePath);
     } catch (cause) {
       const cleanupFailure = this.discardTemp(tempPath, fd, tempCreated);
@@ -476,20 +530,31 @@ class StoreImpl implements Store {
       try {
         this.fs.fsyncDirectorySync(this.directory);
       } catch (cause) {
-        if (!UNSUPPORTED_DIRECTORY_FSYNC_CODES.has(errorCode(cause) ?? "")) {
-          throw new PersistenceError("Failed to flush the store directory", { cause });
-        }
+        // The replacement already happened, so the file holds `next`. Keep
+        // memory identical to the file before rejecting the acknowledgement.
+        this.state = next;
+        throw new PersistenceError("Failed to flush the store directory", { cause });
       }
     }
 
-    // Only now, after the file is safely in place, publish the new state.
+    // Only now, after the file is safely in place, acknowledge the new state.
     this.state = next;
   }
 
   /**
+   * Close a descriptor we own. An EBADF means the descriptor is already closed
+   * (for example after an injected close failure that still closed it), so it
+   * is treated as released; any other failure leaves it possibly open.
+   */
+  private closeDescriptor(fd: number): { closed: boolean; failure?: unknown } {
+    return closeDescriptorSync(this.fs, fd);
+  }
+
+  /**
    * Remove resources left behind by a failed write: close a descriptor we still
-   * own and remove the temporary file only when we created it. Returns the
-   * cleanup error, if any, so the caller can report it.
+   * own and remove the temporary file only when we created it. The file is only
+   * unlinked once its descriptor is known to be closed, so no open file is
+   * deleted. Returns the cleanup error, if any, so the caller can report it.
    */
   private discardTemp(
     tempPath: string,
@@ -497,14 +562,13 @@ class StoreImpl implements Store {
     tempCreated: boolean,
   ): unknown {
     let cleanupFailure: unknown;
+    let descriptorClosed = true;
     if (fd !== null) {
-      try {
-        this.fs.closeSync(fd);
-      } catch (cause) {
-        cleanupFailure = cause;
-      }
+      const result = this.closeDescriptor(fd);
+      descriptorClosed = result.closed;
+      if (!result.closed) cleanupFailure = result.failure;
     }
-    if (tempCreated) {
+    if (tempCreated && descriptorClosed) {
       try {
         this.fs.unlinkSync(tempPath);
       } catch (cause) {
@@ -523,14 +587,24 @@ class StoreImpl implements Store {
   createClient(input: ClientCreate): Promise<Client> {
     return this.enqueue(() =>
       this.commit((draft) => {
+        const fields = supplied(input, [
+          "name",
+          "background",
+          "contacts",
+          "stakeholders",
+          "requirements",
+          "objectives",
+        ]);
+        // Defaults apply only to omitted fields; an explicitly supplied null or
+        // other invalid value reaches validation and is rejected.
         const client = parseClient({
           id: this.nextId(draft, "clients"),
-          name: input.name,
-          background: input.background ?? "",
-          contacts: input.contacts ?? [],
-          stakeholders: input.stakeholders ?? [],
-          requirements: input.requirements ?? [],
-          objectives: input.objectives ?? [],
+          name: fields.name,
+          background: "background" in fields ? fields.background : "",
+          contacts: "contacts" in fields ? fields.contacts : "",
+          stakeholders: "stakeholders" in fields ? fields.stakeholders : "",
+          requirements: "requirements" in fields ? fields.requirements : "",
+          objectives: "objectives" in fields ? fields.objectives : "",
         });
         draft.clients.push(client);
         return client;
@@ -562,12 +636,13 @@ class StoreImpl implements Store {
       this.commit((draft) => {
         const clientId = requireParentId(input.clientId, "clientId", "client");
         findRecord(draft.clients, clientId, "client");
+        const fields = supplied(input, ["name", "objectives", "status"]);
         const engagement = parseEngagement({
           id: this.nextId(draft, "engagements"),
           clientId,
-          name: input.name,
-          objectives: input.objectives ?? [],
-          status: input.status ?? "planned",
+          name: fields.name,
+          objectives: "objectives" in fields ? fields.objectives : "",
+          status: "status" in fields ? fields.status : "planned",
         });
         draft.engagements.push(engagement);
         return engagement;
@@ -592,12 +667,13 @@ class StoreImpl implements Store {
       this.commit((draft) => {
         const engagementId = requireParentId(input.engagementId, "engagementId", "engagement");
         findRecord(draft.engagements, engagementId, "engagement");
+        const fields = supplied(input, ["name", "objectives", "status"]);
         const project = parseProject({
           id: this.nextId(draft, "projects"),
           engagementId,
-          name: input.name,
-          objectives: input.objectives ?? [],
-          status: input.status ?? "planned",
+          name: fields.name,
+          objectives: "objectives" in fields ? fields.objectives : "",
+          status: "status" in fields ? fields.status : "planned",
         });
         draft.projects.push(project);
         return project;
@@ -661,31 +737,54 @@ export async function openStore(
       throw new PersistenceError("Failed to create the store directory", { cause });
     }
 
+    // Acquire the lock with an exclusive create. Only a successful open means
+    // the lock file is ours; an open failure (EEXIST, EMFILE, ...) may have
+    // touched nothing, so it must never remove a lock another writer owns.
+    let lockFd: number | null = null;
     try {
-      fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid }), {
-        encoding: "utf8",
-        flag: "wx",
-      });
-      lockCreated = true;
+      lockFd = fs.openSync(lockPath, "wx");
     } catch (cause) {
-      // EEXIST means the exclusive create never opened the file: another writer
-      // owns the lock, and we must never remove it.
       if (errorCode(cause) === "EEXIST") {
         throw new BusyStoreError(
           `Store directory ${JSON.stringify(directory)} is owned by another writer`,
         );
       }
-      // Any other failure happened after the exclusive open succeeded, so the
-      // lock file is ours (possibly partial) and must be removed before failing.
-      try {
-        fs.unlinkSync(lockPath);
-      } catch (cleanupCause) {
-        if (!isMissing(cleanupCause)) {
-          throw new PersistenceError(
-            "Failed to acquire store ownership and could not remove the partial lock",
-            { cause },
-          );
+      throw new PersistenceError("Failed to acquire store ownership", { cause });
+    }
+    lockCreated = true;
+    try {
+      writeFully(fs, lockFd, JSON.stringify({ pid: process.pid }));
+      const closed = closeDescriptorSync(fs, lockFd);
+      // Keep ownership until close is confirmed; cleanup closes it again if not.
+      if (closed.closed) lockFd = null;
+      else throw closed.failure;
+    } catch (cause) {
+      // The exclusive create succeeded, so this partial lock is ours and must be
+      // removed before failing. Close any descriptor we still own only once its
+      // descriptor is known to be closed, then unlink.
+      let cleanupFailure: unknown;
+      if (lockFd !== null) {
+        const result = closeDescriptorSync(fs, lockFd);
+        if (!result.closed) cleanupFailure = result.failure;
+        else lockFd = null;
+      }
+      if (lockFd === null) {
+        try {
+          fs.unlinkSync(lockPath);
+        } catch (cleanupCause) {
+          if (!isMissing(cleanupCause) && cleanupFailure === undefined) {
+            cleanupFailure = cleanupCause;
+          }
         }
+      }
+      // The cleanup has been attempted; do not retry it in the outer catch and
+      // thereby hide the original, more specific error.
+      lockCreated = false;
+      if (cleanupFailure !== undefined) {
+        throw new PersistenceError(
+          "Failed to acquire store ownership and could not remove the partial lock",
+          { cause: failureOr(cause, cleanupFailure) },
+        );
       }
       throw new PersistenceError("Failed to acquire store ownership", { cause });
     }

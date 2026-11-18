@@ -45,14 +45,17 @@ function fsError(code: string): NodeJS.ErrnoException {
 const enoent = () => fsError("ENOENT");
 
 interface FailOn {
-  /** Fail when opening the given path with the exclusive-create flag. */
-  openSync?: (path: string) => "before" | "after" | false;
-  writeSync?: (fd: number, isTemp: boolean) => boolean;
+  /**
+   * Fail when opening the given path with the exclusive-create flag.
+   * "before" fails without creating anything; "collide" leaves a foreign file
+   * at the exact requested path and reports EEXIST, as a real collision would.
+   */
+  openSync?: (path: string) => "before" | "collide" | "after" | false;
+  writeSync?: (fd: number, isTemp: boolean, path: string) => boolean;
   fsyncSync?: (fd: number, isTemp: boolean) => boolean;
   closeSync?: (fd: number, isTemp: boolean) => boolean;
-  /** Create the file, then fail the write, to simulate a partially written file. */
-  createThenFailWriteFileSync?: (path: string) => boolean;
-  writeFileSync?: (path: string) => boolean;
+  /** Fail the write after the exclusive create has already produced a file. */
+  createThenFailWriteLock?: (path: string) => boolean;
   renameSync?: (path: string) => boolean;
   readFileSync?: (path: string) => boolean;
   unlinkSync?: (path: string) => boolean;
@@ -68,8 +71,11 @@ function failingFs(failOn: FailOn) {
   const descriptors = new Map<number, string>();
   /** Bytes acknowledged by earlier writes on each descriptor. */
   const written = new Map<number, number>();
-  const isTemp = (fd: number) => (descriptors.get(fd) ?? "").endsWith(".tmp");
-  return {
+  /** Paths at which a simulated collision was placed. */
+  const collisions = new Set<string>();
+  const pathOf = (fd: number) => descriptors.get(fd) ?? "";
+  const isTemp = (fd: number) => pathOf(fd).endsWith(".tmp");
+  const adapter = {
     existsSync: (path: string) => existsSync(path),
     mkdirSync: (path: string, options: { recursive: true }) => {
       if (failOn.mkdirSync?.(path)) throw fsError("EACCES");
@@ -78,13 +84,25 @@ function failingFs(failOn: FailOn) {
     openSync: (path: string, flags: "wx") => {
       const mode = failOn.openSync?.(path) ?? false;
       if (mode === "before") throw fsError("EIO");
+      if (mode === "collide") {
+        writeFileSync(path, "not ours", "utf8");
+        collisions.add(path);
+        throw fsError("EEXIST");
+      }
       const fd = openSync(path, flags);
       descriptors.set(fd, path);
       if (mode === "after") throw fsError("EIO");
       return fd;
     },
     writeSync: (fd: number, data: Uint8Array) => {
-      if (failOn.writeSync?.(fd, isTemp(fd))) throw fsError("EIO");
+      if (failOn.writeSync?.(fd, isTemp(fd), pathOf(fd))) throw fsError("EIO");
+      if (
+        failOn.createThenFailWriteLock &&
+        pathOf(fd).split(/[\\/]/).at(-1) === "workspace.lock" &&
+        failOn.createThenFailWriteLock(pathOf(fd))
+      ) {
+        throw fsError("EIO");
+      }
       // Track the descriptor's position so writes honor the store's byte offset.
       const offset = written.get(fd) ?? 0;
       const bytes = writeSync(fd, data, 0, data.length, null);
@@ -104,14 +122,6 @@ function failingFs(failOn: FailOn) {
       written.delete(fd);
       if (shouldFail) throw fsError("EIO");
     },
-    writeFileSync: (path: string, data: string, options: { encoding: "utf8"; flag?: string }) => {
-      if (failOn.createThenFailWriteFileSync?.(path)) {
-        writeFileSync(path, "", options);
-        throw fsError("EIO");
-      }
-      if (failOn.writeFileSync?.(path)) throw fsError("EIO");
-      writeFileSync(path, data, options);
-    },
     renameSync: (oldPath: string, newPath: string) => {
       if (failOn.renameSync?.(oldPath)) throw fsError("EIO");
       renameSyncImpl(oldPath, newPath);
@@ -129,10 +139,11 @@ function failingFs(failOn: FailOn) {
     },
     fsyncDirectorySync: (path: string) => {
       if (failOn.fsyncDirectorySync?.(path)) throw fsError("EIO");
-      // Real directory flushing is best-effort in tests; the adapter contract
-      // is what the store must tolerate.
+      // Simulated directory flush: this adapter reports success unless a test
+      // injects a failure, and the store treats any throw as a real failure.
     },
   };
+  return Object.assign(adapter, { collisions });
 }
 
 const alwaysMissing = () => true;
@@ -152,30 +163,30 @@ describe("client creation and editing", () => {
       const client = await store.createClient({ name: "Acme" });
       assert.equal(client.name, "Acme");
       assert.equal(client.background, "");
-      assert.deepEqual(client.contacts, []);
-      assert.deepEqual(client.stakeholders, []);
-      assert.deepEqual(client.requirements, []);
-      assert.deepEqual(client.objectives, []);
+      assert.equal(client.contacts, "");
+      assert.equal(client.stakeholders, "");
+      assert.equal(client.requirements, "");
+      assert.equal(client.objectives, "");
       assert.match(client.id, /^client-\d+$/);
 
       const edited = await store.updateClient(client.id, {
         background: "An industrial supplier.",
-        contacts: ["Dana <dana@example.com>"],
-        requirements: ["Ship in 2027"],
-        objectives: ["Cut waste"],
-        stakeholders: ["Sam the sponsor"],
+        contacts: "Dana <dana@example.com>",
+        requirements: "Ship in 2027",
+        objectives: "Cut waste",
+        stakeholders: "Sam the sponsor",
       });
       assert.equal(edited.name, "Acme");
       assert.equal(edited.background, "An industrial supplier.");
-      assert.deepEqual(edited.contacts, ["Dana <dana@example.com>"]);
-      assert.deepEqual(edited.requirements, ["Ship in 2027"]);
-      assert.deepEqual(edited.objectives, ["Cut waste"]);
-      assert.deepEqual(edited.stakeholders, ["Sam the sponsor"]);
+      assert.equal(edited.contacts, "Dana <dana@example.com>");
+      assert.equal(edited.requirements, "Ship in 2027");
+      assert.equal(edited.objectives, "Cut waste");
+      assert.equal(edited.stakeholders, "Sam the sponsor");
 
       const renamed = await store.updateClient(client.id, { name: "Acme Holdings" });
       assert.equal(renamed.name, "Acme Holdings");
       assert.equal(renamed.background, "An industrial supplier.");
-      assert.deepEqual(renamed.contacts, ["Dana <dana@example.com>"]);
+      assert.equal(renamed.contacts, "Dana <dana@example.com>");
 
       const snapshot = store.snapshot();
       assert.equal(snapshot.clients.length, 1);
@@ -191,13 +202,17 @@ describe("client creation and editing", () => {
       const client = await store.createClient({
         name: "Acme",
         background: "Existing",
-        contacts: ["Existing contact"],
+        contacts: "Existing contact",
       });
       await assert.rejects(store.updateClient(client.id, { background: null as never }), ValidationError);
       await assert.rejects(store.updateClient(client.id, { name: null as never }), ValidationError);
       await assert.rejects(store.updateClient(client.id, { contacts: null as never }), ValidationError);
       await assert.rejects(store.updateClient(client.id, { name: "   " }), ValidationError);
-      await assert.rejects(store.updateClient(client.id, { contacts: [42 as never] }), ValidationError);
+      await assert.rejects(store.updateClient(client.id, { contacts: 42 as never }), ValidationError);
+      await assert.rejects(
+        store.updateClient(client.id, { objectives: ["a list is not text"] as never }),
+        ValidationError,
+      );
       assert.equal(store.snapshot().clients[0].background, "Existing");
       assert.equal(store.snapshot().clients[0].name, "Acme");
 
@@ -218,10 +233,14 @@ describe("client creation and editing", () => {
         store.updateEngagement(engagement.id, { name: null as never }),
         ValidationError,
       );
-      const kept = await store.updateEngagement(engagement.id, { objectives: ["New goal"] });
+      await assert.rejects(
+        store.updateEngagement(engagement.id, { objectives: null as never }),
+        ValidationError,
+      );
+      const kept = await store.updateEngagement(engagement.id, { objectives: "New goal" });
       assert.equal(kept.status, "active");
       assert.equal(kept.name, "Eng");
-      assert.deepEqual(kept.objectives, ["New goal"]);
+      assert.equal(kept.objectives, "New goal");
     } finally {
       await store.close();
     }
@@ -237,10 +256,10 @@ describe("client creation and editing", () => {
           id: "x",
           name: "y",
           background: "",
-          contacts: [],
-          stakeholders: [],
-          requirements: [],
-          objectives: [],
+          contacts: "",
+          stakeholders: "",
+          requirements: "",
+          objectives: "", 
         });
       });
       assert.throws(() => {
@@ -260,7 +279,28 @@ describe("client creation and editing", () => {
       await assert.rejects(store.createClient({ name: "   " }), ValidationError);
       await assert.rejects(store.createClient({ name: 42 as never }), ValidationError);
       await assert.rejects(store.createClient({ background: "x" } as never), ValidationError);
+      // Explicit nulls are invalid values, not omitted fields that take defaults.
+      await assert.rejects(
+        store.createClient({ name: "Acme", background: null as never }),
+        ValidationError,
+      );
+      await assert.rejects(
+        store.createClient({ name: "Acme", contacts: null as never }),
+        ValidationError,
+      );
+      await assert.rejects(
+        store.createClient({ name: "Acme", objectives: null as never }),
+        ValidationError,
+      );
       const client = await store.createClient({ name: "Acme" });
+      await assert.rejects(
+        store.createEngagement({ clientId: client.id, name: "Engagement", status: null as never }),
+        ValidationError,
+      );
+      await assert.rejects(
+        store.createEngagement({ clientId: client.id, name: "Engagement", objectives: null as never }),
+        ValidationError,
+      );
       await assert.rejects(
         store.createEngagement({
           clientId: client.id,
@@ -363,7 +403,7 @@ describe("hierarchy", () => {
       const content = JSON.stringify({
         schemaVersion: 1,
         clients: [],
-        engagements: [{ id: "engagement-1", clientId: "", name: "E", objectives: [], status: "planned" }],
+        engagements: [{ id: "engagement-1", clientId: "", name: "E", objectives: "", status: "planned" }],
         projects: [],
         nextIds: { engagements: 2 },
       });
@@ -464,23 +504,23 @@ describe("persistence", () => {
       const client = await store.createClient({
         name: "Acme",
         background: "Full background text",
-        contacts: ["Dana <d@example.com>", "Second contact"],
-        stakeholders: ["Sam the sponsor"],
-        requirements: ["Req 1", "Req 2"],
-        objectives: ["Goal one"],
+        contacts: "Dana <d@example.com> and a second contact",
+        stakeholders: "Sam the sponsor",
+        requirements: "Req 1, Req 2",
+        objectives: "Goal one",
       });
       clientId = client.id;
       const engagement = await store.createEngagement({
         clientId,
         name: "Eng",
-        objectives: ["Engagement goal"],
+        objectives: "Engagement goal",
         status: "on_hold",
       });
       engagementId = engagement.id;
       const project = await store.createProject({
         engagementId: engagement.id,
         name: "Proj",
-        objectives: ["Project goal", "Second project goal"],
+        objectives: "Project goal, second project goal",
         status: "active",
       });
       projectId = project.id;
@@ -498,10 +538,10 @@ describe("persistence", () => {
           id: clientId,
           name: "Acme",
           background: "Full background text",
-          contacts: ["Dana <d@example.com>", "Second contact"],
-          stakeholders: ["Sam the sponsor"],
-          requirements: ["Req 1", "Req 2"],
-          objectives: ["Goal one"],
+          contacts: "Dana <d@example.com> and a second contact",
+          stakeholders: "Sam the sponsor",
+          requirements: "Req 1, Req 2",
+          objectives: "Goal one",
         },
       ]);
       assert.deepEqual(snapshot.engagements, [
@@ -509,7 +549,7 @@ describe("persistence", () => {
           id: engagementId,
           clientId,
           name: "Eng",
-          objectives: ["Engagement goal"],
+          objectives: "Engagement goal",
           status: "on_hold",
         },
       ]);
@@ -518,7 +558,7 @@ describe("persistence", () => {
           id: projectId,
           engagementId,
           name: "Proj",
-          objectives: ["Project goal", "Second project goal"],
+          objectives: "Project goal, second project goal",
           status: "active",
         },
       ]);
@@ -531,8 +571,8 @@ describe("persistence", () => {
     try {
       await third.updateClient(clientId, {
         background: "Changed background",
-        contacts: ["New contact"],
-        objectives: ["Changed objective"],
+        contacts: "New contact",
+        objectives: "Changed objective",
       });
     } finally {
       await third.close();
@@ -543,10 +583,10 @@ describe("persistence", () => {
         id: clientId,
         name: "Acme",
         background: "Changed background",
-        contacts: ["New contact"],
-        stakeholders: ["Sam the sponsor"],
-        requirements: ["Req 1", "Req 2"],
-        objectives: ["Changed objective"],
+        contacts: "New contact",
+        stakeholders: "Sam the sponsor",
+        requirements: "Req 1, Req 2",
+        objectives: "Changed objective",
       });
     } finally {
       await fourth.close();
@@ -565,7 +605,7 @@ describe("persistence", () => {
       storePath(dir),
       JSON.stringify({
         schemaVersion: 1,
-        clients: [{ id: "client-1", name: "", background: "", contacts: [], stakeholders: [], requirements: [], objectives: [] }],
+        clients: [{ id: "client-1", name: "", background: "", contacts: "", stakeholders: "", requirements: "", objectives: "" }],
         engagements: [],
         projects: [],
         nextIds: { clients: 2 },
@@ -602,7 +642,7 @@ describe("persistence", () => {
     };
     const cases: unknown[] = [
       { ...valid, notes: [{ text: "unexpected" }] },
-      { ...valid, clients: [{ id: "client-1", name: "A", background: "", contacts: [], stakeholders: [], requirements: [], objectives: [], extra: true }], nextIds: { clients: 2 } },
+      { ...valid, clients: [{ id: "client-1", name: "A", background: "", contacts: "", stakeholders: "", requirements: "", objectives: "", extra: true }], nextIds: { clients: 2 } },
       { ...valid, nextIds: { tasks: 1 } },
       { ...valid, nextIds: { client: 2 } },
     ];
@@ -620,7 +660,7 @@ describe("persistence", () => {
     const content = JSON.stringify({
       schemaVersion: 1,
       clients: [],
-      engagements: [{ id: "engagement-1", clientId: "client-9", name: "E", objectives: [], status: "planned" }],
+      engagements: [{ id: "engagement-1", clientId: "client-9", name: "E", objectives: "", status: "planned" }],
       projects: [],
       nextIds: { engagements: 2 },
     });
@@ -632,7 +672,7 @@ describe("persistence", () => {
       schemaVersion: 1,
       clients: [],
       engagements: [],
-      projects: [{ id: "project-1", engagementId: "engagement-9", name: "P", objectives: [], status: "planned" }],
+      projects: [{ id: "project-1", engagementId: "engagement-9", name: "P", objectives: "", status: "planned" }],
       nextIds: { projects: 2 },
     });
     writeFileSync(storePath(dir), projectContent, "utf8");
@@ -642,7 +682,7 @@ describe("persistence", () => {
 
   it("refuses duplicate ids and counters that cannot advance", async () => {
     const dir = tempDir();
-    const client = { id: "client-1", name: "A", background: "", contacts: [], stakeholders: [], requirements: [], objectives: [] };
+    const client = { id: "client-1", name: "A", background: "", contacts: "", stakeholders: "", requirements: "", objectives: "" };
     const cases: unknown[] = [
       { schemaVersion: 1, clients: [client, { ...client, name: "B" }], engagements: [], projects: [], nextIds: { clients: 2 } },
       { schemaVersion: 1, clients: [client], engagements: [], projects: [], nextIds: {} },
@@ -651,6 +691,8 @@ describe("persistence", () => {
       { schemaVersion: 1, clients: [], engagements: [], projects: [], nextIds: { clients: 1.5 } },
       { schemaVersion: 1, clients: [{ ...client, id: "client-0001" }], engagements: [], projects: [], nextIds: { clients: 2 } },
       { schemaVersion: 1, clients: [{ ...client, id: "bogus" }], engagements: [], projects: [], nextIds: { clients: 2 } },
+      // A counter at the safe-integer ceiling cannot advance without overflow.
+      { schemaVersion: 1, clients: [], engagements: [], projects: [], nextIds: { clients: Number.MAX_SAFE_INTEGER } },
       { schemaVersion: 1, clients: [client], engagements: [], projects: [], nextIds: { clients: 2 } },
     ];
     for (const value of cases.slice(0, -1)) {
@@ -670,6 +712,21 @@ describe("persistence", () => {
     } finally {
       await store.close();
     }
+  });
+
+  it("refuses to allocate an id whose counter cannot advance safely", async () => {
+    const dir = tempDir();
+    const content = JSON.stringify({
+      schemaVersion: 1,
+      clients: [],
+      engagements: [],
+      projects: [],
+      nextIds: { clients: Number.MAX_SAFE_INTEGER },
+    });
+    writeFileSync(storePath(dir), content, "utf8");
+    await assert.rejects(openStore(dir), PersistenceError);
+    assert.equal(readFileSync(storePath(dir), "utf8"), content);
+    assert.equal(existsSync(lockPath(dir)), false);
   });
 
   it("refuses a second writer and permits reopening after close", async () => {
@@ -761,20 +818,26 @@ describe("failures", () => {
       await openStore(dir).then((s) => s.close());
     }
 
-    // A real directory flush failure is reported, and nothing is published:
-    // the in-memory state still holds the previous committed value.
-    const flushFailing = failingFs({ fsyncDirectorySync: () => true });
+    // A real directory flush failure is reported after the rename. The store
+    // file already holds the new value, so memory is reconciled to the file:
+    // the snapshot matches disk and later writes never build on stale state.
+    let failFlush = true;
+    const flushFailing = failingFs({ fsyncDirectorySync: () => failFlush });
     const second = await openStore(dir, { fs: flushFailing });
     try {
       await assert.rejects(second.updateClient(clientId, { name: "Flushed" }), PersistenceError);
-      assert.equal(second.snapshot().clients[0].name, "Acme");
-      // The replaced file already holds the rejected value; a writer that saw
-      // the failure keeps building on the state it acknowledged last.
+      assert.equal(second.snapshot().clients[0].name, "Flushed");
       assert.equal(readFileSync(storePath(dir), "utf8").includes("Flushed"), true);
-      await assert.rejects(second.updateClient(clientId, { name: "AfterFlush" }), PersistenceError);
+      failFlush = false;
+      const persisted = await second.updateClient(clientId, { name: "AfterFlush" });
+      assert.equal(persisted.name, "AfterFlush");
+      assert.equal(second.snapshot().clients[0].name, "AfterFlush");
     } finally {
       await flushFailing.unlinkSync(lockPath(dir));
-      await openStore(dir).then((s) => s.close());
+      await openStore(dir).then(async (s) => {
+        assert.equal(s.snapshot().clients[0].name, "AfterFlush");
+        await s.close();
+      });
     }
   });
 
@@ -797,6 +860,9 @@ describe("failures", () => {
       await assert.rejects(store.createClient({ name: "Acme" }), PersistenceError);
       assert.equal(store.snapshot().clients.length, 0);
       assert.deepEqual(readdirSync(dir).filter((n) => n.endsWith(".tmp")), []);
+      // The failed save never replaced the store file, so nothing was persisted
+      // for the rejected create before the following successful save runs.
+      assert.equal(existsSync(storePath(dir)), false);
 
       // The failed close is retried during cleanup, so a later save succeeds.
       failClose = false;
@@ -840,7 +906,7 @@ describe("failures", () => {
     const dir = tempDir();
     let failedOnce = false;
     const failing = failingFs({
-      createThenFailWriteFileSync: (path) => {
+      createThenFailWriteLock: (path) => {
         if (!failedOnce && path.endsWith("workspace.lock")) {
           failedOnce = true;
           return true;
@@ -859,7 +925,7 @@ describe("failures", () => {
   it("reports a lock-write cleanup failure instead of hiding it", async () => {
     const dir = tempDir();
     const failing = failingFs({
-      createThenFailWriteFileSync: (path) => path.endsWith("workspace.lock"),
+      createThenFailWriteLock: (path) => path.endsWith("workspace.lock"),
       unlinkSync: (path) => path.endsWith("workspace.lock"),
     });
     await assert.rejects(openStore(dir, { fs: failing }), (error: unknown) => {
@@ -867,6 +933,26 @@ describe("failures", () => {
       assert.match(error.message, /partial lock/i);
       return true;
     });
+  });
+
+  it("does not remove another writer's lock when its own lock open fails", async () => {
+    const dir = tempDir();
+    // Another writer owns the directory and its lock file is present.
+    const owner = await openStore(dir);
+    const ownerLock = readFileSync(lockPath(dir), "utf8");
+    try {
+      // This opener fails before acquisition (as EMFILE could), so it never
+      // owns the lock and must leave the existing one untouched.
+      const failing = failingFs({
+        openSync: (path) => (path.endsWith("workspace.lock") ? "before" : false),
+      });
+      await assert.rejects(openStore(dir, { fs: failing }), PersistenceError);
+      assert.equal(readFileSync(lockPath(dir), "utf8"), ownerLock);
+      // The owner is still the sole writer.
+      await assert.rejects(openStore(dir), BusyStoreError);
+    } finally {
+      await owner.close();
+    }
   });
 
   it("reports a lock release failure on close and allows retrying close", async () => {
@@ -966,20 +1052,20 @@ describe("failures", () => {
       clientId = (await store.createClient({
         name: "Acme",
         background: "A long background so the document spans several short writes.",
-        contacts: Array.from({ length: 20 }, (_, i) => `Contact ${i} with a reasonably long line`),
+        contacts: Array.from({ length: 20 }, (_, i) => `Contact ${i} with a reasonably long line`).join("; "),
       })).id;
     } finally {
       await store.close();
     }
     const onDisk = JSON.parse(readFileSync(storePath(dir), "utf8"));
     assert.equal(onDisk.clients[0].id, clientId);
-    assert.equal(onDisk.clients[0].contacts.length, 20);
+    assert.equal(onDisk.clients[0].contacts.split("; ").length, 20);
 
     truncateWrites = false;
     const reopened = await openStore(dir);
     try {
       assert.equal(reopened.snapshot().clients[0].background.length > 20, true);
-      assert.equal(reopened.snapshot().clients[0].contacts.length, 20);
+      assert.equal(reopened.snapshot().clients[0].contacts.split("; ").length, 20);
     } finally {
       await reopened.close();
     }
@@ -987,28 +1073,34 @@ describe("failures", () => {
 
   it("leaves a colliding temporary file alone when exclusive creation fails", async () => {
     const dir = tempDir();
-    const colliding = failingFs({ openSync: (path) => (path.endsWith(".tmp") ? "before" : false) });
+    // A foreign file exists at the exact path the store tries to open, so the
+    // adapter reports EEXIST there. The store must not remove that file.
+    let collideOnce = true;
+    const colliding = failingFs({
+      openSync: (path) => {
+        if (collideOnce && path.endsWith(".tmp")) {
+          collideOnce = false;
+          return "collide";
+        }
+        return false;
+      },
+    });
     const store = await openStore(dir, { fs: colliding });
     try {
       await assert.rejects(store.createClient({ name: "Acme" }), PersistenceError);
       assert.equal(store.snapshot().clients.length, 0);
-      assert.deepEqual(readdirSync(dir).filter((n) => n.endsWith(".tmp")), []);
+      // The injected collision happened at the store's attempted temp path.
+      assert.equal(colliding.collisions.size, 1);
+      const attempted = [...colliding.collisions][0];
+      assert.ok(attempted.startsWith(storePath(dir)) && attempted.endsWith(".tmp"));
+      // That exact file is untouched, and no other temporary file was created.
+      assert.equal(readFileSync(attempted, "utf8"), "not ours");
+      assert.deepEqual(readdirSync(dir).filter((n) => n.endsWith(".tmp")), [attempted.split(/[\\/]/).at(-1)]);
+      // A later save succeeds and replaces the store file.
+      const created = await store.createClient({ name: "Second" });
+      assert.equal(created.name, "Second");
     } finally {
       await store.close();
-    }
-
-    // A pre-existing file at the temporary path is never removed by a failed save.
-    const blocked = failingFs({
-      openSync: (path) => (path.endsWith(".tmp") ? "before" : false),
-    });
-    const blockedStore = await openStore(dir, { fs: blocked });
-    try {
-      const foreign = join(dir, "foreign.tmp");
-      writeFileSync(foreign, "not ours", "utf8");
-      await assert.rejects(blockedStore.createClient({ name: "Acme" }), PersistenceError);
-      assert.equal(readFileSync(foreign, "utf8"), "not ours");
-    } finally {
-      await blockedStore.close();
     }
   });
 
