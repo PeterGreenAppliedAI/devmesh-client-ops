@@ -66,13 +66,15 @@ interface FailOn {
   unlinkSync?: (path: string) => boolean;
   mkdirSync?: (path: string) => boolean;
   fsyncDirectorySync?: (path: string) => boolean;
-  /**
-   * Fail opening the directory for the flush with this error code. The
-   * directory flush then fails at its open step, before any flush is made.
-   */
+  /** Fail opening the directory for the flush with this error code. */
   directoryOpenCode?: string;
   /** Fail flushing the opened directory with this error code. */
   directoryFsyncCode?: string;
+  /**
+   * Fail closing the opened directory with this error code. The descriptor is
+   * really closed before the error is reported.
+   */
+  directoryCloseCode?: string;
 }
 
 /**
@@ -80,7 +82,14 @@ interface FailOn {
  * named operations fail. It is injected through openStore's internal option.
  */
 function failingFs(failOn: FailOn) {
+  const realClose = closeSync;
+  const openNormally = openSync;
   const descriptors = new Map<number, string>();
+  /** Descriptors this adapter opened for a directory. */
+  const directoryFds = new Set<number>();
+  /** The close error kept as context when a directory flush also failed. */
+  const failureContext = new WeakMap<object, unknown>();
+  const isDirectory = (fd: number) => directoryFds.has(fd);
   /** Bytes acknowledged by earlier writes on each descriptor. */
   const written = new Map<number, number>();
   /** Paths at which a simulated collision was placed. */
@@ -93,7 +102,12 @@ function failingFs(failOn: FailOn) {
       if (failOn.mkdirSync?.(path)) throw fsError("EACCES");
       mkdirSyncImpl(path, options);
     },
-    openSync: (path: string, flags: "wx") => {
+    openSync: (path: string, flags: "wx" | "r") => {
+      // A directory is opened for reading, by the adapter's directory flush.
+      if (flags === "r") {
+        if (failOn.directoryOpenCode) throw fsError(failOn.directoryOpenCode);
+        return openNormally(path, flags);
+      }
       const mode = failOn.openSync?.(path) ?? false;
       if (mode === "before") throw fsError("EIO");
       if (mode === "collide") {
@@ -101,7 +115,7 @@ function failingFs(failOn: FailOn) {
         collisions.add(path);
         throw fsError("EEXIST");
       }
-      const fd = openSync(path, flags);
+      const fd = openNormally(path, flags as "wx");
       descriptors.set(fd, path);
       if (mode === "after") throw fsError("EIO");
       return fd;
@@ -122,10 +136,22 @@ function failingFs(failOn: FailOn) {
       return bytes;
     },
     fsyncSync: (fd: number) => {
+      if (isDirectory(fd)) {
+        if (failOn.directoryFsyncCode) throw fsError(failOn.directoryFsyncCode);
+        return fsyncSync(fd);
+      }
       if (failOn.fsyncSync?.(fd, isTemp(fd))) throw fsError("EIO");
       fsyncSync(fd);
     },
     closeSync: (fd: number) => {
+      // A directory descriptor is always really closed before a simulated close
+      // failure is reported, so no descriptor is left open by the test.
+      if (isDirectory(fd)) {
+        realClose(fd);
+        directoryFds.delete(fd);
+        if (failOn.directoryCloseCode) throw fsError(failOn.directoryCloseCode);
+        return;
+      }
       // The descriptor is always really closed, so a simulated close failure
       // never leaves it open; the caller sees the failure all the same.
       const shouldFail = failOn.closeSync?.(fd, isTemp(fd)) ?? false;
@@ -149,15 +175,39 @@ function failingFs(failOn: FailOn) {
       if (failOn.unlinkSync?.(path)) throw fsError("EIO");
       rmSync(path, { force: true });
     },
+    // The directory flush runs through this adapter's own open, fsync and close
+    // operations, so each of them can be made to fail on its own, and each one
+    // is reported separately. The store's default directory flush likewise uses
+    // its adapter's openSync, fsyncSync and closeSync.
     fsyncDirectorySync: (path: string) => {
       const counter = failOn.fsyncDirectorySyncAfter;
       if (counter) counter.call += 1;
       if (failOn.fsyncDirectorySync?.(path)) throw fsError("EIO");
-      // Simulated directory flush: this adapter reports success unless a test
-      // injects a failure, and the store treats any throw as a real failure.
+      const fd = adapter.openSync(path, "r");
+      if (!failOn.directoryOpenCode) directoryFds.add(fd);
+      let flushFailure: unknown;
+      try {
+        adapter.fsyncSync(fd);
+      } catch (cause) {
+        flushFailure = cause;
+      }
+      try {
+        // A descriptor the open did not produce is closed directly.
+        if (failOn.directoryOpenCode) realClose(fd);
+        else adapter.closeSync(fd);
+      } catch (closeCause) {
+        // A close error must never replace a flush error: the flush is reported
+        // with the close kept as context on it.
+        if (flushFailure !== undefined) {
+          failureContext.set(flushFailure as object, closeCause);
+          throw flushFailure;
+        }
+        throw closeCause;
+      }
+      if (flushFailure !== undefined) throw flushFailure;
     },
   };
-  return Object.assign(adapter, { collisions });
+  return Object.assign(adapter, { collisions, failureContext, isDirectoryFd: isDirectory });
 }
 
 const alwaysMissing = () => true;
@@ -1059,84 +1109,203 @@ describe("failures", () => {
     }
   });
 
-  it("reports a genuine directory flush failure on POSIX, not an unsupported one", async () => {
-    if (process.platform === "win32") return;
+  /**
+   * Run the shared checks for an injected directory-flush failure: the save is
+   * rejected with the failed operation's error code as the reported cause, and
+   * memory and the store file keep the previously committed state.
+   */
+  async function assertDirectoryFailureReported(
+    failOn: FailOn,
+    code: string,
+    operation: string,
+  ): Promise<void> {
     const dir = tempDir();
-    // A POSIX directory open/flush that fails for a real reason (EIO) must be
-    // reported as a persistence failure, never treated as unsupported. Only
-    // the rejected save's flush fails; the restore of the previous state then
-    // succeeds, so the store is not blocked and a later save works.
-    let flushCalls = 0;
-    const failing = failingFs({
-      fsyncDirectorySync: () => {
-        flushCalls += 1;
-        return flushCalls === 1;
-      },
-    });
-    const store = await openStore(dir, { fs: failing });
+    const setup = await openStore(dir);
     try {
-      await assert.rejects(store.createClient({ name: "Acme" }), PersistenceError);
-      assert.equal(store.snapshot().clients.length, 0);
-      const created = await store.createClient({ name: "Acme" });
-      assert.equal(created.name, "Acme");
+      await setup.createClient({ name: "Acme" });
+    } finally {
+      await setup.close();
+    }
+    const committed = readFileSync(storePath(dir), "utf8");
+    // The adapter's directory flush uses the adapter's own open, flush and
+    // close, so the failing operation is the one the adapter fails. Each of
+    // them fails only once, so the flush that restores the previous committed
+    // state succeeds and the store is not blocked.
+    const adapter = failingFs(failOn);
+    if (failOn.directoryOpenCode) {
+      const openNormally = adapter.openSync;
+      // The rejected save's directory open is the first one the adapter makes.
+      let directoryOpens = 0;
+      adapter.openSync = (path: string, flags: "wx" | "r") => {
+        if (flags !== "r") return openNormally(path, flags);
+        directoryOpens += 1;
+        if (directoryOpens === 1) throw fsError(failOn.directoryOpenCode as string);
+        return openNormally(path, flags);
+      };
+    }
+    if (failOn.directoryFsyncCode) {
+      const fsyncNormally = adapter.fsyncSync;
+      let failed = false;
+      adapter.fsyncSync = (fd: number) => {
+        if (!adapter.isDirectoryFd(fd) || failed) return fsyncNormally(fd);
+        failed = true;
+        throw fsError(failOn.directoryFsyncCode as string);
+      };
+    }
+    if (failOn.directoryCloseCode) {
+      const closeNormally = adapter.closeSync;
+      let failed = false;
+      adapter.closeSync = (fd: number) => {
+        if (!adapter.isDirectoryFd(fd)) return closeNormally(fd);
+        if (failed) return closeNormally(fd);
+        failed = true;
+        throw fsError(failOn.directoryCloseCode as string);
+      };
+    }
+    const store = await openStore(dir, { fs: adapter });
+    try {
+      await assert.rejects(store.createClient({ name: "Rejected" }), (error: unknown) => {
+        assert.ok(error instanceof PersistenceError, operation);
+        const cause = (error as { cause?: NodeJS.ErrnoException }).cause;
+        assert.equal(cause?.code, code, operation);
+        return true;
+      });
+      assert.deepEqual(store.snapshot().clients.map((client) => client.name), ["Acme"], operation);
+      assert.equal(readFileSync(storePath(dir), "utf8"), committed, operation);
+    } finally {
+      await store.close();
+    }
+  }
+
+  it("rejects when opening the directory for the flush fails", async () => {
+    if (process.platform === "win32") return;
+    // A genuine failure to open the directory is reported, never treated as an
+    // unsupported operation. Only the rejected save's flush fails to open; the
+    // flush that restores the previous state then succeeds, so nothing is
+    // published and a later save still works.
+    await assertDirectoryFailureReported({ directoryOpenCode: "EIO" }, "EIO", "directory open");
+    await assertDirectoryFailureReported({ directoryOpenCode: "ENOENT" }, "ENOENT", "directory open");
+    await assertDirectoryFailureReported({ directoryOpenCode: "EINVAL" }, "EINVAL", "directory open");
+  });
+
+  it("rejects when flushing the opened directory fails", async () => {
+    if (process.platform === "win32") return;
+    for (const code of ["EIO", "EINVAL", "ENOTSUP", "EOPNOTSUPP", "EISDIR"]) {
+      await assertDirectoryFailureReported({ directoryFsyncCode: code }, code, "directory fsync");
+    }
+  });
+
+  it("rejects when closing the opened directory fails", async () => {
+    if (process.platform === "win32") return;
+    await assertDirectoryFailureReported({ directoryCloseCode: "EIO" }, "EIO", "directory close");
+  });
+
+  it("reports the flush error, not the close error, when both fail", async () => {
+    if (process.platform === "win32") return;
+    // Both the directory flush and its close fail. The flush error is the
+    // reported cause and the close error is kept as context on it; the close
+    // error never replaces the flush error.
+    const dir = tempDir();
+    const setup = await openStore(dir);
+    try {
+      await setup.createClient({ name: "Acme" });
+    } finally {
+      await setup.close();
+    }
+    const committed = readFileSync(storePath(dir), "utf8");
+    const adapter = failingFs({ directoryFsyncCode: "EIO", directoryCloseCode: "EINVAL" });
+    const store = await openStore(dir, { fs: adapter });
+    try {
+      await assert.rejects(store.createClient({ name: "Rejected" }), (error: unknown) => {
+        assert.ok(error instanceof PersistenceError);
+        const cause = (error as { cause?: NodeJS.ErrnoException }).cause;
+        assert.equal(cause?.code, "EIO");
+        const context = cause as object;
+        assert.equal((adapter.failureContext.get(context) as NodeJS.ErrnoException).code, "EINVAL");
+        return true;
+      });
+      assert.deepEqual(store.snapshot().clients.map((client) => client.name), ["Acme"]);
+      assert.equal(readFileSync(storePath(dir), "utf8"), committed);
     } finally {
       await store.close();
     }
   });
 
-  it("reports a directory flush failure for every error code on POSIX", async () => {
+  it("opens the directory flush through the adapter's own operations on POSIX", async () => {
     if (process.platform === "win32") return;
-    // The store's default adapter no longer classifies directory flush errors
-    // by code: every failure, including the codes some kernels use for an
-    // unsupported operation, is a genuine persistence failure. Only the first
-    // flush fails; the restore of the previous state then succeeds, so the
-    // store stays usable for later saves.
-    for (const code of ["EIO", "EINVAL", "ENOTSUP", "EOPNOTSUPP", "EISDIR"]) {
-      const dir = tempDir();
-      let flushes = 0;
-      const failing = Object.assign(failingFs({}), {
-        fsyncDirectorySync: () => {
-          flushes += 1;
-          if (flushes === 1) throw fsError(code);
-        },
-      });
-      const store = await openStore(dir, { fs: failing });
-      try {
-        await assert.rejects(store.createClient({ name: "Acme" }), (error: unknown) => {
-          assert.ok(error instanceof PersistenceError, code);
-          assert.equal(
-            ((error as { cause?: NodeJS.ErrnoException }).cause as NodeJS.ErrnoException | undefined)
-              ?.code,
-            code,
-          );
-          return true;
-        });
-        assert.equal(store.snapshot().clients.length, 0);
-        const created = await store.createClient({ name: "Acme" });
-        assert.equal(created.name, "Acme");
-      } finally {
-        await store.close();
-      }
+    // The store's directory flush must go through the injected adapter's own
+    // openSync, fsyncSync and closeSync rather than through node:fs directly.
+    // That is what makes the per-operation failure tests meaningful: here all
+    // three directory operations are observed, in order, for a successful save.
+    const dir = tempDir();
+    const adapter = failingFs({});
+    const directoryCalls: string[] = [];
+    const openNormally = adapter.openSync;
+    const fsyncNormally = adapter.fsyncSync;
+    const closeNormally = adapter.closeSync;
+    adapter.openSync = (path: string, flags: "wx" | "r") => {
+      if (flags === "r") directoryCalls.push("open");
+      return openNormally(path, flags);
+    };
+    adapter.fsyncSync = (fd: number) => {
+      if (adapter.isDirectoryFd(fd)) directoryCalls.push("fsync");
+      fsyncNormally(fd);
+    };
+    adapter.closeSync = (fd: number) => {
+      if (adapter.isDirectoryFd(fd)) directoryCalls.push("close");
+      closeNormally(fd);
+    };
+    const store = await openStore(dir, { fs: adapter });
+    try {
+      await store.createClient({ name: "Acme" });
+    } finally {
+      await store.close();
     }
+    assert.deepEqual(directoryCalls, ["open", "fsync", "close"]);
   });
 
   it("does not touch the directory through the default adapter on Windows", async () => {
-    // Windows cannot open or flush a directory; the default adapter must skip
-    // the step by checking the platform rather than by trying and catching an
-    // error. With no adapter injected, a plain save and reopen must succeed,
-    // leaving the rename as the durability point.
     if (process.platform !== "win32") return;
+    // Windows cannot open or flush a directory, so the default adapter must skip
+    // the step by checking the platform before any operation, leaving the rename
+    // as the durability point. The injected adapter is the store's adapter, so
+    // counting its directory operations proves none is made; a second save and a
+    // reopen show the store file itself was written normally.
     const dir = tempDir();
-    const store = await openStore(dir);
+    const adapter = failingFs({});
+    const directoryOperations: string[] = [];
+    const openNormally = adapter.openSync;
+    const fsyncNormally = adapter.fsyncSync;
+    const closeNormally = adapter.closeSync;
+    adapter.openSync = (path: string, flags: "wx" | "r") => {
+      if (flags === "r") directoryOperations.push("open");
+      return openNormally(path, flags);
+    };
+    adapter.fsyncSync = (fd: number) => {
+      if (adapter.isDirectoryFd(fd)) directoryOperations.push("fsync");
+      fsyncNormally(fd);
+    };
+    adapter.closeSync = (fd: number) => {
+      if (adapter.isDirectoryFd(fd)) directoryOperations.push("close");
+      closeNormally(fd);
+    };
+    const store = await openStore(dir, { fs: adapter });
+    let clientId: string;
     try {
       const created = await store.createClient({ name: "Acme" });
       assert.equal(created.name, "Acme");
+      clientId = created.id;
+      const edited = await store.updateClient(clientId, { name: "Acme Ltd" });
+      assert.equal(edited.name, "Acme Ltd");
     } finally {
       await store.close();
     }
+    assert.deepEqual(directoryOperations, []);
+    assert.equal(readFileSync(storePath(dir), "utf8").includes("Acme Ltd"), true);
+
     const reopened = await openStore(dir);
     try {
-      assert.equal(reopened.snapshot().clients[0].name, "Acme");
+      assert.equal(reopened.snapshot().clients[0].name, "Acme Ltd");
     } finally {
       await reopened.close();
     }

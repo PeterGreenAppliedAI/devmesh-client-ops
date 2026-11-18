@@ -101,8 +101,11 @@ export interface FileSystem {
   existsSync(path: string): boolean;
   mkdirSync(path: string, options: { recursive: true }): void;
   readFileSync(path: string, encoding: "utf8"): string;
-  /** Open a file for exclusive creation; fails with EEXIST if it already exists. */
-  openSync(path: string, flags: "wx"): number;
+  /**
+   * Open a file for exclusive creation; fails with EEXIST if it already exists.
+   * It also opens a directory for reading when flushing it, with the "r" flag.
+   */
+  openSync(path: string, flags: "wx" | "r"): number;
   /** Write bytes at the descriptor's current position; returns bytes written. */
   writeSync(fd: number, data: Uint8Array): number;
   fsyncSync(fd: number): void;
@@ -113,6 +116,9 @@ export interface FileSystem {
    * Flush a directory entry. The adapter itself decides whether the platform
    * supports this: it returns normally when unsupported, and throws only for a
    * genuine failure. The store never suppresses a throw from this operation.
+   * It performs the directory's open, flush and close through this adapter's
+   * own openSync, fsyncSync and closeSync, in that order, so each of those
+   * operations can be observed and can fail on its own.
    */
   fsyncDirectorySync?(path: string): void;
 }
@@ -160,15 +166,42 @@ interface State {
 }
 
 /**
+ * Flush a directory through the adapter's own open, flush and close
+ * operations, so a test that injects this adapter can fail any of the three.
+ *
  * Directory durability is handled explicitly per platform: on Windows a
  * directory cannot be opened or flushed as a directory handle, so the step is
- * skipped by checking the platform and the rename is the durability point.
- * That decision is never made by catching errors. On every other platform the
- * directory is opened for reading, flushed and closed, and a failure at any of
- * those steps is a genuine persistence failure that is reported.
+ * skipped by checking the platform before any operation, leaving the rename as
+ * the durability point. That decision is never made by catching errors. On
+ * every other platform the directory is opened for reading, flushed and
+ * closed, and a failure at any of those steps is a genuine persistence failure
+ * that is reported; if the flush fails and the close then fails too, the flush
+ * error is the one reported, with the close error attached as context.
  */
+function flushDirectorySync(fs: FileSystem, path: string): void {
+  if (process.platform === "win32") return;
+  const fd = fs.openSync(path, "r");
+  let flushFailure: unknown;
+  try {
+    fs.fsyncSync(fd);
+  } catch (cause) {
+    flushFailure = cause;
+  }
+  try {
+    fs.closeSync(fd);
+  } catch (closeCause) {
+    if (flushFailure !== undefined) {
+      throw new PersistenceError("Failed to flush the store directory and could not close it", {
+        cause: failureOr(flushFailure, closeCause),
+      });
+    }
+    throw closeCause;
+  }
+  if (flushFailure !== undefined) throw flushFailure;
+}
+
 function defaultFileSystem(): FileSystem {
-  return {
+  const fs: FileSystem = {
     existsSync,
     mkdirSync: (path, options) => mkdirSync(path, options),
     readFileSync: (path, encoding) => readFileSync(path, encoding),
@@ -178,21 +211,9 @@ function defaultFileSystem(): FileSystem {
     closeSync: (fd) => closeSync(fd),
     renameSync: (oldPath, newPath) => renameSync(oldPath, newPath),
     unlinkSync: (path) => unlinkSync(path),
-    fsyncDirectorySync: (path) => {
-      // Windows cannot fsync a directory: skip the open and the flush there by
-      // checking the platform, leaving the rename as the durability point.
-      if (process.platform === "win32") return;
-      // Everywhere else the directory is opened, flushed and closed, and each
-      // step's failure propagates unchanged to be reported as a persistence
-      // failure.
-      const fd = openSync(path, "r");
-      try {
-        fsyncSync(fd);
-      } finally {
-        closeSync(fd);
-      }
-    },
+    fsyncDirectorySync: (path) => flushDirectorySync(fs, path),
   };
+  return fs;
 }
 
 function toJson(state: State): string {
