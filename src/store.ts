@@ -160,27 +160,17 @@ interface State {
 }
 
 /**
- * Error codes that mean a platform cannot flush the contents of a directory at
- * all. These are treated as "unsupported" rather than as a failed save.
+ * Error codes that mean the POSIX kernel or file system does not support
+ * flushing a directory descriptor. These are treated as "unsupported" rather
+ * than as a failed save. Every other error from opening or flushing the
+ * directory is a genuine failure and is reported.
  */
-const UNSUPPORTED_DIRECTORY_CODES = new Set([
+const UNSUPPORTED_POSIX_DIRECTORY_CODES = new Set([
   "EINVAL",
   "ENOTSUP",
   "EOPNOTSUPP",
   "EISDIR",
 ]);
-
-/**
- * Error codes a platform may report for a directory flush that it does not
- * support. On Windows, opening a directory can report EPERM/EACCES and
- * flushing its handle can report EPERM, EBADF, EISDIR or ENOENT depending on
- * the file system and Node version. Genuine failures of the same operations are
- * still reported for every other error code.
- */
-const UNSUPPORTED_DIRECTORY_FLUSH_CODES: ReadonlySet<string> =
-  process.platform === "win32"
-    ? new Set([...UNSUPPORTED_DIRECTORY_CODES, "EPERM", "EACCES", "EBADF", "ENOENT"])
-    : UNSUPPORTED_DIRECTORY_CODES;
 
 function defaultFileSystem(): FileSystem {
   return {
@@ -194,16 +184,17 @@ function defaultFileSystem(): FileSystem {
     renameSync: (oldPath, newPath) => renameSync(oldPath, newPath),
     unlinkSync: (path) => unlinkSync(path),
     fsyncDirectorySync: (path) => {
-      // Some platforms cannot open or flush a directory descriptor at all; only
-      // those platform-specific codes are "unsupported", not a failure of the
-      // data write. Other open, flush and close failures are reported. A
-      // descriptor that did open is always closed, and a real close failure is
-      // reported.
+      // Windows cannot fsync a directory; there the rename is the durability
+      // point, so this step is skipped by platform rather than by catching
+      // errors. On POSIX platforms, only the kernel's "unsupported" codes are
+      // tolerated, never a genuine open, flush or close failure. A descriptor
+      // that did open is always closed, and a real close failure is reported.
+      if (process.platform === "win32") return;
       let fd: number;
       try {
         fd = openSync(path, "r");
       } catch (cause) {
-        if (UNSUPPORTED_DIRECTORY_FLUSH_CODES.has(errorCode(cause) ?? "")) return;
+        if (UNSUPPORTED_POSIX_DIRECTORY_CODES.has(errorCode(cause) ?? "")) return;
         throw cause;
       }
       let failed = false;
@@ -212,7 +203,7 @@ function defaultFileSystem(): FileSystem {
         try {
           fsyncSync(fd);
         } catch (cause) {
-          if (!UNSUPPORTED_DIRECTORY_FLUSH_CODES.has(errorCode(cause) ?? "")) {
+          if (!UNSUPPORTED_POSIX_DIRECTORY_CODES.has(errorCode(cause) ?? "")) {
             failed = true;
             failure = cause;
           }

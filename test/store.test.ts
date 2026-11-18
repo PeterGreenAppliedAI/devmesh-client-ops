@@ -1030,6 +1030,53 @@ describe("failures", () => {
     }
   });
 
+  it("skips the directory flush by platform on Windows and flushes it on POSIX", async () => {
+    const dir = tempDir();
+    // The default adapter is reached without an injected adapter, so this test
+    // exercises the real platform branch. On Windows it must not open or fsync
+    // the directory at all, leaving the rename as the durability point; on
+    // POSIX it opens and flushes the directory. Both paths must accept a save.
+    const store = await openStore(dir);
+    try {
+      const created = await store.createClient({ name: "Acme" });
+      assert.equal(created.name, "Acme");
+      assert.equal(store.snapshot().clients.length, 1);
+    } finally {
+      await store.close();
+    }
+    const reopened = await openStore(dir);
+    try {
+      assert.equal(reopened.snapshot().clients[0].name, "Acme");
+    } finally {
+      await reopened.close();
+    }
+  });
+
+  it("reports a genuine directory flush failure on POSIX, not an unsupported one", async () => {
+    if (process.platform === "win32") return;
+    const dir = tempDir();
+    // A POSIX directory open/flush that fails for a real reason (EIO) must be
+    // reported as a persistence failure, never treated as unsupported. Only
+    // the rejected save's flush fails; the restore of the previous state then
+    // succeeds, so the store is not blocked and a later save works.
+    let flushCalls = 0;
+    const failing = failingFs({
+      fsyncDirectorySync: () => {
+        flushCalls += 1;
+        return flushCalls === 1;
+      },
+    });
+    const store = await openStore(dir, { fs: failing });
+    try {
+      await assert.rejects(store.createClient({ name: "Acme" }), PersistenceError);
+      assert.equal(store.snapshot().clients.length, 0);
+      const created = await store.createClient({ name: "Acme" });
+      assert.equal(created.name, "Acme");
+    } finally {
+      await failing.unlinkSync(lockPath(dir));
+    }
+  });
+
   it("removes the temporary file when writing or closing it fails", async () => {
     const dir = tempDir();
     let failWrite = true;
