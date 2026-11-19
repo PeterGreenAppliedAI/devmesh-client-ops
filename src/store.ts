@@ -21,23 +21,41 @@ import {
   MissingRecordError,
   parseClient,
   parseEngagement,
+  parseMeeting,
   parseProject,
+  parseTask,
+  parseWorkItem,
   PersistenceError,
   ValidationError,
   type Client,
   type Engagement,
   type EngagementStatus,
+  type ItemKind,
+  type ItemState,
+  type Meeting,
   type Project,
   type ProjectStatus,
+  type Task,
+  type TaskPriority,
+  type TaskStatus,
+  type WorkItem,
 } from "./model.ts";
 
 export type {
   Client,
   Engagement,
   EngagementStatus,
+  ItemKind,
+  ItemState,
+  Meeting,
   Project,
   ProjectStatus,
+  Task,
+  TaskPriority,
+  TaskStatus,
+  WorkItem,
 } from "./model.ts";
+export { ITEM_KINDS, ITEM_STATES, TASK_PRIORITIES, TASK_STATUSES } from "./model.ts";
 export {
   BusyStoreError,
   MissingRecordError,
@@ -45,10 +63,20 @@ export {
   ValidationError,
 } from "./model.ts";
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
+/** Version 1 stored only the client/engagement/project hierarchy. */
+const LEGACY_SCHEMA_VERSION = 1;
 const STORE_FILE = "workspace.json";
 const LOCK_FILE = "workspace.lock";
-const STATE_KEYS = ["schemaVersion", "clients", "engagements", "projects", "nextIds"] as const;
+const WORK_KEYS = ["tasks", "items", "meetings"] as const;
+const STATE_KEYS = [
+  "schemaVersion",
+  "clients",
+  "engagements",
+  "projects",
+  ...WORK_KEYS,
+  "nextIds",
+] as const;
 
 /** Input fields accepted when creating a client. */
 export interface ClientCreate {
@@ -89,11 +117,85 @@ export type ProjectEdit = Partial<
   Pick<ProjectCreate, "name" | "objectives" | "status">
 >;
 
+/** Input fields accepted when creating a task. */
+export interface TaskCreate {
+  clientId: string;
+  engagementId: string;
+  projectId?: string;
+  title: string;
+  status?: TaskStatus;
+  priority?: TaskPriority;
+  owner?: string;
+  dueDate?: string;
+  context?: string;
+}
+
+/**
+ * Partial update of a task. Omitted fields keep their current value; the client
+ * and engagement links are immutable. A project link can be set or changed by
+ * supplying `projectId`, and cleared only by setting `clearProject` to true.
+ */
+export interface TaskEdit extends Partial<
+  Pick<TaskCreate, "title" | "status" | "priority" | "owner" | "dueDate" | "context">
+> {
+  projectId?: string;
+  clearProject?: boolean;
+  /** Supplied parent links are ignored: a task cannot move between parents. */
+  clientId?: string;
+  engagementId?: string;
+}
+
+/** Input fields accepted when creating a work item. */
+export interface WorkItemCreate {
+  clientId: string;
+  engagementId: string;
+  projectId?: string;
+  kind: ItemKind;
+  title: string;
+  context?: string;
+  state?: ItemState;
+}
+
+/** Partial update of a work item; client and engagement links are immutable. */
+export interface WorkItemEdit extends Partial<
+  Pick<WorkItemCreate, "kind" | "title" | "context" | "state">
+> {
+  projectId?: string;
+  clearProject?: boolean;
+  /** Supplied parent links are ignored: a work item cannot move between parents. */
+  clientId?: string;
+  engagementId?: string;
+}
+
+/** Input fields accepted when creating a meeting. */
+export interface MeetingCreate {
+  clientId: string;
+  engagementId: string;
+  projectId?: string;
+  title: string;
+  date: string;
+  notes?: string;
+}
+
+/** Partial update of a meeting; client and engagement links are immutable. */
+export interface MeetingEdit extends Partial<
+  Pick<MeetingCreate, "title" | "date" | "notes">
+> {
+  projectId?: string;
+  clearProject?: boolean;
+  /** Supplied parent links are ignored: a meeting cannot move between parents. */
+  clientId?: string;
+  engagementId?: string;
+}
+
 /** Detached, read-only view of the committed state. */
 export interface Snapshot {
   readonly clients: readonly Client[];
   readonly engagements: readonly Engagement[];
   readonly projects: readonly Project[];
+  readonly tasks: readonly Task[];
+  readonly items: readonly WorkItem[];
+  readonly meetings: readonly Meeting[];
 }
 
 /** Internal file-system adapter, injectable so tests can simulate failures. */
@@ -124,6 +226,13 @@ export interface FileSystem {
   fsyncDirectorySync?(path: string): void;
 }
 
+/** Selector scope: records of one client, narrowed by engagement or project. */
+export interface WorkFilter {
+  clientId: string;
+  engagementId?: string;
+  projectId?: string;
+}
+
 /** Internal options accepted by openStore; only tests pass them. */
 export interface StoreOptions {
   fs?: Partial<FileSystem>;
@@ -137,8 +246,8 @@ export interface StoreOptions {
 
 /** A collection of records that a store persists. */
 interface Collection<T extends { id: string }> {
-  readonly key: "clients" | "engagements" | "projects";
-  readonly kind: "client" | "engagement" | "project";
+  readonly key: "clients" | "engagements" | "projects" | "tasks" | "items" | "meetings";
+  readonly kind: "client" | "engagement" | "project" | "task" | "item" | "meeting";
   parse(value: unknown, what: string): T;
 }
 
@@ -158,17 +267,40 @@ const collections = {
     kind: "project",
     parse: parseProject,
   },
+  tasks: {
+    key: "tasks",
+    kind: "task",
+    parse: parseTask,
+  },
+  items: {
+    key: "items",
+    kind: "item",
+    parse: parseWorkItem,
+  },
+  meetings: {
+    key: "meetings",
+    kind: "meeting",
+    parse: parseMeeting,
+  },
 } satisfies Record<string, Collection<{ id: string }>>;
 
 type CollectionKey = keyof typeof collections;
 type Kind = (typeof collections)[CollectionKey]["kind"];
 type CounterKey = (typeof collections)[CollectionKey]["key"];
-const COLLECTION_KEYS = ["clients", "engagements", "projects"] as const;
+const COLLECTION_KEYS = [
+  "clients",
+  "engagements",
+  "projects",
+  ...WORK_KEYS,
+] as const;
 
 interface State {
   clients: Client[];
   engagements: Engagement[];
   projects: Project[];
+  tasks: Task[];
+  items: WorkItem[];
+  meetings: Meeting[];
   nextIds: Record<string, number>;
 }
 
@@ -236,6 +368,9 @@ function toJson(state: State): string {
     clients: state.clients,
     engagements: state.engagements,
     projects: state.projects,
+    tasks: state.tasks,
+    items: state.items,
+    meetings: state.meetings,
     // A stored counter is the next id to allocate. It must therefore stay below
     // the safe-integer ceiling so the loader accepts it and allocation can
     // still advance: when the highest allocated id is one less than the
@@ -255,7 +390,15 @@ function countersOf(state: State): Record<string, number> {
 }
 
 function emptyState(): State {
-  return { clients: [], engagements: [], projects: [], nextIds: {} };
+  return {
+    clients: [],
+    engagements: [],
+    projects: [],
+    tasks: [],
+    items: [],
+    meetings: [],
+    nextIds: {},
+  };
 }
 
 function idSuffix(kind: Kind, id: string): number | null {
@@ -284,16 +427,32 @@ function parseState(text: string): State {
     }
   }
   const version = record.schemaVersion;
-  if (version !== SCHEMA_VERSION) {
+  if (version !== SCHEMA_VERSION && version !== LEGACY_SCHEMA_VERSION) {
     throw new PersistenceError(
       `Unsupported stored schema version: ${JSON.stringify(version)}`,
     );
+  }
+  // A version 1 snapshot predates the work collections; it is accepted as a
+  // document with empty task, item and meeting collections. It must not carry
+  // them, though: a document that mentions them while claiming the old version
+  // is inconsistent and is refused rather than guessed at.
+  const legacy = version === LEGACY_SCHEMA_VERSION;
+  if (legacy) {
+    for (const key of WORK_KEYS) {
+      if (key in record) {
+        throw new PersistenceError(
+          `Stored schema version ${LEGACY_SCHEMA_VERSION} cannot contain ${key}`,
+        );
+      }
+    }
   }
   const state = emptyState();
   const highest: Record<string, number> = {};
   for (const key of COLLECTION_KEYS) {
     const collection = collections[key];
-    const values = record[key];
+    const values = legacy && (WORK_KEYS as readonly string[]).includes(key)
+      ? []
+      : record[key];
     if (!Array.isArray(values)) {
       throw new PersistenceError(`Stored ${key} must be an array`);
     }
@@ -384,6 +543,20 @@ function parseState(text: string): State {
       );
     }
   }
+  // Work records are linked to a client, that client's engagement and, when
+  // present, a project inside the same engagement, exactly as for new creates.
+  for (const key of WORK_KEYS) {
+    for (const record of state[key] as readonly WorkRecord[]) {
+      try {
+        requireWorkParents(state, record.clientId, record.engagementId, record.projectId);
+      } catch (cause) {
+        throw new PersistenceError(
+          `Stored ${collections[key].kind} ${record.id} has invalid parent links`,
+          { cause },
+        );
+      }
+    }
+  }
   return state;
 }
 
@@ -392,7 +565,142 @@ function snapshotOf(state: State): Snapshot {
     clients: clone(state.clients),
     engagements: clone(state.engagements),
     projects: clone(state.projects),
+    tasks: clone(state.tasks),
+    items: clone(state.items),
+    meetings: clone(state.meetings),
   });
+}
+
+/** The parent links every work record shares. */
+interface WorkParents {
+  readonly clientId: string;
+  readonly engagementId: string;
+  readonly projectId?: string;
+}
+
+type WorkRecord = WorkParents & { readonly id: string };
+
+/**
+ * Check that a work record's links form a chain: the engagement belongs to the
+ * client and, when a project is given, the project belongs to that engagement.
+ * A link value that is not a usable id, or a missing or mismatched record, is
+ * refused. This is shared by creates, edits and snapshot loading.
+ */
+function requireWorkParents(
+  state: State,
+  clientId: string,
+  engagementId: string,
+  projectId: string | undefined,
+): void {
+  const client = requireParentId(clientId, "clientId", "client");
+  const engagement = requireParentId(engagementId, "engagementId", "engagement");
+  findRecord(state.clients, client, "client");
+  const parent = findRecord(state.engagements, engagement, "engagement");
+  if (parent.clientId !== client) {
+    throw new ValidationError(
+      `engagementId ${JSON.stringify(engagement)} does not belong to clientId ${JSON.stringify(client)}`,
+    );
+  }
+  if (projectId === undefined) return;
+  const project = requireParentId(projectId, "projectId", "project");
+  const found = findRecord(state.projects, project, "project");
+  if (found.engagementId !== engagement) {
+    throw new ValidationError(
+      `projectId ${JSON.stringify(project)} does not belong to engagementId ${JSON.stringify(engagement)}`,
+    );
+  }
+}
+
+/**
+ * Resolve the project link for a create from the supplied field, then validate
+ * the whole parent chain.
+ */
+function workParentFields(
+  state: State,
+  input: WorkParents,
+): { clientId: string; engagementId: string; projectId?: string } {
+  const projectId = input.projectId;
+  requireWorkParents(state, input.clientId, input.engagementId, projectId);
+  return {
+    clientId: input.clientId,
+    engagementId: input.engagementId,
+    ...(projectId === undefined ? {} : { projectId }),
+  };
+}
+
+/**
+ * Resolve the project link for an edit. The supplied link is validated against
+ * the record's immutable engagement, so it can be set or changed only within
+ * that engagement. `clearProject` removes it; supplying both is refused rather
+ * than silently preferring one.
+ */
+function editedProjectId(
+  state: State,
+  current: WorkRecord,
+  edit: { projectId?: string; clearProject?: boolean },
+): { projectId: string | undefined; clear: boolean } {
+  if (edit.clearProject !== undefined && typeof edit.clearProject !== "boolean") {
+    throw new ValidationError("clearProject must be a boolean");
+  }
+  if (edit.clearProject === true && edit.projectId !== undefined) {
+    throw new ValidationError("projectId and clearProject cannot both be supplied");
+  }
+  if (edit.clearProject === true) return { projectId: undefined, clear: true };
+  return {
+    projectId: edit.projectId === undefined ? current.projectId : edit.projectId,
+    clear: false,
+  };
+}
+
+/**
+ * Build the shared parent fields of an edited work record. `clear` says whether
+ * the edit cleared the project link, so the record's old project link is
+ * dropped rather than retained when the fields are merged.
+ */
+function editedParents(
+  state: State,
+  current: WorkRecord,
+  edit: { projectId?: string; clearProject?: boolean },
+): { clientId: string; engagementId: string; projectId?: string; clear: boolean } {
+  const { projectId, clear } = editedProjectId(state, current, edit);
+  requireWorkParents(state, current.clientId, current.engagementId, projectId);
+  return {
+    clientId: current.clientId,
+    engagementId: current.engagementId,
+    ...(projectId === undefined ? {} : { projectId }),
+    clear,
+  };
+}
+
+/**
+ * Return the detached, frozen records in `items` whose links match a selector
+ * scope. Without a filter, the whole list is returned. The caller's filter is
+ * never trusted as a record link: it only narrows which records are returned.
+ */
+function selectWork<T extends WorkParents>(
+  items: readonly T[],
+  filter?: WorkFilter,
+): readonly T[] {
+  if (filter === undefined) return deepFreeze(clone([...items]));
+  const clientId = requireParentId(filter.clientId, "clientId", "client");
+  const engagementId =
+    filter.engagementId === undefined
+      ? undefined
+      : requireParentId(filter.engagementId, "engagementId", "engagement");
+  const projectId =
+    filter.projectId === undefined
+      ? undefined
+      : requireParentId(filter.projectId, "projectId", "project");
+  return deepFreeze(
+    clone(
+      items.filter(
+        (item) =>
+          item.clientId === clientId &&
+          (engagementId === undefined || item.engagementId === engagementId) &&
+          (projectId === undefined || item.projectId === projectId),
+      ),
+    ),
+  );
 }
 
 function findRecord<T extends { id: string }>(
@@ -494,6 +802,18 @@ export interface Store {
   updateEngagement(id: string, edit: EngagementEdit): Promise<Engagement>;
   createProject(input: ProjectCreate): Promise<Project>;
   updateProject(id: string, edit: ProjectEdit): Promise<Project>;
+  createTask(input: TaskCreate): Promise<Task>;
+  updateTask(id: string, edit: TaskEdit): Promise<Task>;
+  createItem(input: WorkItemCreate): Promise<WorkItem>;
+  updateItem(id: string, edit: WorkItemEdit): Promise<WorkItem>;
+  createMeeting(input: MeetingCreate): Promise<Meeting>;
+  updateMeeting(id: string, edit: MeetingEdit): Promise<Meeting>;
+  /** Tasks of a client, optionally narrowed to one engagement or project. */
+  listTasks(filter?: WorkFilter): readonly Task[];
+  /** Work items of a client, optionally narrowed to one engagement or project. */
+  listItems(filter?: WorkFilter): readonly WorkItem[];
+  /** Meetings of a client, optionally narrowed to one engagement or project. */
+  listMeetings(filter?: WorkFilter): readonly Meeting[];
   /** Release ownership of the data directory; can be retried after failure. */
   close(): Promise<void>;
 }
@@ -828,6 +1148,133 @@ class StoreImpl implements Store {
         return updated;
       }),
     );
+  }
+
+  createTask(input: TaskCreate): Promise<Task> {
+    return this.enqueue(() =>
+      this.commit((draft) => {
+        const parents = workParentFields(draft, input);
+        const fields = supplied(input, [
+          "title",
+          "status",
+          "priority",
+          "owner",
+          "dueDate",
+          "context",
+        ]);
+        const task = parseTask({
+          id: this.nextId(draft, "tasks"),
+          ...parents,
+          title: fields.title,
+          status: "status" in fields ? fields.status : "open",
+          priority: "priority" in fields ? fields.priority : "normal",
+          owner: "owner" in fields ? fields.owner : "",
+          // A blank due date means the task has no due date; there is no default.
+          dueDate: fields.dueDate,
+          context: "context" in fields ? fields.context : "",
+        });
+        draft.tasks.push(task);
+        return task;
+      }),
+    );
+  }
+
+  updateTask(id: string, edit: TaskEdit): Promise<Task> {
+    return this.enqueue(() =>
+      this.commit((draft) => {
+        const current = findRecord(draft.tasks, id, "task");
+        const { clear, ...parents } = editedParents(draft, current, edit);
+        const changes = supplied(edit, [
+          "title",
+          "status",
+          "priority",
+          "owner",
+          "dueDate",
+          "context",
+        ]);
+        const base = { ...current, projectId: clear ? undefined : parents.projectId };
+        const updated = parseTask({ ...base, ...parents, ...changes });
+        draft.tasks = draft.tasks.map((t) => (t.id === id ? updated : t));
+        return updated;
+      }),
+    );
+  }
+
+  createItem(input: WorkItemCreate): Promise<WorkItem> {
+    return this.enqueue(() =>
+      this.commit((draft) => {
+        const parents = workParentFields(draft, input);
+        const fields = supplied(input, ["kind", "title", "context", "state"]);
+        const item = parseWorkItem({
+          id: this.nextId(draft, "items"),
+          ...parents,
+          kind: fields.kind,
+          title: fields.title,
+          context: "context" in fields ? fields.context : "",
+          state: "state" in fields ? fields.state : "open",
+        });
+        draft.items.push(item);
+        return item;
+      }),
+    );
+  }
+
+  updateItem(id: string, edit: WorkItemEdit): Promise<WorkItem> {
+    return this.enqueue(() =>
+      this.commit((draft) => {
+        const current = findRecord(draft.items, id, "item");
+        const { clear, ...parents } = editedParents(draft, current, edit);
+        const changes = supplied(edit, ["kind", "title", "context", "state"]);
+        const base = { ...current, projectId: clear ? undefined : parents.projectId };
+        const updated = parseWorkItem({ ...base, ...parents, ...changes });
+        draft.items = draft.items.map((i) => (i.id === id ? updated : i));
+        return updated;
+      }),
+    );
+  }
+
+  createMeeting(input: MeetingCreate): Promise<Meeting> {
+    return this.enqueue(() =>
+      this.commit((draft) => {
+        const parents = workParentFields(draft, input);
+        const fields = supplied(input, ["title", "date", "notes"]);
+        const meeting = parseMeeting({
+          id: this.nextId(draft, "meetings"),
+          ...parents,
+          title: fields.title,
+          date: fields.date,
+          notes: "notes" in fields ? fields.notes : "",
+        });
+        draft.meetings.push(meeting);
+        return meeting;
+      }),
+    );
+  }
+
+  updateMeeting(id: string, edit: MeetingEdit): Promise<Meeting> {
+    return this.enqueue(() =>
+      this.commit((draft) => {
+        const current = findRecord(draft.meetings, id, "meeting");
+        const { clear, ...parents } = editedParents(draft, current, edit);
+        const changes = supplied(edit, ["title", "date", "notes"]);
+        const base = { ...current, projectId: clear ? undefined : parents.projectId };
+        const updated = parseMeeting({ ...base, ...parents, ...changes });
+        draft.meetings = draft.meetings.map((m) => (m.id === id ? updated : m));
+        return updated;
+      }),
+    );
+  }
+
+  listTasks(filter: WorkFilter): readonly Task[] {
+    return selectWork(this.state.tasks, filter);
+  }
+
+  listItems(filter: WorkFilter): readonly WorkItem[] {
+    return selectWork(this.state.items, filter);
+  }
+
+  listMeetings(filter: WorkFilter): readonly Meeting[] {
+    return selectWork(this.state.meetings, filter);
   }
 
   async close(): Promise<void> {

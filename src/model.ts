@@ -177,3 +177,204 @@ export function deepFreeze<T>(value: T): T {
 export function clone<T>(value: T): T {
   return structuredClone(value);
 }
+
+export type TaskStatus = "open" | "in_progress" | "done";
+export const TASK_STATUSES: readonly TaskStatus[] = ["open", "in_progress", "done"];
+
+export type TaskPriority = "low" | "normal" | "high";
+export const TASK_PRIORITIES: readonly TaskPriority[] = ["low", "normal", "high"];
+
+export type ItemKind =
+  | "decision"
+  | "question"
+  | "blocker"
+  | "commitment"
+  | "waiting"
+  | "follow_up";
+export const ITEM_KINDS: readonly ItemKind[] = [
+  "decision",
+  "question",
+  "blocker",
+  "commitment",
+  "waiting",
+  "follow_up",
+];
+
+export type ItemState = "open" | "closed";
+export const ITEM_STATES: readonly ItemState[] = ["open", "closed"];
+
+export interface Task {
+  id: string;
+  clientId: string;
+  engagementId: string;
+  projectId?: string;
+  title: string;
+  status: TaskStatus;
+  priority: TaskPriority;
+  owner: string;
+  dueDate?: string;
+  context: string;
+}
+
+export interface WorkItem {
+  id: string;
+  clientId: string;
+  engagementId: string;
+  projectId?: string;
+  kind: ItemKind;
+  title: string;
+  context: string;
+  state: ItemState;
+}
+
+export interface Meeting {
+  id: string;
+  clientId: string;
+  engagementId: string;
+  projectId?: string;
+  title: string;
+  date: string;
+  notes: string;
+}
+
+/**
+ * Report a required date that is not a real YYYY-MM-DD calendar date. The
+ * format, the month/day ranges and leap years are all checked, so dates such as
+ * 2023-02-29 or 2026-13-01 are refused rather than normalised.
+ */
+export function requireDate(value: unknown, what: string): string {
+  const text = requireText(value, what);
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+  if (!match) {
+    throw new ValidationError(`${what} must be a YYYY-MM-DD date`);
+  }
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (month < 1 || month > 12) {
+    throw new ValidationError(`${what} must be a real calendar date`);
+  }
+  const daysInMonth = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+  const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  const limit = month === 2 && leap ? 29 : daysInMonth;
+  if (day < 1 || day > limit) {
+    throw new ValidationError(`${what} must be a real calendar date`);
+  }
+  return text;
+}
+
+/**
+ * Accept an absent optional project link. A project link is either omitted
+ * (absent) or a nonblank project id; null is not a way to clear it, an edit
+ * clears it only by supplying the `clearProject` flag.
+ */
+function requireOptionalParentId(value: unknown, what: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new ValidationError(`${what} must be a nonblank project id when supplied`);
+  }
+  return value;
+}
+
+/** Accept an absent task due date; a blank date means the field is absent. */
+function optionalDate(value: unknown, what: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === "string" && value.trim() === "") return undefined;
+  return requireDate(value, what);
+}
+
+function requireEnum<T extends string>(
+  value: unknown,
+  allowed: readonly T[],
+  what: string,
+): T {
+  if (typeof value !== "string" || !allowed.includes(value as T)) {
+    throw new ValidationError(`${what} must be one of ${allowed.join(", ")}`);
+  }
+  return value as T;
+}
+
+const TASK_KEYS = [
+  "id",
+  "clientId",
+  "engagementId",
+  "projectId",
+  "title",
+  "status",
+  "priority",
+  "owner",
+  "dueDate",
+  "context",
+] as const;
+const ITEM_KEYS = [
+  "id",
+  "clientId",
+  "engagementId",
+  "projectId",
+  "kind",
+  "title",
+  "context",
+  "state",
+] as const;
+const MEETING_KEYS = [
+  "id",
+  "clientId",
+  "engagementId",
+  "projectId",
+  "title",
+  "date",
+  "notes",
+] as const;
+
+export function parseTask(value: unknown, what = "task"): Task {
+  const record = requireObject(value, what);
+  requireExactKeys(record, TASK_KEYS, what);
+  const task: Task = {
+    id: requireName(record.id, `${what}.id`),
+    clientId: requireName(record.clientId, `${what}.clientId`),
+    engagementId: requireName(record.engagementId, `${what}.engagementId`),
+    title: requireName(record.title, `${what}.title`),
+    status: requireEnum(record.status, TASK_STATUSES, `${what}.status`),
+    priority: requireEnum(record.priority, TASK_PRIORITIES, `${what}.priority`),
+    owner: requireText(record.owner, `${what}.owner`),
+    context: requireText(record.context, `${what}.context`),
+  };
+  const projectId = requireOptionalParentId(record.projectId, `${what}.projectId`);
+  if (projectId !== undefined) task.projectId = projectId;
+  const dueDate = optionalDate(record.dueDate, `${what}.dueDate`);
+  if (dueDate !== undefined) task.dueDate = dueDate;
+  return task;
+}
+
+export function parseWorkItem(value: unknown, what = "work item"): WorkItem {
+  const record = requireObject(value, what);
+  requireExactKeys(record, ITEM_KEYS, what);
+  const item: WorkItem = {
+    id: requireName(record.id, `${what}.id`),
+    clientId: requireName(record.clientId, `${what}.clientId`),
+    engagementId: requireName(record.engagementId, `${what}.engagementId`),
+    kind: requireEnum(record.kind, ITEM_KINDS, `${what}.kind`),
+    title: requireName(record.title, `${what}.title`),
+    context: requireText(record.context, `${what}.context`),
+    state: requireEnum(record.state, ITEM_STATES, `${what}.state`),
+  };
+  const projectId = requireOptionalParentId(record.projectId, `${what}.projectId`);
+  if (projectId !== undefined) item.projectId = projectId;
+  return item;
+}
+
+export function parseMeeting(value: unknown, what = "meeting"): Meeting {
+  const record = requireObject(value, what);
+  requireExactKeys(record, MEETING_KEYS, what);
+  const meeting: Meeting = {
+    id: requireName(record.id, `${what}.id`),
+    clientId: requireName(record.clientId, `${what}.clientId`),
+    engagementId: requireName(record.engagementId, `${what}.engagementId`),
+    title: requireName(record.title, `${what}.title`),
+    date: requireDate(record.date, `${what}.date`),
+    notes: requireText(record.notes, `${what}.notes`),
+  };
+  const projectId = requireOptionalParentId(record.projectId, `${what}.projectId`);
+  if (projectId !== undefined) meeting.projectId = projectId;
+  return meeting;
+}
