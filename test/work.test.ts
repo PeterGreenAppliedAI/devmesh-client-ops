@@ -803,7 +803,7 @@ describe("work persistence", () => {
     }
     // The migrated document is written at the current schema version.
     const saved = JSON.parse(readFileSync(storePath(dir), "utf8"));
-    assert.equal(saved.schemaVersion, 2);
+    assert.equal(saved.schemaVersion, 3);
     assert.equal(saved.tasks.length, 1);
 
     const reopened = await openStore(dir);
@@ -843,19 +843,19 @@ describe("work persistence", () => {
     };
     const cases: unknown[] = [
       // Engagement from another client.
-      { ...hierarchyDoc, schemaVersion: 2, tasks: [{ ...validTask, engagementId: "engagement-2" }], items: [], meetings: [], nextIds: { clients: 3, engagements: 3, projects: 2, tasks: 2 } },
+      { ...hierarchyDoc, schemaVersion: 3, tasks: [{ ...validTask, engagementId: "engagement-2" }], items: [], meetings: [], nextIds: { clients: 3, engagements: 3, projects: 2, tasks: 2 } },
       // Project from another engagement.
-      { ...hierarchyDoc, schemaVersion: 2, tasks: [], items: [], meetings: [{ id: "meeting-1", clientId: "client-2", engagementId: "engagement-2", projectId: "project-1", title: "M", date: "2026-01-01", notes: "" }], nextIds: { clients: 3, engagements: 3, projects: 2, meetings: 2 } },
+      { ...hierarchyDoc, schemaVersion: 3, tasks: [], items: [], meetings: [{ id: "meeting-1", clientId: "client-2", engagementId: "engagement-2", projectId: "project-1", title: "M", date: "2026-01-01", notes: "" }], nextIds: { clients: 3, engagements: 3, projects: 2, meetings: 2 } },
       // Impossible date.
-      { ...hierarchyDoc, schemaVersion: 2, tasks: [{ ...validTask, dueDate: "2023-02-29" }], items: [], meetings: [], nextIds: { clients: 3, engagements: 3, projects: 2, tasks: 2 } },
+      { ...hierarchyDoc, schemaVersion: 3, tasks: [{ ...validTask, dueDate: "2023-02-29" }], items: [], meetings: [], nextIds: { clients: 3, engagements: 3, projects: 2, tasks: 2 } },
       // Invalid item kind.
-      { ...hierarchyDoc, schemaVersion: 2, tasks: [], items: [{ id: "item-1", clientId: "client-1", engagementId: "engagement-1", kind: "idea", title: "I", context: "", state: "open" }], meetings: [], nextIds: { clients: 3, engagements: 3, projects: 2, items: 2 } },
+      { ...hierarchyDoc, schemaVersion: 3, tasks: [], items: [{ id: "item-1", clientId: "client-1", engagementId: "engagement-1", kind: "idea", title: "I", context: "", state: "open" }], meetings: [], nextIds: { clients: 3, engagements: 3, projects: 2, items: 2 } },
       // Work collection present but not an array.
-      { ...hierarchyDoc, schemaVersion: 2, tasks: {}, items: [], meetings: [], nextIds: { clients: 3, engagements: 3, projects: 2 } },
+      { ...hierarchyDoc, schemaVersion: 3, tasks: {}, items: [], meetings: [], nextIds: { clients: 3, engagements: 3, projects: 2 } },
       // Work ids must follow the generated pattern.
-      { ...hierarchyDoc, schemaVersion: 2, tasks: [{ ...validTask, id: "bogus" }], items: [], meetings: [], nextIds: { clients: 3, engagements: 3, projects: 2, tasks: 2 } },
+      { ...hierarchyDoc, schemaVersion: 3, tasks: [{ ...validTask, id: "bogus" }], items: [], meetings: [], nextIds: { clients: 3, engagements: 3, projects: 2, tasks: 2 } },
       // A counter is required once records exist.
-      { ...hierarchyDoc, schemaVersion: 2, tasks: [validTask], items: [], meetings: [], nextIds: { clients: 3, engagements: 3, projects: 2 } },
+      { ...hierarchyDoc, schemaVersion: 3, tasks: [validTask], items: [], meetings: [], nextIds: { clients: 3, engagements: 3, projects: 2 } },
     ];
     for (const value of cases) {
       const content = JSON.stringify(value);
@@ -866,6 +866,22 @@ describe("work persistence", () => {
     }
 
     // An invalid legacy version 1 document is still refused.
+    const invalidLegacy = [
+      // A version 1 document with a work counter is inconsistent.
+      { ...hierarchyDoc, schemaVersion: 1, nextIds: { clients: 3, engagements: 3, projects: 2, tasks: 1 } },
+      // A version 1 document with a work collection is inconsistent.
+      { ...hierarchyDoc, schemaVersion: 1, tasks: [], items: [], meetings: [], nextIds: { clients: 3, engagements: 3, projects: 2 } },
+      // Version 2 was never written and stays unsupported.
+      { ...hierarchyDoc, schemaVersion: 2, tasks: [], items: [], meetings: [], nextIds: { clients: 3, engagements: 3, projects: 2 } },
+    ];
+    for (const value of invalidLegacy) {
+      const content = JSON.stringify(value);
+      writeFileSync(storePath(dir), content, "utf8");
+      await assert.rejects(openStore(dir), PersistenceError);
+      assert.equal(readFileSync(storePath(dir), "utf8"), content);
+      assert.equal(existsSync(lockPath(dir)), false);
+    }
+
     writeFileSync(
       storePath(dir),
       JSON.stringify({ ...hierarchyDoc, schemaVersion: 1, nextIds: { clients: 3, engagements: 3, projects: 2 } }),

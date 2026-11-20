@@ -63,17 +63,22 @@ export {
   ValidationError,
 } from "./model.ts";
 
-const SCHEMA_VERSION = 2;
+/** Version 3 carries the hierarchy plus the work collections. */
+const SCHEMA_VERSION = 3;
 /** Version 1 stored only the client/engagement/project hierarchy. */
 const LEGACY_SCHEMA_VERSION = 1;
 const STORE_FILE = "workspace.json";
 const LOCK_FILE = "workspace.lock";
 const WORK_KEYS = ["tasks", "items", "meetings"] as const;
-const STATE_KEYS = [
+const LEGACY_STATE_KEYS = [
   "schemaVersion",
   "clients",
   "engagements",
   "projects",
+  "nextIds",
+] as const;
+const STATE_KEYS = [
+  ...LEGACY_STATE_KEYS.slice(0, 4),
   ...WORK_KEYS,
   "nextIds",
 ] as const;
@@ -287,12 +292,8 @@ const collections = {
 type CollectionKey = keyof typeof collections;
 type Kind = (typeof collections)[CollectionKey]["kind"];
 type CounterKey = (typeof collections)[CollectionKey]["key"];
-const COLLECTION_KEYS = [
-  "clients",
-  "engagements",
-  "projects",
-  ...WORK_KEYS,
-] as const;
+const LEGACY_COLLECTION_KEYS = ["clients", "engagements", "projects"] as const;
+const COLLECTION_KEYS = [...LEGACY_COLLECTION_KEYS, ...WORK_KEYS] as const;
 
 interface State {
   clients: Client[];
@@ -421,11 +422,6 @@ function parseState(text: string): State {
     throw new PersistenceError("Stored data must be a JSON object");
   }
   const record = raw as Record<string, unknown>;
-  for (const key of Object.keys(record)) {
-    if (!(STATE_KEYS as readonly string[]).includes(key)) {
-      throw new PersistenceError(`Stored data has unsupported field ${JSON.stringify(key)}`);
-    }
-  }
   const version = record.schemaVersion;
   if (version !== SCHEMA_VERSION && version !== LEGACY_SCHEMA_VERSION) {
     throw new PersistenceError(
@@ -433,10 +429,18 @@ function parseState(text: string): State {
     );
   }
   // A version 1 snapshot predates the work collections; it is accepted as a
-  // document with empty task, item and meeting collections. It must not carry
-  // them, though: a document that mentions them while claiming the old version
-  // is inconsistent and is refused rather than guessed at.
+  // document with empty task, item and meeting collections. Each version keeps
+  // the strict key rules of its own generation: version 1 must contain exactly
+  // the hierarchy keys, so a document that mentions a work collection or a
+  // work counter while claiming the old version is refused rather than guessed
+  // at. Version 3 must contain exactly the hierarchy plus the work collections.
   const legacy = version === LEGACY_SCHEMA_VERSION;
+  const allowedKeys = legacy ? LEGACY_STATE_KEYS : STATE_KEYS;
+  for (const key of Object.keys(record)) {
+    if (!(allowedKeys as readonly string[]).includes(key)) {
+      throw new PersistenceError(`Stored data has unsupported field ${JSON.stringify(key)}`);
+    }
+  }
   if (legacy) {
     for (const key of WORK_KEYS) {
       if (key in record) {
@@ -488,8 +492,9 @@ function parseState(text: string): State {
   if (typeof nextIds !== "object" || nextIds === null || Array.isArray(nextIds)) {
     throw new PersistenceError("Stored nextIds must be an object");
   }
+  const allowedCounters = legacy ? LEGACY_COLLECTION_KEYS : COLLECTION_KEYS;
   for (const [key, value] of Object.entries(nextIds)) {
-    if (!(COLLECTION_KEYS as readonly string[]).includes(key)) {
+    if (!(allowedCounters as readonly string[]).includes(key)) {
       throw new PersistenceError(`Stored nextIds has unsupported field ${JSON.stringify(key)}`);
     }
     if (
