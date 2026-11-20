@@ -15,6 +15,7 @@ import {
   PersistenceError,
   ValidationError,
   type Store,
+  type WorkFilter,
 } from "../src/store.ts";
 
 const roots: string[] = [];
@@ -670,6 +671,15 @@ describe("parent links", () => {
 
       assert.throws(() => store.listTasks({ clientId: "  " }), ValidationError);
       assert.throws(() => store.listTasks({ clientId: h.client.id, engagementId: "" }), ValidationError);
+
+      // Every selector is client-scoped: an omitted filter is refused.
+      for (const list of [
+        store.listTasks.bind(store),
+        store.listItems.bind(store),
+        store.listMeetings.bind(store),
+      ]) {
+        assert.throws(() => list(undefined as unknown as WorkFilter), ValidationError);
+      }
     } finally {
       await store.close();
     }

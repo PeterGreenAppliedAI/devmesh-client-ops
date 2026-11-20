@@ -679,14 +679,18 @@ function editedParents(
 
 /**
  * Return the detached, frozen records in `items` whose links match a selector
- * scope. Without a filter, the whole list is returned. The caller's filter is
- * never trusted as a record link: it only narrows which records are returned.
+ * scope. The scope is always a client, optionally narrowed by engagement or
+ * project; an omitted filter is refused rather than widening to every client.
+ * The caller's filter is never trusted as a record link: it only narrows which
+ * records are returned.
  */
 function selectWork<T extends WorkParents>(
   items: readonly T[],
-  filter?: WorkFilter,
+  filter: WorkFilter,
 ): readonly T[] {
-  if (filter === undefined) return deepFreeze(clone([...items]));
+  if (filter === undefined || filter === null || typeof filter !== "object") {
+    throw new ValidationError("a client-scoped WorkFilter is required");
+  }
   const clientId = requireParentId(filter.clientId, "clientId", "client");
   const engagementId =
     filter.engagementId === undefined
@@ -814,11 +818,11 @@ export interface Store {
   createMeeting(input: MeetingCreate): Promise<Meeting>;
   updateMeeting(id: string, edit: MeetingEdit): Promise<Meeting>;
   /** Tasks of a client, optionally narrowed to one engagement or project. */
-  listTasks(filter?: WorkFilter): readonly Task[];
+  listTasks(filter: WorkFilter): readonly Task[];
   /** Work items of a client, optionally narrowed to one engagement or project. */
-  listItems(filter?: WorkFilter): readonly WorkItem[];
+  listItems(filter: WorkFilter): readonly WorkItem[];
   /** Meetings of a client, optionally narrowed to one engagement or project. */
-  listMeetings(filter?: WorkFilter): readonly Meeting[];
+  listMeetings(filter: WorkFilter): readonly Meeting[];
   /** Release ownership of the data directory; can be retried after failure. */
   close(): Promise<void>;
 }
