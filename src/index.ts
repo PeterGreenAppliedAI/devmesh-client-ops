@@ -274,8 +274,11 @@ export class CliError extends Error {
  * Parse the CLI arguments: `--port <number>` and `--data-dir <path>`. Unknown
  * options, missing values (including an option followed by another option),
  * repeated options and an invalid port are refused with a clear message.
- * Omitted options default to port 3000 and the default data directory; an
- * explicitly given data directory must be an absolute path.
+ * Omitted options default to port 3000 and the default data directory. A
+ * relative data directory is resolved against the launch directory (the
+ * process's current working directory), the usual convention for CLI paths, so
+ * `--data-dir workspace` names the `workspace` directory where the program was
+ * started.
  */
 export function parseCliArguments(
   args: readonly string[],
@@ -297,10 +300,7 @@ export function parseCliArguments(
       port = parsePort(value);
     } else {
       if (dataDirectory !== undefined) throw new CliError("--data-dir may only be given once");
-      if (!isAbsolute(value)) {
-        throw new CliError(`Invalid data directory: ${value}. The directory must be an absolute path.`);
-      }
-      dataDirectory = value;
+      dataDirectory = resolve(value);
     }
     index += 1;
   }

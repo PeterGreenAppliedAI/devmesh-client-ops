@@ -334,10 +334,23 @@ describe("CLI argument parsing", () => {
     assert.throws(() => parseCliArguments(["--port", "--data-dir", "/x"], defaults), /Missing value/);
     assert.throws(() => parseCliArguments(["--port", "3000", "--port", "3001"], defaults), /once/);
     assert.throws(() => parseCliArguments(["--data-dir", "/a", "--data-dir", "/b"], defaults), /once/);
-    // The data directory must be absolute, so it never depends on the launch
-    // directory; on Windows a rooted path without a drive is refused too.
-    assert.throws(() => parseCliArguments(["--data-dir", "relative/dir"], defaults), CliError);
     assert.throws(() => parseCliArguments(["--data-dir", ""], defaults), /Missing value/);
+  });
+
+  it("resolves a relative --data-dir against the launch directory", () => {
+    // A relative directory follows the usual CLI convention: it is resolved
+    // against the process's current working directory, the launch directory.
+    assert.equal(
+      parseCliArguments(["--data-dir", "relative/dir"], defaults).dataDirectory,
+      resolve("relative/dir"),
+    );
+    assert.equal(
+      parseCliArguments(["--data-dir", join("a", "b")], defaults).dataDirectory,
+      resolve(join("a", "b")),
+    );
+    // An absolute directory is kept as an absolute location.
+    const absolute = resolve("named", "dir");
+    assert.equal(parseCliArguments(["--data-dir", absolute], defaults).dataDirectory, absolute);
   });
 });
 
@@ -446,6 +459,24 @@ describe("CLI main and startup cleanup", () => {
     await result.shutdown();
     assert.equal(fake.closes(), 1);
     assert.deepEqual(recorded.exits, [0]);
+  });
+
+  it("passes a relative --data-dir, resolved against the launch directory, to start", async () => {
+    // main observes the directory the application is started with: a relative
+    // argument names a directory under the launch directory.
+    const fake = fakeApplication("http://127.0.0.1:3000");
+    let seen: string | undefined;
+    const recorded = recordingEnvironment(["--data-dir", join("workspace", "data")], async (options) => {
+      seen = options.dataDirectory;
+      return fake.application;
+    });
+    const result = await main(recorded.environment);
+    assert.ok(result !== null);
+    assert.equal(seen, resolve(join("workspace", "data")));
+    assert.ok(isAbsolute(seen ?? ""));
+    assert.deepEqual(recorded.exits, []);
+    assert.deepEqual(recorded.stdout, [`Listening on ${fake.application.url}`]);
+    await result.shutdown();
   });
 
   it("rejects an invalid argument without starting anything", async () => {
