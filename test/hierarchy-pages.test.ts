@@ -322,13 +322,17 @@ describe("CLI argument parsing", () => {
   });
 
   it("accepts --port and --data-dir in any order", () => {
-    assert.deepEqual(parseCliArguments(["--port", "8080", "--data-dir", "/tmp/x"], defaults), {
+    // A portable absolute directory: built with the platform's path rules, so
+    // it stays absolute and unchanged on Windows as well as Linux.
+    const dataDir = resolve(tmpdir(), "hierarchy-arguments");
+    assert.ok(isAbsolute(dataDir), "fixture directory is absolute");
+    assert.deepEqual(parseCliArguments(["--port", "8080", "--data-dir", dataDir], defaults), {
       port: 8080,
-      dataDirectory: "/tmp/x",
+      dataDirectory: dataDir,
     });
-    assert.deepEqual(parseCliArguments(["--data-dir", "/tmp/x", "--port", "1"], defaults), {
+    assert.deepEqual(parseCliArguments(["--data-dir", dataDir, "--port", "1"], defaults), {
       port: 1,
-      dataDirectory: "/tmp/x",
+      dataDirectory: dataDir,
     });
   });
 
