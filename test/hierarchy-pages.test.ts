@@ -43,8 +43,17 @@ function tempDir(): string {
 
 /** True when `candidate` is, or sits inside, `root`; portable path handling. */
 function isInside(candidate: string, root: string): boolean {
-  const rel = relative(resolve(root), resolve(candidate));
+  const rel = relative(portablePath(root), portablePath(candidate));
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+/**
+ * Resolve a path to an absolute one; on Windows, lower its case the way that
+ * filesystem compares names, so paths that differ only in case compare equal.
+ */
+function portablePath(value: string): string {
+  const absolute = resolve(value);
+  return process.platform === "win32" ? absolute.toLowerCase() : absolute;
 }
 
 interface Running {
@@ -95,6 +104,9 @@ function send(base: string, options: RequestOptions = {}): Promise<Reply> {
   const url = new URL(base);
   const method = options.method ?? "GET";
   const body = options.form === undefined ? "" : formBody(options.form);
+  // The canonical Host authority is set explicitly from the URL, so the same
+  // request is sent on every platform; Node's own default Host header differs
+  // between platforms and would otherwise fail the server's Host check.
   const headers: Record<string, string | number> = {
     host: options.host ?? url.host,
     "content-length": Buffer.byteLength(body),
@@ -272,7 +284,8 @@ describe("index exports and entry point", () => {
     // so this is the default path the rule protects. A data directory inside
     // another checkout is not this one and is accepted.
     const repository = resolve(fileURLToPath(new URL("..", import.meta.url)));
-    const defaultDir = join(repository, DATA_DIRECTORY_NAME);
+    const defaultDir = resolve(join(repository, DATA_DIRECTORY_NAME));
+    assert.ok(isAbsolute(defaultDir));
     assert.equal(isInside(defaultDir, repository), true);
     let started = 0;
     const recorded = recordingEnvironment([], async () => {
@@ -304,19 +317,21 @@ describe("index exports and entry point", () => {
     recorded.environment.defaultDataDirectory = join(repository, DATA_DIRECTORY_NAME);
     const result = await main(recorded.environment);
     assert.ok(result !== null);
-    assert.equal(seen, chosen);
+    assert.equal(seen, portablePath(chosen));
     assert.deepEqual(recorded.exits, []);
     await result.shutdown();
   });
 });
 
 describe("CLI argument parsing", () => {
-  const defaults = { dataDirectory: "/home/user/data" };
+  // The default directory is a portable absolute path, built with the
+  // platform's own path rules so it is absolute on Windows and Linux alike.
+  const defaults = { dataDirectory: defaultDataDirectory() };
 
   it("defaults to port 3000 and the default data directory", () => {
     assert.deepEqual(parseCliArguments([], defaults), {
       port: DEFAULT_PORT,
-      dataDirectory: "/home/user/data",
+      dataDirectory: defaults.dataDirectory,
     });
     assert.equal(DEFAULT_PORT, 3000);
   });
@@ -342,9 +357,12 @@ describe("CLI argument parsing", () => {
     }
     assert.throws(() => parseCliArguments(["--bogus"], defaults), /Unknown argument/);
     assert.throws(() => parseCliArguments(["--port"], defaults), /Missing value/);
-    assert.throws(() => parseCliArguments(["--port", "--data-dir", "/x"], defaults), /Missing value/);
+    // Portable fixture paths: the options are refused whatever the platform.
+    const first = resolve(tmpdir(), "arg-a");
+    const second = resolve(tmpdir(), "arg-b");
+    assert.throws(() => parseCliArguments(["--port", "--data-dir", first], defaults), /Missing value/);
     assert.throws(() => parseCliArguments(["--port", "3000", "--port", "3001"], defaults), /once/);
-    assert.throws(() => parseCliArguments(["--data-dir", "/a", "--data-dir", "/b"], defaults), /once/);
+    assert.throws(() => parseCliArguments(["--data-dir", first, "--data-dir", second], defaults), /once/);
     assert.throws(() => parseCliArguments(["--data-dir", ""], defaults), /Missing value/);
   });
 
@@ -352,8 +370,8 @@ describe("CLI argument parsing", () => {
     // A relative directory follows the usual CLI convention: it is resolved
     // against the process's current working directory, the launch directory.
     assert.equal(
-      parseCliArguments(["--data-dir", "relative/dir"], defaults).dataDirectory,
-      resolve("relative/dir"),
+      parseCliArguments(["--data-dir", join("relative", "dir")], defaults).dataDirectory,
+      resolve(join("relative", "dir")),
     );
     assert.equal(
       parseCliArguments(["--data-dir", join("a", "b")], defaults).dataDirectory,
@@ -361,6 +379,7 @@ describe("CLI argument parsing", () => {
     );
     // An absolute directory is kept as an absolute location.
     const absolute = resolve("named", "dir");
+    assert.ok(isAbsolute(absolute));
     assert.equal(parseCliArguments(["--data-dir", absolute], defaults).dataDirectory, absolute);
   });
 });
@@ -395,7 +414,7 @@ function recordingEnvironment(
       args,
       stdout: (line) => stdout.push(line),
       stderr: (line) => stderr.push(line),
-      defaultDataDirectory: "/home/user/default",
+      defaultDataDirectory: resolve(tmpdir(), "home", "default"),
       start,
       onShutdown: (handler) => {
         handlers.push(handler);
@@ -429,7 +448,12 @@ describe("CLI main and startup cleanup", () => {
     const runningApp = await running();
     const recorded = recordingEnvironment([], async (options) => {
       assert.equal(options.port, DEFAULT_PORT);
-      assert.equal(options.dataDirectory, "/home/user/default");
+      // No --data-dir is given, so the application is started on the default
+      // directory the recorded environment computed from the user's home.
+      assert.equal(
+        portablePath(options.dataDirectory),
+        portablePath(recorded.environment.defaultDataDirectory),
+      );
       return {
         url: runningApp.origin,
         port: runningApp.port,
@@ -483,7 +507,7 @@ describe("CLI main and startup cleanup", () => {
     });
     const result = await main(recorded.environment);
     assert.ok(result !== null);
-    assert.equal(seen, resolve(join("workspace", "data")));
+    assert.equal(portablePath(seen ?? ""), portablePath(join("workspace", "data")));
     assert.ok(isAbsolute(seen ?? ""));
     assert.deepEqual(recorded.exits, []);
     assert.deepEqual(recorded.stdout, [`Listening on ${fake.application.url}`]);
