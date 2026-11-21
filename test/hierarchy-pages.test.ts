@@ -73,6 +73,7 @@ interface RequestOptions {
   readonly method?: string;
   readonly path?: string;
   readonly origin?: string;
+  readonly host?: string;
   readonly form?: Record<string, string>;
 }
 
@@ -86,7 +87,7 @@ function send(base: string, options: RequestOptions = {}): Promise<Reply> {
   const method = options.method ?? "GET";
   const body = options.form === undefined ? "" : formBody(options.form);
   const headers: Record<string, string | number> = {
-    host: url.host,
+    host: options.host ?? url.host,
     "content-length": Buffer.byteLength(body),
   };
   if (method === "POST") {
@@ -755,6 +756,54 @@ describe("hierarchy pages", () => {
         const reply = await send(server.origin, { method: "POST", path, form: { name: "x" } });
         assert.equal(reply.status, 405, path);
       }
+      assert.equal(JSON.stringify(server.store.snapshot()), before);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("refuses unregistered paths and keeps POST-only endpoints method-guarded", async () => {
+    const server = await running();
+    try {
+      // A path the hierarchy matcher does not know is a plain 404.
+      for (const path of ["/unknown", "/clients/", "/clients/client-1/other"]) {
+        const reply = await send(server.origin, { path });
+        assert.equal(reply.status, 404, path);
+      }
+      // The collection new endpoints are POST-only; GET is refused by the
+      // shell before any handler runs, and the store is untouched.
+      const before = JSON.stringify(server.store.snapshot());
+      for (const path of ["/engagements/new", "/projects/new"]) {
+        const reply = await send(server.origin, { path });
+        assert.equal(reply.status, 405, path);
+        assert.equal(reply.headers.allow, "GET, POST", path);
+      }
+      // A same-origin POST to a path with no POST route is refused too.
+      const childNew = await send(server.origin, {
+        method: "POST",
+        path: "/clients/client-99/engagements/new",
+        form: { name: "x" },
+      });
+      assert.equal(childNew.status, 405);
+      assert.equal(JSON.stringify(server.store.snapshot()), before);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("keeps the Host check ahead of hierarchy dispatch", async () => {
+    const server = await running();
+    try {
+      // A foreign Host is refused before the hierarchy path is matched, so a
+      // handler that would mutate never runs.
+      const before = JSON.stringify(server.store.snapshot());
+      const reply = await send(server.origin, {
+        method: "POST",
+        path: "/clients/new",
+        host: "evil.example",
+        form: { name: "x" },
+      });
+      assert.equal(reply.status, 403);
       assert.equal(JSON.stringify(server.store.snapshot()), before);
     } finally {
       await server.close();

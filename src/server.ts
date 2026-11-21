@@ -46,10 +46,15 @@ export type RouteResult =
       readonly headers?: Readonly<Record<string, string>>;
     };
 
-/** What a route may read from an accepted request. */
+/**
+ * What a route may read from an accepted request.
+ *
+ * `path` is the request path with the query string removed (the query is never
+ * a route input); for a hierarchy route it also names the record whose detail,
+ * edit or child-new page is requested.
+ */
 export interface RouteRequest {
   readonly method: "GET" | "POST";
-  /** The request path only; the query string is never a route input. */
   readonly path: string;
   /** The canonical origin this server was bound to. */
   readonly origin: string;
@@ -68,13 +73,28 @@ export interface Route {
 }
 
 /**
+ * An extension route table: a path matcher and its route lookup. The shell
+ * keeps the matched value opaque (`P`); the extension decides what a match is
+ * and how it maps to a guarded route, so no route name ever comes from a
+ * request. A path the matcher does not match is refused like any other
+ * unregistered path.
+ */
+export interface PathRouteTable<P> {
+  match(path: string): P | null;
+  route(matched: P, method: "GET" | "POST"): Route | undefined;
+}
+
+/**
  * The fixed route table: route names are server constants, never request data.
  * `home` serves `/` and `health` serves `/health`; each may carry a GET and a
- * POST route. An unregistered path is refused before any handler runs.
+ * POST route. The optional `hierarchy` extension serves the canonical
+ * list/detail hierarchy routes and their explicit new/edit forms. An
+ * unregistered path is refused before any handler runs.
  */
 export interface Routes {
   readonly home: { readonly get: Route; readonly post?: Route };
   readonly health: { readonly get: Route; readonly post?: Route };
+  readonly hierarchy?: PathRouteTable<unknown>;
 }
 
 export interface ServerOptions {
@@ -383,12 +403,11 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
       }
 
       // Dispatch only on the fixed route table; an unknown path is 404.
-      const page = path === "/" ? routes.home : path === "/health" ? routes.health : undefined;
-      if (page === undefined) {
+      const route = dispatch(routes, path, method);
+      if (route === UNREGISTERED) {
         send(res, 404, "Not found.\n", "text/plain; charset=utf-8");
         return;
       }
-      const route = isPost ? page.post : page.get;
       if (route === undefined || route.method !== method) {
         send(res, 405, "Method not allowed.\n", "text/plain; charset=utf-8", { Allow: "GET, POST" });
         return;
@@ -445,6 +464,23 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
         server.closeAllConnections();
       }),
   };
+}
+
+/** The sentinel for a path that names none of the route table's routes. */
+const UNREGISTERED = Symbol("unregistered");
+
+/**
+ * Find the guarded route for a path: the fixed `/` and `/health` routes, else
+ * the extension's route for a matched hierarchy path. An unmatched path is
+ * reported separately so the caller answers it as unregistered.
+ */
+function dispatch(routes: Routes, path: string, method: "GET" | "POST"): Route | undefined | typeof UNREGISTERED {
+  const page = path === "/" ? routes.home : path === "/health" ? routes.health : undefined;
+  if (page !== undefined) return method === "POST" ? page.post : page.get;
+  if (routes.hierarchy === undefined) return UNREGISTERED;
+  const matched = routes.hierarchy.match(path);
+  if (matched === null) return UNREGISTERED;
+  return routes.hierarchy.route(matched, method);
 }
 
 function errorResponse(error: unknown): RouteResult {
