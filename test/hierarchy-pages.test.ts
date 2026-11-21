@@ -276,6 +276,30 @@ describe("index exports and entry point", () => {
     assert.equal(isInside(dir, repository), false, `${dir} is inside ${repository}`);
   });
 
+  it("uses the OS user's home directory default for an omitted --data-dir", async () => {
+    // The default data directory is computed from the OS user's home with the
+    // platform's path rules, so on Windows it is an absolute Windows path
+    // under that home and outside the repository. The home directory is
+    // injected, so no environment is changed for the check.
+    const home = resolve(tmpdir(), "home-user");
+    const defaultDir = join(home, DATA_DIRECTORY_NAME);
+    assert.ok(isAbsolute(defaultDir), defaultDir);
+    const repository = resolve(fileURLToPath(new URL("..", import.meta.url)));
+    assert.equal(isInside(defaultDir, repository), false, `${defaultDir} is inside ${repository}`);
+    // main passes exactly that default to the application when it is omitted.
+    let seen: string | undefined;
+    const recorded = recordingEnvironment([], async (options) => {
+      seen = options.dataDirectory;
+      return fakeApplication("http://127.0.0.1:3000").application;
+    });
+    recorded.environment.defaultDataDirectory = defaultDir;
+    const result = await main(recorded.environment);
+    assert.ok(result !== null);
+    assert.equal(portablePath(seen ?? ""), portablePath(defaultDir));
+    assert.deepEqual(recorded.exits, []);
+    await result.shutdown();
+  });
+
   it("refuses a default data directory that collides with the repository", async () => {
     // The checkout sits exactly at the default home-directory path, so the
     // default would write workspace data into the repository. The collision is

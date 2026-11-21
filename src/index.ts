@@ -44,12 +44,18 @@ export function defaultDataDirectory(): string {
 /**
  * True when `candidate` is the repository directory or sits inside it. Both
  * paths are resolved first, so a relative or differently-spelled path compares
- * the same on every platform, and no filesystem access is needed. Symlinks are
- * not followed, so a checkout reached through a link is compared as spelled.
+ * the same on every platform, and on Windows both are lowercased because that
+ * filesystem compares names case-insensitively. No filesystem access is needed.
+ * Symlinks are not followed, so a checkout reached through a link is compared
+ * as spelled.
  */
 function isInsideRepository(candidate: string, repository: string): boolean {
-  const from = resolve(repository);
-  const to = resolve(candidate);
+  const normalize = (path: string): string => {
+    const absolute = resolve(path);
+    return process.platform === "win32" ? absolute.toLowerCase() : absolute;
+  };
+  const from = normalize(repository);
+  const to = normalize(candidate);
   const rel = relative(from, to);
   if (rel === "") return true;
   return !rel.startsWith("..") && !isAbsolute(rel);
