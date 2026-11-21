@@ -260,7 +260,7 @@ describe("index exports and entry point", () => {
 
   it("recognises its own entry point and not an import", () => {
     const entry = join(tempDir(), "index.js");
-    const url = new URL(`file://${entry.replace(/\\/g, "/")}`).href;
+    const url = pathToFileURL(entry).href;
     assert.equal(isEntryPoint(url, ["node", entry]), true);
     assert.equal(isEntryPoint(url, ["node", "dist/other.js"]), false);
     assert.equal(isEntryPoint(url, ["node"]), false);
