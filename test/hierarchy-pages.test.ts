@@ -155,16 +155,23 @@ function assertNoRaw(body: string, hostile: string): void {
 }
 
 /**
- * Read the form controls out of a rendered HTML document: the action, and each
- * named control's current value (the text of a textarea, the selected option of
- * a select, the value attribute of an input). This is what a browser would post
- * back from the correction form, so a resubmission test exercises the real
- * rendered controls.
+ * A rendered form as a browser would submit it: the form's action (escaped in
+ * the markup, decoded here) and each named control's current value (the text of
+ * a textarea, the selected option of a select, the value attribute of an input).
+ * A resubmission test posts the extracted action and controls, so it exercises
+ * the real rendered form rather than a hard-coded destination.
  */
-function parseControls(document: string): Map<string, string> {
+interface ParsedForm {
+  readonly action: string;
+  readonly controls: Map<string, string>;
+}
+
+function parseForm(document: string): ParsedForm {
   const controls = new Map<string, string>();
   const form = /<form[^>]*>([\s\S]*?)<\/form>/.exec(document);
   assert.ok(form !== null, "page has a form");
+  const action = /<form[^>]*\saction="([^"]*)"/.exec(form[0]);
+  assert.ok(action !== null, "the form has an action");
   const inner = form[1];
   for (const match of inner.matchAll(/<textarea[^>]*name="([^"]+)"[^>]*>([\s\S]*?)<\/textarea>/g)) {
     controls.set(unescapeHtml(match[1]), unescapeHtml(match[2]));
@@ -177,7 +184,7 @@ function parseControls(document: string): Map<string, string> {
     const selected = options.find((option) => option[2].includes("selected")) ?? options[0];
     controls.set(unescapeHtml(match[1]), selected === undefined ? "" : unescapeHtml(selected[1]));
   }
-  return controls;
+  return { action: unescapeHtml(action[1]), controls };
 }
 
 /** Reverse `escapeHtml` for a parsed attribute or text value. */
@@ -918,6 +925,102 @@ describe("hierarchy pages", () => {
     assert.ok(!known.includes("not a valid choice"));
   });
 
+  it("corrects and resubmits an invalid edit for every record type", async () => {
+    const server = await running();
+    try {
+      const client = await server.store.createClient({ name: "Acme", objectives: "old" });
+      const engagement = await server.store.createEngagement({
+        clientId: client.id,
+        name: "Discovery",
+        objectives: "old",
+        status: "planned",
+      });
+      const project = await server.store.createProject({
+        engagementId: engagement.id,
+        name: "Prototype",
+        objectives: "old",
+        status: "planned",
+      });
+      // Each invalid edit is refused with the record id still in the form, so
+      // the corrected resubmission reaches the same record and saves. The
+      // submitted objectives and status are kept for correction.
+      const cases: {
+        path: string;
+        fields: Record<string, string>;
+        corrected: Record<string, string>;
+        check: (snapshot: ReturnType<Store["snapshot"]>) => void;
+      }[] = [
+        {
+          path: `/clients/${client.id}/edit`,
+          fields: { name: "   ", objectives: "correctable" },
+          corrected: { name: "Acme again", objectives: "correctable" },
+          check: (snapshot: ReturnType<Store["snapshot"]>) => {
+            assert.equal(snapshot.clients[0].name, "Acme again");
+            assert.equal(snapshot.clients[0].objectives, "correctable");
+          },
+        },
+        {
+          path: `/engagements/${engagement.id}/edit`,
+          fields: { name: "   ", objectives: "correctable", status: "active" },
+          corrected: { name: "Discovery again", objectives: "correctable", status: "active" },
+          check: (snapshot: ReturnType<Store["snapshot"]>) => {
+            assert.equal(snapshot.engagements[0].name, "Discovery again");
+            assert.equal(snapshot.engagements[0].objectives, "correctable");
+            assert.equal(snapshot.engagements[0].status, "active");
+          },
+        },
+        {
+          path: `/projects/${project.id}/edit`,
+          fields: { name: "   ", objectives: "correctable", status: "completed" },
+          corrected: { name: "Prototype again", objectives: "correctable", status: "completed" },
+          check: (snapshot: ReturnType<Store["snapshot"]>) => {
+            assert.equal(snapshot.projects[0].name, "Prototype again");
+            assert.equal(snapshot.projects[0].objectives, "correctable");
+            assert.equal(snapshot.projects[0].status, "completed");
+          },
+        },
+      ];
+      for (const item of cases) {
+        const id = item.path.split("/")[2];
+        const before = JSON.stringify(server.store.snapshot());
+        const invalid = await send(server.origin, {
+          method: "POST",
+          path: item.path,
+          form: { id, ...item.fields },
+        });
+        assert.equal(invalid.status, 400, item.path);
+        assert.match(String(invalid.headers["content-type"]), /^text\/html/, item.path);
+        assert.match(invalid.body, /role="alert"/, item.path);
+        // The rendered correction form targets the same edit URL and keeps the
+        // record identity and every submitted value.
+        const { action, controls } = parseForm(invalid.body);
+        assert.equal(action, item.path, item.path);
+        assert.equal(controls.get("id"), id, item.path);
+        for (const [field, value] of Object.entries(item.fields)) {
+          if (field === "name") {
+            assert.equal(controls.get(field), value, `${item.path} keeps the invalid name`);
+          } else {
+            assert.equal(controls.get(field), value, `${item.path} keeps ${field}`);
+          }
+        }
+        // Nothing was written by the refused edit.
+        assert.equal(JSON.stringify(server.store.snapshot()), before, item.path);
+
+        // Correct and resubmit to the rendered form's own action.
+        controls.set("name", item.corrected.name);
+        const corrected = await send(server.origin, {
+          method: "POST",
+          path: action,
+          form: Object.fromEntries(controls),
+        });
+        assert.equal(redirectTarget(corrected), item.path.replace(/\/edit$/, ""), item.path);
+        item.check(server.store.snapshot());
+      }
+    } finally {
+      await server.close();
+    }
+  });
+
   it("keeps omitted edit fields in the correction form and resubmits it", async () => {
     const server = await running();
     try {
@@ -976,9 +1079,11 @@ describe("hierarchy pages", () => {
           form: { id, name: "   " },
         });
         assert.equal(invalid.status, 400, item.path);
+        assert.match(String(invalid.headers["content-type"]), /^text\/html/, item.path);
         assert.match(invalid.body, /role="alert"/, item.path);
         // The rendered form is a correction form posting back to the record.
-        const controls = parseControls(invalid.body);
+        const { action, controls } = parseForm(invalid.body);
+        assert.equal(action, item.path, item.path);
         assert.equal(controls.get("id"), id, item.path);
         for (const [field, value] of Object.entries(item.expected)) {
           // The invalid name keeps the submitted (blank) value for correction,
@@ -988,11 +1093,11 @@ describe("hierarchy pages", () => {
         // Nothing was written by the refused edit.
         assert.equal(JSON.stringify(server.store.snapshot()), before, item.path);
 
-        // Correct and resubmit exactly the controls the rendered form carries.
+        // Correct and resubmit to the action the rendered form carries.
         controls.set("name", item.name);
         const corrected = await send(server.origin, {
           method: "POST",
-          path: item.path,
+          path: action,
           form: Object.fromEntries(controls),
         });
         assert.equal(redirectTarget(corrected), `/${item.path.split("/")[1]}/${id}`, item.path);
@@ -1033,9 +1138,10 @@ describe("hierarchy pages", () => {
       assert.match(String(conflict.headers["content-type"]), /^text\/html/);
       assert.match(conflict.body, /role="alert"/);
       assert.match(conflict.body, /does not match this URL/);
-      // The form targets the record in the URL and keeps the editable values.
-      assert.match(conflict.body, new RegExp(`action="/clients/${first.id}/edit"`));
-      const controls = parseControls(conflict.body);
+      // The rendered form targets the record in the URL and keeps the
+      // editable values; its extracted action is used for the resubmission.
+      const { action, controls } = parseForm(conflict.body);
+      assert.equal(action, `/clients/${first.id}/edit`);
       assert.equal(controls.get("id"), first.id);
       assert.equal(controls.get("name"), "Corrected name");
       assert.equal(controls.get("background"), "first background");
@@ -1045,7 +1151,7 @@ describe("hierarchy pages", () => {
       // Submitting the rendered form saves the URL record, not the other one.
       const saved = await send(server.origin, {
         method: "POST",
-        path: `/clients/${first.id}/edit`,
+        path: action,
         form: Object.fromEntries(controls),
       });
       assert.equal(redirectTarget(saved), `/clients/${first.id}`);
@@ -1068,8 +1174,11 @@ describe("hierarchy pages", () => {
         form: { id: otherEngagement.id, objectives: "new objectives" },
       });
       assert.equal(badEngagement.status, 400);
+      assert.match(String(badEngagement.headers["content-type"]), /^text\/html/);
       assert.match(badEngagement.body, /role="alert"/);
-      const engagementControls = parseControls(badEngagement.body);
+      const badEngagementForm = parseForm(badEngagement.body);
+      assert.equal(badEngagementForm.action, `/engagements/${engagement.id}/edit`);
+      const engagementControls = badEngagementForm.controls;
       assert.equal(engagementControls.get("id"), engagement.id);
       assert.equal(engagementControls.get("objectives"), "new objectives");
       assert.equal(engagementControls.get("status"), "active");
@@ -1086,15 +1195,34 @@ describe("hierarchy pages", () => {
         form: { id: otherProject.id, status: "completed" },
       });
       assert.equal(badProject.status, 400);
-      const projectControls = parseControls(badProject.body);
+      assert.match(String(badProject.headers["content-type"]), /^text\/html/);
+      assert.match(badProject.body, /role="alert"/);
+      const badProjectForm = parseForm(badProject.body);
+      assert.equal(badProjectForm.action, `/projects/${project.id}/edit`);
+      const projectControls = badProjectForm.controls;
       assert.equal(projectControls.get("id"), project.id);
       assert.equal(projectControls.get("name"), "Prototype");
       assert.equal(projectControls.get("objectives"), "project objectives");
       assert.equal(projectControls.get("status"), "completed");
+      // Correcting and resubmitting the rendered engagement form saves the
+      // record the URL names, not the submitted id.
+      const correctedEngagement = await send(server.origin, {
+        method: "POST",
+        path: badEngagementForm.action,
+        form: Object.fromEntries(engagementControls),
+      });
+      assert.equal(redirectTarget(correctedEngagement), `/engagements/${engagement.id}`);
+      const correctedProject = await send(server.origin, {
+        method: "POST",
+        path: badProjectForm.action,
+        form: Object.fromEntries(projectControls),
+      });
+      assert.equal(redirectTarget(correctedProject), `/projects/${project.id}`);
       const after = server.store.snapshot();
-      assert.equal(after.engagements.find((e) => e.id === otherEngagement.id)?.name, "Other");
-      assert.equal(after.projects.find((p) => p.id === otherProject.id)?.name, "Other project");
-      assert.equal(after.engagements.find((e) => e.id === engagement.id)?.objectives, "engagement objectives");
+      assert.equal(after.engagements.find((e) => e.id === otherEngagement.id)?.objectives, "");
+      assert.equal(after.projects.find((p) => p.id === otherProject.id)?.status, "planned");
+      assert.equal(after.engagements.find((e) => e.id === engagement.id)?.objectives, "new objectives");
+      assert.equal(after.projects.find((p) => p.id === project.id)?.status, "completed");
     } finally {
       await server.close();
     }
