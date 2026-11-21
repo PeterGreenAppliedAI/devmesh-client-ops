@@ -3,21 +3,25 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { after, describe, it } from "node:test";
 import { escapeHtml } from "../src/html.ts";
 import {
   DEFAULT_PORT,
   cliEnvironment,
   defaultDataDirectory,
+  requireOutsideRepository,
   isEntryPoint,
   main,
   parseCliArguments,
   registerRoutes,
   startApplication,
+  REAL_DEPENDENCIES,
   CliError,
   StartupError,
   health,
   type Application,
+  type ApplicationDependencies,
   type CliEnvironment,
 } from "../src/index.ts";
 import { startServer, canonicalOrigin } from "../src/server.ts";
@@ -166,18 +170,29 @@ describe("index exports and entry point", () => {
     assert.deepEqual(health(), { status: "ok" });
   });
 
-  it("importing index.ts does not start a listener", async () => {
-    // Import resolved through the module cache; if index.ts had started a
-    // listener on import, this import would have bound a port. Check that the
-    // default port is free after importing by binding it ourselves.
-    const { createServer } = await import("node:net");
-    await new Promise<void>((resolve, reject) => {
-      const probe = createServer();
-      probe.once("error", reject);
-      probe.listen(DEFAULT_PORT, "127.0.0.1", () => {
-        probe.close(() => resolve());
-      });
-    });
+  it("importing index.ts starts no listener, in an isolated child process", async () => {
+    // The import runs in a fresh Node process, so no other test's listener or
+    // a listener on a fixed port can confuse the result. The child imports
+    // index.ts, then reports whether the process holds any TCP listening handle
+    // of its own. An import that started a listener would show one.
+    const { spawnSync } = await import("node:child_process");
+    const script = [
+      `await import(${JSON.stringify(pathToFileURL(join(process.cwd(), "src/index.ts")).href)});`,
+      'const { getActiveResourcesInfo } = await import("node:process");',
+      'await new Promise((resolve) => setTimeout(resolve, 50));',
+      'const listeners = getActiveResourcesInfo().filter((name) => name === "TCPServerWrap" || name === "TCPSocketWrap");',
+      'process.stdout.write(JSON.stringify(listeners));',
+    ].join("\n");
+    const child = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", "--input-type=module", "--eval", script],
+      { encoding: "utf8" },
+    );
+    assert.equal(child.status, 0, child.stderr);
+    // A socket from the eval harness itself is not the module's; the module
+    // must hold no listening handle. No listener means no TCPServerWrap.
+    const listeners = JSON.parse(child.stdout) as string[];
+    assert.ok(!listeners.includes("TCPServerWrap"), `import started a listener: ${child.stdout}`);
   });
 
   it("recognises its own entry point and not an import", () => {
@@ -196,6 +211,28 @@ describe("index exports and entry point", () => {
     const cwd = process.cwd();
     assert.equal(dir === cwd, false);
     assert.ok(!dir.startsWith(cwd + (cwd.endsWith("/") ? "" : "/")));
+  });
+
+  it("refuses a data directory inside the repository", () => {
+    // Portable containment check using join/relative, no POSIX-only path.
+    const repository = join(tempDir(), "repo");
+    const inside = join(repository, "workspace", "data");
+    const outside = join(tempDir(), "elsewhere", "data");
+    assert.throws(() => requireOutsideRepository(inside, repository), StartupError);
+    assert.throws(() => requireOutsideRepository(repository, repository), StartupError);
+    assert.equal(requireOutsideRepository(outside, repository), outside);
+    // The CLI refuses it clearly before starting anything and exits 2.
+    const recorded = recordingEnvironment(["--data-dir", inside], async () => {
+      throw new Error("must not start");
+    });
+    (recorded.environment as { repositoryDirectory?: string }).repositoryDirectory = repository;
+    return main(recorded.environment).then((result) => {
+      assert.equal(result, null);
+      assert.deepEqual(recorded.exits, [2]);
+      assert.equal(recorded.stderr.length, 1);
+      assert.match(recorded.stderr[0], /inside the repository/);
+      assert.deepEqual(recorded.stdout, []);
+    });
   });
 });
 
@@ -385,54 +422,94 @@ describe("startApplication startup and cleanup", () => {
     await reopened.close();
   });
 
-  it("cleans up the store when the port is already occupied", async () => {
-    // Bind an occupied port with a plain listener, then start the application
-    // on that port. The startup must fail clearly and release the store it
-    // opened before starting the server, so the lock is gone afterwards.
-    const { createServer } = await import("node:net");
-    const blocker = createServer();
-    await new Promise<void>((resolve) => blocker.listen(0, "127.0.0.1", () => resolve()));
-    const address = blocker.address();
-    assert.ok(address !== null && typeof address !== "string");
-    const port = address.port;
-    const dir = tempDir();
-    try {
-      await assert.rejects(
-        startApplication({ dataDirectory: dir, port }),
-        (error: unknown) => {
-          assert.ok(error instanceof StartupError);
-          assert.match(error.message, /Port \d+ is already in use/);
-          return true;
-        },
-      );
-    } finally {
-      await new Promise<void>((resolve) => blocker.close(() => resolve()));
-    }
-    // The store lock from the failed startup is released; reopening works and
-    // the workspace is empty (no partial data was written).
-    const reopened = await openStore(dir);
-    try {
-      assert.equal(reopened.snapshot().clients.length, 0);
-    } finally {
-      await reopened.close();
-    }
-  });
-
-  it("reports a clear message when the data directory cannot be opened", async () => {
-    // Inject a failing file system through openStore's interface is not
-    // reachable from startApplication, so exercise a real failure: a path that
-    // is a regular file, which cannot be a directory on any platform.
-    const file = join(tempDir(), "not-a-dir");
-    const { writeFileSync } = await import("node:fs");
-    writeFileSync(file, "x");
+  it("releases the opened store when the server fails to start through injection", async () => {
+    // The occupied-port error is injected through the start dependency, and the
+    // store is a recording stub, so the cleanup is observed directly rather
+    // than induced by binding a real port or touching the environment.
+    let closed = 0;
+    const store = {
+      closed: () => closed,
+      async close() {
+        closed += 1;
+      },
+    } as unknown as Store;
+    let started = 0;
+    const failure = Object.assign(new Error("listen EADDRINUSE"), { code: "EADDRINUSE" });
+    const dependencies: ApplicationDependencies = {
+      open: async () => store,
+      start: async () => {
+        started += 1;
+        throw failure;
+      },
+    };
     await assert.rejects(
-      startApplication({ dataDirectory: file, port: 0 }),
+      startApplication({ dataDirectory: tempDir(), port: 3000 }, dependencies),
       (error: unknown) => {
         assert.ok(error instanceof StartupError);
-        assert.match(error.message, /Cannot open the workspace store/);
+        assert.match(error.message, /Port 3000 is already in use/);
         return true;
       },
     );
+    assert.equal(started, 1);
+    // Startup released the store it opened, so its lock is not left behind.
+    assert.equal(closed, 1);
+  });
+
+  it("reports a store release failure alongside the startup failure", async () => {
+    // A failed store close must not be swallowed while reporting the startup
+    // failure: both are reported. Everything is injected.
+    let closed = 0;
+    const store = {
+      async close() {
+        closed += 1;
+        throw new Error("lock still held");
+      },
+    } as unknown as Store;
+    const dependencies: ApplicationDependencies = {
+      open: async () => store,
+      start: async () => {
+        throw new Error("could not bind");
+      },
+    };
+    await assert.rejects(
+      startApplication({ dataDirectory: tempDir(), port: 3001 }, dependencies),
+      (error: unknown) => {
+        assert.ok(error instanceof StartupError);
+        // Both failures appear in the message.
+        assert.match(error.message, /Cannot start the server: could not bind/);
+        assert.match(error.message, /could not be closed either: lock still held/);
+        // The release error is the reported cause.
+        assert.match(String((error.cause as Error).message), /lock still held/);
+        return true;
+      },
+    );
+    assert.equal(closed, 1);
+  });
+
+  it("reports a clear message when the store cannot be opened through injection", async () => {
+    // The file/system failure is injected through the open dependency instead
+    // of being induced by making a real path invalid.
+    let started = 0;
+    const dependencies: ApplicationDependencies = {
+      open: async () => {
+        throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+      },
+      start: async () => {
+        started += 1;
+        throw new Error("must not start");
+      },
+    };
+    await assert.rejects(
+      startApplication({ dataDirectory: tempDir(), port: 0 }, dependencies),
+      (error: unknown) => {
+        assert.ok(error instanceof StartupError);
+        assert.match(error.message, /Cannot open the workspace store/);
+        assert.match(error.message, /permission denied/);
+        return true;
+      },
+    );
+    // No server was started when the store could not open.
+    assert.equal(started, 0);
   });
 });
 
@@ -690,9 +767,238 @@ describe("hierarchy pages", () => {
         form: { clientId: client.id, name: "E", objectives: "keep me", status: "nope" },
       });
       assert.equal(badStatus.status, 400);
-      assert.ok(invalid.body.includes("role=\"alert\""));
+      assert.match(String(badStatus.headers["content-type"]), /^text\/html/);
+      // The invalid-status response itself is a correctable form, not the
+      // earlier client response.
+      assert.match(badStatus.body, /role="alert"/);
+      assert.match(badStatus.body, /must be one of planned, active, on_hold, completed/);
+      // The submitted values are kept, including the hidden parent, and the
+      // rejected status is shown as the selected option so it can be corrected.
       assert.ok(containsEscaped(badStatus.body, "keep me"));
+      assert.match(badStatus.body, new RegExp(`type="hidden" name="clientId" value="${client.id}"`));
+      assert.match(badStatus.body, /<option value="nope" selected>nope \(not a valid choice\)<\/option>/);
+      // Nothing was written.
       assert.equal(JSON.stringify(server.store.snapshot().engagements), engagementBefore);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("corrects and resubmits an invalid edit for every record type", async () => {
+    const server = await running();
+    try {
+      const client = await server.store.createClient({ name: "Acme", objectives: "old" });
+      const engagement = await server.store.createEngagement({
+        clientId: client.id,
+        name: "Discovery",
+        objectives: "old",
+        status: "planned",
+      });
+      const project = await server.store.createProject({
+        engagementId: engagement.id,
+        name: "Prototype",
+        objectives: "old",
+        status: "planned",
+      });
+      // Each invalid edit is refused with the record id still in the form, so
+      // the corrected resubmission reaches the same record and saves.
+      const cases: {
+        path: string;
+        fields: Record<string, string>;
+        corrected: Record<string, string>;
+        check: (snapshot: ReturnType<Store["snapshot"]>) => void;
+      }[] = [
+        {
+          path: `/clients/${client.id}/edit`,
+          fields: { name: "   ", objectives: "correctable" },
+          corrected: { name: "Acme again", objectives: "correctable" },
+          check: (snapshot: ReturnType<Store["snapshot"]>) => {
+            assert.equal(snapshot.clients[0].name, "Acme again");
+            assert.equal(snapshot.clients[0].objectives, "correctable");
+          },
+        },
+        {
+          path: `/engagements/${engagement.id}/edit`,
+          fields: { name: "   ", objectives: "correctable", status: "active" },
+          corrected: { name: "Discovery again", objectives: "correctable", status: "active" },
+          check: (snapshot: ReturnType<Store["snapshot"]>) => {
+            assert.equal(snapshot.engagements[0].name, "Discovery again");
+            assert.equal(snapshot.engagements[0].status, "active");
+          },
+        },
+        {
+          path: `/projects/${project.id}/edit`,
+          fields: { name: "   ", objectives: "correctable", status: "completed" },
+          corrected: { name: "Prototype again", objectives: "correctable", status: "completed" },
+          check: (snapshot: ReturnType<Store["snapshot"]>) => {
+            assert.equal(snapshot.projects[0].name, "Prototype again");
+            assert.equal(snapshot.projects[0].status, "completed");
+          },
+        },
+      ];
+      for (const item of cases) {
+        const id = item.path.split("/")[2];
+        const before = JSON.stringify(server.store.snapshot());
+        const invalid = await send(server.origin, {
+          method: "POST",
+          path: item.path,
+          form: { id, ...item.fields },
+        });
+        assert.equal(invalid.status, 400, item.path);
+        assert.match(String(invalid.headers["content-type"]), /^text\/html/, item.path);
+        assert.match(invalid.body, /role="alert"/, item.path);
+        // The id survives the error re-render, so resubmitting is possible.
+        assert.match(invalid.body, new RegExp(`type="hidden" name="id" value="${id}"`), item.path);
+        assert.match(invalid.body, new RegExp(`action="${item.path}"`), item.path);
+        for (const value of Object.values(item.fields)) {
+          if (value.trim() === "") continue;
+          assert.ok(containsEscaped(invalid.body, value), `${item.path} keeps ${value}`);
+        }
+        // Nothing was written by the refused edit.
+        assert.equal(JSON.stringify(server.store.snapshot()), before, item.path);
+
+        // Correct and resubmit with the id the rendered form carries.
+        const corrected = await send(server.origin, {
+          method: "POST",
+          path: item.path,
+          form: { id, ...item.corrected },
+        });
+        assert.equal(redirectTarget(corrected), `/${item.path.split("/")[1]}/${id}`, item.path);
+        item.check(server.store.snapshot());
+      }
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("edits the record named by its URL and rejects a conflicting submitted id", async () => {
+    const server = await running();
+    try {
+      const first = await server.store.createClient({ name: "First" });
+      const second = await server.store.createClient({ name: "Second" });
+      const before = JSON.stringify(server.store.snapshot());
+      // Posting another record's id to this record's edit URL is refused, and
+      // no record is changed.
+      const conflict = await send(server.origin, {
+        method: "POST",
+        path: `/clients/${first.id}/edit`,
+        form: { id: second.id, name: "Hijacked" },
+      });
+      assert.equal(conflict.status, 400);
+      assert.equal(JSON.stringify(server.store.snapshot()), before);
+
+      // Without a submitted id, the URL still names the target.
+      const edited = await send(server.origin, {
+        method: "POST",
+        path: `/clients/${first.id}/edit`,
+        form: { name: "First edited" },
+      });
+      assert.equal(redirectTarget(edited), `/clients/${first.id}`);
+      const snapshot = server.store.snapshot();
+      assert.equal(snapshot.clients[0].name, "First edited");
+      assert.equal(snapshot.clients[1].name, "Second");
+
+      // The same rule holds for engagements and projects.
+      const engagement = await server.store.createEngagement({ clientId: first.id, name: "E" });
+      const otherEngagement = await server.store.createEngagement({ clientId: first.id, name: "E2" });
+      const badEngagement = await send(server.origin, {
+        method: "POST",
+        path: `/engagements/${engagement.id}/edit`,
+        form: { id: otherEngagement.id, name: "X" },
+      });
+      assert.equal(badEngagement.status, 400);
+      const project = await server.store.createProject({ engagementId: engagement.id, name: "P" });
+      const otherProject = await server.store.createProject({ engagementId: engagement.id, name: "P2" });
+      const badProject = await send(server.origin, {
+        method: "POST",
+        path: `/projects/${project.id}/edit`,
+        form: { id: otherProject.id, name: "X" },
+      });
+      assert.equal(badProject.status, 400);
+      const after = server.store.snapshot();
+      assert.equal(after.engagements.find((e) => e.id === otherEngagement.id)?.name, "E2");
+      assert.equal(after.projects.find((p) => p.id === otherProject.id)?.name, "P2");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("keeps omitted fields when an edit supplies only some of them", async () => {
+    const server = await running();
+    try {
+      const client = await server.store.createClient({
+        name: "Acme",
+        background: "b",
+        contacts: "c",
+        stakeholders: "s",
+        requirements: "r",
+        objectives: "o",
+      });
+      const engagement = await server.store.createEngagement({
+        clientId: client.id,
+        name: "Discovery",
+        objectives: "keep objectives",
+        status: "active",
+      });
+      const project = await server.store.createProject({
+        engagementId: engagement.id,
+        name: "Prototype",
+        objectives: "keep project objectives",
+        status: "on_hold",
+      });
+
+      // A name-only client edit changes only the name.
+      const nameOnly = await send(server.origin, {
+        method: "POST",
+        path: `/clients/${client.id}/edit`,
+        form: { name: "Renamed" },
+      });
+      assert.equal(redirectTarget(nameOnly), `/clients/${client.id}`);
+      const storedClient = server.store.snapshot().clients[0];
+      assert.equal(storedClient.name, "Renamed");
+      assert.equal(storedClient.background, "b");
+      assert.equal(storedClient.contacts, "c");
+      assert.equal(storedClient.stakeholders, "s");
+      assert.equal(storedClient.requirements, "r");
+      assert.equal(storedClient.objectives, "o");
+
+      // An objectives-only engagement edit keeps its name and status.
+      const objectivesOnly = await send(server.origin, {
+        method: "POST",
+        path: `/engagements/${engagement.id}/edit`,
+        form: { objectives: "new objectives" },
+      });
+      assert.equal(redirectTarget(objectivesOnly), `/engagements/${engagement.id}`);
+      let storedEngagement = server.store.snapshot().engagements[0];
+      assert.equal(storedEngagement.objectives, "new objectives");
+      assert.equal(storedEngagement.name, "Discovery");
+      assert.equal(storedEngagement.status, "active");
+
+      // A status-only edit keeps the project's other fields.
+      const statusOnly = await send(server.origin, {
+        method: "POST",
+        path: `/projects/${project.id}/edit`,
+        form: { status: "completed" },
+      });
+      assert.equal(redirectTarget(statusOnly), `/projects/${project.id}`);
+      const storedProject = server.store.snapshot().projects[0];
+      assert.equal(storedProject.status, "completed");
+      assert.equal(storedProject.name, "Prototype");
+      assert.equal(storedProject.objectives, "keep project objectives");
+
+      // An explicitly empty status is invalid input: it is refused, not
+      // defaulted, and nothing is changed.
+      const before = JSON.stringify(server.store.snapshot());
+      const emptyStatus = await send(server.origin, {
+        method: "POST",
+        path: `/engagements/${engagement.id}/edit`,
+        form: { status: "" },
+      });
+      assert.equal(emptyStatus.status, 400);
+      assert.match(emptyStatus.body, /role="alert"/);
+      assert.equal(JSON.stringify(server.store.snapshot()), before);
+      storedEngagement = server.store.snapshot().engagements[0];
+      assert.equal(storedEngagement.status, "active");
     } finally {
       await server.close();
     }

@@ -24,7 +24,6 @@ import type {
   ClientCreate,
   Engagement,
   EngagementCreate,
-  EngagementStatus,
   Project,
   ProjectCreate,
   Snapshot,
@@ -382,9 +381,11 @@ function projectShowPage(project: Project, snapshot: Snapshot): Page {
 }
 
 /** Values for a create form: selects start at their first choice. */
+/** Values for a create form: selects start at their first choice. */
 function createFormValues(fields: readonly FieldSpec[]): Record<string, string> {
   const values: Record<string, string> = {};
   for (const field of fields) {
+    if (field.hidden) continue;
     values[field.name] = field.value ?? (field.type === "select" ? ENGAGEMENT_STATUSES[0] : "");
   }
   return values;
@@ -414,6 +415,18 @@ function renderHierarchyForm(
   return renderPage(title, body);
 }
 
+/**
+ * The controls for a submission that the store refused. The fixed hidden
+ * fields (a record id or a parent id) are part of the form, so a corrected
+ * resubmission still names the same record or parent.
+ */
+function submissionFields(
+  base: readonly FieldSpec[],
+  hidden: readonly FieldSpec[],
+): readonly FieldSpec[] {
+  return [...hidden, ...base];
+}
+
 /** Build a correctable form error from a store validation refusal. */
 function formFailure(
   error: unknown,
@@ -432,31 +445,63 @@ function text(form: Readonly<Record<string, string>>, name: string): string {
   return form[name] ?? "";
 }
 
+/**
+ * The fields the submission actually supplied: only names present in the form.
+ * An edit changes only what was posted and keeps every omitted field, which is
+ * the store's own partial-update contract.
+ */
+function suppliedFields(
+  form: Readonly<Record<string, string>>,
+  fields: readonly FieldSpec[],
+): Record<string, string> {
+  const values: Record<string, string> = {};
+  for (const field of fields) {
+    if (field.hidden) continue;
+    if (Object.hasOwn(form, field.name)) values[field.name] = form[field.name];
+  }
+  return values;
+}
+
+/**
+ * Resolve the record an edit names. The target is the record in the URL path;
+ * a submitted `id` must either be absent or name that same record, so one
+ * record's edit URL can never write another record. A conflicting id is
+ * refused as invalid input, and a missing target is a missing record.
+ */
+function editTargetId(
+  request: HierarchyRequest,
+  form: Readonly<Record<string, string>>,
+  kind: string,
+): string {
+  let id: string;
+  try {
+    id = decodeURIComponent(idFromPath(request.path));
+  } catch {
+    throw new MissingRecordError(`No ${kind} for that path`);
+  }
+  const submitted = form["id"];
+  if (submitted !== undefined && submitted !== "" && submitted !== id) {
+    throw new ValidationError(`The submitted ${kind} id does not match this URL`);
+  }
+  return id;
+}
+
 /** Build the hierarchy routes for a store. */
 export function hierarchyRoutes(store: Store): HierarchyRoutes {
   const snapshot = (): Snapshot => store.snapshot();
 
-  function clientValues(form: Readonly<Record<string, string>>): Record<string, string> {
-    const values: Record<string, string> = {};
-    for (const field of CLIENT_FIELDS) values[field.name] = text(form, field.name);
-    return values;
+  function hiddenId(id: string): readonly FieldSpec[] {
+    return [{ name: "id", label: "Id", hidden: true, value: id }];
   }
 
-  function clientInput(values: Readonly<Record<string, string>>): ClientCreate {
-    return {
-      name: values.name,
-      background: values.background,
-      contacts: values.contacts,
-      stakeholders: values.stakeholders,
-      requirements: values.requirements,
-      objectives: values.objectives,
-    };
+  function hiddenParent(name: string, id: string, label: string): readonly FieldSpec[] {
+    return [{ name, label, hidden: true, value: id }];
   }
 
   async function createClient(form: Readonly<Record<string, string>>): Promise<HierarchyResult> {
-    const values = clientValues(form);
+    const values = suppliedFields(form, CLIENT_FIELDS);
     try {
-      const client = await store.createClient(clientInput(values));
+      const client = await store.createClient(values as unknown as ClientCreate);
       return redirect(`/clients/${encodeURIComponent(client.id)}`);
     } catch (error) {
       const failure = formFailure(error, values, CLIENT_FIELDS, "/clients/new");
@@ -465,17 +510,19 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
     }
   }
 
-  async function editClient(form: Readonly<Record<string, string>>): Promise<HierarchyResult> {
-    const id = text(form, "id");
+  async function editClient(request: HierarchyRequest): Promise<HierarchyResult> {
+    const id = editTargetId(request, request.form, "client");
     const client = findRecord(snapshot().clients, id, "client");
-    // An edit posts the whole profile, so it replaces every profile field; a
-    // blank name is refused by the store and the rest of the values are kept.
-    const values = clientValues(form);
+    const action = `/clients/${encodeURIComponent(client.id)}/edit`;
+    const fields = submissionFields(CLIENT_FIELDS, hiddenId(client.id));
+    // An edit changes only the fields it was given and keeps the others, so a
+    // name-only submission leaves the rest of the profile untouched.
+    const values = suppliedFields(request.form, CLIENT_FIELDS);
     try {
-      await store.updateClient(client.id, clientInput(values));
+      await store.updateClient(client.id, values);
       return redirect(`/clients/${encodeURIComponent(client.id)}`);
     } catch (error) {
-      const failure = formFailure(error, values, CLIENT_FIELDS, `/clients/${encodeURIComponent(client.id)}/edit`);
+      const failure = formFailure(error, values, fields, action);
       if (failure !== null) throw failure;
       throw error;
     }
@@ -483,56 +530,35 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
 
   async function createEngagement(form: Readonly<Record<string, string>>): Promise<HierarchyResult> {
     const client = findRecord(snapshot().clients, text(form, "clientId"), "client");
-    const values = {
-      clientId: client.id,
-      name: text(form, "name"),
-      objectives: text(form, "objectives"),
-      status: text(form, "status") || ENGAGEMENT_STATUSES[0],
-    };
-    const input: EngagementCreate = {
-      clientId: client.id,
-      name: values.name,
-      objectives: values.objectives,
-      status: values.status as EngagementStatus,
-    };
+    const values = suppliedFields(form, ENGAGEMENT_FIELDS);
+    const input = { ...values, clientId: client.id } as unknown as EngagementCreate;
     try {
       const engagement = await store.createEngagement(input);
       return redirect(`/engagements/${encodeURIComponent(engagement.id)}`);
     } catch (error) {
       // The correction form repeats the hidden parent so the client is kept,
       // and posts to the same new endpoint again.
-      const fields: readonly FieldSpec[] = [
-        { name: "clientId", label: "Client", hidden: true, value: client.id },
-        ...ENGAGEMENT_FIELDS,
-      ];
+      const fields = submissionFields(
+        ENGAGEMENT_FIELDS,
+        hiddenParent("clientId", client.id, "Client"),
+      );
       const failure = formFailure(error, values, fields, "/engagements/new");
       if (failure !== null) throw failure;
       throw error;
     }
   }
 
-  async function editEngagement(form: Readonly<Record<string, string>>): Promise<HierarchyResult> {
-    const id = text(form, "id");
+  async function editEngagement(request: HierarchyRequest): Promise<HierarchyResult> {
+    const id = editTargetId(request, request.form, "engagement");
     const engagement = findRecord(snapshot().engagements, id, "engagement");
-    const values = {
-      name: text(form, "name"),
-      objectives: text(form, "objectives"),
-      status: text(form, "status") || ENGAGEMENT_STATUSES[0],
-    };
+    const action = `/engagements/${encodeURIComponent(engagement.id)}/edit`;
+    const fields = submissionFields(ENGAGEMENT_FIELDS, hiddenId(engagement.id));
+    const values = suppliedFields(request.form, ENGAGEMENT_FIELDS);
     try {
-      await store.updateEngagement(engagement.id, {
-        name: values.name,
-        objectives: values.objectives,
-        status: values.status as EngagementStatus,
-      });
+      await store.updateEngagement(engagement.id, values);
       return redirect(`/engagements/${encodeURIComponent(engagement.id)}`);
     } catch (error) {
-      const failure = formFailure(
-        error,
-        values,
-        ENGAGEMENT_FIELDS,
-        `/engagements/${encodeURIComponent(engagement.id)}/edit`,
-      );
+      const failure = formFailure(error, values, fields, action);
       if (failure !== null) throw failure;
       throw error;
     }
@@ -540,54 +566,33 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
 
   async function createProject(form: Readonly<Record<string, string>>): Promise<HierarchyResult> {
     const engagement = findRecord(snapshot().engagements, text(form, "engagementId"), "engagement");
-    const values = {
-      engagementId: engagement.id,
-      name: text(form, "name"),
-      objectives: text(form, "objectives"),
-      status: text(form, "status") || ENGAGEMENT_STATUSES[0],
-    };
-    const input: ProjectCreate = {
-      engagementId: engagement.id,
-      name: values.name,
-      objectives: values.objectives,
-      status: values.status as EngagementStatus,
-    };
+    const values = suppliedFields(form, PROJECT_FIELDS);
+    const input = { ...values, engagementId: engagement.id } as unknown as ProjectCreate;
     try {
       const project = await store.createProject(input);
       return redirect(`/projects/${encodeURIComponent(project.id)}`);
     } catch (error) {
-      const fields: readonly FieldSpec[] = [
-        { name: "engagementId", label: "Engagement", hidden: true, value: engagement.id },
-        ...PROJECT_FIELDS,
-      ];
+      const fields = submissionFields(
+        PROJECT_FIELDS,
+        hiddenParent("engagementId", engagement.id, "Engagement"),
+      );
       const failure = formFailure(error, values, fields, "/projects/new");
       if (failure !== null) throw failure;
       throw error;
     }
   }
 
-  async function editProject(form: Readonly<Record<string, string>>): Promise<HierarchyResult> {
-    const id = text(form, "id");
+  async function editProject(request: HierarchyRequest): Promise<HierarchyResult> {
+    const id = editTargetId(request, request.form, "project");
     const project = findRecord(snapshot().projects, id, "project");
-    const values = {
-      name: text(form, "name"),
-      objectives: text(form, "objectives"),
-      status: text(form, "status") || ENGAGEMENT_STATUSES[0],
-    };
+    const action = `/projects/${encodeURIComponent(project.id)}/edit`;
+    const fields = submissionFields(PROJECT_FIELDS, hiddenId(project.id));
+    const values = suppliedFields(request.form, PROJECT_FIELDS);
     try {
-      await store.updateProject(project.id, {
-        name: values.name,
-        objectives: values.objectives,
-        status: values.status as EngagementStatus,
-      });
+      await store.updateProject(project.id, values);
       return redirect(`/projects/${encodeURIComponent(project.id)}`);
     } catch (error) {
-      const failure = formFailure(
-        error,
-        values,
-        PROJECT_FIELDS,
-        `/projects/${encodeURIComponent(project.id)}/edit`,
-      );
+      const failure = formFailure(error, values, fields, action);
       if (failure !== null) throw failure;
       throw error;
     }
@@ -623,10 +628,7 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
         method: "GET",
         render: (request) => {
           const client = findRecord(snapshot().clients, idFromPath(request.path), "client");
-          const fields: readonly FieldSpec[] = [
-            { name: "id", label: "Id", hidden: true, value: client.id },
-            ...CLIENT_FIELDS,
-          ];
+          const fields = submissionFields(CLIENT_FIELDS, hiddenId(client.id));
           return renderHierarchyForm(
             "Edit client",
             `/clients/${encodeURIComponent(client.id)}/edit`,
@@ -642,7 +644,7 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
         async render(request) {
           // A refused write throws a FormError, which the shell renders as a
           // correctable 400 page with the submitted values kept.
-          return await editClient(request.form);
+          return await editClient(request);
         },
       },
     },
@@ -651,10 +653,10 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
         method: "GET",
         render: (request) => {
           const client = findRecord(snapshot().clients, idFromPath(request.path), "client");
-          const fields: readonly FieldSpec[] = [
-            { name: "clientId", label: "Client", hidden: true, value: client.id },
-            ...ENGAGEMENT_FIELDS,
-          ];
+          const fields = submissionFields(
+            ENGAGEMENT_FIELDS,
+            hiddenParent("clientId", client.id, "Client"),
+          );
           return renderHierarchyForm(
             "New engagement",
             // The form posts to the collection's new endpoint, which writes
@@ -690,10 +692,7 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
         method: "GET",
         render: (request) => {
           const engagement = findRecord(snapshot().engagements, idFromPath(request.path), "engagement");
-          const fields: readonly FieldSpec[] = [
-            { name: "id", label: "Id", hidden: true, value: engagement.id },
-            ...ENGAGEMENT_FIELDS,
-          ];
+          const fields = submissionFields(ENGAGEMENT_FIELDS, hiddenId(engagement.id));
           return renderHierarchyForm(
             "Edit engagement",
             `/engagements/${encodeURIComponent(engagement.id)}/edit`,
@@ -709,7 +708,7 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
         async render(request) {
           // A refused write throws a FormError, which the shell renders as a
           // correctable 400 page with the submitted values kept.
-          return await editEngagement(request.form);
+          return await editEngagement(request);
         },
       },
     },
@@ -718,10 +717,10 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
         method: "GET",
         render: (request) => {
           const engagement = findRecord(snapshot().engagements, idFromPath(request.path), "engagement");
-          const fields: readonly FieldSpec[] = [
-            { name: "engagementId", label: "Engagement", hidden: true, value: engagement.id },
-            ...PROJECT_FIELDS,
-          ];
+          const fields = submissionFields(
+            PROJECT_FIELDS,
+            hiddenParent("engagementId", engagement.id, "Engagement"),
+          );
           return renderHierarchyForm(
             "New project",
             `/projects/new`,
@@ -755,10 +754,7 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
         method: "GET",
         render: (request) => {
           const project = findRecord(snapshot().projects, idFromPath(request.path), "project");
-          const fields: readonly FieldSpec[] = [
-            { name: "id", label: "Id", hidden: true, value: project.id },
-            ...PROJECT_FIELDS,
-          ];
+          const fields = submissionFields(PROJECT_FIELDS, hiddenId(project.id));
           return renderHierarchyForm(
             "Edit project",
             `/projects/${encodeURIComponent(project.id)}/edit`,
@@ -774,7 +770,7 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
         async render(request) {
           // A refused write throws a FormError, which the shell renders as a
           // correctable 400 page with the submitted values kept.
-          return await editProject(request.form);
+          return await editProject(request);
         },
       },
     },

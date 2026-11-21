@@ -178,10 +178,21 @@ export function renderForm(options: {
         `<textarea id="${id}" name="${escapeHtml(field.name)}"${required}${invalid}>${escapeHtml(value)}</textarea>`,
       );
     } else if (field.type === "select") {
-      const choices = (field.options ?? []).map((option) => {
+      const options = field.options ?? [];
+      const choices = options.map((option) => {
         const selected = option.value === value ? " selected" : "";
         return `<option value="${escapeHtml(option.value)}"${selected}>${escapeHtml(option.label)}</option>`;
       });
+      // A re-rendered form shows exactly what was submitted. When the value is
+      // not one of the known choices it is kept as a visible marked option
+      // rather than silently showing a different choice, so the user can see
+      // the rejected value and correct it.
+      const known = options.some((option) => option.value === value);
+      if (value !== "" && !known) {
+        choices.push(
+          `<option value="${escapeHtml(value)}" selected>${escapeHtml(value)} (not a valid choice)</option>`,
+        );
+      }
       parts.push(
         `<select id="${id}" name="${escapeHtml(field.name)}"${required}${invalid}>${choices.join("")}</select>`,
       );

@@ -16,7 +16,7 @@
  * and the first failure is reported.
  */
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { appRoutes, startServer, type PathRouteTable, type RouteResult, type RouteRequest, type Routes, type ServerOptions, type StartedServer } from "./server.ts";
 import { hierarchyRoutes, matchHierarchyPath, routeForPattern, type HierarchyPath } from "./hierarchy-pages.ts";
@@ -39,6 +39,37 @@ export const DATA_DIRECTORY_NAME = ".devmesh-client-ops";
  */
 export function defaultDataDirectory(): string {
   return join(homedir(), DATA_DIRECTORY_NAME);
+}
+
+/**
+ * True when `candidate` is the repository directory or sits inside it. Both
+ * paths are resolved first, so a relative or differently-spelled path compares
+ * the same on every platform, and no filesystem access is needed.
+ */
+function isInsideRepository(candidate: string, repository: string): boolean {
+  const from = resolve(repository);
+  const to = resolve(candidate);
+  const rel = relative(from, to);
+  if (rel === "") return true;
+  return !rel.startsWith("..") && !isAbsolute(rel);
+}
+
+/**
+ * The workspace data directory must never be the repository or inside it:
+ * workspace data belongs to the OS user's home, not to the source tree. A data
+ * directory that resolves inside the repository is refused clearly before the
+ * store opens.
+ */
+export function requireOutsideRepository(
+  dataDirectory: string,
+  repository: string = process.cwd(),
+): string {
+  if (isInsideRepository(dataDirectory, repository)) {
+    throw new StartupError(
+      `The data directory ${JSON.stringify(dataDirectory)} is inside the repository ${JSON.stringify(repository)}; choose a directory outside it`,
+    );
+  }
+  return dataDirectory;
 }
 
 /** A running application: its canonical local URL and a shutdown method. */
@@ -103,13 +134,41 @@ export class StartupError extends Error {
  * method. A failure at any step releases what was already opened before the
  * failure is rethrown as a `StartupError` with a readable message.
  */
-export async function startApplication(options: {
-  readonly dataDirectory: string;
-  readonly port: number;
-}): Promise<Application> {
+/**
+ * The dependencies of `startApplication`. The default is the real store and
+ * server; a test supplies these so a failing file or system operation is
+ * injected through this interface instead of induced by changing the
+ * environment.
+ */
+export interface ApplicationDependencies {
+  open(directory: string): Promise<Store>;
+  start(options: ServerOptions): Promise<StartedServer>;
+}
+
+/** The real dependencies: the on-disk store and the loopback HTTP server. */
+export const REAL_DEPENDENCIES: ApplicationDependencies = Object.freeze({
+  open: openStore,
+  start: startServer,
+});
+
+/**
+ * Start the application: open the store at `dataDirectory`, start the loopback
+ * server on `port` with the full route table, and return its URL and shutdown
+ * method. A failure at any step releases what was already opened before the
+ * failure is rethrown as a `StartupError` with a readable message. A release
+ * failure during startup cleanup is reported alongside the startup failure,
+ * never hidden.
+ */
+export async function startApplication(
+  options: {
+    readonly dataDirectory: string;
+    readonly port: number;
+  },
+  dependencies: ApplicationDependencies = REAL_DEPENDENCIES,
+): Promise<Application> {
   let store: Store;
   try {
-    store = await openStore(options.dataDirectory);
+    store = await dependencies.open(options.dataDirectory);
   } catch (error) {
     throw new StartupError(`Cannot open the workspace store: ${describe(error)}`, { cause: error });
   }
@@ -121,17 +180,21 @@ export async function startApplication(options: {
       port: options.port,
       routes: registerRoutes(store),
     };
-    server = await startServer(serverOptions);
+    server = await dependencies.start(serverOptions);
   } catch (error) {
     const failure = isPortInUse(error)
       ? new StartupError(`Port ${options.port} is already in use`, { cause: error })
       : new StartupError(`Cannot start the server: ${describe(error)}`, { cause: error });
     // Release the store opened above, even though startup has failed. A
-    // release failure here never hides the startup failure.
+    // release failure is reported with the startup failure, so neither is
+    // swallowed: the message names both, and the release error is the cause.
     try {
       await store.close();
-    } catch {
-      // The startup failure is the one reported; the store is unusable anyway.
+    } catch (closeError) {
+      throw new StartupError(
+        `${failure.message}; the store could not be closed either: ${describe(closeError)}`,
+        { cause: closeError },
+      );
     }
     throw failure;
   }
@@ -240,6 +303,8 @@ export interface CliEnvironment {
   readonly stderr: (line: string) => void;
   /** The default data directory, computed from the OS user's home. */
   readonly defaultDataDirectory: string;
+  /** The repository directory the data directory must stay outside of. */
+  readonly repositoryDirectory?: string;
   /** Start the application. */
   readonly start: (options: { readonly dataDirectory: string; readonly port: number }) => Promise<Application>;
   /** Register a normal-shutdown handler; returns a function that removes it. */
@@ -267,8 +332,12 @@ export async function main(environment: CliEnvironment): Promise<CliResult | nul
   let options: CliOptions;
   try {
     options = parseCliArguments(environment.args, { dataDirectory: environment.defaultDataDirectory });
+    requireOutsideRepository(
+      options.dataDirectory,
+      environment.repositoryDirectory ?? process.cwd(),
+    );
   } catch (error) {
-    if (error instanceof CliError) {
+    if (error instanceof CliError || error instanceof StartupError) {
       environment.stderr(`Error: ${error.message}`);
       environment.exit(2);
       return null;
@@ -325,6 +394,7 @@ export function cliEnvironment(args: readonly string[]): CliEnvironment {
     stdout: (line) => process.stdout.write(`${line}\n`),
     stderr: (line) => process.stderr.write(`${line}\n`),
     defaultDataDirectory: defaultDataDirectory(),
+    repositoryDirectory: process.cwd(),
     start: startApplication,
     onShutdown: (handler) => {
       const stop = (): void => {
