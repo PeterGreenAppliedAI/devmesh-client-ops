@@ -341,7 +341,9 @@ describe("index exports and entry point", () => {
     recorded.environment.defaultDataDirectory = join(repository, DATA_DIRECTORY_NAME);
     const result = await main(recorded.environment);
     assert.ok(result !== null);
-    assert.equal(seen, portablePath(chosen));
+    assert.ok(seen !== undefined, "start received a data directory");
+    assert.equal(portablePath(seen), portablePath(chosen));
+    assert.equal(seen, chosen);
     assert.deepEqual(recorded.exits, []);
     await result.shutdown();
   });
