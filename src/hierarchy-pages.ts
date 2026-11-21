@@ -381,7 +381,6 @@ function projectShowPage(project: Project, snapshot: Snapshot): Page {
 }
 
 /** Values for a create form: selects start at their first choice. */
-/** Values for a create form: selects start at their first choice. */
 function createFormValues(fields: readonly FieldSpec[]): Record<string, string> {
   const values: Record<string, string> = {};
   for (const field of fields) {
@@ -427,18 +426,38 @@ function submissionFields(
   return [...hidden, ...base];
 }
 
-/** Build a correctable form error from a store validation refusal. */
+/**
+ * Build a correctable form error from a store refusal. The submitted values are
+ * kept exactly as posted (an explicitly empty value stays empty), and every
+ * field the submission omitted is filled from `record` when the edit names a
+ * stored record, so the form the user corrects and resubmits carries the
+ * current record instead of blank controls. A create has no record, so its
+ * omitted controls stay blank.
+ */
 function formFailure(
   error: unknown,
   values: Readonly<Record<string, string>>,
   fields: readonly FieldSpec[],
   action: string,
+  record?: object,
 ): FormError | null {
+  if (!(error instanceof ValidationError)) return null;
+  const base = record === undefined ? {} : editFormValues(record);
+  const filled: Record<string, string> = {};
+  for (const field of fields) {
+    // A hidden control keeps the server-chosen value; a visible one shows the
+    // submitted value, else the stored value, else nothing.
+    if (field.hidden) {
+      filled[field.name] = field.value ?? "";
+    } else if (Object.hasOwn(values, field.name)) {
+      filled[field.name] = values[field.name];
+    } else if (Object.hasOwn(base, field.name)) {
+      filled[field.name] = base[field.name];
+    }
+  }
   // The store's validation message names the field and the reason; it is shown
   // as the form summary so every submitted value can be corrected in place.
-  return error instanceof ValidationError
-    ? new FormError(error.message, values, [], fields, action)
-    : null;
+  return new FormError(error.message, filled, [], fields, action);
 }
 
 function text(form: Readonly<Record<string, string>>, name: string): string {
@@ -462,28 +481,42 @@ function suppliedFields(
   return values;
 }
 
+/** The record an edit names and the identity it posts back. */
+interface EditTarget<T> {
+  readonly record: T;
+  readonly id: string;
+  /** A problem with the submitted identity; the target record is still shown. */
+  readonly conflict: ValidationError | null;
+}
+
 /**
- * Resolve the record an edit names. The target is the record in the URL path;
- * a submitted `id` must either be absent or name that same record, so one
+ * Resolve the record an edit names. The target is always the record in the URL
+ * path; a submitted `id` must either be absent or name that same record, so one
  * record's edit URL can never write another record. A conflicting id is
- * refused as invalid input, and a missing target is a missing record.
+ * reported as invalid input on a correctable form for the URL record, and a
+ * missing target is a missing record.
  */
-function editTargetId(
+function editTarget<T extends { readonly id: string }>(
+  items: readonly T[],
   request: HierarchyRequest,
-  form: Readonly<Record<string, string>>,
   kind: string,
-): string {
+): EditTarget<T> {
   let id: string;
   try {
     id = decodeURIComponent(idFromPath(request.path));
   } catch {
     throw new MissingRecordError(`No ${kind} for that path`);
   }
-  const submitted = form["id"];
-  if (submitted !== undefined && submitted !== "" && submitted !== id) {
-    throw new ValidationError(`The submitted ${kind} id does not match this URL`);
-  }
-  return id;
+  const record = findRecord(items, id, kind);
+  const submitted = request.form["id"];
+  return {
+    id,
+    record,
+    conflict:
+      submitted !== undefined && submitted !== "" && submitted !== id
+        ? new ValidationError(`The submitted ${kind} id does not match this URL`)
+        : null,
+  };
 }
 
 /** Build the hierarchy routes for a store. */
@@ -511,18 +544,22 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
   }
 
   async function editClient(request: HierarchyRequest): Promise<HierarchyResult> {
-    const id = editTargetId(request, request.form, "client");
-    const client = findRecord(snapshot().clients, id, "client");
+    const target = editTarget(snapshot().clients, request, "client");
+    const client = target.record;
     const action = `/clients/${encodeURIComponent(client.id)}/edit`;
+    // The corrected form always targets the record in the URL, whatever id the
+    // submission carried.
     const fields = submissionFields(CLIENT_FIELDS, hiddenId(client.id));
     // An edit changes only the fields it was given and keeps the others, so a
     // name-only submission leaves the rest of the profile untouched.
     const values = suppliedFields(request.form, CLIENT_FIELDS);
+    const refusal = target.conflict;
     try {
+      if (refusal !== null) throw refusal;
       await store.updateClient(client.id, values);
       return redirect(`/clients/${encodeURIComponent(client.id)}`);
     } catch (error) {
-      const failure = formFailure(error, values, fields, action);
+      const failure = formFailure(error, values, fields, action, client);
       if (failure !== null) throw failure;
       throw error;
     }
@@ -549,16 +586,18 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
   }
 
   async function editEngagement(request: HierarchyRequest): Promise<HierarchyResult> {
-    const id = editTargetId(request, request.form, "engagement");
-    const engagement = findRecord(snapshot().engagements, id, "engagement");
+    const target = editTarget(snapshot().engagements, request, "engagement");
+    const engagement = target.record;
     const action = `/engagements/${encodeURIComponent(engagement.id)}/edit`;
     const fields = submissionFields(ENGAGEMENT_FIELDS, hiddenId(engagement.id));
     const values = suppliedFields(request.form, ENGAGEMENT_FIELDS);
+    const refusal = target.conflict;
     try {
+      if (refusal !== null) throw refusal;
       await store.updateEngagement(engagement.id, values);
       return redirect(`/engagements/${encodeURIComponent(engagement.id)}`);
     } catch (error) {
-      const failure = formFailure(error, values, fields, action);
+      const failure = formFailure(error, values, fields, action, engagement);
       if (failure !== null) throw failure;
       throw error;
     }
@@ -583,16 +622,18 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
   }
 
   async function editProject(request: HierarchyRequest): Promise<HierarchyResult> {
-    const id = editTargetId(request, request.form, "project");
-    const project = findRecord(snapshot().projects, id, "project");
+    const target = editTarget(snapshot().projects, request, "project");
+    const project = target.record;
     const action = `/projects/${encodeURIComponent(project.id)}/edit`;
     const fields = submissionFields(PROJECT_FIELDS, hiddenId(project.id));
     const values = suppliedFields(request.form, PROJECT_FIELDS);
+    const refusal = target.conflict;
     try {
+      if (refusal !== null) throw refusal;
       await store.updateProject(project.id, values);
       return redirect(`/projects/${encodeURIComponent(project.id)}`);
     } catch (error) {
-      const failure = formFailure(error, values, fields, action);
+      const failure = formFailure(error, values, fields, action, project);
       if (failure !== null) throw failure;
       throw error;
     }

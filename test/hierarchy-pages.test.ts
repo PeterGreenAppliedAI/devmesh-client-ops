@@ -2,21 +2,20 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { isAbsolute, join, relative, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { after, describe, it } from "node:test";
-import { escapeHtml } from "../src/html.ts";
+import { escapeHtml, renderForm } from "../src/html.ts";
 import {
   DEFAULT_PORT,
+  DATA_DIRECTORY_NAME,
   cliEnvironment,
   defaultDataDirectory,
-  requireOutsideRepository,
   isEntryPoint,
   main,
   parseCliArguments,
   registerRoutes,
   startApplication,
-  REAL_DEPENDENCIES,
   CliError,
   StartupError,
   health,
@@ -40,6 +39,12 @@ function tempDir(): string {
   const dir = mkdtempSync(join(tmpdir(), "hierarchy-"));
   roots.push(dir);
   return dir;
+}
+
+/** True when `candidate` is, or sits inside, `root`; portable path handling. */
+function isInside(candidate: string, root: string): boolean {
+  const rel = relative(resolve(root), resolve(candidate));
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
 interface Running {
@@ -149,6 +154,42 @@ function assertNoRaw(body: string, hostile: string): void {
   assert.ok(containsEscaped(body, hostile), `escaped hostile text must be shown: ${JSON.stringify(hostile)}`);
 }
 
+/**
+ * Read the form controls out of a rendered HTML document: the action, and each
+ * named control's current value (the text of a textarea, the selected option of
+ * a select, the value attribute of an input). This is what a browser would post
+ * back from the correction form, so a resubmission test exercises the real
+ * rendered controls.
+ */
+function parseControls(document: string): Map<string, string> {
+  const controls = new Map<string, string>();
+  const form = /<form[^>]*>([\s\S]*?)<\/form>/.exec(document);
+  assert.ok(form !== null, "page has a form");
+  const inner = form[1];
+  for (const match of inner.matchAll(/<textarea[^>]*name="([^"]+)"[^>]*>([\s\S]*?)<\/textarea>/g)) {
+    controls.set(unescapeHtml(match[1]), unescapeHtml(match[2]));
+  }
+  for (const match of inner.matchAll(/<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"[^>]*>/g)) {
+    controls.set(unescapeHtml(match[1]), unescapeHtml(match[2]));
+  }
+  for (const match of inner.matchAll(/<select[^>]*name="([^"]+)"[^>]*>([\s\S]*?)<\/select>/g)) {
+    const options = [...match[2].matchAll(/<option value="([^"]*)"([^>]*)>([\s\S]*?)<\/option>/g)];
+    const selected = options.find((option) => option[2].includes("selected")) ?? options[0];
+    controls.set(unescapeHtml(match[1]), selected === undefined ? "" : unescapeHtml(selected[1]));
+  }
+  return controls;
+}
+
+/** Reverse `escapeHtml` for a parsed attribute or text value. */
+function unescapeHtml(value: string): string {
+  return value
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
 /** A client profile with every field populated, including hostile text. */
 function fullProfile(): Record<string, string> {
   return {
@@ -173,26 +214,29 @@ describe("index exports and entry point", () => {
   it("importing index.ts starts no listener, in an isolated child process", async () => {
     // The import runs in a fresh Node process, so no other test's listener or
     // a listener on a fixed port can confuse the result. The child imports
-    // index.ts, then reports whether the process holds any TCP listening handle
-    // of its own. An import that started a listener would show one.
+    // index.ts, reports whether the process holds a TCP listening handle, then
+    // exits of its own accord. The parent bounds the child's lifetime: a child
+    // that stayed alive because the import left a listener would be killed for
+    // exceeding the bound, which fails this test instead of blocking it.
     const { spawnSync } = await import("node:child_process");
     const script = [
       `await import(${JSON.stringify(pathToFileURL(join(process.cwd(), "src/index.ts")).href)});`,
       'const { getActiveResourcesInfo } = await import("node:process");',
       'await new Promise((resolve) => setTimeout(resolve, 50));',
-      'const listeners = getActiveResourcesInfo().filter((name) => name === "TCPServerWrap" || name === "TCPSocketWrap");',
+      'const listeners = getActiveResourcesInfo().filter((name) => name === "TCPServerWrap");',
       'process.stdout.write(JSON.stringify(listeners));',
     ].join("\n");
     const child = spawnSync(
       process.execPath,
       ["--experimental-strip-types", "--input-type=module", "--eval", script],
-      { encoding: "utf8" },
+      { encoding: "utf8", timeout: 60_000 },
     );
+    // A child killed for hanging past the timeout is a failure, not a pass.
+    assert.equal(child.signal, null, "the importing child did not exit on its own");
     assert.equal(child.status, 0, child.stderr);
-    // A socket from the eval harness itself is not the module's; the module
-    // must hold no listening handle. No listener means no TCPServerWrap.
+    assert.equal((child.stderr ?? "").trim(), "");
     const listeners = JSON.parse(child.stdout) as string[];
-    assert.ok(!listeners.includes("TCPServerWrap"), `import started a listener: ${child.stdout}`);
+    assert.deepEqual(listeners, [], `import started a listener: ${child.stdout}`);
   });
 
   it("recognises its own entry point and not an import", () => {
@@ -205,34 +249,57 @@ describe("index exports and entry point", () => {
 
   it("defaults the data directory to a location under the user's home", () => {
     const dir = defaultDataDirectory();
-    // The default is an absolute location outside the repository working
-    // directory, so workspace data never lands in the source tree.
-    assert.ok(dir.length > 0);
-    const cwd = process.cwd();
-    assert.equal(dir === cwd, false);
-    assert.ok(!dir.startsWith(cwd + (cwd.endsWith("/") ? "" : "/")));
+    // The default is an absolute location outside the repository checkout, so
+    // workspace data never lands in the source tree. The repository is found
+    // from this module's own location, not from a launch directory.
+    assert.ok(isAbsolute(dir));
+    const repository = resolve(fileURLToPath(new URL("..", import.meta.url)));
+    assert.equal(isInside(dir, repository), false, `${dir} is inside ${repository}`);
   });
 
-  it("refuses a data directory inside the repository", () => {
-    // Portable containment check using join/relative, no POSIX-only path.
-    const repository = join(tempDir(), "repo");
-    const inside = join(repository, "workspace", "data");
-    const outside = join(tempDir(), "elsewhere", "data");
-    assert.throws(() => requireOutsideRepository(inside, repository), StartupError);
-    assert.throws(() => requireOutsideRepository(repository, repository), StartupError);
-    assert.equal(requireOutsideRepository(outside, repository), outside);
-    // The CLI refuses it clearly before starting anything and exits 2.
-    const recorded = recordingEnvironment(["--data-dir", inside], async () => {
-      throw new Error("must not start");
+  it("refuses a default data directory that collides with the repository", async () => {
+    // The checkout sits exactly at the default home-directory path, so the
+    // default would write workspace data into the repository. The collision is
+    // detected from this module's own repository, independent of the launch
+    // directory, and refused before anything starts. No --data-dir is given,
+    // so this is the default path the rule protects. A data directory inside
+    // another checkout is not this one and is accepted.
+    const repository = resolve(fileURLToPath(new URL("..", import.meta.url)));
+    const defaultDir = join(repository, DATA_DIRECTORY_NAME);
+    assert.equal(isInside(defaultDir, repository), true);
+    let started = 0;
+    const recorded = recordingEnvironment([], async () => {
+      started += 1;
+      return fakeApplication("http://127.0.0.1:3000").application;
     });
-    (recorded.environment as { repositoryDirectory?: string }).repositoryDirectory = repository;
-    return main(recorded.environment).then((result) => {
-      assert.equal(result, null);
-      assert.deepEqual(recorded.exits, [2]);
-      assert.equal(recorded.stderr.length, 1);
-      assert.match(recorded.stderr[0], /inside the repository/);
-      assert.deepEqual(recorded.stdout, []);
+    recorded.environment.defaultDataDirectory = defaultDir;
+    const result = await main(recorded.environment);
+    assert.equal(result, null);
+    assert.equal(started, 0);
+    assert.deepEqual(recorded.exits, [2]);
+    assert.equal(recorded.stderr.length, 1);
+    assert.match(recorded.stderr[0], /inside the repository/);
+    assert.deepEqual(recorded.stdout, []);
+  });
+
+  it("uses an explicitly named data directory inside the checkout as given", async () => {
+    // A2-F8 covers the default only: a directory the user names with
+    // --data-dir is used as given, even when it lies inside the checkout.
+    const repository = join(tempDir(), "checkout");
+    const chosen = join(repository, "workspace", "data");
+    const fake = fakeApplication("http://127.0.0.1:3000");
+    let seen: string | undefined;
+    const recorded = recordingEnvironment(["--data-dir", chosen], async (options) => {
+      seen = options.dataDirectory;
+      return fake.application;
     });
+    // An unrelated default that would be refused if it were used.
+    recorded.environment.defaultDataDirectory = join(repository, DATA_DIRECTORY_NAME);
+    const result = await main(recorded.environment);
+    assert.ok(result !== null);
+    assert.equal(seen, chosen);
+    assert.deepEqual(recorded.exits, []);
+    await result.shutdown();
   });
 });
 
@@ -267,6 +334,10 @@ describe("CLI argument parsing", () => {
     assert.throws(() => parseCliArguments(["--port", "--data-dir", "/x"], defaults), /Missing value/);
     assert.throws(() => parseCliArguments(["--port", "3000", "--port", "3001"], defaults), /once/);
     assert.throws(() => parseCliArguments(["--data-dir", "/a", "--data-dir", "/b"], defaults), /once/);
+    // The data directory must be absolute, so it never depends on the launch
+    // directory; on Windows a rooted path without a drive is refused too.
+    assert.throws(() => parseCliArguments(["--data-dir", "relative/dir"], defaults), CliError);
+    assert.throws(() => parseCliArguments(["--data-dir", ""], defaults), /Missing value/);
   });
 });
 
@@ -275,7 +346,8 @@ describe("CLI argument parsing", () => {
 // ---------------------------------------------------------------------------
 
 interface CliRecorder {
-  readonly environment: CliEnvironment;
+  /** Mutable so a test can supply the default directory for this checkout. */
+  readonly environment: { -readonly [K in keyof CliEnvironment]: CliEnvironment[K] };
   readonly stdout: string[];
   readonly stderr: string[];
   readonly exits: number[];
@@ -784,56 +856,84 @@ describe("hierarchy pages", () => {
     }
   });
 
-  it("corrects and resubmits an invalid edit for every record type", async () => {
+  it("renders a rejected select value visibly, including an empty one", () => {
+    const options = [
+      { value: "planned", label: "planned" },
+      { value: "active", label: "active" },
+    ];
+    // An unknown value is kept as a visible, selected, marked option so the
+    // browser shows exactly what was rejected.
+    const unknown = renderForm({
+      action: "/x",
+      fields: [{ name: "status", label: "Status", type: "select", options }],
+      values: { status: "nope" },
+    });
+    assert.match(unknown, /<option value="nope" selected>nope \(not a valid choice\)<\/option>/);
+    // An explicitly empty value is kept too, rather than showing the first choice.
+    const empty = renderForm({
+      action: "/x",
+      fields: [{ name: "status", label: "Status", type: "select", options }],
+      values: { status: "" },
+    });
+    assert.match(empty, /<option value="" selected>\(not a valid choice\)<\/option>/);
+    assert.ok(!/<option value="planned" selected>/.test(empty));
+    // A known value is the plain selected option, with no extra choice.
+    const known = renderForm({
+      action: "/x",
+      fields: [{ name: "status", label: "Status", type: "select", options }],
+      values: { status: "active" },
+    });
+    assert.match(known, /<option value="active" selected>active<\/option>/);
+    assert.ok(!known.includes("not a valid choice"));
+  });
+
+  it("keeps omitted edit fields in the correction form and resubmits it", async () => {
     const server = await running();
     try {
-      const client = await server.store.createClient({ name: "Acme", objectives: "old" });
+      const profile = {
+        name: "Acme",
+        background: "a background",
+        contacts: "a contact",
+        stakeholders: "a stakeholder",
+        requirements: "a requirement",
+        objectives: "old objectives",
+      };
+      const client = await server.store.createClient(profile);
       const engagement = await server.store.createEngagement({
         clientId: client.id,
         name: "Discovery",
-        objectives: "old",
-        status: "planned",
+        objectives: "engagement objectives",
+        status: "active",
       });
       const project = await server.store.createProject({
         engagementId: engagement.id,
         name: "Prototype",
-        objectives: "old",
+        objectives: "project objectives",
         status: "planned",
       });
-      // Each invalid edit is refused with the record id still in the form, so
-      // the corrected resubmission reaches the same record and saves.
+
+      // Each edit submits only a name (and an invalid one). The correction form
+      // must repopulate every omitted control from the stored record, so the
+      // browser resubmits the whole record, not blanks.
       const cases: {
         path: string;
-        fields: Record<string, string>;
-        corrected: Record<string, string>;
-        check: (snapshot: ReturnType<Store["snapshot"]>) => void;
+        expected: Record<string, string>;
+        name: string;
       }[] = [
         {
           path: `/clients/${client.id}/edit`,
-          fields: { name: "   ", objectives: "correctable" },
-          corrected: { name: "Acme again", objectives: "correctable" },
-          check: (snapshot: ReturnType<Store["snapshot"]>) => {
-            assert.equal(snapshot.clients[0].name, "Acme again");
-            assert.equal(snapshot.clients[0].objectives, "correctable");
-          },
+          name: "Acme again",
+          expected: profile,
         },
         {
           path: `/engagements/${engagement.id}/edit`,
-          fields: { name: "   ", objectives: "correctable", status: "active" },
-          corrected: { name: "Discovery again", objectives: "correctable", status: "active" },
-          check: (snapshot: ReturnType<Store["snapshot"]>) => {
-            assert.equal(snapshot.engagements[0].name, "Discovery again");
-            assert.equal(snapshot.engagements[0].status, "active");
-          },
+          name: "Discovery again",
+          expected: { name: "Discovery", objectives: "engagement objectives", status: "active" },
         },
         {
           path: `/projects/${project.id}/edit`,
-          fields: { name: "   ", objectives: "correctable", status: "completed" },
-          corrected: { name: "Prototype again", objectives: "correctable", status: "completed" },
-          check: (snapshot: ReturnType<Store["snapshot"]>) => {
-            assert.equal(snapshot.projects[0].name, "Prototype again");
-            assert.equal(snapshot.projects[0].status, "completed");
-          },
+          name: "Prototype again",
+          expected: { name: "Prototype", objectives: "project objectives", status: "planned" },
         },
       ];
       for (const item of cases) {
@@ -842,30 +942,128 @@ describe("hierarchy pages", () => {
         const invalid = await send(server.origin, {
           method: "POST",
           path: item.path,
-          form: { id, ...item.fields },
+          form: { id, name: "   " },
         });
         assert.equal(invalid.status, 400, item.path);
-        assert.match(String(invalid.headers["content-type"]), /^text\/html/, item.path);
         assert.match(invalid.body, /role="alert"/, item.path);
-        // The id survives the error re-render, so resubmitting is possible.
-        assert.match(invalid.body, new RegExp(`type="hidden" name="id" value="${id}"`), item.path);
-        assert.match(invalid.body, new RegExp(`action="${item.path}"`), item.path);
-        for (const value of Object.values(item.fields)) {
-          if (value.trim() === "") continue;
-          assert.ok(containsEscaped(invalid.body, value), `${item.path} keeps ${value}`);
+        // The rendered form is a correction form posting back to the record.
+        const controls = parseControls(invalid.body);
+        assert.equal(controls.get("id"), id, item.path);
+        for (const [field, value] of Object.entries(item.expected)) {
+          // The invalid name keeps the submitted (blank) value for correction,
+          // every omitted field shows the stored value instead of blank.
+          assert.equal(controls.get(field), field === "name" ? "   " : value, `${item.path} ${field}`);
         }
         // Nothing was written by the refused edit.
         assert.equal(JSON.stringify(server.store.snapshot()), before, item.path);
 
-        // Correct and resubmit with the id the rendered form carries.
+        // Correct and resubmit exactly the controls the rendered form carries.
+        controls.set("name", item.name);
         const corrected = await send(server.origin, {
           method: "POST",
           path: item.path,
-          form: { id, ...item.corrected },
+          form: Object.fromEntries(controls),
         });
         assert.equal(redirectTarget(corrected), `/${item.path.split("/")[1]}/${id}`, item.path);
-        item.check(server.store.snapshot());
       }
+
+      // The resubmissions kept every field, because the omitted controls were
+      // never blanked.
+      const snapshot = server.store.snapshot();
+      assert.deepEqual({ ...snapshot.clients[0] }, { ...client, name: "Acme again" });
+      assert.equal(snapshot.engagements[0].name, "Discovery again");
+      assert.equal(snapshot.engagements[0].objectives, "engagement objectives");
+      assert.equal(snapshot.engagements[0].status, "active");
+      assert.equal(snapshot.projects[0].name, "Prototype again");
+      assert.equal(snapshot.projects[0].objectives, "project objectives");
+      assert.equal(snapshot.projects[0].status, "planned");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("corrects a conflicting submitted identity on a form for the URL record", async () => {
+    const server = await running();
+    try {
+      const first = await server.store.createClient({
+        name: "First",
+        background: "first background",
+        objectives: "first objectives",
+      });
+      const second = await server.store.createClient({ name: "Second" });
+      const before = JSON.stringify(server.store.snapshot());
+      const conflict = await send(server.origin, {
+        method: "POST",
+        path: `/clients/${first.id}/edit`,
+        form: { id: second.id, name: "Corrected name" },
+      });
+      // The conflict is invalid input, shown as a correctable form, not plain text.
+      assert.equal(conflict.status, 400);
+      assert.match(String(conflict.headers["content-type"]), /^text\/html/);
+      assert.match(conflict.body, /role="alert"/);
+      assert.match(conflict.body, /does not match this URL/);
+      // The form targets the record in the URL and keeps the editable values.
+      assert.match(conflict.body, new RegExp(`action="/clients/${first.id}/edit"`));
+      const controls = parseControls(conflict.body);
+      assert.equal(controls.get("id"), first.id);
+      assert.equal(controls.get("name"), "Corrected name");
+      assert.equal(controls.get("background"), "first background");
+      assert.equal(controls.get("objectives"), "first objectives");
+      assert.equal(JSON.stringify(server.store.snapshot()), before);
+
+      // Submitting the rendered form saves the URL record, not the other one.
+      const saved = await send(server.origin, {
+        method: "POST",
+        path: `/clients/${first.id}/edit`,
+        form: Object.fromEntries(controls),
+      });
+      assert.equal(redirectTarget(saved), `/clients/${first.id}`);
+      const snapshot = server.store.snapshot();
+      assert.equal(snapshot.clients[0].name, "Corrected name");
+      assert.equal(snapshot.clients[0].background, "first background");
+      assert.equal(snapshot.clients[1].name, "Second");
+
+      // The same rule for engagements and projects.
+      const engagement = await server.store.createEngagement({
+        clientId: first.id,
+        name: "Discovery",
+        objectives: "engagement objectives",
+        status: "active",
+      });
+      const otherEngagement = await server.store.createEngagement({ clientId: first.id, name: "Other" });
+      const badEngagement = await send(server.origin, {
+        method: "POST",
+        path: `/engagements/${engagement.id}/edit`,
+        form: { id: otherEngagement.id, objectives: "new objectives" },
+      });
+      assert.equal(badEngagement.status, 400);
+      assert.match(badEngagement.body, /role="alert"/);
+      const engagementControls = parseControls(badEngagement.body);
+      assert.equal(engagementControls.get("id"), engagement.id);
+      assert.equal(engagementControls.get("objectives"), "new objectives");
+      assert.equal(engagementControls.get("status"), "active");
+      const project = await server.store.createProject({
+        engagementId: engagement.id,
+        name: "Prototype",
+        objectives: "project objectives",
+        status: "planned",
+      });
+      const otherProject = await server.store.createProject({ engagementId: engagement.id, name: "Other project" });
+      const badProject = await send(server.origin, {
+        method: "POST",
+        path: `/projects/${project.id}/edit`,
+        form: { id: otherProject.id, status: "completed" },
+      });
+      assert.equal(badProject.status, 400);
+      const projectControls = parseControls(badProject.body);
+      assert.equal(projectControls.get("id"), project.id);
+      assert.equal(projectControls.get("name"), "Prototype");
+      assert.equal(projectControls.get("objectives"), "project objectives");
+      assert.equal(projectControls.get("status"), "completed");
+      const after = server.store.snapshot();
+      assert.equal(after.engagements.find((e) => e.id === otherEngagement.id)?.name, "Other");
+      assert.equal(after.projects.find((p) => p.id === otherProject.id)?.name, "Other project");
+      assert.equal(after.engagements.find((e) => e.id === engagement.id)?.objectives, "engagement objectives");
     } finally {
       await server.close();
     }
@@ -996,6 +1194,11 @@ describe("hierarchy pages", () => {
       });
       assert.equal(emptyStatus.status, 400);
       assert.match(emptyStatus.body, /role="alert"/);
+      assert.match(emptyStatus.body, /must be one of planned, active, on_hold, completed/);
+      // The explicitly empty status is retained as the selected option, not
+      // silently replaced by the first valid status.
+      assert.match(emptyStatus.body, /<option value="" selected>\(not a valid choice\)<\/option>/);
+      assert.match(emptyStatus.body, new RegExp(`type="hidden" name="id" value="${engagement.id}"`));
       assert.equal(JSON.stringify(server.store.snapshot()), before);
       storedEngagement = server.store.snapshot().engagements[0];
       assert.equal(storedEngagement.status, "active");

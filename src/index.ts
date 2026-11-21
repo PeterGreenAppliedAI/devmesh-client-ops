@@ -17,7 +17,7 @@
  */
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { appRoutes, startServer, type PathRouteTable, type RouteResult, type RouteRequest, type Routes, type ServerOptions, type StartedServer } from "./server.ts";
 import { hierarchyRoutes, matchHierarchyPath, routeForPattern, type HierarchyPath } from "./hierarchy-pages.ts";
 import type { HierarchyRoute } from "./hierarchy-pages.ts";
@@ -44,7 +44,8 @@ export function defaultDataDirectory(): string {
 /**
  * True when `candidate` is the repository directory or sits inside it. Both
  * paths are resolved first, so a relative or differently-spelled path compares
- * the same on every platform, and no filesystem access is needed.
+ * the same on every platform, and no filesystem access is needed. Symlinks are
+ * not followed, so a checkout reached through a link is compared as spelled.
  */
 function isInsideRepository(candidate: string, repository: string): boolean {
   const from = resolve(repository);
@@ -55,18 +56,40 @@ function isInsideRepository(candidate: string, repository: string): boolean {
 }
 
 /**
- * The workspace data directory must never be the repository or inside it:
- * workspace data belongs to the OS user's home, not to the source tree. A data
- * directory that resolves inside the repository is refused clearly before the
- * store opens.
+ * The repository this module was built from, found from the module's own
+ * location rather than the launch directory: `node dist/index.js` run from a
+ * subdirectory must still recognise the checkout it lives in. The compiled
+ * module sits at `<repository>/dist/index.js` and the source at
+ * `<repository>/src/index.ts`, so the directory above the module's own folder
+ * is the repository root when the checkout has those layouts. When the module
+ * is loaded from elsewhere (a test runner importing `src/index.ts`), the
+ * launch directory is the best available answer.
  */
-export function requireOutsideRepository(
-  dataDirectory: string,
-  repository: string = process.cwd(),
-): string {
+function repositoryDirectory(moduleUrl: string): string {
+  if (!moduleUrl.startsWith("file:")) return resolve(process.cwd());
+  const modulePath = fileURLToPath(moduleUrl);
+  const parts = modulePath.split(/[\\/]/);
+  const parentName = parts[parts.length - 2];
+  const fileName = parts[parts.length - 1];
+  if (
+    (parentName === "dist" && fileName === "index.js") ||
+    (parentName === "src" && fileName === "index.ts")
+  ) {
+    return resolve(modulePath, "..", "..");
+  }
+  return resolve(process.cwd());
+}
+
+/**
+ * The default data directory must never be the repository or inside it:
+ * workspace data belongs to the OS user's home, not to the source tree. Only
+ * the default is checked; a data directory the user names with `--data-dir` is
+ * used as given. A collision is refused clearly before the store opens.
+ */
+function requireDefaultOutsideRepository(dataDirectory: string, repository: string): string {
   if (isInsideRepository(dataDirectory, repository)) {
     throw new StartupError(
-      `The data directory ${JSON.stringify(dataDirectory)} is inside the repository ${JSON.stringify(repository)}; choose a directory outside it`,
+      `The default data directory ${JSON.stringify(dataDirectory)} is inside the repository ${JSON.stringify(repository)}; pass --data-dir to choose a directory outside it`,
     );
   }
   return dataDirectory;
@@ -146,7 +169,7 @@ export interface ApplicationDependencies {
 }
 
 /** The real dependencies: the on-disk store and the loopback HTTP server. */
-export const REAL_DEPENDENCIES: ApplicationDependencies = Object.freeze({
+const REAL_DEPENDENCIES: ApplicationDependencies = Object.freeze({
   open: openStore,
   start: startServer,
 });
@@ -251,7 +274,8 @@ export class CliError extends Error {
  * Parse the CLI arguments: `--port <number>` and `--data-dir <path>`. Unknown
  * options, missing values (including an option followed by another option),
  * repeated options and an invalid port are refused with a clear message.
- * Omitted options default to port 3000 and the default data directory.
+ * Omitted options default to port 3000 and the default data directory; an
+ * explicitly given data directory must be an absolute path.
  */
 export function parseCliArguments(
   args: readonly string[],
@@ -273,6 +297,9 @@ export function parseCliArguments(
       port = parsePort(value);
     } else {
       if (dataDirectory !== undefined) throw new CliError("--data-dir may only be given once");
+      if (!isAbsolute(value)) {
+        throw new CliError(`Invalid data directory: ${value}. The directory must be an absolute path.`);
+      }
       dataDirectory = value;
     }
     index += 1;
@@ -303,8 +330,6 @@ export interface CliEnvironment {
   readonly stderr: (line: string) => void;
   /** The default data directory, computed from the OS user's home. */
   readonly defaultDataDirectory: string;
-  /** The repository directory the data directory must stay outside of. */
-  readonly repositoryDirectory?: string;
   /** Start the application. */
   readonly start: (options: { readonly dataDirectory: string; readonly port: number }) => Promise<Application>;
   /** Register a normal-shutdown handler; returns a function that removes it. */
@@ -332,10 +357,11 @@ export async function main(environment: CliEnvironment): Promise<CliResult | nul
   let options: CliOptions;
   try {
     options = parseCliArguments(environment.args, { dataDirectory: environment.defaultDataDirectory });
-    requireOutsideRepository(
-      options.dataDirectory,
-      environment.repositoryDirectory ?? process.cwd(),
-    );
+    // Only an omitted data directory is the default; a named one is used as
+    // given. The default must lie outside the repository.
+    if (!environment.args.includes("--data-dir")) {
+      requireDefaultOutsideRepository(options.dataDirectory, repositoryDirectory(import.meta.url));
+    }
   } catch (error) {
     if (error instanceof CliError || error instanceof StartupError) {
       environment.stderr(`Error: ${error.message}`);
@@ -394,7 +420,6 @@ export function cliEnvironment(args: readonly string[]): CliEnvironment {
     stdout: (line) => process.stdout.write(`${line}\n`),
     stderr: (line) => process.stderr.write(`${line}\n`),
     defaultDataDirectory: defaultDataDirectory(),
-    repositoryDirectory: process.cwd(),
     start: startApplication,
     onShutdown: (handler) => {
       const stop = (): void => {

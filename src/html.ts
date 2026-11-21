@@ -183,14 +183,13 @@ export function renderForm(options: {
         const selected = option.value === value ? " selected" : "";
         return `<option value="${escapeHtml(option.value)}"${selected}>${escapeHtml(option.label)}</option>`;
       });
-      // A re-rendered form shows exactly what was submitted. When the value is
-      // not one of the known choices it is kept as a visible marked option
-      // rather than silently showing a different choice, so the user can see
-      // the rejected value and correct it.
-      const known = options.some((option) => option.value === value);
-      if (value !== "" && !known) {
+      // A re-rendered form shows exactly what was submitted. A value that is
+      // not one of the known choices (an explicitly empty one included) is kept
+      // as a visible, selected, marked option rather than silently showing a
+      // different choice, so the user can see the rejected value and correct it.
+      if (!options.some((option) => option.value === value)) {
         choices.push(
-          `<option value="${escapeHtml(value)}" selected>${escapeHtml(value)} (not a valid choice)</option>`,
+          `<option value="${escapeHtml(value)}" selected>${escapeHtml(value === "" ? "(not a valid choice)" : value + " (not a valid choice)")}</option>`,
         );
       }
       parts.push(
