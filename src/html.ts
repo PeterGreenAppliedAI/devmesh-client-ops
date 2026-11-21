@@ -126,6 +126,12 @@ export interface FieldSpec {
   /** Value shown when the form is first displayed. */
   readonly value?: string;
   readonly required?: boolean;
+  /**
+   * True for a fixed, server-chosen field that must still appear in the
+   * submitted values (for example a record id an edit posts back) but is not
+   * shown as a control. Its value travels in a hidden input, always escaped.
+   */
+  readonly hidden?: boolean;
 }
 
 /**
@@ -151,6 +157,16 @@ export function renderForm(options: {
   parts.push(`<form method="post" action="${escapeHtml(options.action)}">`);
   for (const field of options.fields) {
     const value = values[field.name] ?? field.value ?? "";
+    if (field.hidden) {
+      // A hidden control carries the server-chosen value; the submitted value
+      // is shown if the form was re-rendered after an error, otherwise the
+      // fixed value the server put on the form.
+      const hiddenValue = values[field.name] ?? field.value ?? "";
+      parts.push(
+        `<input type="hidden" name="${escapeHtml(field.name)}" value="${escapeHtml(hiddenValue)}">`,
+      );
+      continue;
+    }
     const error = errors.find((candidate) => candidate.field === field.name);
     const id = `field-${escapeHtml(field.name)}`;
     parts.push(`<div>`);
@@ -195,10 +211,25 @@ const REDIRECT_HEADERS: Readonly<Record<string, string>> = Object.freeze({
 });
 
 /**
- * The internal routes a redirect may target: the server's own fixed route
- * paths, never a destination taken from a request.
+ * The fixed route families a redirect may target: the server's own route
+ * paths, never a destination taken from a request. The hierarchy detail routes
+ * carry a record id in their path, which is always a server-chosen id of a
+ * record that exists in the store, escaped through `redirect`, and matched
+ * against these exact segment shapes.
  */
 const INTERNAL_REDIRECT_PATHS: readonly string[] = Object.freeze(["/", "/health"]);
+const INTERNAL_REDIRECT_PATTERNS: readonly RegExp[] = Object.freeze([
+  /^\/clients\/[A-Za-z0-9_-]+$/,
+  /^\/engagements\/[A-Za-z0-9_-]+$/,
+  /^\/projects\/[A-Za-z0-9_-]+$/,
+]);
+
+function isInternalPath(pathname: string): boolean {
+  return (
+    INTERNAL_REDIRECT_PATHS.includes(pathname) ||
+    INTERNAL_REDIRECT_PATTERNS.some((pattern) => pattern.test(pathname))
+  );
+}
 
 /**
  * Build a redirect to a server-chosen destination. The destination must be an
@@ -236,7 +267,7 @@ export function redirect(location: string): Redirect {
     throw new Error("Redirect destinations must be internal routes");
   }
   // Only the server's own fixed route paths are valid destinations.
-  if (!INTERNAL_REDIRECT_PATHS.includes(target.pathname)) {
+  if (!isInternalPath(target.pathname)) {
     throw new Error("Redirect destinations must be internal routes");
   }
   return {
