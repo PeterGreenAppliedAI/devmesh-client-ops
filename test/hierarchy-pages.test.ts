@@ -1186,6 +1186,17 @@ describe("hierarchy pages", () => {
       assert.equal(engagementControls.get("id"), engagement.id);
       assert.equal(engagementControls.get("objectives"), "new objectives");
       assert.equal(engagementControls.get("status"), "active");
+      // Invalid input changes nothing: the URL record and the submitted record
+      // still hold their names and the URL record keeps its objectives.
+      const afterBadEngagement = server.store.snapshot();
+      assert.equal(
+        afterBadEngagement.engagements.find((e) => e.id === otherEngagement.id)?.name,
+        "Other",
+      );
+      assert.equal(
+        afterBadEngagement.engagements.find((e) => e.id === engagement.id)?.objectives,
+        "engagement objectives",
+      );
       const project = await server.store.createProject({
         engagementId: engagement.id,
         name: "Prototype",
@@ -1208,6 +1219,14 @@ describe("hierarchy pages", () => {
       assert.equal(projectControls.get("name"), "Prototype");
       assert.equal(projectControls.get("objectives"), "project objectives");
       assert.equal(projectControls.get("status"), "completed");
+      // Invalid input changes nothing: the other project keeps its name and
+      // the URL project keeps its planned status.
+      const afterBadProject = server.store.snapshot();
+      assert.equal(
+        afterBadProject.projects.find((p) => p.id === otherProject.id)?.name,
+        "Other project",
+      );
+      assert.equal(afterBadProject.projects.find((p) => p.id === project.id)?.status, "planned");
       // Correcting and resubmitting the rendered engagement form saves the
       // record the URL names, not the submitted id.
       const correctedEngagement = await send(server.origin, {
@@ -1223,7 +1242,9 @@ describe("hierarchy pages", () => {
       });
       assert.equal(redirectTarget(correctedProject), `/projects/${project.id}`);
       const after = server.store.snapshot();
+      assert.equal(after.engagements.find((e) => e.id === otherEngagement.id)?.name, "Other");
       assert.equal(after.engagements.find((e) => e.id === otherEngagement.id)?.objectives, "");
+      assert.equal(after.projects.find((p) => p.id === otherProject.id)?.name, "Other project");
       assert.equal(after.projects.find((p) => p.id === otherProject.id)?.status, "planned");
       assert.equal(after.engagements.find((e) => e.id === engagement.id)?.objectives, "new objectives");
       assert.equal(after.projects.find((p) => p.id === project.id)?.status, "completed");
