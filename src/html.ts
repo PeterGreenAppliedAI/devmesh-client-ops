@@ -25,10 +25,23 @@ export function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (char) => HTML_ESCAPES[char] ?? char);
 }
 
-/** A rendered page: the document and the response headers it must carry. */
+import { renderLayoutDocument, type LayoutContext } from "./layout.ts";
+
+/**
+ * A rendered page: the document and the response headers it must carry.
+ *
+ * `title` and `body` are the structured parts `renderPage` built from. The
+ * server response boundary reads them to wrap the page in the shared layout
+ * when the page was rendered without explicit context; a page that already
+ * carries `layout` is sent as it was rendered. Both are optional so a caller
+ * that supplies its own raw `html` is never re-wrapped.
+ */
 export interface Page {
   readonly html: string;
   readonly headers: Readonly<Record<string, string>>;
+  readonly title?: string;
+  readonly body?: string;
+  readonly layout?: LayoutContext;
 }
 
 /**
@@ -42,8 +55,26 @@ export const PAGE_HEADERS: Readonly<Record<string, string>> = Object.freeze({
   "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
 });
 
-/** Render a complete document around a body, escaped title included. */
-export function renderPage(title: string, body: string): Page {
+/**
+ * Render a complete document around a body, escaped title included.
+ *
+ * With an explicit layout context the document is the shared application
+ * shell (skip link, navigation, location header, one main landmark). Without
+ * context the page is still a complete, usable document, so existing callers
+ * and tests keep working; the server fills in the layout at the response
+ * boundary from the accepted route and the authoritative snapshot and keeps
+ * the page's own headers, which are always `PAGE_HEADERS`.
+ */
+export function renderPage(title: string, body: string, layout?: LayoutContext): Page {
+  if (layout !== undefined) {
+    return {
+      html: renderLayoutDocument(layout, title, body),
+      headers: PAGE_HEADERS,
+      title,
+      body,
+      layout,
+    };
+  }
   const html = [
     "<!doctype html>",
     '<html lang="en">',
@@ -59,7 +90,7 @@ export function renderPage(title: string, body: string): Page {
     "</body>",
     "</html>",
   ].join("\n");
-  return { html, headers: PAGE_HEADERS };
+  return { html, headers: PAGE_HEADERS, title, body };
 }
 
 /** One correctable field problem: the field, its message and the submitted value. */
@@ -104,7 +135,11 @@ export class FormError extends Error {
  * a complete page. It is only rendered by the server, after a route reported a
  * `FormError`; every value in it is escaped.
  */
-export function renderFormError(error: FormError, title = "Check the form"): Page {
+export function renderFormError(
+  error: FormError,
+  title = "Check the form",
+  layout?: LayoutContext,
+): Page {
   const body = renderForm({
     action: error.action,
     fields: error.fields,
@@ -113,7 +148,7 @@ export function renderFormError(error: FormError, title = "Check the form"): Pag
     summary: error.message,
     submitLabel: "Try again",
   });
-  return renderPage(title, body);
+  return renderPage(title, body, layout);
 }
 
 /** Definition of one form control. */
