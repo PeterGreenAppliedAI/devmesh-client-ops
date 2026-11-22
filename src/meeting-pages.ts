@@ -362,6 +362,7 @@ function formFailure(
   fields: readonly FieldSpec[],
   action: string,
   record?: Readonly<Record<string, string>>,
+  notice = "",
 ): FormError | null {
   if (!(error instanceof ValidationError) && !(error instanceof MissingRecordError)) {
     return null;
@@ -387,7 +388,7 @@ function formFailure(
     ? undefined
     : { field: "projectId", value: selectedProject };
   const errors = fieldErrorsFor(error.message, filled, fields, selected);
-  return new FormError(error.message, filled, errors, fields, action);
+  return new FormError(error.message, filled, errors, fields, action).withNotice(notice);
 }
 
 /** A record id from a path that names no record: a missing record. */
@@ -660,7 +661,7 @@ export function meetingRoutes(store: Store): MeetingRoutes {
       const meeting = await store.createMeeting(input as MeetingCreate);
       return redirect(`/meetings/${encodeURIComponent(meeting.id)}`);
     } catch (error) {
-      const failure = formFailure(error, values, fields, action);
+      const failure = formFailure(error, values, fields, action, undefined, archiveNotice(snap, scope.engagement));
       if (failure !== null) throw failure;
       throw error;
     }
@@ -724,7 +725,14 @@ export function meetingRoutes(store: Store): MeetingRoutes {
       await store.updateMeeting(meeting.id, meetingEdit(values, false));
       return redirect(`/meetings/${encodeURIComponent(meeting.id)}`);
     } catch (error) {
-      const failure = formFailure(error, values, target.fields, target.action, stored);
+      const failure = formFailure(
+        error,
+        values,
+        target.fields,
+        target.action,
+        stored,
+        archiveNotice(target.snap, target.record),
+      );
       if (failure !== null) throw failure;
       throw error;
     }

@@ -599,7 +599,7 @@ describe("archived discovery page", () => {
     }
   });
 
-  it("groups inherited-only records, including hidden meetings, under their archived ancestor", async () => {
+  it("groups inherited-only records, including hidden meetings, under their own families with ancestry", async () => {
     const server = await running();
     try {
       const s = await seed(server.store);
@@ -615,24 +615,39 @@ describe("archived discovery page", () => {
 
       const reply = await send(server.origin, { path: "/archived" });
       assert.equal(reply.status, 200);
-      // The client is the only own-flag record; the rest sit under Clients and
-      // link to the archived client for restoration.
+      // Every hidden record sits under its own family heading, and meetings are
+      // a family too.
       const groups = archivedGroups(server.store.snapshot());
-      assert.deepEqual(groups.map((group) => group.title), ["Clients"]);
-      const inherited = groups[0].entries.filter((entry) => entry.inheritedOnly);
+      assert.deepEqual(groups.map((group) => group.title), [
+        "Clients",
+        "Engagements",
+        "Projects",
+        "Tasks",
+        "Work items",
+        "Meetings",
+      ]);
+      const inherited = groups
+        .filter((group) => group.family !== "clients")
+        .flatMap((group) => group.entries);
       assert.deepEqual(
         inherited.map((entry) => entry.family).sort(),
         ["engagements", "engagements", "items", "meetings", "projects", "tasks"],
         "the engagement, project, task, item and meeting are inherited-only",
       );
       for (const entry of inherited) {
-        assert.equal(entry.entry.href, `/clients/${s.client.id}`, "inherited entry links to the ancestor");
+        assert.equal(entry.inheritedOnly, true);
         assert.ok(entry.reason.startsWith("client:"), entry.reason);
+        // Each entry keeps its own detail link and lists the archived ancestor
+        // to restore, so the entry itself stays reachable.
+        assert.ok(!entry.entry.href.startsWith("/clients/"), `${entry.family} keeps its own link`);
+        assert.match(String(entry.entry.trailing), new RegExp(`href="/clients/${s.client.id}"`));
       }
-      // The hidden meeting is discoverable on the page and links to the client.
+      // The hidden meeting is discoverable on the page under Meetings, with its
+      // own detail link and a link to the archived client for restoration.
+      assert.match(reply.body, /<section><h2>Meetings<\/h2>/);
       assert.ok(containsEscaped(reply.body, s.meeting.title), "hidden meeting is discoverable");
-      assert.match(reply.body, new RegExp(`href="/clients/${s.client.id}"`));
-      assert.ok(!reply.body.includes(`href="/meetings/${s.meeting.id}"`), "inherited meeting links to its ancestor");
+      assert.match(reply.body, new RegExp(`href="/meetings/${s.meeting.id}"`), "meeting keeps its detail link");
+      assert.match(reply.body, new RegExp(`href="/clients/${s.client.id}"`), "meeting links its archived ancestor");
     } finally {
       await server.close();
     }
@@ -645,10 +660,23 @@ describe("archived discovery page", () => {
       await server.store.setArchived("engagement", s.engagement.id, true);
       const groups = archivedGroups(server.store.snapshot());
       const engagements = groups.find((group) => group.family === "engagements")!;
-      const project = engagements.entries.find((entry) => entry.family === "projects")!;
-      assert.equal(project.inheritedOnly, true);
-      assert.equal(project.reason, `engagement:${s.engagement.id}`);
-      assert.equal(project.entry.href, `/engagements/${s.engagement.id}`);
+      // The archived engagement itself is an own-flag entry.
+      const own = engagements.entries.find((entry) => entry.family === "engagements")!;
+      assert.equal(own.inheritedOnly, false);
+      assert.equal(own.entry.href, `/engagements/${s.engagement.id}`);
+      // The project, task, item and meeting it hides are in their own families.
+      const projects = groups.find((group) => group.family === "projects")!;
+      const inheritedProject = projects.entries[0];
+      assert.equal(inheritedProject.family, "projects");
+      assert.equal(inheritedProject.inheritedOnly, true);
+      assert.equal(inheritedProject.reason, `engagement:${s.engagement.id}`);
+      assert.equal(inheritedProject.entry.href, `/projects/${s.project.id}`);
+      assert.match(String(inheritedProject.entry.trailing), new RegExp(`href="/engagements/${s.engagement.id}"`));
+      const tasks = groups.find((group) => group.family === "tasks")!;
+      assert.equal(tasks.entries[0].reason, `engagement:${s.engagement.id}`);
+      const meetings = groups.find((group) => group.family === "meetings")!;
+      assert.equal(meetings.entries[0].family, "meetings");
+      assert.match(String(meetings.entries[0].entry.trailing), new RegExp(`href="/engagements/${s.engagement.id}"`));
     } finally {
       await server.close();
     }
@@ -997,9 +1025,18 @@ describe("restoring ancestors preserves child flags", () => {
       await server.store.setArchived("task", s.task.id, true);
 
       // Before restoring the client, the task is listed under its own family
-      // (its nearest archive is its own flag), and no other record is.
+      // (its nearest archive is its own flag); the records it does not link
+      // to are unaffected, while those hidden through the client sit in their
+      // own families as inherited-only entries.
       const before = archivedGroups(server.store.snapshot());
-      assert.deepEqual(before.map((group) => group.title), ["Clients", "Tasks"]);
+      assert.deepEqual(before.map((group) => group.title), [
+        "Clients",
+        "Engagements",
+        "Projects",
+        "Tasks",
+        "Work items",
+        "Meetings",
+      ]);
       const taskEntry = before.find((group) => group.family === "tasks")!.entries[0];
       assert.equal(taskEntry.inheritedOnly, false);
       assert.equal(taskEntry.reason, "self");
@@ -1023,5 +1060,253 @@ describe("restoring ancestors preserves child flags", () => {
     } finally {
       await server.close();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Overviews and rollups hide effective archives too
+// ---------------------------------------------------------------------------
+
+describe("overviews and rollups agree with the lists", () => {
+  it("hides effectively archived engagements, projects and work from the client overview", async () => {
+    const server = await running();
+    try {
+      const s = await seed(server.store);
+      // Archiving the project hides its task, item and meeting through it, and
+      // archiving the sibling engagement hides that engagement itself.
+      await server.store.setArchived("project", s.project.id, true);
+      await server.store.setArchived("engagement", s.siblingEngagement.id, true);
+
+      const overview = await send(server.origin, { path: `/clients/${s.client.id}` });
+      assert.equal(overview.status, 200);
+      assert.ok(!overview.body.includes(`href="/projects/${s.project.id}"`), "archived project hidden from projects");
+      assert.ok(!overview.body.includes(`href="/tasks/${s.task.id}"`), "inherited task hidden from tasks");
+      assert.ok(!overview.body.includes(`href="/items/${s.item.id}"`), "inherited item hidden from items");
+      assert.ok(!overview.body.includes(`href="/meetings/${s.meeting.id}"`), "inherited meeting hidden from history");
+      assert.ok(
+        !overview.body.includes(`href="/engagements/${s.siblingEngagement.id}"`),
+        "archived engagement hidden from the overview",
+      );
+      // The active engagement stays listed and the overview's tallies agree:
+      // its own engagement-only work is empty and only visible records count.
+      assert.ok(overview.body.includes(`href="/engagements/${s.engagement.id}"`));
+      assert.match(overview.body, /<li>open: 0<\/li>/);
+
+      // Archiving the client hides everything the overview would list, while
+      // the detail page itself stays usable.
+      await server.store.setArchived("client", s.client.id, true);
+      const archived = await send(server.origin, { path: `/clients/${s.client.id}` });
+      assert.equal(archived.status, 200);
+      assert.ok(archived.body.includes("This record is archived"));
+      assert.match(archived.body, /No engagements yet\./);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("hides effectively archived projects and their work from the engagement page", async () => {
+    const server = await running();
+    try {
+      const s = await seed(server.store);
+      await server.store.setArchived("project", s.project.id, true);
+      await server.store.setArchived("engagement", s.siblingEngagement.id, true);
+      const page = await send(server.origin, { path: `/engagements/${s.engagement.id}` });
+      assert.equal(page.status, 200);
+      assert.ok(!page.body.includes(`href="/projects/${s.project.id}"`), "archived project hidden from the list");
+      assert.ok(!page.body.includes("<h2>Project Prototype"), "archived project has no section");
+      assert.ok(!page.body.includes(`href="/tasks/${s.task.id}"`), "inherited task hidden from engagement work");
+      assert.ok(!page.body.includes(`href="/items/${s.item.id}"`), "inherited item hidden");
+      assert.ok(!page.body.includes(`href="/meetings/${s.meeting.id}"`), "inherited meeting hidden");
+      assert.match(page.body, /<li>open: 0<\/li>/);
+      assert.equal(flagOf(server.store, "tasks", s.task.id), undefined, "no cascade to the task");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("counts only visible records on the home page, including meetings", async () => {
+    const server = await running();
+    try {
+      const s = await seed(server.store);
+      const before = await send(server.origin, { path: "/" });
+      assert.equal(before.status, 200);
+      assert.match(before.body, /clients 2, engagements 2, projects 1, tasks 1, items 1, meetings 1\./);
+      // Archive the client: all its records, the meetings included, stop
+      // counting; the unrelated client still does.
+      await server.store.setArchived("client", s.client.id, true);
+      const after = await send(server.origin, { path: "/" });
+      assert.match(
+        after.body,
+        /clients 1, engagements 0, projects 0, tasks 0, items 0, meetings 0\./,
+        "the home rollup hides effective archives",
+      );
+      // Restoring the client brings them back into the counts.
+      await server.store.setArchived("client", s.client.id, false);
+      const restored = await send(server.origin, { path: "/" });
+      assert.match(restored.body, /clients 2, engagements 2, projects 1, tasks 1, items 1, meetings 1\./);
+    } finally {
+      await server.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A client's archive target identity
+// ---------------------------------------------------------------------------
+
+describe("archive conflicts compare the client's own identity", () => {
+  it("accepts a matching clientId and refuses an empty or foreign one", async () => {
+    const server = await running();
+    try {
+      const s = await seed(server.store);
+      const target = `/clients/${s.client.id}/archive`;
+      const conflicting: Record<string, string>[] = [{ clientId: "" }, { clientId: s.otherClient.id }, { id: s.otherClient.id }];
+      for (const form of conflicting) {
+        const reply = await send(server.origin, { method: "POST", path: target, form });
+        assert.equal(reply.status, 400, JSON.stringify(form));
+        assert.match(String(reply.headers["content-type"]), /^text\/plain/);
+        assert.equal(flagOf(server.store, "clients", s.client.id), undefined);
+      }
+      const accepted = await send(server.origin, {
+        method: "POST",
+        path: target,
+        form: { id: s.client.id, clientId: s.client.id, engagementId: "", projectId: "" },
+      });
+      assert.equal(accepted.status, 303, "the client's own identity is accepted");
+      assert.equal(redirectTarget(accepted), `/clients/${s.client.id}`);
+      assert.equal(flagOf(server.store, "clients", s.client.id), true);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("compares identity against the current ancestry, not the target's own fields", () => {
+    const expected = { id: "client-1", clientId: "client-1", engagementId: "", projectId: "" };
+    assert.equal(archiveConflict({ clientId: "client-1" }, expected, "client"), null);
+    const conflict = archiveConflict({ clientId: "" }, expected, "client");
+    assert.ok(conflict !== null);
+    assert.equal(conflict.name, "ValidationError");
+    assert.match(conflict.message, /clientId/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A refused save on an archived record's form keeps its notice
+// ---------------------------------------------------------------------------
+
+describe("archived forms keep their notice on a correctable refusal", () => {
+  it("keeps the archive notice on refused edits of archived records", async () => {
+    const server = await running();
+    try {
+      const s = await seed(server.store);
+      await server.store.setArchived("client", s.client.id, true);
+      // A blank name is refused; the corrected page still shows the notice.
+      for (const path of [
+        `/clients/${s.client.id}/edit`,
+        `/engagements/${s.engagement.id}/edit`,
+        `/projects/${s.project.id}/edit`,
+        `/tasks/${s.task.id}/edit`,
+        `/items/${s.item.id}/edit`,
+      ]) {
+        const reply = await send(server.origin, { method: "POST", path, form: { name: "", title: "" } });
+        assert.equal(reply.status, 400, path);
+        assert.match(String(reply.headers["content-type"]), /^text\/html/, path);
+        assert.ok(reply.body.includes("This record is archived"), `${path} keeps the notice`);
+        assert.ok(reply.body.includes("Check the form"), `${path} is still correctable`);
+      }
+      // The stored client is untouched by the refused edits.
+      assert.equal(flagOf(server.store, "clients", s.client.id), true);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("keeps the ancestor notice on a refused meeting edit of an archived project", async () => {
+    const server = await running();
+    try {
+      const s = await seed(server.store);
+      await server.store.setArchived("project", s.project.id, true);
+      const reply = await send(server.origin, {
+        method: "POST",
+        path: `/meetings/${s.meeting.id}/edit`,
+        form: { title: "" },
+      });
+      assert.equal(reply.status, 400);
+      assert.ok(reply.body.includes("This record is archived"));
+      assert.match(reply.body, new RegExp(`href="/projects/${s.project.id}"`));
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("keeps an archived client's notice on a refused engagement create", async () => {
+    const server = await running();
+    try {
+      const s = await seed(server.store);
+      await server.store.setArchived("client", s.client.id, true);
+      const reply = await send(server.origin, {
+        method: "POST",
+        path: "/engagements/new",
+        form: { clientId: s.client.id, name: "" },
+      });
+      assert.equal(reply.status, 400);
+      assert.ok(reply.body.includes("This record is archived"), "the client's notice is kept");
+      assert.match(reply.body, new RegExp(`action="/clients/${s.client.id}/unarchive"`));
+      // No engagement was created by the refused submission.
+      assert.deepEqual(
+        server.store.snapshot().engagements.map((engagement) => engagement.name).sort(),
+        ["Discovery & design", "Sibling <eng>"],
+      );
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("keeps the parent's notice on a refused create under an archived engagement", async () => {
+    const server = await running();
+    try {
+      const s = await seed(server.store);
+      await server.store.setArchived("engagement", s.engagement.id, true);
+      for (const path of [`/engagements/${s.engagement.id}/tasks/new`, `/engagements/${s.engagement.id}/items/new`]) {
+        const reply = await send(server.origin, {
+          method: "POST",
+          path,
+          form: { engagementId: s.engagement.id, title: "" },
+        });
+        assert.equal(reply.status, 400, path);
+        assert.ok(reply.body.includes("This record is archived"), `${path} keeps the parent's notice`);
+      }
+      // The same holds for a refused meeting create under the archived project:
+      // the notice names the archived ancestor.
+      await server.store.setArchived("project", s.project.id, true);
+      const meetingCreate = await send(server.origin, {
+        method: "POST",
+        path: `/projects/${s.project.id}/meetings/new`,
+        form: { engagementId: s.engagement.id, title: "", date: "" },
+      });
+      assert.equal(meetingCreate.status, 400);
+      assert.ok(meetingCreate.body.includes("This record is archived"));
+      assert.match(meetingCreate.body, new RegExp(`href="/projects/${s.project.id}"`));
+    } finally {
+      await server.close();
+    }
+  });
+});
+
+describe("a corrected form error keeps an attached notice above the form", () => {
+  it("renders the notice, the submitted values and the field messages together", async () => {
+    const { FormError, renderFormError } = await import("../src/html.ts");
+    const fields = [{ name: "name", label: "Name" }];
+    const notice = '<div class="archive-notice" role="status"><p>This record is archived.</p></div>';
+    const error = new FormError("Check", { name: "" }, [{ field: "name", message: "Name is required", value: "" }], fields, "/clients/c-1/edit");
+    assert.equal(error.notice, "", "a form error starts without a notice");
+    error.withNotice(notice);
+    const page = renderFormError(error);
+    assert.ok(page.html.includes(notice), "the notice is shown above the form");
+    assert.ok(page.html.indexOf(notice) < page.html.indexOf('<form method="post"'), "notice precedes the form");
+    assert.match(page.html, /Name is required/);
+    assert.match(page.html, /action="\/clients\/c-1\/edit"/);
+    // The notice never replaces the form's own messages or values.
+    assert.match(page.html, /value=""/);
   });
 });

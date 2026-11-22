@@ -18,7 +18,7 @@
  * grouped with the family of their nearest archived ancestor; a meeting hidden
  * only by its parents links to those archived ancestors for restoration.
  */
-import { archivedReason, ancestorsOf, isEffectivelyArchived, type ArchiveRecord } from "./archive.ts";
+import { ancestorsOf, archivedReason, hasArchivedFlag, isEffectivelyArchived, type ArchiveRecord } from "./archive.ts";
 import { escapeHtml, redirect, type Page, type Redirect } from "./html.ts";
 import { MissingRecordError, ValidationError } from "./model.ts";
 import type {
@@ -184,7 +184,9 @@ function expectedLinks(
   switch (family) {
     case "clients": {
       const client = found(snapshot.clients, "client") as Client;
-      return { id: client.id, clientId: "", engagementId: "", projectId: "" };
+      // A client is its own client: a supplied clientId must name it, and an
+      // empty clientId is a conflict. It names no engagement or project.
+      return { id: client.id, clientId: client.id, engagementId: "", projectId: "" };
     }
     case "engagements": {
       const engagement = found(snapshot.engagements, "engagement") as Engagement;
@@ -261,6 +263,17 @@ export function archiveConflict(
 function detailPath(family: ArchiveFamily, id: string): string {
   return `/${family}/${encodeURIComponent(id)}`;
 }
+
+/**
+ * The records of a family that are not effectively archived. This is the one
+ * selection every active view applies: lists, rollups, counts and histories
+ * use it, so they always agree on what is visible. Direct lookups (a record's
+ * own detail, edit or create page) use the full snapshot instead.
+ */
+export function visibleRecords<T extends ArchiveRecord>(snapshot: Snapshot, records: readonly T[]): readonly T[] {
+  return records.filter((record) => !isEffectivelyArchived(snapshot, record));
+}
+
 
 const FLAG_OF_ACTION: Readonly<Record<ArchiveAction, boolean>> = Object.freeze({
   archive: true,
@@ -360,6 +373,18 @@ export function archiveNotice(
   return parts.join("\n");
 }
 
+/**
+ * The archive notice for a record a write targets, or an empty string when the
+ * record is not effectively archived. The corrected page shows the same notice
+ * the record's own form shows (with its restore control), so an archived
+ * record's edit or create form stays usable and clearly marked after a refused
+ * submission. A record that is not effectively archived has no notice.
+ */
+export function archiveNoticeFor(snapshot: Snapshot, record: ArchiveRecord & { readonly name?: string }, family: ArchiveFamily): string {
+  if (!isEffectivelyArchived(snapshot, record)) return "";
+  return archiveNotice(snapshot, record, { family });
+}
+
 // ---------------------------------------------------------------------------
 // The /archived discovery page
 // ---------------------------------------------------------------------------
@@ -375,17 +400,20 @@ export interface ArchivedEntry {
    * detail link is to that archived ancestor, where restoration is offered.
    */
   readonly inheritedOnly: boolean;
-  /** The detail link, with its reason badge and, when inherited, the ancestor. */
+  /** The detail link, with its reason badge and, when inherited, the ancestry. */
   readonly entry: ListEntry;
 }
 
-/** The family headings of the discovery page, in hierarchy order. */
-const FAMILY_HEADINGS: readonly { readonly family: ArchiveFamily; readonly title: string }[] = [
+/** The headings of the discovery page, in hierarchy order: five families and meetings. */
+type ArchivedGroupFamily = ArchiveFamily | "meetings";
+
+const FAMILY_HEADINGS: readonly { readonly family: ArchivedGroupFamily; readonly title: string }[] = [
   { family: "clients", title: "Clients" },
   { family: "engagements", title: "Engagements" },
   { family: "projects", title: "Projects" },
   { family: "tasks", title: "Tasks" },
   { family: "items", title: "Work items" },
+  { family: "meetings", title: "Meetings" },
 ];
 
 /** A human phrase for a record's archive reason. */
@@ -396,38 +424,25 @@ function reasonText(reason: string): string {
   return `archived through ${label} ${rest.join(":")}`;
 }
 
-/** The family a reason's archived ancestor belongs to. */
-function reasonFamily(reason: string): ArchiveFamily {
-  const kind = reason.split(":")[0];
-  return kind === "client" ? "clients" : kind === "engagement" ? "engagements" : "projects";
-}
+/** The archived ancestor's family by hierarchy position: client, engagement, project. */
+const ANCESTOR_FAMILIES: readonly ArchiveFamily[] = ["clients", "engagements", "projects"];
 
 /**
- * The detail link of the archived ancestor a reason names, or undefined when
- * that ancestor is no longer stored. This is the link an inherited-only entry
- * carries so restoration happens on the archived ancestor's own page.
+ * The detail links of a record's current stored archived ancestors, most
+ * significant first (client, engagement, project). An inherited-only entry
+ * carries these so its ancestry is visible and each ancestor can be opened for
+ * restoration. It is empty for a record archived by its own flag.
  */
-function ancestorEntry(snapshot: Snapshot, reason: string): ListEntry | undefined {
-  const [kind, ...rest] = reason.split(":");
-  const id = rest.join(":");
-  if (kind === "client") {
-    const client = snapshot.clients.find((candidate) => candidate.id === id);
-    return client === undefined
-      ? undefined
-      : { href: detailPath("clients", client.id), label: client.name };
+function ancestryLinks(snapshot: Snapshot, record: ArchiveRecord): readonly ListEntry[] {
+  const links: ListEntry[] = [];
+  for (const [index, ancestor] of ancestorsOf(snapshot, record).entries()) {
+    if (!hasArchivedFlag(ancestor)) continue;
+    const family = ANCESTOR_FAMILIES[index];
+    const name = (ancestor as { readonly name?: string }).name ?? ancestor.id;
+    links.push({ href: detailPath(family, ancestor.id), label: name });
   }
-  if (kind === "engagement") {
-    const engagement = snapshot.engagements.find((candidate) => candidate.id === id);
-    return engagement === undefined
-      ? undefined
-      : { href: detailPath("engagements", engagement.id), label: engagement.name };
-  }
-  const project = snapshot.projects.find((candidate) => candidate.id === id);
-  return project === undefined
-    ? undefined
-    : { href: detailPath("projects", project.id), label: project.name };
+  return links;
 }
-
 /** One record to place on the discovery page. */
 interface DiscoveryCandidate {
   /** The record's own family heading ("meetings" for a meeting). */
@@ -446,16 +461,18 @@ interface DiscoveryCandidate {
  * family. This is the one place the rule is applied, for all five families and
  * for meetings, so the headings, badges and links always agree.
  *
- * A record hidden by its own flag sits under its own family heading and links
- * to its own detail page, where it is restored. A record hidden only through a
- * current stored ancestor (an inherited-only record, including a meeting, which
- * never carries a flag) sits under the heading of its nearest archived ancestor
- * and links to that ancestor's detail page, where restoration is offered;
- * restoring an ancestor can reveal its descendants but never changes their own
- * flags. Records appear once: the nearest archive decides the heading.
+ * A record is grouped under its own family heading (Clients, Engagements,
+ * Projects, Tasks, Work items or Meetings) and always links to its own detail
+ * page. Its reason names why it is hidden: `self` for its own flag, or the
+ * nearest archived ancestor. An inherited-only record (hidden only through a
+ * current stored ancestor, including a meeting, which never carries a flag)
+ * also lists each current stored archived ancestor, most significant first, with
+ * its own detail link, where that ancestor is restored; restoring an ancestor
+ * can reveal its descendants but never changes their own flags. Records appear
+ * exactly once.
  */
 export function archivedGroups(snapshot: Snapshot): readonly {
-  readonly family: ArchiveFamily;
+  readonly family: ArchivedGroupFamily;
   readonly title: string;
   readonly entries: readonly ArchivedEntry[];
 }[] {
@@ -472,21 +489,24 @@ export function archivedGroups(snapshot: Snapshot): readonly {
     const reason = archivedReason(snapshot, record);
     if (reason === null) return;
     const ownFlag = reason === "self";
-    // A meeting is never "self": it carries no flag, so it always sits under its
-    // nearest archived ancestor's family heading.
-    const heading: ArchiveFamily = ownFlag && candidate.family !== "meetings" ? candidate.family : reasonFamily(reason);
-    const group = byFamily.get(heading);
+    // Every record sits under the heading of its own family; nothing is moved
+    // to the ancestor's heading, so the groups are the families' own archives.
+    const group = byFamily.get(candidate.family);
     if (group === undefined) return;
-    const ancestor = ownFlag ? undefined : ancestorEntry(snapshot, reason);
-    // An inherited-only entry links to its archived ancestor; without one it
-    // still lists the record itself so it stays discoverable.
+    // An inherited-only entry keeps its own detail link and adds a link to each
+    // current stored archived ancestor, where restoration is offered.
+    const ancestry = ownFlag ? [] : ancestryLinks(snapshot, record);
     const entry: ListEntry = {
-      href: ancestor === undefined ? candidate.href : ancestor.href,
+      href: candidate.href,
       label: candidate.label,
       badges: [...(candidate.badges ?? []), reasonText(reason)],
-      ...(ancestor === undefined
+      ...(ancestry.length === 0
         ? {}
-        : { trailing: `${link(ancestor.href, ancestor.label)} — restore there` }),
+        : {
+            trailing: `${ancestry
+              .map((ancestor) => link(ancestor.href, ancestor.label))
+              .join(", ")} — restore archived ancestors there`,
+          }),
     };
     group.entries.push({
       family: candidate.family,

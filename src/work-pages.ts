@@ -24,8 +24,8 @@ import {
   type Page,
   type Redirect,
 } from "./html.ts";
-import { isEffectivelyArchived } from "./archive.ts";
-import { archiveControl, archiveNotice } from "./archive-pages.ts";
+import { isEffectivelyArchived, type ArchiveRecord } from "./archive.ts";
+import { archiveControl, archiveNotice, archiveNoticeFor, visibleRecords, type ArchiveFamily } from "./archive-pages.ts";
 import {
   ITEM_KINDS,
   ITEM_STATES,
@@ -770,8 +770,11 @@ function formFailure(
   values: Readonly<Record<string, string>>,
   fields: readonly FieldSpec[],
   action: string,
-  record?: Readonly<Record<string, string>>,
+  record?: ArchiveRecord | undefined,
   selected?: string,
+  snapshot?: Snapshot,
+  recordFamily: ArchiveFamily | null = null,
+  notice = "",
 ): FormError | null {
   if (!(error instanceof ValidationError) && !(error instanceof MissingRecordError)) {
     return null;
@@ -791,7 +794,14 @@ function formFailure(
     }
   }
   const errors = fieldErrorsFor(error.message, filled, fields, associateSelected(selected));
-  return new FormError(error.message, filled, errors, fields, action);
+  // A record hidden by an archive keeps its page marked after a refused save.
+  // A record hidden by an archive keeps its page marked after a refused save;
+  // a creation form under an archived scope carries the parent's notice.
+  const archive =
+    record === undefined || snapshot === undefined || recordFamily === null
+      ? ""
+      : archiveNoticeFor(snapshot, record, recordFamily);
+  return new FormError(error.message, filled, errors, fields, action).withNotice(archive + notice);
 }
 
 /**
@@ -1088,7 +1098,17 @@ export function workRoutes(store: Store): WorkRoutes {
       const task = await store.createTask(input as TaskCreate);
       return redirect(`/tasks/${encodeURIComponent(task.id)}`);
     } catch (error) {
-      const failure = formFailure(error, values, fields, action, undefined, values["projectId"]);
+      const failure = formFailure(
+        error,
+        values,
+        fields,
+        action,
+        undefined,
+        values["projectId"],
+        snap,
+        "tasks",
+        archiveNotice(snap, scope.engagement),
+      );
       if (failure !== null) throw failure;
       throw error;
     }
@@ -1119,7 +1139,17 @@ export function workRoutes(store: Store): WorkRoutes {
       const item = await store.createItem(input as WorkItemCreate);
       return redirect(`/items/${encodeURIComponent(item.id)}`);
     } catch (error) {
-      const failure = formFailure(error, values, fields, action, undefined, values["projectId"]);
+      const failure = formFailure(
+        error,
+        values,
+        fields,
+        action,
+        undefined,
+        values["projectId"],
+        snap,
+        "items",
+        archiveNotice(snap, scope.engagement),
+      );
       if (failure !== null) throw failure;
       throw error;
     }
@@ -1179,13 +1209,23 @@ export function workRoutes(store: Store): WorkRoutes {
     const target = editTarget(request, "tasks");
     const task = target.record as Task;
     const values = suppliedValues(request.form, target.fields);
-    const stored = taskFormValues(task);
+    const recordId = task.id;
+    const stored = target.snap.tasks.find((candidate) => candidate.id === recordId)!;
     try {
       if (target.conflict !== null) throw target.conflict;
       await store.updateTask(task.id, taskEdit(values, false));
       return redirect(`/tasks/${encodeURIComponent(task.id)}`);
     } catch (error) {
-      const failure = formFailure(error, values, target.fields, target.action, stored, values["projectId"]);
+      const failure = formFailure(
+        error,
+        values,
+        target.fields,
+        target.action,
+        stored,
+        values["projectId"],
+        target.snap,
+        "tasks",
+      );
       if (failure !== null) throw failure;
       throw error;
     }
@@ -1195,13 +1235,23 @@ export function workRoutes(store: Store): WorkRoutes {
     const target = editTarget(request, "items");
     const item = target.record as WorkItem;
     const values = suppliedValues(request.form, target.fields);
-    const stored = itemFormValues(item);
+    const recordId = item.id;
+    const stored = target.snap.items.find((candidate) => candidate.id === recordId)!;
     try {
       if (target.conflict !== null) throw target.conflict;
       await store.updateItem(item.id, itemEdit(values, false));
       return redirect(`/items/${encodeURIComponent(item.id)}`);
     } catch (error) {
-      const failure = formFailure(error, values, target.fields, target.action, stored, values["projectId"]);
+      const failure = formFailure(
+        error,
+        values,
+        target.fields,
+        target.action,
+        stored,
+        values["projectId"],
+        target.snap,
+        "items",
+      );
       if (failure !== null) throw failure;
       throw error;
     }

@@ -112,6 +112,13 @@ export class FormError extends Error {
   readonly fields: readonly FieldSpec[];
   /** The fixed internal destination the form posted to. */
   readonly action: string;
+  /**
+   * An escaped notice shown above the corrected form, such as a record's
+   * archive notice. A route sets it only when the record it corrects is
+   * effectively archived, so a refused submission on an archived record's
+   * edit or create page keeps its page marked and usable. Empty by default.
+   */
+  notice: string;
 
   constructor(
     message: string,
@@ -126,6 +133,16 @@ export class FormError extends Error {
     this.fieldErrors = fieldErrors.map((error) => ({ ...error }));
     this.fields = [...fields];
     this.action = action;
+    this.notice = "";
+  }
+  /**
+   * Attach the escaped notice to show above the corrected form and return the
+   * same error, so a route can add it in one expression. The validation message,
+   * field messages and values are untouched.
+   */
+  withNotice(notice: string): this {
+    this.notice = notice;
+    return this;
   }
 }
 
@@ -148,7 +165,9 @@ export function renderFormError(
     summary: error.message,
     submitLabel: "Try again",
   });
-  return renderPage(title, body, layout);
+  // A notice a route attached to the refusal is shown above the form; it is
+  // already escaped HTML, and it never replaces the form or its messages.
+  return renderPage(title, error.notice === "" ? body : `${error.notice}\n${body}`, layout);
 }
 
 /**

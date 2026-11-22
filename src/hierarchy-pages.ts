@@ -58,7 +58,7 @@ import {
   type PageSection,
   type WorkEntry,
 } from "./work-pages.ts";
-import { archiveControl, archiveNotice } from "./archive-pages.ts";
+import { archiveControl, archiveNotice, archiveNoticeFor, visibleRecords } from "./archive-pages.ts";
 import {
   clientMeetings,
   engagementMeetings,
@@ -406,11 +406,17 @@ function itemCardList(items: readonly WorkItem[]): string {
  */
 function clientShowPage(client: Client, snapshot: Snapshot, store: Store): Page {
   const clientId = client.id;
-  const engagements = snapshot.engagements.filter((engagement) => engagement.clientId === clientId);
+  const engagements = visibleRecords(
+    snapshot,
+    snapshot.engagements.filter((engagement) => engagement.clientId === clientId),
+  );
   const engagementIds = new Set(engagements.map((engagement) => engagement.id));
-  const projects = snapshot.projects.filter((project) => engagementIds.has(project.engagementId));
-  const tasks = store.listTasks({ clientId });
-  const items = store.listItems({ clientId });
+  const projects = visibleRecords(
+    snapshot,
+    snapshot.projects.filter((project) => engagementIds.has(project.engagementId)),
+  );
+  const tasks = visibleRecords(snapshot, store.listTasks({ clientId }));
+  const items = visibleRecords(snapshot, store.listItems({ clientId }));
 
   const engagementItems = engagements.map((engagement) => ({
     href: `/engagements/${encodeURIComponent(engagement.id)}`,
@@ -544,9 +550,10 @@ function clientShowPage(client: Client, snapshot: Snapshot, store: Store): Page 
 
 function engagementShowPage(engagement: Engagement, snapshot: Snapshot, store: Store): Page {
   const client = findRecord(snapshot.clients, engagement.clientId, "client");
-  const projects = snapshot.projects
-    .filter((project) => project.engagementId === engagement.id)
-    .map((project) => ({
+  const projects = visibleRecords(
+    snapshot,
+    snapshot.projects.filter((project) => project.engagementId === engagement.id),
+  ).map((project) => ({
       href: `/projects/${encodeURIComponent(project.id)}`,
       label: project.name,
       badges: [project.status],
@@ -597,7 +604,10 @@ function engagementShowPage(engagement: Engagement, snapshot: Snapshot, store: S
     ),
   );
 
-  for (const project of snapshot.projects.filter((candidate) => candidate.engagementId === engagementId)) {
+  for (const project of visibleRecords(
+    snapshot,
+    snapshot.projects.filter((candidate) => candidate.engagementId === engagementId),
+  )) {
     const work = projectWork(store, clientId, engagementId, project.id);
     sections.push({
       title: `Project ${project.name}`,
@@ -737,6 +747,7 @@ function formFailure(
   fields: readonly FieldSpec[],
   action: string,
   record?: object,
+  notice = "",
 ): FormError | null {
   if (!(error instanceof ValidationError)) return null;
   const base = record === undefined ? {} : editFormValues(record);
@@ -753,7 +764,7 @@ function formFailure(
     }
   }
   const errors = fieldErrorsFor(error.message, filled, fields);
-  return new FormError(error.message, filled, errors, fields, action);
+  return new FormError(error.message, filled, errors, fields, action).withNotice(notice);
 }
 
 function text(form: Readonly<Record<string, string>>, name: string): string {
@@ -855,7 +866,14 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
       await store.updateClient(client.id, values);
       return redirect(`/clients/${encodeURIComponent(client.id)}`);
     } catch (error) {
-      const failure = formFailure(error, values, fields, action, client);
+      const failure = formFailure(
+        error,
+        values,
+        fields,
+        action,
+        client,
+        archiveNoticeFor(snapshot(), client, "clients"),
+      );
       if (failure !== null) throw failure;
       throw error;
     }
@@ -875,7 +893,14 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
         ENGAGEMENT_FIELDS,
         hiddenParent("clientId", client.id, "Client"),
       );
-      const failure = formFailure(error, values, fields, "/engagements/new");
+      const failure = formFailure(
+        error,
+        values,
+        fields,
+        "/engagements/new",
+        undefined,
+        archiveNoticeFor(snapshot(), client, "clients"),
+      );
       if (failure !== null) throw failure;
       throw error;
     }
@@ -893,7 +918,14 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
       await store.updateEngagement(engagement.id, values);
       return redirect(`/engagements/${encodeURIComponent(engagement.id)}`);
     } catch (error) {
-      const failure = formFailure(error, values, fields, action, engagement);
+      const failure = formFailure(
+        error,
+        values,
+        fields,
+        action,
+        engagement,
+        archiveNoticeFor(snapshot(), engagement, "engagements"),
+      );
       if (failure !== null) throw failure;
       throw error;
     }
@@ -911,7 +943,14 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
         PROJECT_FIELDS,
         hiddenParent("engagementId", engagement.id, "Engagement"),
       );
-      const failure = formFailure(error, values, fields, "/projects/new");
+      const failure = formFailure(
+        error,
+        values,
+        fields,
+        "/projects/new",
+        undefined,
+        archiveNoticeFor(snapshot(), engagement, "engagements"),
+      );
       if (failure !== null) throw failure;
       throw error;
     }
@@ -929,7 +968,14 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
       await store.updateProject(project.id, values);
       return redirect(`/projects/${encodeURIComponent(project.id)}`);
     } catch (error) {
-      const failure = formFailure(error, values, fields, action, project);
+      const failure = formFailure(
+        error,
+        values,
+        fields,
+        action,
+        project,
+        archiveNoticeFor(snapshot(), project, "projects"),
+      );
       if (failure !== null) throw failure;
       throw error;
     }
