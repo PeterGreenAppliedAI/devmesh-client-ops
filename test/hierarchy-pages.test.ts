@@ -1253,45 +1253,75 @@ describe("hierarchy pages", () => {
       const client = await server.store.createClient({ name: "Acme" });
 
       // A client with no engagement: every empty work and history section
-      // offers creating the client's first engagement, and the guidance asks
-      // the user to choose or create one. Nothing links to a guessed parent.
+      // offers creating the client's first engagement, the only valid next
+      // step, and the guidance asks the user to choose or create one. Nothing
+      // links to a guessed parent.
       const empty = await send(server.origin, { path: `/clients/${client.id}` });
       assert.equal(empty.status, 200);
       assert.match(empty.body, /Choose an engagement to add them from its page\./);
-      const createEngagement = '<a href="/clients/' + client.id + '/engagements/new">New engagement</a>';
-      for (const title of ["Current tasks (open or in progress)", "Open blockers", "Open questions", "Decisions"]) {
+      assert.match(empty.body, /New engagement/);
+      const createEngagement = `<a href="/clients/${client.id}/engagements/new">New engagement</a>`;
+      for (const title of [
+        "Current tasks (open or in progress)",
+        "Open blockers",
+        "Open questions",
+        "Decisions",
+      ]) {
         const section = sectionOf(empty.body, title);
         assert.ok(section.includes("No "), title);
-        assert.ok(section.includes(createEngagement), title);
+        assert.ok(section.includes(createEngagement), `${title} offers the first engagement`);
       }
+      // Projects are created under an engagement, so the project list's empty
+      // state names that and offers the same first-engagement step.
+      const emptyProjects = sectionOf(empty.body, "Projects");
+      assert.match(emptyProjects, /No projects yet\./);
+      assert.ok(emptyProjects.includes(createEngagement));
+      // The next-step groups each end with the same valid next step.
+      const emptySteps = sectionOf(empty.body, "Next steps");
+      assert.match(emptySteps, /No open follow-ups\./);
+      assert.match(emptySteps, /No open commitments\./);
+      assert.match(emptySteps, /No open waiting items\./);
+      assert.equal(emptySteps.split(createEngagement).length - 1, 3);
       // The meeting history's empty state names the missing meetings and
       // offers creating the client's first engagement as the next step.
       const emptyHistory = sectionOf(empty.body, "Meeting history");
       assert.match(emptyHistory, /No meetings recorded yet\./);
       assert.ok(emptyHistory.includes(createEngagement));
-      assert.match(sectionOf(empty.body, "Next steps"), /No open follow-ups\./);
-      assert.match(sectionOf(empty.body, "Next steps"), /No open waiting items\./);
-      assert.ok(sectionOf(empty.body, "Next steps").includes(createEngagement));
       assert.ok(!empty.body.includes("/engagements//"));
 
       // A client with engagements: the empty sections ask the user to choose
-      // an engagement and link to a real engagement page, not directly to an
-      // engagement's creation forms.
+      // an engagement. The choice is the client's own engagement list (or a
+      // link to it), never a guessed first engagement and never a creation
+      // form under a guessed parent.
       const engagement = await server.store.createEngagement({ clientId: client.id, name: "Discovery" });
       const filled = await send(server.origin, { path: `/clients/${client.id}` });
       assert.equal(filled.status, 200);
-      for (const title of ["Current tasks (open or in progress)", "Open blockers", "Open questions", "Decisions"]) {
+      for (const title of [
+        "Current tasks (open or in progress)",
+        "Open blockers",
+        "Open questions",
+        "Decisions",
+      ]) {
         const section = sectionOf(filled.body, title);
-        assert.ok(section.includes("Choose an engagement"), title);
-        assert.ok(section.includes('<a href="/engagements/' + engagement.id + '">'), title);
+        assert.match(section, /Choose an engagement/, title);
+        assert.ok(section.includes(`<a href="/clients/${client.id}">Choose an engagement</a>`), title);
         assert.ok(!section.includes("/tasks/new"), title);
         assert.ok(!section.includes("/items/new"), title);
       }
+      const steps = sectionOf(filled.body, "Next steps");
+      assert.equal(steps.split(">Choose an engagement</a>").length - 1, 3);
+      assert.ok(!steps.includes(`/engagements/${engagement.id}"`));
       const history = sectionOf(filled.body, "Meeting history");
       assert.match(history, /No meetings recorded yet\./);
-      assert.ok(history.includes('<a href="/engagements/' + engagement.id + '">Choose an engagement</a>'));
+      assert.ok(history.includes('<a href="/clients/' + client.id + '">Choose an engagement</a>'));
       assert.ok(!history.includes('/engagements/' + engagement.id + '/meetings/new'));
       assert.ok(!filled.body.includes("/engagements//"));
+      // The work sections name the engagement in the client's own engagement
+      // list, which is the choice; the client's empty work sections never
+      // open it as if it had been chosen.
+      for (const title of ["Current tasks (open or in progress)", "Open blockers", "Open questions", "Decisions", "Meeting history"]) {
+        assert.ok(!sectionOf(filled.body, title).includes(`/engagements/${engagement.id}`), title);
+      }
     } finally {
       await server.close();
     }

@@ -320,7 +320,9 @@ function clientsListPage(snapshot: Snapshot): Page {
 /**
  * A linked list section: the page's one primary creation action (when given),
  * then the entries. When there are none, the empty state names what is missing
- * and offers the same creation action as the valid next step.
+ * and offers the same creation action as the valid next step, or the scope's
+ * own next step when the section cannot create its records directly (a
+ * client's project list asks for an engagement first).
  */
 function listSection(
   title: string,
@@ -329,6 +331,7 @@ function listSection(
     readonly newHref?: string;
     readonly newLabel?: string;
     readonly empty?: string;
+    readonly nextStep?: { readonly href: string; readonly label: string };
   } = {},
 ): PageSection {
   const body: string[] = [];
@@ -341,7 +344,7 @@ function listSection(
         options.empty,
         options.newHref !== undefined && options.newLabel !== undefined
           ? { href: options.newHref, label: options.newLabel }
-          : undefined,
+          : options.nextStep,
       ),
     );
   } else {
@@ -352,16 +355,18 @@ function listSection(
 
 /**
  * A card list section: the rendered cards, or an empty state that names what is
- * missing and, when the client has an engagement to add work from, points the
- * user at choosing it. The client overview never guesses a parent, so the
- * empty state's next step is the engagement page, not a creation URL.
+ * missing and points the user at the valid next step for this scope: opening
+ * one of the client's engagements (where the work is created), or creating the
+ * client's first engagement. The client overview never guesses a parent, so the
+ * next step is an engagement page or its creation form, not a creation URL
+ * under a guessed parent.
  */
 function cardSection(
   title: string,
   cards: string,
   options: {
     readonly empty: string;
-    readonly emptyAction?: { readonly href: string; readonly label: string };
+    readonly nextStep?: { readonly href: string; readonly label: string };
   },
 ): PageSection {
   const rendered = cards.trim();
@@ -370,7 +375,7 @@ function cardSection(
   const hasCards = rendered.includes("<li");
   return {
     title,
-    body: hasCards ? rendered : emptyState(options.empty, options.emptyAction),
+    body: hasCards ? rendered : emptyState(options.empty, options.nextStep),
   };
 }
 
@@ -428,12 +433,13 @@ function clientShowPage(client: Client, snapshot: Snapshot, store: Store): Page 
   // choosing one of this client's engagements, where the work is created. A
   // client without an engagement is pointed at creating one. The client never
   // guesses a parent by opening the first engagement, so the choice is a link
-  // to an engagement page (or to the client's new-engagement form), never
-  // directly to a creation form under a guessed parent.
-  const chooseAction: { readonly href: string; readonly label: string } | undefined =
+  // to the client's engagement list (or to the client's new-engagement form),
+  // never directly to an engagement page or a creation form under a guessed
+  // parent.
+  const nextStep: { readonly href: string; readonly label: string } =
     engagements.length === 0
       ? { href: `/clients/${encodeURIComponent(clientId)}/engagements/new`, label: "New engagement" }
-      : { href: `/engagements/${encodeURIComponent(engagements[0].id)}`, label: "Choose an engagement" };
+      : { href: `/clients/${encodeURIComponent(clientId)}`, label: "Choose an engagement" };
 
   // The next steps are grouped by kind, each group with its own heading and
   // list (or its own empty state), so a follow-up, a commitment and a waiting
@@ -450,7 +456,7 @@ function clientShowPage(client: Client, snapshot: Snapshot, store: Store): Page 
       title: group.title,
       body:
         group.items.length === 0
-          ? emptyState(group.empty, chooseAction)
+          ? emptyState(group.empty, nextStep)
           : itemCardList(group.items),
     })),
   );
@@ -479,7 +485,7 @@ function clientShowPage(client: Client, snapshot: Snapshot, store: Store): Page 
         newLabel: "New engagement",
         empty: "No engagements yet.",
       }),
-      listSection("Projects", projectItems, { empty: "No projects yet." }),
+      listSection("Projects", projectItems, { empty: "No projects yet.", nextStep }),
       {
         title: "Adding work",
         body: clientGuidance(
@@ -501,22 +507,22 @@ function clientShowPage(client: Client, snapshot: Snapshot, store: Store): Page 
       },
       cardSection("Current tasks (open or in progress)", taskCardList(currentTasks), {
         empty: "No current tasks.",
-        emptyAction: chooseAction,
+        nextStep,
       }),
       cardSection("Open blockers", itemCardList(blockers), {
         empty: "No open blockers.",
-        emptyAction: chooseAction,
+        nextStep,
       }),
       cardSection("Open questions", itemCardList(questions), {
         empty: "No open questions.",
-        emptyAction: chooseAction,
+        nextStep,
       }),
       cardSection("Decisions", itemCardList(decisions), {
         empty: "No decisions recorded yet.",
-        emptyAction: chooseAction,
+        nextStep,
       }),
       { title: "Next steps", body: nextStepsBody },
-      meetingSection("Meeting history", "", clientMeetings(store, clientId), chooseAction),
+      meetingSection("Meeting history", "", clientMeetings(store, clientId), nextStep),
     ],
   );
 }
@@ -534,6 +540,7 @@ function engagementShowPage(engagement: Engagement, snapshot: Snapshot, store: S
   const engagementId = engagement.id;
   const newTaskHref = `/engagements/${encodeURIComponent(engagementId)}/tasks/new`;
   const newItemHref = `/engagements/${encodeURIComponent(engagementId)}/items/new`;
+  const projectNewHref = `/engagements/${encodeURIComponent(engagementId)}/projects/new`;
 
   // Engagement-only work: tasks and items that belong to no project. Each
   // project's own work is shown beside it, so a project task is never listed
@@ -544,12 +551,9 @@ function engagementShowPage(engagement: Engagement, snapshot: Snapshot, store: S
     {
       title: "Projects",
       body: [
-        primaryAction(`/engagements/${encodeURIComponent(engagementId)}/projects/new`, "New project"),
+        primaryAction(projectNewHref, "New project"),
         projects.length === 0
-          ? emptyState("No projects yet.", {
-              href: `/engagements/${encodeURIComponent(engagementId)}/projects/new`,
-              label: "New project",
-            })
+          ? emptyState("No projects yet.", { href: projectNewHref, label: "New project" })
           : childList(projects),
       ].join("\n"),
     },
