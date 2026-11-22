@@ -62,22 +62,14 @@ export const PAGE_HEADERS: Readonly<Record<string, string>> = Object.freeze({
  * shell (skip link, navigation, location header, one main landmark). Without
  * context the page is still a complete, usable document, so existing callers
  * and tests keep working; the server fills in the layout at the response
- * boundary from the accepted route and the authoritative snapshot.
- *
- * `headers` are the page's own response headers. Defaulting to `PAGE_HEADERS`
- * keeps every existing caller unchanged; the server passes the headers of the
- * page it is wrapping so a page that carried its own headers keeps them.
+ * boundary from the accepted route and the authoritative snapshot and keeps
+ * the page's own headers, which are always `PAGE_HEADERS`.
  */
-export function renderPage(
-  title: string,
-  body: string,
-  layout?: LayoutContext,
-  headers: Readonly<Record<string, string>> = PAGE_HEADERS,
-): Page {
+export function renderPage(title: string, body: string, layout?: LayoutContext): Page {
   if (layout !== undefined) {
     return {
       html: renderLayoutDocument(layout, title, body),
-      headers,
+      headers: PAGE_HEADERS,
       title,
       body,
       layout,
@@ -98,7 +90,7 @@ export function renderPage(
     "</body>",
     "</html>",
   ].join("\n");
-  return { html, headers, title, body };
+  return { html, headers: PAGE_HEADERS, title, body };
 }
 
 /** One correctable field problem: the field, its message and the submitted value. */

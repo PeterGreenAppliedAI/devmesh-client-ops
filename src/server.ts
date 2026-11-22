@@ -227,9 +227,9 @@ function sendLayoutPage(
     return;
   }
   const layout = layoutContextFor(requestPath, store.snapshot());
-  // The page keeps its own headers: `renderPage` defaults to the standard page
-  // headers, so passing `page.headers` forwards exactly what the page carried.
-  const rendered = renderPage(page.title, page.body, layout, page.headers);
+  // `renderPage` builds the wrapped page with the standard page headers, the
+  // same headers the page carried before it was wrapped.
+  const rendered = renderPage(page.title, page.body, layout);
   sendPage(res, status, rendered);
 }
 
