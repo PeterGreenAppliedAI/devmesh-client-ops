@@ -335,34 +335,36 @@ function wordsOutsideQuotes(message: string): readonly string[] {
  * control (a hidden identity or parent link, or a record the form cannot
  * name) reports nothing and stays in the summary alone.
  *
- * `selectedField` is the visible control a form boundary already knows the
- * refusal is about: the one control whose submitted value the refusal names.
- * It is used only when the message names no visible control of its own and
- * quotes exactly that submitted value in its own text, outside any quoted
- * value (`No project with id "project-99"`). Then the problem is associated
- * with that control, so an unknown value the user selected on the form points
- * at the choice that has to be corrected. It never overrides a message that
- * names a visible control, and a message about a hidden identity or parent
- * link (a submitted parent mismatch, an unassignable parent chain) names a
- * different value or a hidden link, so it stays in the summary alone.
+ * `selectedValue` is the value a visible control was submitted with when a
+ * form boundary already knows the refusal is about that choice (the project
+ * select). It is used only when the message names no visible control of its
+ * own and quotes exactly that submitted value in its own text, outside any
+ * quoted value (`No project with id "project-99"`). Then the problem is
+ * associated with that control, so an unknown value the user selected on the
+ * form points at the choice that has to be corrected. It never overrides a
+ * message that names a visible control, and a message about a hidden identity
+ * or parent link (a submitted parent mismatch, an unassignable parent chain)
+ * names a different value or a hidden link, so it stays in the summary alone.
  */
 export function fieldErrorsFor(
   message: string,
   values: Readonly<Record<string, string>>,
   fields: readonly FieldSpec[],
-  selectedField?: string,
+  selectedValue?: string,
 ): readonly FieldError[] {
   const named = namedVisibleField(message, fields);
   if (named !== undefined) return [fieldErrorFor(named, message, values, fields)];
-  if (selectedField === undefined) return [];
-  const field = fields.find((candidate) => candidate.name === selectedField && candidate.hidden !== true);
+  if (selectedValue === undefined || selectedValue === "") return [];
+  // The selected value belongs to the one visible control that was submitted
+  // with it; a message about the choice is associated with that control.
+  const field = fields.find(
+    (candidate) => candidate.hidden !== true && values[candidate.name] === selectedValue,
+  );
   if (field === undefined) return [];
-  const value = values[selectedField];
-  if (namesSubmittedChoice(message, field, value)) {
-    return [fieldErrorFor(selectedField, message, values, fields)];
+  if (!namesSubmittedChoice(message, field, selectedValue) && !quotesSubmittedValue(message, selectedValue)) {
+    return [];
   }
-  if (!quotesSubmittedValue(message, value)) return [];
-  return [fieldErrorFor(selectedField, message, values, fields)];
+  return [fieldErrorFor(field.name, message, values, fields)];
 }
 
 /** One field problem for a visible control, with the value the form holds. */
@@ -420,17 +422,28 @@ function quotesSubmittedValue(message: string, value: string | undefined): boole
   return !linked;
 }
 
-/** The text of the first complete quoted value in a message that equals
- * `value`, as written; undefined when no quoted value equals it. Quoted values are read
- * the same way the message text treats them as value text rather than field
- * references.
+/** The text of the first quoted reference in a message that carries `value`,
+ * as written; undefined when no quoted reference carries it. A quoted
+ * reference is a complete quoted value that is delimited as a value in the
+ * message: it opens at a quote character that begins a word and closes at the
+ * matching quote before a word boundary, so the value appears as a whole
+ * (`"project-99"`, `"project-99" is not a project`) and never as a fragment
+ * of a longer value (`"project-99x"`). A reference is not required to be the
+ * whole quoted value, so a message that qualifies a value (`"project-99" (not
+ * a project)`) still carries it. Quoted text is read the same way the message
+ * text treats it as value text rather than field references, escaped quotes
+ * included.
  */
 function quotedReference(message: string, value: string): string | undefined {
+  if (value === "") return undefined;
   const opens = /("|'|`)/g;
   for (let match = opens.exec(message); match !== null; match = opens.exec(message)) {
+    // A quote inside a word (such as an apostrophe) opens no value.
+    if (match.index > 0 && !/\s/.test(message[match.index - 1])) continue;
     const quote = match[1];
     let raw = "";
     let closed = false;
+    let end = message.length;
     for (let index = match.index + match[0].length; index < message.length; index += 1) {
       const char = message[index];
       if (char === "\\" && message[index + 1] === quote) {
@@ -440,11 +453,14 @@ function quotedReference(message: string, value: string): string | undefined {
       }
       if (char === quote) {
         closed = true;
+        end = index;
         break;
       }
       raw += char;
     }
-    if (closed && raw === value) return raw;
+    if (closed && raw === value && (end + 1 === message.length || /\s/.test(message[end + 1]))) {
+      return raw;
+    }
   }
   return undefined;
 }

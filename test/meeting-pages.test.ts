@@ -1038,6 +1038,33 @@ describe("meeting pages: editing", () => {
       const afterUnknownFix = JSON.stringify(server.store.snapshot());
       assert.notEqual(afterUnknownFix, beforeEdit);
 
+      // A project of another engagement on an edit reaches the store's own
+      // refusal. It is a correctable 400 that keeps the submitted values, and
+      // the parent-chain message is about the hidden engagement and client
+      // links, not the project select, so it stays in the summary and marks no
+      // control invalid. Nothing is written.
+      const unassignableEdit = await send(server.origin, {
+        method: "POST",
+        path: `/meetings/${meeting.id}/edit`,
+        form: {
+          id: meeting.id,
+          title: "Unassignable",
+          date: "2026-03-03",
+          notes: "keep",
+          projectId: h.siblingProject.id,
+        },
+      });
+      assert.equal(unassignableEdit.status, 400);
+      assert.match(unassignableEdit.body, /does not belong to engagementId/);
+      assert.equal((unassignableEdit.body.match(/aria-invalid="true"/g) ?? []).length, 0);
+      assert.doesNotMatch(unassignableEdit.body, /id="field-projectId"[^>]*aria-invalid/);
+      assert.match(
+        unassignableEdit.body,
+        new RegExp(`<option value="${h.siblingProject.id}" selected>`),
+      );
+      assert.equal(parseForm(unassignableEdit.body).controls.get("title"), "Unassignable");
+      assert.equal(JSON.stringify(server.store.snapshot()), afterUnknownFix);
+
       // A conflicting submitted id is refused on a form for the URL record.
       const conflicting = await send(server.origin, {
         method: "POST",

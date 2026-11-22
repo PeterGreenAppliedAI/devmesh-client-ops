@@ -766,22 +766,20 @@ function formFailure(
       filled[field.name] = omittedControlValue(field, base) ?? "";
     }
   }
-  const errors = fieldErrorsFor(error.message, filled, fields, associateSelected(error, selected));
+  const errors = fieldErrorsFor(error.message, filled, fields, associateSelected(selected));
   return new FormError(error.message, filled, errors, fields, action);
 }
 
 /**
- * The project select a refusal is associated with on either work form path.
- * A create keeps its selected project for any refusal. An edit's store refusal
- * is associated only for a missing record (`No project with id "..."`): a
+ * The project value a refusal may be associated with on either work form
+ * path: the project the submission selected on the form, when it selected one.
+ * `fieldErrorsFor` then associates the refusal with the project select only if
+ * the message quotes exactly that value and names no hidden link, so an
+ * unknown project (on a create or an edit) points at the select while a
  * parent-chain or identity refusal stays in the summary alone.
  */
-function associateSelected(
-  error: unknown,
-  selected: string | undefined,
-): string | undefined {
+function associateSelected(selected: string | undefined): string | undefined {
   if (selected === undefined || selected === "") return undefined;
-  if (error instanceof MissingRecordError) return selected;
   return selected;
 }
 

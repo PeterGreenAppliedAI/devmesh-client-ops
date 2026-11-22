@@ -1349,10 +1349,20 @@ describe("work pages: tasks", () => {
 
       // A work item edit is associated the same way: the store's missing-record
       // refusal for a nonexistent supplied project points at the item select.
+      const storedItem = await server.store.createItem({
+        clientId: h.client.id,
+        engagementId: h.engagement.id,
+        kind: "question",
+        title: "Edit item",
+        context: "context",
+        state: "open",
+        projectId: h.project.id,
+      });
+      const itemEditBefore = JSON.stringify(server.store.snapshot());
       const invalidItemEdit = await send(server.origin, {
         method: "POST",
-        path: `/items/${server.store.snapshot().items[0].id}/edit`,
-        form: { id: server.store.snapshot().items[0].id, projectId: "project-99" },
+        path: `/items/${storedItem.id}/edit`,
+        form: { id: storedItem.id, projectId: "project-99" },
       });
       assert.equal(invalidItemEdit.status, 400);
       assert.match(invalidItemEdit.body, /role="alert"><p>No project with id &quot;project-99&quot;<\/p>/);
@@ -1362,7 +1372,7 @@ describe("work pages: tasks", () => {
       const itemEditInline = /<p id="field-projectId-error">([^<]*)<\/p>/.exec(invalidItemEdit.body);
       assert.ok(itemEditInline !== null);
       assert.ok(invalidItemEdit.body.includes(`<li>${itemEditInline[1]}</li>`));
-      assert.equal(JSON.stringify(server.store.snapshot()), beforeEdit);
+      assert.equal(JSON.stringify(server.store.snapshot()), itemEditBefore);
     } finally {
       await server.close();
     }
@@ -1664,132 +1674,6 @@ describe("work pages: tasks", () => {
       const form = parseForm(conflict.body);
       assert.equal(form.action, `/tasks/${first.id}/edit`);
       assert.equal(form.controls.get("id"), first.id);
-    } finally {
-      await server.close();
-    }
-  });
-
-  it("associates an unknown project with the select on a task edit", async () => {
-    const server = await running();
-    try {
-      const h = await hierarchy(server.store);
-      const task = await server.store.createTask({
-        clientId: h.client.id,
-        engagementId: h.engagement.id,
-        title: "Edit target",
-        owner: "owner",
-        context: "context",
-        projectId: h.project.id,
-      });
-      const before = JSON.stringify(server.store.snapshot());
-
-      // An edit naming a project that does not exist is a correctable 400. The
-      // submitted project is the form's visible choice, so the select is marked
-      // invalid and points at its own message, which the summary repeats.
-      const invalid = await send(server.origin, {
-        method: "POST",
-        path: `/tasks/${task.id}/edit`,
-        form: { id: task.id, title: "Edited", projectId: "project-99" },
-      });
-      assert.equal(invalid.status, 400);
-      assert.doesNotMatch(invalid.body, /Not found/);
-      assert.match(invalid.body, /role="alert"><p>No project with id &quot;project-99&quot;<\/p>/);
-      assert.equal((invalid.body.match(/aria-invalid="true"/g) ?? []).length, 1);
-      const marked = invalidControls(invalid.body);
-      assert.equal(marked.length, 1);
-      assert.equal(marked[0].field, "projectId");
-      assert.match(
-        invalid.body,
-        /<select[^>]*\sid="field-projectId"[^>]*\saria-invalid="true"[^>]*\saria-describedby="field-projectId-error"/,
-      );
-      const inline = /<p id="field-projectId-error">([^<]*)<\/p>/.exec(invalid.body);
-      assert.ok(inline !== null);
-      assert.equal(inline[1], "No project with id &quot;project-99&quot;");
-      assert.ok(invalid.body.includes(`<li>${inline[1]}</li>`));
-      assert.match(invalid.body, /<option value="project-99" selected>project-99 \(not a valid choice\)<\/option>/);
-      // The submitted values and the omitted stored values are kept for
-      // correction, and nothing is written.
-      const form = parseForm(invalid.body);
-      assert.equal(form.action, `/tasks/${task.id}/edit`);
-      assert.equal(form.controls.get("title"), "Edited");
-      assert.equal(form.controls.get("owner"), "owner");
-      assert.equal(form.controls.get("context"), "context");
-      assert.equal(JSON.stringify(server.store.snapshot()), before);
-
-      // Correcting the project and resubmitting the whole rendered form saves
-      // it, changing only the submitted fields.
-      form.controls.set("projectId", h.secondProject.id);
-      const corrected = await send(server.origin, {
-        method: "POST",
-        path: form.action,
-        form: Object.fromEntries(form.controls),
-      });
-      assert.match(redirectTarget(corrected), /^\/tasks\/task-\d+$/);
-      const stored = server.store.snapshot().tasks.find((candidate) => candidate.id === task.id);
-      assert.ok(stored !== undefined);
-      assert.equal(stored.title, "Edited");
-      assert.equal(stored.owner, "owner");
-      assert.equal(stored.projectId, h.secondProject.id);
-    } finally {
-      await server.close();
-    }
-  });
-
-  it("associates an unknown project with the select on a work item edit", async () => {
-    const server = await running();
-    try {
-      const h = await hierarchy(server.store);
-      const item = await server.store.createItem({
-        clientId: h.client.id,
-        engagementId: h.engagement.id,
-        kind: "question",
-        title: "Item edit target",
-        context: "context",
-        state: "open",
-        projectId: h.project.id,
-      });
-      const before = JSON.stringify(server.store.snapshot());
-
-      const invalid = await send(server.origin, {
-        method: "POST",
-        path: `/items/${item.id}/edit`,
-        form: { id: item.id, title: "Edited item", projectId: "project-99" },
-      });
-      assert.equal(invalid.status, 400);
-      assert.doesNotMatch(invalid.body, /Not found/);
-      assert.match(invalid.body, /role="alert"><p>No project with id &quot;project-99&quot;<\/p>/);
-      assert.equal((invalid.body.match(/aria-invalid="true"/g) ?? []).length, 1);
-      const marked = invalidControls(invalid.body);
-      assert.equal(marked.length, 1);
-      assert.equal(marked[0].field, "projectId");
-      assert.match(
-        invalid.body,
-        /<select[^>]*\sid="field-projectId"[^>]*\saria-invalid="true"[^>]*\saria-describedby="field-projectId-error"/,
-      );
-      const inline = /<p id="field-projectId-error">([^<]*)<\/p>/.exec(invalid.body);
-      assert.ok(inline !== null);
-      assert.equal(inline[1], "No project with id &quot;project-99&quot;");
-      assert.ok(invalid.body.includes(`<li>${inline[1]}</li>`));
-      assert.match(invalid.body, /<option value="project-99" selected>project-99 \(not a valid choice\)<\/option>/);
-      const form = parseForm(invalid.body);
-      assert.equal(form.action, `/items/${item.id}/edit`);
-      assert.equal(form.controls.get("title"), "Edited item");
-      assert.equal(form.controls.get("context"), "context");
-      assert.equal(form.controls.get("state"), "open");
-      assert.equal(JSON.stringify(server.store.snapshot()), before);
-
-      form.controls.set("projectId", h.secondProject.id);
-      const corrected = await send(server.origin, {
-        method: "POST",
-        path: form.action,
-        form: Object.fromEntries(form.controls),
-      });
-      assert.match(redirectTarget(corrected), /^\/items\/item-\d+$/);
-      const stored = server.store.snapshot().items.find((candidate) => candidate.id === item.id);
-      assert.ok(stored !== undefined);
-      assert.equal(stored.title, "Edited item");
-      assert.equal(stored.context, "context");
-      assert.equal(stored.projectId, h.secondProject.id);
     } finally {
       await server.close();
     }

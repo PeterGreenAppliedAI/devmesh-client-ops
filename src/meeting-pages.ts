@@ -357,14 +357,10 @@ function formFailure(
   // The meeting's own project choice, when the submission selected one, is a
   // visible control: a refusal about that value (an unknown project, on a
   // create or an edit) is associated with it, while a refusal about the
-  // meeting's identity or parent chain stays in the summary alone. On an edit
-  // the store refuses a project that does not exist with a missing-record
-  // message that names no control, so the edit path keeps the select only for
-  // that refusal.
+  // meeting's identity or parent chain names a hidden link and stays in the
+  // summary alone.
   const selected = values["projectId"];
-  const associate =
-    record === undefined || error instanceof MissingRecordError ? selected : undefined;
-  const errors = fieldErrorsFor(error.message, filled, fields, associate);
+  const errors = fieldErrorsFor(error.message, filled, fields, selected);
   return new FormError(error.message, filled, errors, fields, action);
 }
 
