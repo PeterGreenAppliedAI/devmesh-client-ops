@@ -100,8 +100,12 @@ export function addCalendarDays(date: string, days: number): string {
   const month = Number(date.slice(5, 7));
   const day = Number(date.slice(8, 10));
   // Date.UTC is pure calendar arithmetic; the result is read back through the
-  // UTC getters so no local time zone can shift the day.
-  const shifted = new Date(Date.UTC(year, month - 1, day + days));
+  // UTC getters so no local time zone can shift the day. Date.UTC maps years
+  // 0-99 to 1900-1999, so `new Date(0)` is first given the literal year through
+  // setUTCFullYear (with the time of day kept), then the day offset is added.
+  const shifted = new Date(0);
+  shifted.setUTCFullYear(year, month - 1, day);
+  shifted.setUTCDate(shifted.getUTCDate() + days);
   const yyyy = String(shifted.getUTCFullYear()).padStart(4, "0");
   const mm = String(shifted.getUTCMonth() + 1).padStart(2, "0");
   const dd = String(shifted.getUTCDate()).padStart(2, "0");

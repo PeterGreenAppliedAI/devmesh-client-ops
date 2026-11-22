@@ -1193,21 +1193,37 @@ describe("overviews and rollups agree with the lists", () => {
           .join("");
         return sections;
       };
-      const before = await send(server.origin, { path: "/" });
-      assert.equal(before.status, 200);
+      // A successful home response carries every named section, so the absence
+      // checks below cannot pass on an error page.
+      const sixSections = (reply: Reply): string => {
+        assert.equal(reply.status, 200);
+        for (const title of [
+          "Overdue tasks",
+          "Tasks due soon",
+          "Open blockers",
+          "Open questions",
+          "Open commitments",
+          "Open waiting items",
+        ]) {
+          assert.ok(reply.body.includes(`<h2>${title}</h2>`), `dashboard has the ${title} section`);
+        }
+        return dashboardRows(reply.body);
+      };
+
+      const before = sixSections(await send(server.origin, { path: "/" }));
       // An undated task never appears; the open blocker is linked.
-      assert.ok(!dashboardRows(before.body).includes(`href="/tasks/${s.task.id}"`));
-      assert.ok(dashboardRows(before.body).includes(`href="/items/${s.item.id}"`));
+      assert.ok(!before.includes(`href="/tasks/${s.task.id}"`));
+      assert.ok(before.includes(`href="/items/${s.item.id}"`));
 
       // Archiving the client hides the item through its inherited archive.
       await server.store.setArchived("client", s.client.id, true);
-      const after = await send(server.origin, { path: "/" });
-      assert.ok(!dashboardRows(after.body).includes(`href="/items/${s.item.id}"`), "the dashboard hides effective archives");
+      const after = sixSections(await send(server.origin, { path: "/" }));
+      assert.ok(!after.includes(`href="/items/${s.item.id}"`), "the dashboard hides effective archives");
 
       // Restoring the client brings the item back into its section.
       await server.store.setArchived("client", s.client.id, false);
-      const restored = await send(server.origin, { path: "/" });
-      assert.ok(dashboardRows(restored.body).includes(`href="/items/${s.item.id}"`));
+      const restored = sixSections(await send(server.origin, { path: "/" }));
+      assert.ok(restored.includes(`href="/items/${s.item.id}"`));
     } finally {
       await server.close();
     }

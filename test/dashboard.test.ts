@@ -73,6 +73,16 @@ describe("dashboard calendar arithmetic", () => {
     assert.equal(addCalendarDays("2026-12-28", 7), "2027-01-04");
   });
 
+  it("keeps the literal year when adding days to dates below the year 100", () => {
+    // Date.UTC would read years 0-99 as 1900-1999; calendar arithmetic must not.
+    assert.equal(addCalendarDays("0099-12-28", 7), "0100-01-04");
+    assert.equal(addCalendarDays("0099-12-31", 1), "0100-01-01");
+    assert.equal(addCalendarDays("0001-12-31", 1), "0002-01-01");
+    assert.equal(addCalendarDays("0099-12-28", -28), "0099-11-30");
+    assert.equal(addCalendarDays("0001-01-01", 0), "0001-01-01");
+    assert.equal(addCalendarDays("0004-02-28", 1), "0004-02-29");
+  });
+
   it("recognises real calendar dates and refuses invalid ones", () => {
     assert.equal(isCalendarDate("2026-11-22"), true);
     assert.equal(isCalendarDate("2028-02-29"), true);
@@ -242,8 +252,8 @@ describe("dashboard selection", () => {
       for (const kind of ["blocker", "question", "commitment", "waiting"] as const) {
         await store.createItem({ ...base, kind, title: `Closed ${kind}`, state: "closed" });
       }
-      await store.createItem({ ...base, kind: "decision", title: "Decision", state: "open" });
-      await store.createItem({ ...base, kind: "follow_up", title: "Follow-up", state: "open" });
+      const decision = await store.createItem({ ...base, kind: "decision", title: "Decision", state: "open" });
+      const followUp = await store.createItem({ ...base, kind: "follow_up", title: "Follow-up", state: "open" });
 
       const dashboard = selectDashboard(store.snapshot(), "2026-11-22");
       assert.deepEqual(rowIds(dashboard, "blocker"), [blocker.id]);
@@ -252,7 +262,9 @@ describe("dashboard selection", () => {
       assert.deepEqual(rowIds(dashboard, "waiting"), [waiting.id]);
       // No section contains a decision or a follow-up.
       const allIds = dashboard.sections.flatMap((section) => section.rows.map((row) => row.id));
-      assert.ok(!allIds.includes("anything-but-the-open-items"));
+      assert.ok(!allIds.includes(decision.id));
+      assert.ok(!allIds.includes(followUp.id));
+      assert.deepEqual(allIds.sort(), [blocker.id, question.id, commitment.id, waiting.id].sort());
       assert.equal(allIds.length, 4);
     });
   });

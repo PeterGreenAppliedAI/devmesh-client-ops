@@ -157,32 +157,6 @@ function sectionOf(body: string, title: string): string {
 }
 
 /**
- * The home dashboard's six attention sections, as one text block. The home
- * page is a read-only view of the store, so it is a safe, lock-respecting way
- * for this test to observe the committed records without opening a second
- * writer: a hostile write that changed a title, a date, a kind or a state
- * changes the dashboard's rows even when the number of records stays the same.
- */
-function dashboardText(reply: Reply): string {
-  assert.equal(reply.status, 200);
-  const titles = [
-    "Overdue tasks",
-    "Tasks due soon",
-    "Open blockers",
-    "Open questions",
-    "Open commitments",
-    "Open waiting items",
-  ];
-  return titles
-    .map((title) => {
-      const at = reply.body.indexOf(`<h2>${title}</h2>`);
-      assert.ok(at >= 0, `home dashboard has the ${title} section`);
-      return reply.body.slice(at, reply.body.indexOf("</section>", at));
-    })
-    .join("");
-}
-
-/**
  * The part of `body` from the first occurrence of `start` to the next occurrence
  * of `end`, so one group inside a section can be inspected without the groups
  * that follow it. When `end` does not occur the slice runs to the end.
@@ -222,13 +196,17 @@ interface ObservedPage {
 }
 
 /**
- * The committed state as it is visible over HTTP: the home dashboard's six
- * attention sections, the detail page of every known record, and every
- * engagement, project and client page (which carry the histories, the counts
- * and the project links). A hostile write that changed a title, a date, a
- * notes field, a kind, a state, a parent link or a project link changes one of
- * these pages even when the number of records stays the same, so comparing the
- * pages compares record values, not just collection sizes.
+ * The committed state as it is visible over HTTP: the detail page of every
+ * known record, and every engagement, project and client page (which carry the
+ * histories, the counts and the project links). A hostile write that changed a
+ * title, a date, a notes field, a kind, a state, a parent link or a project link
+ * changes one of these pages even when the number of records stays the same, so
+ * comparing the pages compares record values, not just collection sizes.
+ *
+ * The home dashboard is deliberately not part of this observation. Its task
+ * sections carry date ranges computed from the server's real calendar, so
+ * crossing local midnight changes them without any mutation; the dashboard's
+ * membership is asserted with a fixed clock in test/dashboard.test.ts instead.
  */
 async function observe(
   base: string,
@@ -248,10 +226,8 @@ async function observe(
     readonly otherItem: string;
   },
 ): Promise<{
-  readonly dashboard: string;
   readonly pages: readonly ObservedPage[];
 }> {
-  const dashboard = dashboardText(await send(base, { path: "/" }));
   const paths = [
     ...ids.tasks.map((id) => `/tasks/${id}`),
     ...ids.items.map((id) => `/items/${id}`),
@@ -273,7 +249,7 @@ async function observe(
     assert.equal(reply.status, 200, `${path} is a readable record or page`);
     pages.push({ path, status: reply.status, body: reply.body });
   }
-  return { dashboard, pages };
+  return { pages };
 }
 
 // ---------------------------------------------------------------------------
@@ -826,7 +802,7 @@ describe("workspace integration: linked overview and restart", () => {
       // -- The home dashboard, read-only and cross-client. -------------------
       // The dashboard's task sections depend on the server's real calendar
       // day, so their membership is asserted with a fixed clock in
-      // test/dashboard.test.ts. Here the read-only page is observed: it has
+      // test/dashboard.test.ts. Here the read-only page is checked: it has
       // the six named sections and never offers a form, and its item sections
       // (which do not depend on the day) show the still-open records across
       // clients. Done, closed, undated and follow-up records never appear.
@@ -893,6 +869,8 @@ describe("workspace integration: linked overview and restart", () => {
       assert.ok(!mainContentOf(overview.body).includes("Empty client"));
 
       // The state as it stands before the restart, after the accepted writes.
+      // The observed pages are persisted record values, not the dashboard's
+      // day-dependent ranges, so this comparison survives local midnight.
       beforeRestart = JSON.stringify(await observe(base, ids));
     } finally {
       await app.close();
