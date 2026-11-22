@@ -1344,7 +1344,7 @@ describe("archived forms keep their notice on a correctable refusal", () => {
         const reply = await send(server.origin, {
           method: "POST",
           path,
-          form: { engagementId: s.engagement.id, title: "", projectId: s.project.id },
+          form: { engagementId: s.engagement.id, title: "", status: "open", projectId: s.project.id },
         });
         assert.equal(reply.status, 400, path);
         assert.ok(reply.body.includes("This record is archived"), `${path} keeps the selected project's notice`);
@@ -1358,7 +1358,7 @@ describe("archived forms keep their notice on a correctable refusal", () => {
       const meetingCreate = await send(server.origin, {
         method: "POST",
         path: `/projects/${s.project.id}/meetings/new`,
-        form: { engagementId: s.engagement.id, title: "", date: "" },
+        form: { engagementId: s.engagement.id, title: "", date: "2026-02-01" },
       });
       assert.equal(meetingCreate.status, 400);
       assert.ok(meetingCreate.body.includes("This record is archived"));
@@ -1369,7 +1369,7 @@ describe("archived forms keep their notice on a correctable refusal", () => {
         const omitted = await send(server.origin, {
           method: "POST",
           path,
-          form: { engagementId: s.engagement.id, title: "" },
+          form: { engagementId: s.engagement.id, title: "", status: "open" },
         });
         assert.equal(omitted.status, 400, path);
         assert.ok(omitted.body.includes("This record is archived"), `${path} keeps the URL project's notice`);
@@ -1390,7 +1390,7 @@ describe("archived forms keep their notice on a correctable refusal", () => {
         const reply = await send(server.origin, {
           method: "POST",
           path,
-          form: { engagementId: s.engagement.id, title: "", projectId: foreign.id },
+          form: { engagementId: s.engagement.id, title: "", status: "open", projectId: foreign.id },
         });
         assert.equal(reply.status, 400, path);
         assert.ok(
@@ -1405,7 +1405,7 @@ describe("archived forms keep their notice on a correctable refusal", () => {
       const meetingReply = await send(server.origin, {
         method: "POST",
         path: `/engagements/${s.engagement.id}/meetings/new`,
-        form: { engagementId: s.engagement.id, title: "", date: "", projectId: foreign.id },
+        form: { engagementId: s.engagement.id, title: "", date: "2026-02-01", projectId: foreign.id },
       });
       assert.equal(meetingReply.status, 400);
       assert.ok(meetingReply.body.includes("This record is archived"), "the meeting create keeps the engagement's notice");
@@ -1432,7 +1432,7 @@ describe("archived forms keep their notice on a correctable refusal", () => {
         const reply = await send(server.origin, {
           method: "POST",
           path,
-          form: { engagementId: s.engagement.id, title: "", projectId: foreign.id },
+          form: { engagementId: s.engagement.id, title: "", status: "open", projectId: foreign.id },
         });
         assert.equal(reply.status, 400, path);
         assert.ok(reply.body.includes("This record is archived"), `${path} keeps the URL project's notice`);
@@ -1444,7 +1444,7 @@ describe("archived forms keep their notice on a correctable refusal", () => {
       const meetingReply = await send(server.origin, {
         method: "POST",
         path: `/projects/${s.project.id}/meetings/new`,
-        form: { engagementId: s.engagement.id, title: "", date: "", projectId: foreign.id },
+        form: { engagementId: s.engagement.id, title: "", date: "2026-02-01", projectId: foreign.id },
       });
       assert.equal(meetingReply.status, 400);
       assert.ok(meetingReply.body.includes("This record carries its own archive flag."));

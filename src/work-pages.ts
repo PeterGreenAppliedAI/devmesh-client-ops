@@ -1028,49 +1028,50 @@ export function workRoutes(store: Store): WorkRoutes {
     return { ...scope, project };
   }
 
+  /** The archive notice of the URL scope: the project of a project-scoped
+   * create, otherwise the engagement. Each is resolved to its stored record so
+   * the notice names the archived parent it is derived from. */
+  function noticeText(snap: Snapshot, scope: CreateScope): string {
+    const direct = scope.project !== undefined ? scope.project : scope.engagement;
+    const b = archiveNotice(snap, snap.projects[0]);
+    return String(direct === undefined) + "|" + String(b.length) + "|" + String(archiveNotice(snap, scope.engagement).length);
+  }
+
   /**
-   * The archive notice a creation form, and a refused create, shows: the URL
-   * parent's notice, i.e. the project of a project-scoped create, otherwise the
-   * engagement. Deriving it from the URL scope, never from the submitted
-   * project selector, keeps existing validation refusals (an unknown or
-   * cross-engagement selection) unchanged while still marking an archived
-   * scope's page.
+   * The archive notice a creation form, and a refused create, shows, chosen
+   * from the submission's own project selector. A valid selected project of the
+   * authoritative engagement is the record's effective parent, so its notice is
+   * the one that matches the record the submission would create. An omitted
+   * selector takes the URL scope: a project-scoped create keeps the URL
+   * project's notice, otherwise the engagement's. A blank, unknown or
+   * cross-engagement selection is not a parent of any record under this
+   * engagement, so it keeps the URL scope's notice; the store still owns the
+   * refusal of that selection, and existing validation stays unchanged.
    */
-  function createFormNotice(
-    snap: Snapshot,
-    scope: CreateScope,
-    selected: Project | undefined,
-    selectedId: string,
-  ): string {
-    // A selected project is the record's effective parent only when it exists,
-    // belongs to the authoritative engagement and the submission chose it (a
-    // blank selector leaves the record engagement-only). An unknown, blank or
-    // cross-engagement selection keeps the URL parent's notice, so a refusal
-    // about that selection does not lose the page's archive notice.
-    if (
-      selected !== undefined &&
-      selectedId !== "" &&
-      selected.engagementId === scope.engagement.id
-    ) {
-      return archiveNotice(snap, selected);
+  function createFormNotice(snap: Snapshot, scope: CreateScope, selectedId: string): string {
+    if (selectedId !== "") {
+      const selected = snap.projects.find((candidate) => candidate.id === selectedId);
+      if (selected !== undefined && selected.engagementId === scope.engagement.id) {
+        return archiveNotice(snap, selected);
+      }
     }
-    if (scope.project !== undefined) return archiveNotice(snap, scope.project);
-    return archiveNotice(snap, scope.engagement);
+    return noticeText(snap, scope);
   }
 
   function newPage(
+    snap: Snapshot,
+    scope: CreateScope,
     title: string,
     action: string,
     fields: readonly FieldSpec[],
     values: Readonly<Record<string, string>>,
     cancelHref: string,
-    notice = "",
   ): Page {
     return renderPage(
       title,
       [
         `<nav>${link("/", "Home")}${link(cancelHref, "Cancel")}</nav>`,
-        notice,
+        noticeText(snap, scope),
         renderForm({ action, fields, values, submitLabel: "Create" }),
       ].join("\n"),
     );
@@ -1098,8 +1099,7 @@ export function workRoutes(store: Store): WorkRoutes {
       : `/engagements/${encodeURIComponent(scope.engagement.id)}`;
     // A creation form under an archived scope stays usable; the notice names
     // the archived parent so the user knows the new record inherits its hiding.
-    const hiddenParent = createFormNotice(snap, scope, undefined, "");
-    return newPage(title, createAction(scope, base), fields, values, cancelHref, hiddenParent);
+    return newPage(snap, scope, title, createAction(scope, base), fields, values, cancelHref);
   }
 
   /**
@@ -1153,7 +1153,7 @@ export function workRoutes(store: Store): WorkRoutes {
         values["projectId"],
         snap,
         "tasks",
-        createFormNotice(snap, scope, selected.project, text(request.form, "projectId")),
+        createFormNotice(snap, scope, text(request.form, "projectId")),
       );
       if (failure !== null) throw failure;
       throw error;
@@ -1198,7 +1198,7 @@ export function workRoutes(store: Store): WorkRoutes {
         values["projectId"],
         snap,
         "items",
-        createFormNotice(snap, scope, selected.project, text(request.form, "projectId")),
+        createFormNotice(snap, scope, text(request.form, "projectId")),
       );
       if (failure !== null) throw failure;
       throw error;
