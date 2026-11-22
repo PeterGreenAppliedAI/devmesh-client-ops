@@ -1244,8 +1244,11 @@ describe("work pages: lists and rollups", () => {
       // The sibling's work never appears on this engagement's page.
       assert.ok(!page.body.includes("Sibling task"));
       assert.ok(!page.body.includes("Sibling item"));
-      // The meeting is not listed as a task or an item.
-      assert.ok(!page.body.includes(`href="/meetings/`));
+      // The meeting is listed in the separate meeting history, never as a
+      // task or an item.
+      assert.match(page.body, new RegExp(`href="/meetings/meeting-\\d+"`));
+      assert.ok(!page.body.includes(`href="/tasks/meeting`));
+      assert.ok(!page.body.includes(`href="/items/meeting`));
 
       // An engagement rollup counts engagement-only work exactly once, and the
       // page renders the engagement-wide counts using the explicit engagement

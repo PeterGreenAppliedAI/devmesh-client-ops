@@ -23,6 +23,8 @@ import { hierarchyRoutes, matchHierarchyPath, routeForPattern, type HierarchyPat
 import type { HierarchyRoute } from "./hierarchy-pages.ts";
 import { matchWorkPath, routeForWorkPattern, workRoutes, type WorkPath } from "./work-pages.ts";
 import type { WorkRoute } from "./work-pages.ts";
+import { matchMeetingPath, meetingRoutes, routeForMeetingPattern, type MeetingPath } from "./meeting-pages.ts";
+import type { MeetingRoute } from "./meeting-pages.ts";
 import { openStore, type Store } from "./store.ts";
 
 export function health(): { status: "ok" } {
@@ -119,7 +121,7 @@ export interface Application {
  * what a match is and how it maps to a guarded route.
  */
 export interface HierarchyPathMatch {
-  readonly pattern: HierarchyPath | WorkPath;
+  readonly pattern: HierarchyPath | WorkPath | MeetingPath;
   readonly id: string;
 }
 
@@ -132,14 +134,16 @@ export function registerRoutes(store: Store): Routes {
   const base = appRoutes(store);
   const hierarchy = hierarchyRoutes(store);
   const work = workRoutes(store);
+  const meetings = meetingRoutes(store);
   const table: PathRouteTable<HierarchyPathMatch> = {
     match: (path: string) => {
-      // Hierarchy paths are matched first; every other canonical path is tried
-      // against the fixed work patterns. An unknown path matches neither and is
-      // refused by the shell.
+      // Hierarchy paths are matched first, then the fixed work and meeting
+      // patterns. An unknown path matches none and is refused by the shell.
       const matched = matchHierarchyPath(path);
       if (matched !== null) return matched;
-      return matchWorkPath(path);
+      const work = matchWorkPath(path);
+      if (work !== null) return work;
+      return matchMeetingPath(path);
     },
     route: (matched, method) => {
       // `matched` is only produced by `match` above, so its pattern is one of
@@ -147,7 +151,9 @@ export function registerRoutes(store: Store): Routes {
       // destination.
       const route = isWorkPath(matched.pattern)
         ? routeForWorkPattern(work, matched.pattern, method)
-        : routeForPattern(hierarchy, matched.pattern, method);
+        : isMeetingPath(matched.pattern)
+          ? routeForMeetingPattern(meetings, matched.pattern, method)
+          : routeForPattern(hierarchy, matched.pattern, method);
       return route === undefined ? undefined : adaptRoute(route);
     },
   };
@@ -166,12 +172,24 @@ const WORK_PATTERNS: readonly WorkPath[] = Object.freeze([
   "/projects/:id/items/new",
 ]);
 
-function isWorkPath(pattern: HierarchyPath | WorkPath): pattern is WorkPath {
+function isWorkPath(pattern: HierarchyPath | WorkPath | MeetingPath): pattern is WorkPath {
   return (WORK_PATTERNS as readonly string[]).includes(pattern);
 }
 
+/** The fixed meeting patterns; a matched pattern outside both lists is a hierarchy pattern. */
+const MEETING_PATTERNS: readonly MeetingPath[] = Object.freeze([
+  "/meetings/:id",
+  "/meetings/:id/edit",
+  "/engagements/:id/meetings/new",
+  "/projects/:id/meetings/new",
+]);
+
+function isMeetingPath(pattern: HierarchyPath | WorkPath | MeetingPath): pattern is MeetingPath {
+  return (MEETING_PATTERNS as readonly string[]).includes(pattern);
+}
+
 /** Adapt a hierarchy or work route to the shell's generic route interface. */
-function adaptRoute(route: HierarchyRoute | WorkRoute): { readonly method: "GET" | "POST"; render(request: RouteRequest): Promise<RouteResult> | RouteResult } {
+function adaptRoute(route: HierarchyRoute | WorkRoute | MeetingRoute): { readonly method: "GET" | "POST"; render(request: RouteRequest): Promise<RouteResult> | RouteResult } {
   return {
     method: route.method,
     render: (request: RouteRequest) => route.render(request),
