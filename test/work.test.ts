@@ -813,7 +813,7 @@ describe("work persistence", () => {
     }
     // The migrated document is written at the current schema version.
     const saved = JSON.parse(readFileSync(storePath(dir), "utf8"));
-    assert.equal(saved.schemaVersion, 3);
+    assert.equal(saved.schemaVersion, 4);
     assert.equal(saved.tasks.length, 1);
 
     const reopened = await openStore(dir);

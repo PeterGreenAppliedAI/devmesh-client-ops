@@ -18,6 +18,8 @@ export interface Client {
   stakeholders: string;
   requirements: string;
   objectives: string;
+  /** Present and true only when the record is archived; absent otherwise. */
+  archived?: boolean;
 }
 
 export interface Engagement {
@@ -26,6 +28,8 @@ export interface Engagement {
   name: string;
   objectives: string;
   status: EngagementStatus;
+  /** Present and true only when the record is archived; absent otherwise. */
+  archived?: boolean;
 }
 
 export interface Project {
@@ -34,6 +38,8 @@ export interface Project {
   name: string;
   objectives: string;
   status: ProjectStatus;
+  /** Present and true only when the record is archived; absent otherwise. */
+  archived?: boolean;
 }
 
 /** Error raised when a record or one of its fields is invalid. */
@@ -111,6 +117,31 @@ function requireStatus(value: unknown, what: string): EngagementStatus {
   return value as EngagementStatus;
 }
 
+/**
+ * Accept an optional archival flag. The flag is only ever boolean, and only
+ * `true` marks a record archived: an absent value leaves the record active, so
+ * a stored `false` is refused rather than kept as a second spelling of active.
+ */
+function optionalArchived(value: unknown, what: string): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") {
+    throw new ValidationError(`${what} must be a boolean`);
+  }
+  if (value === false) {
+    throw new ValidationError(`${what} must be true when supplied`);
+  }
+  return true;
+}
+
+/** Add the archival flag only when it is true; otherwise the field is absent. */
+function withArchived<T extends { archived?: boolean }>(
+  record: T,
+  archived: boolean | undefined,
+): T {
+  if (archived === true) record.archived = true;
+  return record;
+}
+
 const CLIENT_KEYS = [
   "id",
   "name",
@@ -119,46 +150,70 @@ const CLIENT_KEYS = [
   "stakeholders",
   "requirements",
   "objectives",
+  "archived",
 ] as const;
-const ENGAGEMENT_KEYS = ["id", "clientId", "name", "objectives", "status"] as const;
-const PROJECT_KEYS = ["id", "engagementId", "name", "objectives", "status"] as const;
+const ENGAGEMENT_KEYS = [
+  "id",
+  "clientId",
+  "name",
+  "objectives",
+  "status",
+  "archived",
+] as const;
+const PROJECT_KEYS = [
+  "id",
+  "engagementId",
+  "name",
+  "objectives",
+  "status",
+  "archived",
+] as const;
 
 export function parseClient(value: unknown, what = "client"): Client {
   const record = requireObject(value, what);
   requireExactKeys(record, CLIENT_KEYS, what);
-  return {
-    id: requireName(record.id, `${what}.id`),
-    name: requireName(record.name, `${what}.name`),
-    background: requireText(record.background, `${what}.background`),
-    contacts: requireText(record.contacts, `${what}.contacts`),
-    stakeholders: requireText(record.stakeholders, `${what}.stakeholders`),
-    requirements: requireText(record.requirements, `${what}.requirements`),
-    objectives: requireText(record.objectives, `${what}.objectives`),
-  };
+  return withArchived<Client>(
+    {
+      id: requireName(record.id, `${what}.id`),
+      name: requireName(record.name, `${what}.name`),
+      background: requireText(record.background, `${what}.background`),
+      contacts: requireText(record.contacts, `${what}.contacts`),
+      stakeholders: requireText(record.stakeholders, `${what}.stakeholders`),
+      requirements: requireText(record.requirements, `${what}.requirements`),
+      objectives: requireText(record.objectives, `${what}.objectives`),
+    },
+    optionalArchived(record.archived, `${what}.archived`),
+  );
 }
 
 export function parseEngagement(value: unknown, what = "engagement"): Engagement {
   const record = requireObject(value, what);
   requireExactKeys(record, ENGAGEMENT_KEYS, what);
-  return {
-    id: requireName(record.id, `${what}.id`),
-    clientId: requireName(record.clientId, `${what}.clientId`),
-    name: requireName(record.name, `${what}.name`),
-    objectives: requireText(record.objectives, `${what}.objectives`),
-    status: requireStatus(record.status, `${what}.status`),
-  };
+  return withArchived<Engagement>(
+    {
+      id: requireName(record.id, `${what}.id`),
+      clientId: requireName(record.clientId, `${what}.clientId`),
+      name: requireName(record.name, `${what}.name`),
+      objectives: requireText(record.objectives, `${what}.objectives`),
+      status: requireStatus(record.status, `${what}.status`),
+    },
+    optionalArchived(record.archived, `${what}.archived`),
+  );
 }
 
 export function parseProject(value: unknown, what = "project"): Project {
   const record = requireObject(value, what);
   requireExactKeys(record, PROJECT_KEYS, what);
-  return {
-    id: requireName(record.id, `${what}.id`),
-    engagementId: requireName(record.engagementId, `${what}.engagementId`),
-    name: requireName(record.name, `${what}.name`),
-    objectives: requireText(record.objectives, `${what}.objectives`),
-    status: requireStatus(record.status, `${what}.status`),
-  };
+  return withArchived<Project>(
+    {
+      id: requireName(record.id, `${what}.id`),
+      engagementId: requireName(record.engagementId, `${what}.engagementId`),
+      name: requireName(record.name, `${what}.name`),
+      objectives: requireText(record.objectives, `${what}.objectives`),
+      status: requireStatus(record.status, `${what}.status`),
+    },
+    optionalArchived(record.archived, `${what}.archived`),
+  );
 }
 
 /** Freeze an array (and nested plain objects) so snapshots cannot be mutated. */
@@ -214,6 +269,8 @@ export interface Task {
   owner: string;
   dueDate?: string;
   context: string;
+  /** Present and true only when the record is archived; absent otherwise. */
+  archived?: boolean;
 }
 
 export interface WorkItem {
@@ -225,6 +282,8 @@ export interface WorkItem {
   title: string;
   context: string;
   state: ItemState;
+  /** Present and true only when the record is archived; absent otherwise. */
+  archived?: boolean;
 }
 
 export interface Meeting {
@@ -305,6 +364,7 @@ const TASK_KEYS = [
   "owner",
   "dueDate",
   "context",
+  "archived",
 ] as const;
 const ITEM_KEYS = [
   "id",
@@ -315,6 +375,7 @@ const ITEM_KEYS = [
   "title",
   "context",
   "state",
+  "archived",
 ] as const;
 const MEETING_KEYS = [
   "id",
@@ -343,7 +404,7 @@ export function parseTask(value: unknown, what = "task"): Task {
   if (projectId !== undefined) task.projectId = projectId;
   const dueDate = optionalDate(record.dueDate, `${what}.dueDate`);
   if (dueDate !== undefined) task.dueDate = dueDate;
-  return task;
+  return withArchived(task, optionalArchived(record.archived, `${what}.archived`));
 }
 
 export function parseWorkItem(value: unknown, what = "work item"): WorkItem {
@@ -360,7 +421,7 @@ export function parseWorkItem(value: unknown, what = "work item"): WorkItem {
   };
   const projectId = requireOptionalParentId(record.projectId, `${what}.projectId`);
   if (projectId !== undefined) item.projectId = projectId;
-  return item;
+  return withArchived(item, optionalArchived(record.archived, `${what}.archived`));
 }
 
 export function parseMeeting(value: unknown, what = "meeting"): Meeting {

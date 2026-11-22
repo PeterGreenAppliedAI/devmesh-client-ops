@@ -93,6 +93,7 @@ function instrumentedStore(inner: Store, calls: Calls): Store {
     updateItem: (id, edit) => count(() => inner.updateItem(id, edit)),
     createMeeting: (input) => count(() => inner.createMeeting(input)),
     updateMeeting: (id, edit) => count(() => inner.updateMeeting(id, edit)),
+    setArchived: (kind, id, archived) => count(() => inner.setArchived(kind, id, archived)),
     listTasks: (filter) => inner.listTasks(filter),
     listItems: (filter) => inner.listItems(filter),
     listMeetings: (filter) => inner.listMeetings(filter),
