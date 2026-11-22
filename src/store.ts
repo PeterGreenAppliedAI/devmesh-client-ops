@@ -454,7 +454,8 @@ function parseState(text: string): State {
   // document that mentions a work collection or a work counter while claiming
   // the old version is refused rather than guessed at. Versions 3 and 4 must
   // contain exactly the hierarchy plus the work collections. Only version 4
-  // may carry an `archived` field, and only as `true`.
+  // may carry an `archived` field, and only as a boolean; `true` means archived
+  // and `false` means active, read exactly as an absent flag.
   const legacy = version === LEGACY_SCHEMA_VERSION;
   const flagsAllowed = version === SCHEMA_VERSION;
   const allowedKeys = legacy ? LEGACY_STATE_KEYS : STATE_KEYS;
@@ -1311,17 +1312,14 @@ class StoreImpl implements Store {
   }
 
   setArchived(kind: ArchiveKind, id: string, archived: boolean): Promise<void> {
-    // Arguments are validated before the store is consulted, so a bad kind,
-    // flag or id is refused with a rejected promise even on a closed or
-    // blocked store; whether the id exists is the queue's own check.
-    let args: { kind: ArchiveKind; id: string; archived: boolean };
-    try {
-      args = requireArchiveArguments(kind, id, archived);
-    } catch (error) {
-      return Promise.reject(error);
-    }
+    // Archival is an ordinary mutation: it enters the queue first, so a closed
+    // or blocked store refuses it exactly as it refuses every other mutation.
+    // The arguments are then validated inside the queued operation, and only
+    // after that is the record looked up; a bad argument is refused without
+    // writing anything.
     return this.enqueue(() =>
       this.commit((draft) => {
+        const args = requireArchiveArguments(kind, id, archived);
         const key = ARCHIVE_COLLECTION_KEYS[args.kind];
         const items = draft[key];
         const current = findRecord(

@@ -18,7 +18,7 @@ export interface Client {
   stakeholders: string;
   requirements: string;
   objectives: string;
-  /** Present and true only when the record is archived; absent otherwise. */
+  /** True when the record is archived; false or absent means active. */
   archived?: boolean;
 }
 
@@ -28,7 +28,7 @@ export interface Engagement {
   name: string;
   objectives: string;
   status: EngagementStatus;
-  /** Present and true only when the record is archived; absent otherwise. */
+  /** True when the record is archived; false or absent means active. */
   archived?: boolean;
 }
 
@@ -38,7 +38,7 @@ export interface Project {
   name: string;
   objectives: string;
   status: ProjectStatus;
-  /** Present and true only when the record is archived; absent otherwise. */
+  /** True when the record is archived; false or absent means active. */
   archived?: boolean;
 }
 
@@ -118,27 +118,26 @@ function requireStatus(value: unknown, what: string): EngagementStatus {
 }
 
 /**
- * Accept an optional archival flag. The flag is only ever boolean, and only
- * `true` marks a record archived: an absent value leaves the record active, so
- * a stored `false` is refused rather than kept as a second spelling of active.
+ * Accept an optional archival flag. The flag is only ever boolean; `true`
+ * marks a record archived and `false` means active. A stored document may
+ * spell active either as an absent flag or as `false`; both are read as
+ * active. Removing the flag from a record is `setArchived(false)`'s job, not
+ * the parser's, so a stored `false` is accepted rather than refused.
  */
 function optionalArchived(value: unknown, what: string): boolean | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== "boolean") {
     throw new ValidationError(`${what} must be a boolean`);
   }
-  if (value === false) {
-    throw new ValidationError(`${what} must be true when supplied`);
-  }
-  return true;
+  return value;
 }
 
-/** Add the archival flag only when it is true; otherwise the field is absent. */
+/** Keep the archival flag when one is given; otherwise the field is absent. */
 function withArchived<T extends { archived?: boolean }>(
   record: T,
   archived: boolean | undefined,
 ): T {
-  if (archived === true) record.archived = true;
+  if (archived !== undefined) record.archived = archived;
   return record;
 }
 
@@ -269,7 +268,7 @@ export interface Task {
   owner: string;
   dueDate?: string;
   context: string;
-  /** Present and true only when the record is archived; absent otherwise. */
+  /** True when the record is archived; false or absent means active. */
   archived?: boolean;
 }
 
@@ -282,7 +281,7 @@ export interface WorkItem {
   title: string;
   context: string;
   state: ItemState;
-  /** Present and true only when the record is archived; absent otherwise. */
+  /** True when the record is archived; false or absent means active. */
   archived?: boolean;
 }
 
