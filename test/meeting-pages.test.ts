@@ -323,6 +323,20 @@ describe("meeting pages: creation", () => {
         assert.equal(correction.controls.get("date"), date);
         assert.equal(correction.controls.get("notes"), "keep notes");
         assert.equal(correction.controls.get("projectId"), h.project.id);
+        // The failing visible field is marked invalid and describes itself with
+        // a message of its own, which the summary also carries.
+        const failing = title.trim() === "" ? "title" : "date";
+        assert.equal((reply.body.match(/aria-invalid="true"/g) ?? []).length, 1, `${title} ${date}`);
+        assert.match(
+          reply.body,
+          new RegExp(
+            `<(?<tag>input)[^>]*\\sid="field-${failing}"[^>]*\\saria-invalid="true"[^>]*\\saria-describedby="field-${failing}-error"`,
+          ),
+          `${title} ${date}`,
+        );
+        const inline = new RegExp(`<p id="field-${failing}-error">([^<]*)<\\/p>`).exec(reply.body);
+        assert.ok(inline !== null, `${title} ${date}`);
+        assert.ok(reply.body.includes(`<li>${inline[1]}</li>`), `${title} ${date} summary`);
       }
       assert.equal(JSON.stringify(server.store.snapshot()), before);
 

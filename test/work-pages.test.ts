@@ -9,9 +9,16 @@ import { registerRoutes } from "../src/index.ts";
 import { startServer } from "../src/server.ts";
 import { openStore, type Store } from "../src/store.ts";
 import {
+  badge,
+  clientGuidance,
+  displayList,
+  displayValues,
+  emptyState,
   engagementOnlyWork,
+  groupedSections,
   matchWorkPath,
   openItemCount,
+  primaryAction,
   projectWork,
   routeForWorkPattern,
   taskStatusCounts,
@@ -519,6 +526,14 @@ describe("work pages: tasks", () => {
       assert.equal(form.controls.get("engagementId"), h.engagement.id);
       // The rejected status is shown as the selected, marked option.
       assert.match(invalid.body, /<option value="active" selected>active \(not a valid choice\)<\/option>/);
+      // Fail-fast validation names the first problem, the blank title, and that
+      // visible control is marked invalid with its own message.
+      assert.match(invalid.body, /task\.title must be nonblank/);
+      assert.match(
+        invalid.body,
+        /<input type="text" id="field-title" name="title" value="   " required aria-invalid="true" aria-describedby="field-title-error">/,
+      );
+      assert.match(invalid.body, /<p id="field-title-error">task\.title must be nonblank<\/p>/);
 
       // Correct the title and resubmit the rendered form; it redirects.
       form.controls.set("title", "Fixed");
@@ -535,6 +550,218 @@ describe("work pages: tasks", () => {
       assert.equal(stored.status, "in_progress");
       assert.equal(stored.owner, "keep owner");
       assert.equal(stored.dueDate, "2027-02-28");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("associates enum and date errors with the visible control that caused them", async () => {
+    const server = await running();
+    try {
+      const h = await hierarchy(server.store);
+      for (const [path, form, field, id, message] of [
+        [
+          `/engagements/${h.engagement.id}/tasks/new`,
+          { title: "T", status: "active", priority: "high", owner: "", dueDate: "", context: "", projectId: "" },
+          "status",
+          "select",
+          /task\.status must be one of/,
+        ],
+        [
+          `/engagements/${h.engagement.id}/tasks/new`,
+          { title: "T", status: "open", priority: "high", owner: "", dueDate: "not-a-date", context: "", projectId: "" },
+          "dueDate",
+          "input",
+          /task\.dueDate must be a YYYY-MM-DD date/,
+        ],
+        [
+          `/engagements/${h.engagement.id}/items/new`,
+          { kind: "question", title: "I", context: "", state: "closed-ish", projectId: "" },
+          "state",
+          "select",
+          /item\.state must be one of/,
+        ],
+      ] as const) {
+        const before = JSON.stringify(server.store.snapshot());
+        const reply = await send(server.origin, {
+          method: "POST",
+          path,
+          form: { engagementId: h.engagement.id, ...form },
+        });
+        assert.equal(reply.status, 400, `${path} ${field}`);
+        // Only the failing field's control is marked invalid, and it points at
+        // a message that carries the same text as the summary entry.
+        const marked = reply.body.match(/aria-invalid="true"/g) ?? [];
+        assert.equal(marked.length, 1, `${path} ${field} marks one control`);
+        assert.match(
+          reply.body,
+          new RegExp(
+            `<${id}[^>]*\\sid="field-${field}"[^>]*\\saria-invalid="true"[^>]*\\saria-describedby="field-${field}-error"`,
+          ),
+        );
+        assert.match(reply.body, message, `${path} ${field} summary text`);
+        assert.equal(JSON.stringify(server.store.snapshot()), before, `${path} ${field}`);
+      }
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("refuses create/edit parent mismatches, accepting blank, matching and omitted parents", async () => {
+    const server = await running();
+    try {
+      const h = await hierarchy(server.store);
+
+      // Create: an omitted, blank or matching parent is valid; a differing
+      // parent is a correctable 400 that writes nothing.
+      const createUrl = `/engagements/${h.engagement.id}/tasks/new`;
+      const base = { title: "Parent check", status: "open", priority: "normal", owner: "", dueDate: "", context: "", projectId: "" };
+      const omitted = await send(server.origin, { method: "POST", path: createUrl, form: base });
+      assert.match(redirectTarget(omitted), /^\/tasks\/task-\d+$/);
+      const matching = await send(server.origin, {
+        method: "POST",
+        path: createUrl,
+        form: { engagementId: h.engagement.id, ...base },
+      });
+      assert.match(redirectTarget(matching), /^\/tasks\/task-\d+$/);
+
+      const beforeBlank = JSON.stringify(server.store.snapshot());
+      const blank = await send(server.origin, {
+        method: "POST",
+        path: createUrl,
+        form: { engagementId: "", ...base },
+      });
+      assert.equal(blank.status, 400);
+      assert.match(blank.body, /not the parent engagement of this form/);
+      assert.equal(JSON.stringify(server.store.snapshot()), beforeBlank);
+      // A hidden identity error has no control of its own.
+      assert.equal((blank.body.match(/aria-invalid="true"/g) ?? []).length, 0);
+      // The correction keeps the URL parent in its hidden control.
+      assert.equal(parseForm(blank.body).controls.get("engagementId"), h.engagement.id);
+
+      const beforeOther = JSON.stringify(server.store.snapshot());
+      const other = await send(server.origin, {
+        method: "POST",
+        path: createUrl,
+        form: { engagementId: h.sibling.id, ...base },
+      });
+      assert.equal(other.status, 400);
+      assert.match(other.body, /not the parent engagement of this form/);
+      assert.equal(JSON.stringify(server.store.snapshot()), beforeOther);
+
+      // Edit: omitted or matching parents are valid; a differing client,
+      // engagement or blank parent is refused before the store saves anything.
+      const task = await server.store.createTask({
+        clientId: h.client.id,
+        engagementId: h.engagement.id,
+        title: "Edit parent",
+        owner: "keep",
+      });
+      const editUrl = `/tasks/${task.id}/edit`;
+      const beforeEdit = JSON.stringify(server.store.snapshot());
+      const editMismatch = await send(server.origin, {
+        method: "POST",
+        path: editUrl,
+        form: { id: task.id, title: "Renamed", engagementId: h.sibling.id },
+      });
+      assert.equal(editMismatch.status, 400);
+      assert.match(editMismatch.body, /not the parent engagement of this form/);
+      assert.equal(JSON.stringify(server.store.snapshot()), beforeEdit);
+
+      const editClientMismatch = await send(server.origin, {
+        method: "POST",
+        path: editUrl,
+        form: { id: task.id, title: "Renamed", clientId: h.otherClient.id },
+      });
+      assert.equal(editClientMismatch.status, 400);
+      assert.match(editClientMismatch.body, /not the client of this engagement/);
+      assert.equal(JSON.stringify(server.store.snapshot()), beforeEdit);
+
+      // An existing identity conflict takes precedence over a parent mismatch.
+      const precedence = await send(server.origin, {
+        method: "POST",
+        path: editUrl,
+        form: { id: "task-99", title: "Renamed", engagementId: h.sibling.id },
+      });
+      assert.equal(precedence.status, 400);
+      assert.match(precedence.body, /does not match this URL/);
+      assert.doesNotMatch(precedence.body, /not the parent engagement/);
+      assert.equal(JSON.stringify(server.store.snapshot()), beforeEdit);
+
+      // A matching-parent edit with omitted values keeps the stored fields.
+      const ok = await send(server.origin, {
+        method: "POST",
+        path: editUrl,
+        form: { id: task.id, title: "Renamed", engagementId: h.engagement.id, clientId: h.client.id },
+      });
+      assert.match(redirectTarget(ok), /^\/tasks\/task-\d+$/);
+      const stored = server.store.snapshot().tasks.find((candidate) => candidate.id === task.id);
+      assert.ok(stored !== undefined);
+      assert.equal(stored.title, "Renamed");
+      assert.equal(stored.owner, "keep");
+      assert.equal(stored.engagementId, h.engagement.id);
+      assert.equal(stored.clientId, h.client.id);
+
+      // The same rules hold for work items.
+      const itemCreateUrl = `/engagements/${h.engagement.id}/items/new`;
+      const itemBase = { kind: "question", title: "Item parent", context: "", state: "open", projectId: "" };
+      const itemOmitted = await send(server.origin, { method: "POST", path: itemCreateUrl, form: itemBase });
+      assert.match(redirectTarget(itemOmitted), /^\/items\/item-\d+$/);
+      const itemMatching = await send(server.origin, {
+        method: "POST",
+        path: itemCreateUrl,
+        form: { engagementId: h.engagement.id, ...itemBase },
+      });
+      assert.match(redirectTarget(itemMatching), /^\/items\/item-\d+$/);
+      for (const parent of ["", h.sibling.id]) {
+        const beforeItem = JSON.stringify(server.store.snapshot());
+        const itemConflict = await send(server.origin, {
+          method: "POST",
+          path: itemCreateUrl,
+          form: { engagementId: parent, ...itemBase },
+        });
+        assert.equal(itemConflict.status, 400, JSON.stringify(parent));
+        assert.match(itemConflict.body, /not the parent engagement of this form/);
+        assert.equal(JSON.stringify(server.store.snapshot()), beforeItem);
+      }
+
+      const item = await server.store.createItem({
+        clientId: h.client.id,
+        engagementId: h.engagement.id,
+        kind: "question",
+        title: "Item edit parent",
+        context: "keep item",
+      });
+      const itemEditUrl = `/items/${item.id}/edit`;
+      const beforeItemEdit = JSON.stringify(server.store.snapshot());
+      const itemEditMismatch = await send(server.origin, {
+        method: "POST",
+        path: itemEditUrl,
+        form: { id: item.id, title: "Renamed item", engagementId: h.sibling.id },
+      });
+      assert.equal(itemEditMismatch.status, 400);
+      assert.match(itemEditMismatch.body, /not the parent engagement of this form/);
+      const itemPrecedence = await send(server.origin, {
+        method: "POST",
+        path: itemEditUrl,
+        form: { id: "item-99", title: "Renamed item", clientId: h.otherClient.id },
+      });
+      assert.equal(itemPrecedence.status, 400);
+      assert.match(itemPrecedence.body, /does not match this URL/);
+      assert.doesNotMatch(itemPrecedence.body, /not the client of this engagement/);
+      assert.equal(JSON.stringify(server.store.snapshot()), beforeItemEdit);
+      const itemOk = await send(server.origin, {
+        method: "POST",
+        path: itemEditUrl,
+        form: { id: item.id, title: "Renamed item", engagementId: h.engagement.id, clientId: h.client.id },
+      });
+      assert.match(redirectTarget(itemOk), /^\/items\/item-\d+$/);
+      const storedItem = server.store.snapshot().items.find((candidate) => candidate.id === item.id);
+      assert.ok(storedItem !== undefined);
+      assert.equal(storedItem.title, "Renamed item");
+      assert.equal(storedItem.context, "keep item");
+      assert.equal(storedItem.engagementId, h.engagement.id);
+      assert.equal(storedItem.clientId, h.client.id);
     } finally {
       await server.close();
     }
@@ -1434,6 +1661,55 @@ describe("work pages: guards", () => {
     } finally {
       await server.close();
     }
+  });
+});
+
+describe("work pages: presentation helpers", () => {
+  it("escapes badge text, groups sections and offers only a real empty-state step", () => {
+    // A badge is escaped text, so a stored value can never bring markup in.
+    assert.equal(badge("<b>x</b>"), '<span class="badge">&lt;b&gt;x&lt;/b&gt;</span>');
+
+    // Groups become lower-level headings with their own bodies.
+    assert.equal(
+      groupedSections([
+        { title: "Open <a>", body: "<p>one</p>" },
+        { title: "Done", body: "<p>two</p>" },
+      ]),
+      "<h3>Open &lt;a&gt;</h3><p>one</p>\n<h3>Done</h3><p>two</p>",
+    );
+
+    // An empty state names the gap and, when the scope offers one, the next
+    // step; without one it never guesses a destination.
+    assert.equal(emptyState("Nothing <yet>.", { href: "/new?a=1&b=2", label: "Add" }), '<p>Nothing &lt;yet&gt;.</p>\n<p><a href="/new?a=1&amp;b=2">Add</a></p>');
+    assert.equal(emptyState("Nothing <yet>."), "<p>Nothing &lt;yet&gt;.</p>");
+
+    // A primary action is one escaped link in a labelled paragraph.
+    assert.equal(
+      primaryAction("/new", "New <x>"),
+      '<p class="primary-action"><a href="/new">New &lt;x&gt;</a></p>',
+    );
+
+    // Client guidance always asks the user to choose an engagement, and links
+    // only engagements it was given.
+    assert.match(clientGuidance([]), /choose an engagement/i);
+    assert.ok(!clientGuidance([]).includes("<a "));
+    assert.match(clientGuidance([{ href: "/engagements/e1", label: "E1" }]), /<a href="\/engagements\/e1">E1<\/a>/);
+  });
+
+  it("shows badge-marked fields as escaped text badges and hides identity fields", () => {
+    const fields = [
+      { name: "title", label: "Title" },
+      { name: "status", label: "Status", presentation: { badge: true } },
+      { name: "clientId", label: "Client", presentation: { identity: true } },
+    ] as const;
+    assert.deepEqual(displayValues(fields, { title: "T", status: "<open>", clientId: "c1" }), [
+      { label: "Title", value: "T", badge: false },
+      { label: "Status", value: "<open>", badge: true },
+    ]);
+    assert.equal(
+      displayList(displayValues(fields, { title: "T", status: "<open>" })),
+      '<dl><dt>Title</dt><dd>T</dd><dt>Status</dt><dd><span class="badge">&lt;open&gt;</span></dd></dl>',
+    );
   });
 });
 

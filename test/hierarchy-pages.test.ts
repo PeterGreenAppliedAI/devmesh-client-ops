@@ -1228,7 +1228,8 @@ describe("hierarchy pages", () => {
       // The client's one primary action is creating an engagement; the empty
       // project list names what is missing rather than guessing a project.
       assert.match(overview.body, /<section><h2>Engagements<\/h2><p class="primary-action"><a href="[^"]+">New engagement<\/a>/);
-      assert.match(overview.body, /<section><h2>Projects<\/h2><p>No projects yet\.<\/p>/);
+      assert.match(overview.body, /<section><h2>Projects<\/h2><ul><li><a href="\/projects\/[^"]+">Prototype<\/a> \(completed · Discovery\)<\/li><\/ul>/);
+      assert.doesNotMatch(overview.body, /No projects yet\./);
     } finally {
       await server.close();
     }
