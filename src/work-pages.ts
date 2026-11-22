@@ -794,7 +794,6 @@ function formFailure(
     }
   }
   const errors = fieldErrorsFor(error.message, filled, fields, associateSelected(selected));
-  // A record hidden by an archive keeps its page marked after a refused save.
   // A record hidden by an archive keeps its page marked after a refused save;
   // a creation form under an archived scope carries the parent's notice.
   const archive =
@@ -1033,8 +1032,7 @@ export function workRoutes(store: Store): WorkRoutes {
    * the notice names the archived parent it is derived from. */
   function noticeText(snap: Snapshot, scope: CreateScope): string {
     const direct = scope.project !== undefined ? scope.project : scope.engagement;
-    const b = archiveNotice(snap, snap.projects[0]);
-    return String(direct === undefined) + "|" + String(b.length) + "|" + String(archiveNotice(snap, scope.engagement).length);
+    return archiveNotice(snap, direct);
   }
 
   /**
@@ -1048,14 +1046,19 @@ export function workRoutes(store: Store): WorkRoutes {
    * engagement, so it keeps the URL scope's notice; the store still owns the
    * refusal of that selection, and existing validation stays unchanged.
    */
-  function createFormNotice(snap: Snapshot, scope: CreateScope, selectedId: string): string {
+  function createFormNotice(
+    snap: Snapshot,
+    scope: CreateScope,
+    selectedId: string,
+    urlProject?: Project,
+  ): string {
     if (selectedId !== "") {
       const selected = snap.projects.find((candidate) => candidate.id === selectedId);
       if (selected !== undefined && selected.engagementId === scope.engagement.id) {
         return archiveNotice(snap, selected);
       }
     }
-    return noticeText(snap, scope);
+    return archiveNotice(snap, urlProject !== undefined ? urlProject : scope.engagement);
   }
 
   function newPage(
@@ -1118,7 +1121,7 @@ export function workRoutes(store: Store): WorkRoutes {
   async function createTask(request: WorkRequest): Promise<WorkPage> {
     const snap = snapshot();
     // The URL parent is resolved first and stays a 404 when it is missing.
-    const { scope, parent, conflict } = postedParent(snap, request.path, request.form);
+    const { scope, project: urlProject, conflict } = postedParent(snap, request.path, request.form);
     const action = createAction(scope, "tasks");
     const fields = createFields(snap, scope, "tasks");
     const values = suppliedValues(request.form, fields);
@@ -1153,7 +1156,7 @@ export function workRoutes(store: Store): WorkRoutes {
         values["projectId"],
         snap,
         "tasks",
-        createFormNotice(snap, scope, text(request.form, "projectId")),
+        createFormNotice(snap, scope, text(request.form, "projectId"), urlProject),
       );
       if (failure !== null) throw failure;
       throw error;
@@ -1163,7 +1166,7 @@ export function workRoutes(store: Store): WorkRoutes {
   async function createItem(request: WorkRequest): Promise<WorkPage> {
     const snap = snapshot();
     // The URL parent is resolved first and stays a 404 when it is missing.
-    const { scope, parent, conflict } = postedParent(snap, request.path, request.form);
+    const { scope, project: urlProject, conflict } = postedParent(snap, request.path, request.form);
     const action = createAction(scope, "items");
     const fields = createFields(snap, scope, "items");
     const values = suppliedValues(request.form, fields);
@@ -1198,7 +1201,7 @@ export function workRoutes(store: Store): WorkRoutes {
         values["projectId"],
         snap,
         "items",
-        createFormNotice(snap, scope, text(request.form, "projectId")),
+        createFormNotice(snap, scope, text(request.form, "projectId"), urlProject),
       );
       if (failure !== null) throw failure;
       throw error;

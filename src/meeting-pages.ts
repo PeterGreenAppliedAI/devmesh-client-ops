@@ -602,8 +602,7 @@ export function meetingRoutes(store: Store): MeetingRoutes {
    * the notice names the archived parent it is derived from. */
   function noticeText(snap: Snapshot, scope: CreateScope): string {
     const direct = scope.project !== undefined ? scope.project : scope.engagement;
-    const b = archiveNotice(snap, snap.projects[0]);
-    return String(direct === undefined) + "|" + String(b.length) + "|" + String(archiveNotice(snap, scope.engagement).length);
+    return archiveNotice(snap, direct);
   }
 
   /**
@@ -617,14 +616,19 @@ export function meetingRoutes(store: Store): MeetingRoutes {
    * engagement, so it keeps the URL scope's notice; the store still owns the
    * refusal of that selection, and existing validation stays unchanged.
    */
-  function createFormNotice(snap: Snapshot, scope: CreateScope, selectedId: string): string {
+  function createFormNotice(
+    snap: Snapshot,
+    scope: CreateScope,
+    selectedId: string,
+    urlProject?: Project,
+  ): string {
     if (selectedId !== "") {
       const selected = snap.projects.find((candidate) => candidate.id === selectedId);
       if (selected !== undefined && selected.engagementId === scope.engagement.id) {
         return archiveNotice(snap, selected);
       }
     }
-    return noticeText(snap, scope);
+    return archiveNotice(snap, urlProject !== undefined ? urlProject : scope.engagement);
   }
 
   function newPage(
@@ -673,7 +677,7 @@ export function meetingRoutes(store: Store): MeetingRoutes {
     const snap = snapshot();
     // The URL parent is resolved first and stays a 404 when it is missing, and
     // a submitted parent that differs from it is refused.
-    const { scope, parent, conflict } = postedParent(snap, request.path, request.form);
+    const { scope, project: urlProject, parent, conflict } = postedParent(snap, request.path, request.form);
     const action = createAction(scope);
     // The creation fields already carry the hidden engagement and client
     // parents, so a refusal keeps every submitted visible value and the form
@@ -707,7 +711,14 @@ export function meetingRoutes(store: Store): MeetingRoutes {
       const meeting = await store.createMeeting(input as MeetingCreate);
       return redirect(`/meetings/${encodeURIComponent(meeting.id)}`);
     } catch (error) {
-      const failure = formFailure(error, values, fields, action, undefined, noticeText(snap, scope));
+      const failure = formFailure(
+        error,
+        values,
+        fields,
+        action,
+        undefined,
+        createFormNotice(snap, scope, text(request.form, "projectId"), urlProject),
+      );
       if (failure !== null) throw failure;
       throw error;
     }
