@@ -348,6 +348,10 @@ describe("meeting pages: creation", () => {
         // The failing visible field is marked invalid and describes itself with
         // a message of its own, which the summary also carries.
         const fields = title.trim() === "" ? ["title"] : ["date"];
+        // Exactly the failing controls are invalid, whether or not they are
+        // described: the independent count keeps an extra marked control from
+        // slipping in unnoticed, alongside the association check below.
+        assert.equal((reply.body.match(/aria-invalid="true"/g) ?? []).length, fields.length, `${title} ${date}`);
         assert.equal(invalidControls(reply.body).length, fields.length, `${title} ${date}`);
         for (const failing of fields) {
           const associated = invalidControls(reply.body).find((control) => control.field === failing);
@@ -442,6 +446,27 @@ describe("meeting pages: creation", () => {
         assert.equal(JSON.stringify(server.store.snapshot()), before, impossibleDate);
       }
 
+      // A year-zero day the store refuses (`0000-02-30` is not a real day) is
+      // still rendered as text: a browser's date control sanitises `0000-MM-DD`
+      // to empty, so the value would not survive as text on a date control.
+      for (const refusedZero of ["0000-02-30"]) {
+        const zero = await send(server.origin, {
+          method: "POST",
+          path: `/engagements/${h.engagement.id}/meetings/new`,
+          form: { engagementId: h.engagement.id, title: "Zero", date: refusedZero, notes: "keep", projectId: "" },
+        });
+        assert.equal(zero.status, 400, refusedZero);
+        assert.match(
+          zero.body,
+          new RegExp(`<input type="text" id="field-date" name="date" value="${escapeHtml(refusedZero)}" required aria-invalid="true"`),
+          refusedZero,
+        );
+        assert.equal(parseForm(zero.body).controls.get("date"), refusedZero, refusedZero);
+        assert.match(zero.body, /must be a real calendar date/, refusedZero);
+        assert.equal(parseForm(zero.body).controls.get("notes"), "keep", refusedZero);
+        assert.equal(JSON.stringify(server.store.snapshot()), before, refusedZero);
+      }
+
       // A leap day of a leap year is a real date and keeps the date control,
       // which shows it exactly as written.
       const leapDay = await send(server.origin, {
@@ -519,6 +544,35 @@ describe("meeting pages: creation", () => {
       assert.equal(engagementTamper.status, 400);
       assert.match(engagementTamper.body, /not the parent engagement of this form/);
       assert.equal(invalidControls(engagementTamper.body).length, 0);
+
+      // A parent value quoting a visible field name together with other words
+      // (`projectId` quoted inside the engagement value) is still a value: the
+      // message names the hidden engagement link, and the quoted project does
+      // not mark the project select invalid.
+      const quotedProject = await send(server.origin, {
+        method: "POST",
+        path: `/engagements/${h.engagement.id}/meetings/new`,
+        form: { engagementId: "x projectId y", title: "T", date: "2026-01-01", notes: "", projectId: "" },
+      });
+      assert.equal(quotedProject.status, 400);
+      assert.match(quotedProject.body, /not the parent engagement of this form/);
+      assert.equal((quotedProject.body.match(/aria-invalid="true"/g) ?? []).length, 0);
+      assert.doesNotMatch(quotedProject.body, /id="field-projectId"[^>]*aria-invalid/);
+      assert.equal(parseForm(quotedProject.body).controls.get("projectId"), "");
+
+      // A parent value carrying an escaped quote (`x\" notes`) is one complete
+      // quoted value through to its closing quote, so the notes control after
+      // it is never named.
+      const escapedQuote = await send(server.origin, {
+        method: "POST",
+        path: `/engagements/${h.engagement.id}/meetings/new`,
+        form: { clientId: "x\\\" notes", title: "T", date: "2026-01-01", notes: "keep", projectId: "" },
+      });
+      assert.equal(escapedQuote.status, 400);
+      assert.match(escapedQuote.body, /not the client of this engagement/);
+      assert.equal((escapedQuote.body.match(/aria-invalid="true"/g) ?? []).length, 0);
+      assert.doesNotMatch(escapedQuote.body, /id="field-notes"[^>]*aria-invalid/);
+      assert.equal(parseForm(escapedQuote.body).controls.get("notes"), "keep");
       assert.equal(JSON.stringify(server.store.snapshot()), before);
       assert.equal(JSON.stringify(server.store.snapshot()), before);
 

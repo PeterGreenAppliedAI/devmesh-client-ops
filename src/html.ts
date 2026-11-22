@@ -221,53 +221,91 @@ export function renderFormSummary(summary: string, errors: readonly FieldError[]
  * word that is exactly one of the visible controls' names (`projectId`). A
  * word inside a quoted submitted value, and an incidental word that merely
  * reads like a field name, is not a field reference. A parent link
- * (`engagementId`) is only named when a message names its field itself, not
- * when it quotes a value; a hidden control is never matched, so an identity or
- * parent problem stays in the summary alone.
+ * (`engagementId`, `clientId`) and any other hidden control is never matched,
+ * so an identity or parent problem stays in the summary alone.
+ *
+ * The message is read as the text outside every complete quoted value: a
+ * quoted value may itself contain spaces, field-like words and even an escaped
+ * quote (`\"`), and none of it is ever a field reference. So a parent value
+ * that quotes a field name (such as `engagementId "title"`) never marks that
+ * visible control. A name outside the quotes may still introduce a quoted
+ * value (`projectId: "..."`) and is named as usual.
+ *
+ * A message that names one of the form's hidden controls (an identity or
+ * parent link) in text that the user did not submit is about that link, so it
+ * reports no visible control and stays in the summary alone: an unassignable
+ * project message (`projectId "p" does not belong to engagementId "e"`)
+ * names the hidden engagement link, not the project select.
  */
 export function namedVisibleField(
   message: string,
   fields: readonly FieldSpec[],
 ): string | undefined {
   const visible = new Set<string>();
-  const parentLinks = new Set<string>();
+  const hidden = new Set<string>();
   for (const field of fields) {
-    if (field.hidden === true) parentLinks.add(field.name);
+    if (field.hidden === true) hidden.add(field.name);
     else visible.add(field.name);
   }
-  // A message about a parent chain (naming an identity or parent link together
-  // with a visible link, such as `projectId "x" does not belong to
-  // engagementId "y"`) is about the links and never reports a visible control.
-  const namesParentLink = message
-    .split(/\s+/)
-    .some((word) => parentLinks.has(word.replace(/[[][0-9]+[]]/g, "").replace(/[:;,]$/, "")));
-  // A quoted submitted value is skipped whole: everything between its opening
-  // quote and the matching closing quote is a value, never a field reference.
-  let quoted: string | null = null;
-  for (const raw of message.split(/\s+/)) {
-    const word = raw.replace(/[[][0-9]+[]]/g, "");
-    if (quoted !== null) {
-      if (word.includes(quoted)) quoted = null;
-      continue;
-    }
-    if (word.startsWith("\"") || word.startsWith("'") || word.startsWith("`")) {
-      // A word that opens a quoted value holds no field reference; a name that
-      // introduces the value (such as `engagementId "x"`) is the word before
-      // it, which the loop has already read.
-      if (word.length === 1 || !word.slice(1).includes(word[0])) quoted = word[0];
-      continue;
-    }
-    // A qualified name (`task.title`, `task.dueDate:`) names the part after
-    // its record prefix; a bare word must be a control's exact name.
-    const unquoted = word.replace(/[:;,]$/, "");
-    if (unquoted === "") continue;
-    const name = unquoted.includes(".") ? unquoted.slice(unquoted.lastIndexOf(".") + 1) : unquoted;
-    // A parent link has no visible control, and a parent-chain message names
-    // no single control, so both stay in the summary alone.
-    if (parentLinks.has(name) || namesParentLink) continue;
+  const unquotedWords = wordsOutsideQuotes(message);
+  // The hidden controls named in the message's own text (never a quoted value).
+  const namesHidden = unquotedWords.some((word) => hidden.has(fieldName(word)));
+  for (const word of unquotedWords) {
+    const name = fieldName(word);
+    // A hidden control has no visible field of its own, and a message about
+    // one stays in the summary alone rather than marking a visible control.
+    if (name === "" || hidden.has(name) || namesHidden) continue;
     if (visible.has(name)) return name;
   }
   return undefined;
+}
+
+/** The field a message word names, if it names one: a qualified name
+ * (`task.title`, `task.dueDate:`) names the part after its record prefix, and
+ * a bare word must be a control's exact name. Padded indexes are ignored. */
+function fieldName(word: string): string {
+  const unquoted = word.replace(/[[][0-9]+[]]/g, "").replace(/[:;,]$/, "");
+  if (unquoted === "") return "";
+  return unquoted.includes(".") ? unquoted.slice(unquoted.lastIndexOf(".") + 1) : unquoted;
+}
+
+/**
+ * The text words of a message that lie outside every complete quoted value.
+ * A quoted value opens at a quote character that begins a word (`"`, `'` or a
+ * backtick) and runs until the next same quote that closes it; an escaped
+ * quote (`\"`, `\'`) is part of the value it does not close. An unclosed quote
+ * runs to the end of the message, so the rest of the message stays treated as
+ * value text rather than as field references. A quote inside a word (such as
+ * an apostrophe) is not a value opener.
+ */
+function wordsOutsideQuotes(message: string): readonly string[] {
+  const words: string[] = [];
+  let word = "";
+  let quote: string | null = null;
+  for (let index = 0; index < message.length; index += 1) {
+    const char = message[index];
+    if (quote !== null) {
+      if (char === "\\" && message[index + 1] === quote) {
+        index += 1;
+        continue;
+      }
+      if (char === quote) quote = null;
+      continue;
+    }
+    if (char === "\"" || char === "'" || char === "`") {
+      // A quote inside a word (such as an apostrophe) is not a value opener.
+      if (word === "") quote = char;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (word !== "") words.push(word);
+      word = "";
+      continue;
+    }
+    word += char;
+  }
+  if (word !== "") words.push(word);
+  return words;
 }
 
 /**
@@ -398,6 +436,9 @@ function isCalendarDate(value: string): boolean {
   const year = Number(match[1]);
   const month = Number(match[2]);
   const day = Number(match[3]);
+  // Year zero is not a valid year for an HTML date control, which sanitises
+  // `0000-MM-DD` to empty; such a value is shown as text so it is kept.
+  if (year < 1) return false;
   if (month < 1 || month > 12) return false;
   const daysInMonth = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
   const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;

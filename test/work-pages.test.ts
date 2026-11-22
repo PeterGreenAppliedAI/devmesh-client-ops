@@ -172,6 +172,25 @@ function parseForm(document: string): ParsedForm {
   return { action: unescapeHtml(action[1]), controls };
 }
 
+/**
+ * The visible controls a page associates with a field error: each control
+ * carrying `aria-invalid="true"` with an `aria-describedby` naming a message
+ * element of the same text as the control's own error paragraph.
+ */
+function invalidControls(
+  document: string,
+): readonly { readonly field: string; readonly describedBy: string }[] {
+  const found: { field: string; describedBy: string }[] = [];
+  for (const match of document.matchAll(
+    /<(?:input|textarea|select)[^>]*\sid="field-(?<field>[^"]+)"[^>]*\saria-invalid="true"[^>]*\saria-describedby="(?<described>[^"]+)"/g,
+  )) {
+    if (match.groups === undefined) continue;
+    assert.ok(document.includes(`id="${match.groups.described}"`), `${match.groups.field} describes a message`);
+    found.push({ field: match.groups.field, describedBy: match.groups.described });
+  }
+  return found;
+}
+
 /** A client with an engagement, a sibling engagement and one project each. */
 async function hierarchy(store: Store) {
   const client = await store.createClient({ name: "Acme" });
@@ -840,6 +859,14 @@ describe("work pages: tasks", () => {
         [`/engagements/${h.engagement.id}/tasks/new`, { ...taskBase, clientId: "notes" }],
         [`/engagements/${h.engagement.id}/items/new`, { ...itemBase, engagementId: "kind" }],
         [`/engagements/${h.engagement.id}/items/new`, { ...itemBase, clientId: "context" }],
+        // A parent value quoting a visible field name together with other words
+        // is still one value: it names the hidden parent link, not the control.
+        [`/engagements/${h.engagement.id}/tasks/new`, { ...taskBase, engagementId: "x projectId y" }],
+        [`/engagements/${h.engagement.id}/tasks/new`, { ...taskBase, clientId: "owner title" }],
+        // A parent value carrying an escaped quote (`x\" title`) stays quoted
+        // through its closing quote, so the visible word after it is not named.
+        [`/engagements/${h.engagement.id}/items/new`, { ...itemBase, engagementId: "x\\\" title" }],
+        [`/engagements/${h.engagement.id}/items/new`, { ...itemBase, clientId: "x\\\" context" }],
       ] as const) {
         const before = JSON.stringify(server.store.snapshot());
         const reply = await send(server.origin, { method: "POST", path, form });
@@ -847,6 +874,7 @@ describe("work pages: tasks", () => {
         assert.match(reply.body, /not the (parent engagement|client) of this/, path);
         assert.match(reply.body, /role="alert"/, path);
         assert.equal((reply.body.match(/aria-invalid="true"/g) ?? []).length, 0, path);
+        assert.equal(invalidControls(reply.body).length, 0, path);
         assert.equal(JSON.stringify(server.store.snapshot()), before, path);
       }
 
