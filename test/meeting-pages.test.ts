@@ -370,6 +370,184 @@ describe("meeting pages: creation", () => {
     }
   });
 
+  it("renders a rejected date as plain text that shows and resubmits the exact value", async () => {
+    const server = await running();
+    try {
+      const h = await hierarchy(server.store);
+      const before = JSON.stringify(server.store.snapshot());
+
+      // A valid date (and an empty one) keeps the browser's date control.
+      const createPage = await send(server.origin, {
+        path: `/engagements/${h.engagement.id}/meetings/new`,
+      });
+      assert.match(createPage.body, /<input type="date" id="field-date" name="date" value=""/);
+      assert.doesNotMatch(createPage.body, /<input type="date"[^>]*aria-invalid/);
+      // An invalid date is rendered as a text control, because a browser
+      // sanitises an invalid value on a date input to empty. The exact
+      // submitted text stays visible and in the value a resubmission sends.
+      for (const badDate of ["not a date", "2026-2-30", "05/05/2026", "20260230"]) {
+        const reply = await send(server.origin, {
+          method: "POST",
+          path: `/engagements/${h.engagement.id}/meetings/new`,
+          form: { engagementId: h.engagement.id, title: "Dated", date: badDate, notes: "keep", projectId: "" },
+        });
+        assert.equal(reply.status, 400, badDate);
+        assert.match(
+          reply.body,
+          new RegExp(`<input type="text" id="field-date" name="date" value="${escapeHtml(badDate)}" required[^>]*aria-invalid="true"`),
+          badDate,
+        );
+        // The exact text is the control's submitted value.
+        assert.equal(parseForm(reply.body).controls.get("date"), badDate, badDate);
+        // A valid stored date keeps the date control on an edit correction.
+        assert.equal(JSON.stringify(server.store.snapshot()), before, badDate);
+      }
+
+      // A well formed but impossible date is kept on the date control, which
+      // a browser displays as written; its exact text is still submitted.
+      const impossible = await send(server.origin, {
+        method: "POST",
+        path: `/engagements/${h.engagement.id}/meetings/new`,
+        form: { engagementId: h.engagement.id, title: "Dated", date: "2026-02-30", notes: "", projectId: "" },
+      });
+      assert.equal(impossible.status, 400);
+      assert.match(impossible.body, /<input type="date" id="field-date" name="date" value="2026-02-30" required/);
+      assert.equal(parseForm(impossible.body).controls.get("date"), "2026-02-30");
+      assert.match(impossible.body, /must be a real calendar date/);
+
+      // A valid date is rendered as a date control again.
+      const meeting = await server.store.createMeeting({
+        clientId: h.client.id,
+        engagementId: h.engagement.id,
+        title: "Valid",
+        date: "2026-01-02",
+      });
+      const validEdit = await send(server.origin, {
+        method: "POST",
+        path: `/meetings/${meeting.id}/edit`,
+        form: { id: meeting.id, title: "", date: meeting.date },
+      });
+      assert.equal(validEdit.status, 400);
+      assert.match(validEdit.body, /<input type="date" id="field-date" name="date" value="2026-01-02" required/);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("associates only the visible field it names, never a quoted submitted value", async () => {
+    const server = await running();
+    try {
+      const h = await hierarchy(server.store);
+      const before = JSON.stringify(server.store.snapshot());
+
+      // A blank title with notes submitted as a field-like word: the message
+      // names the title, and the quoted value in no message marks notes.
+      const reply = await send(server.origin, {
+        method: "POST",
+        path: `/engagements/${h.engagement.id}/meetings/new`,
+        form: { engagementId: h.engagement.id, title: "", date: "2026-01-01", notes: "notes", projectId: "" },
+      });
+      assert.equal(reply.status, 400);
+      const marked = reply.body.match(/aria-invalid="true"/g) ?? [];
+      assert.equal(marked.length, 1);
+      assert.match(
+        reply.body,
+        /<input[^>]*\sid="field-title"[^>]*\saria-invalid="true"[^>]*\saria-describedby="field-title-error"/,
+      );
+      assert.doesNotMatch(reply.body, /id="field-notes"[^>]*aria-invalid/);
+      assert.equal(parseForm(reply.body).controls.get("notes"), "notes");
+
+      // A tampered parent quoting a visible field name (notes) is about the
+      // hidden parent link, so it stays in the summary and marks no control.
+      const parentTamper = await send(server.origin, {
+        method: "POST",
+        path: `/engagements/${h.engagement.id}/meetings/new`,
+        form: { clientId: "notes", title: "T", date: "2026-01-01", notes: "keep", projectId: "" },
+      });
+      assert.equal(parentTamper.status, 400);
+      assert.match(parentTamper.body, /not the client of this engagement/);
+      assert.equal((parentTamper.body.match(/aria-invalid="true"/g) ?? []).length, 0);
+      assert.equal(parseForm(parentTamper.body).controls.get("notes"), "keep");
+      assert.equal(JSON.stringify(server.store.snapshot()), before);
+
+      // An existing identity conflict takes precedence over a parent mismatch
+      // and over any invalid visible field.
+      const meeting = await server.store.createMeeting({
+        clientId: h.client.id,
+        engagementId: h.engagement.id,
+        title: "Keep",
+        date: "2026-01-02",
+        notes: "old",
+      });
+      const editBefore = JSON.stringify(server.store.snapshot());
+      const precedence = await send(server.origin, {
+        method: "POST",
+        path: `/meetings/${meeting.id}/edit`,
+        form: { id: "meeting-99", title: "", date: "bad", engagementId: h.sibling.id, notes: "new" },
+      });
+      assert.equal(precedence.status, 400);
+      assert.match(precedence.body, /does not match this URL/);
+      assert.doesNotMatch(precedence.body, /not the parent engagement/);
+      assert.doesNotMatch(precedence.body, /must be nonblank/);
+      assert.equal((precedence.body.match(/aria-invalid="true"/g) ?? []).length, 0);
+      assert.equal(JSON.stringify(server.store.snapshot()), editBefore);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("keeps omitted fields on a corrected meeting edit", async () => {
+    const server = await running();
+    try {
+      const h = await hierarchy(server.store);
+      const meeting = await server.store.createMeeting({
+        clientId: h.client.id,
+        engagementId: h.engagement.id,
+        title: "Omit",
+        date: "2026-01-02",
+        notes: "Keep notes",
+        projectId: h.project.id,
+      });
+      const before = JSON.stringify(server.store.snapshot());
+
+      // A blank title with every other field omitted shows the submitted blank
+      // title and the stored values of the omitted controls.
+      const invalid = await send(server.origin, {
+        method: "POST",
+        path: `/meetings/${meeting.id}/edit`,
+        form: { id: meeting.id, title: "" },
+      });
+      assert.equal(invalid.status, 400);
+      const form = parseForm(invalid.body);
+      assert.equal(form.action, `/meetings/${meeting.id}/edit`);
+      assert.equal(form.controls.get("title"), "");
+      assert.equal(form.controls.get("date"), "2026-01-02");
+      assert.equal(form.controls.get("notes"), "Keep notes");
+      assert.equal(form.controls.get("projectId"), h.project.id);
+      assert.equal((invalid.body.match(/aria-invalid="true"/g) ?? []).length, 1);
+      assert.equal(JSON.stringify(server.store.snapshot()), before);
+
+      // Correcting the title on the rendered form and resubmitting saves only
+      // what was posted and keeps every omitted field, the project included.
+      form.controls.set("title", "Corrected");
+      for (const name of ["date", "notes", "projectId"]) form.controls.delete(name);
+      const corrected = await send(server.origin, {
+        method: "POST",
+        path: form.action,
+        form: Object.fromEntries(form.controls),
+      });
+      assert.match(redirectTarget(corrected), /^\/meetings\/meeting-\d+$/);
+      const stored = server.store.snapshot().meetings.find((candidate) => candidate.id === meeting.id);
+      assert.ok(stored !== undefined);
+      assert.equal(stored.title, "Corrected");
+      assert.equal(stored.date, "2026-01-02");
+      assert.equal(stored.notes, "Keep notes");
+      assert.equal(stored.projectId, h.project.id);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("rejects tampered parents from the path parent and leaves the data unchanged", async () => {
     const server = await running();
     try {

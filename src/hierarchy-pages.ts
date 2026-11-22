@@ -54,7 +54,6 @@ import {
   itemEntries,
   workSection,
   workList,
-  type ListEntry,
   type PageSection,
   type WorkEntry,
 } from "./work-pages.ts";
@@ -325,7 +324,7 @@ function clientsListPage(snapshot: Snapshot): Page {
  */
 function listSection(
   title: string,
-  items: readonly { readonly href: string; readonly label: string; readonly note?: string }[],
+  items: readonly { readonly href: string; readonly label: string; readonly badges?: readonly string[] }[],
   options: {
     readonly newHref?: string;
     readonly newLabel?: string;
@@ -404,14 +403,17 @@ function clientShowPage(client: Client, snapshot: Snapshot, store: Store): Page 
   const engagementItems = engagements.map((engagement) => ({
     href: `/engagements/${encodeURIComponent(engagement.id)}`,
     label: engagement.name,
-    note: engagement.status,
+    badges: [engagement.status],
   }));
   const projectItems = projects.map((project) => {
     const engagement = engagements.find((candidate) => candidate.id === project.engagementId);
     return {
       href: `/projects/${encodeURIComponent(project.id)}`,
       label: project.name,
-      note: [project.status, engagement?.name].filter((part) => part !== undefined).join(" · "),
+      badges:
+        engagement === undefined
+          ? [project.status]
+          : [`${project.status} · ${engagement.name}`],
     };
   });
 
@@ -422,22 +424,33 @@ function clientShowPage(client: Client, snapshot: Snapshot, store: Store): Page 
   const openItems = (kind: "follow_up" | "commitment" | "waiting") =>
     items.filter((item) => item.kind === kind && item.state === "open");
 
+  // Every empty list on the client overview points at its own valid next step:
+  // choosing one of this client's engagements, where the work is created. A
+  // client without an engagement is pointed at creating one. The client never
+  // guesses a parent by opening the first engagement, so the choice is a link
+  // to an engagement page (or to the client's new-engagement form), never
+  // directly to a creation form under a guessed parent.
+  const chooseAction: { readonly href: string; readonly label: string } | undefined =
+    engagements.length === 0
+      ? { href: `/clients/${encodeURIComponent(clientId)}/engagements/new`, label: "New engagement" }
+      : { href: `/engagements/${encodeURIComponent(engagements[0].id)}`, label: "Choose an engagement" };
+
   // The next steps are grouped by kind, each group with its own heading and
-  // list (or its own empty sentence), so a follow-up, a commitment and a
-  // waiting item are never merged into one undifferentiated list. Closed items
-  // are excluded from every group; they stay reachable through their own
-  // lists on the engagement and project pages.
-  const nextStepGroups: readonly { readonly title: string; readonly items: readonly WorkItem[] }[] = [
-    { title: "Open follow-ups", items: openItems("follow_up") },
-    { title: "Open commitments", items: openItems("commitment") },
-    { title: "Open waiting items", items: openItems("waiting") },
+  // list (or its own empty state), so a follow-up, a commitment and a waiting
+  // item are never merged into one undifferentiated list. Closed items are
+  // excluded from every group; they stay reachable through their own lists on
+  // the engagement and project pages.
+  const nextStepGroups: readonly { readonly title: string; readonly empty: string; readonly items: readonly WorkItem[] }[] = [
+    { title: "Open follow-ups", empty: "No open follow-ups.", items: openItems("follow_up") },
+    { title: "Open commitments", empty: "No open commitments.", items: openItems("commitment") },
+    { title: "Open waiting items", empty: "No open waiting items.", items: openItems("waiting") },
   ];
   const nextStepsBody = groupedSections(
     nextStepGroups.map((group) => ({
       title: group.title,
       body:
         group.items.length === 0
-          ? `<p>No ${group.title.toLowerCase()}.</p>`
+          ? emptyState(group.empty, chooseAction)
           : itemCardList(group.items),
     })),
   );
@@ -488,25 +501,22 @@ function clientShowPage(client: Client, snapshot: Snapshot, store: Store): Page 
       },
       cardSection("Current tasks (open or in progress)", taskCardList(currentTasks), {
         empty: "No current tasks.",
-        emptyAction:
-          engagements.length === 0
-            ? undefined
-            : {
-                href: `/engagements/${encodeURIComponent(engagements[0].id)}`,
-                label: "Choose an engagement to add a task",
-              },
+        emptyAction: chooseAction,
       }),
       cardSection("Open blockers", itemCardList(blockers), {
         empty: "No open blockers.",
+        emptyAction: chooseAction,
       }),
       cardSection("Open questions", itemCardList(questions), {
         empty: "No open questions.",
+        emptyAction: chooseAction,
       }),
       cardSection("Decisions", itemCardList(decisions), {
         empty: "No decisions recorded yet.",
+        emptyAction: chooseAction,
       }),
       { title: "Next steps", body: nextStepsBody },
-      meetingSection("Meeting history", "", clientMeetings(store, clientId)),
+      meetingSection("Meeting history", "", clientMeetings(store, clientId), chooseAction),
     ],
   );
 }
@@ -518,7 +528,7 @@ function engagementShowPage(engagement: Engagement, snapshot: Snapshot, store: S
     .map((project) => ({
       href: `/projects/${encodeURIComponent(project.id)}`,
       label: project.name,
-      note: project.status,
+      badges: [project.status],
     }));
   const clientId = client.id;
   const engagementId = engagement.id;
@@ -698,16 +708,24 @@ function reportedFieldErrors(
     if (field.hidden !== true) visible.set(field.name, field);
   }
   const errors: FieldError[] = [];
-  for (const match of message.matchAll(/\b([A-Za-z_][\w.\[\]]*)\b/g)) {
-    const parts = match[1].replace(/\[[0-9]+\]/g, "").split(".");
-    const candidates = parts.length > 1 ? parts.slice(1) : parts;
-    if (!candidates.every((part) => visible.has(part))) continue;
-    for (const name of candidates) {
-      if (errors.some((error) => error.field === name)) continue;
-      const field = visible.get(name);
-      if (field === undefined) continue;
-      const value = values[name] ?? field.value;
-      errors.push(value === undefined ? { field: name, message } : { field: name, message, value });
+  // A field is named only by its actual identity: a word such as
+  // `meeting.date` or `projectId` that is either qualified by the record or
+  // equal to a visible control's name. A quoted submitted value is not a
+  // field reference, so a message about a hidden identity or parent link never
+  // marks a visible control invalid.
+  const words = message.split(/[:\s]+/).filter((word) => word !== "");
+  const name = words.find((word) => {
+    const dotted = word.replace(/[[][0-9]+[]]/g, "");
+    const field = dotted.includes(".") ? dotted.slice(dotted.indexOf(".") + 1) : dotted;
+    return visible.has(field);
+  });
+  if (name !== undefined) {
+    const dotted = name.replace(/[[][0-9]+[]]/g, "");
+    const fieldName = dotted.includes(".") ? dotted.slice(dotted.indexOf(".") + 1) : dotted;
+    const field = visible.get(fieldName);
+    if (field !== undefined) {
+      const value = values[fieldName] ?? field.value;
+      errors.push(value === undefined ? { field: fieldName, message } : { field: fieldName, message, value });
     }
   }
   return errors;

@@ -251,6 +251,9 @@ export function renderForm(options: {
       continue;
     }
     const error = errors.find((candidate) => candidate.field === field.name);
+    // A reported problem names the exact control, so a message that happens
+    // to quote another submitted value (or a word that reads like a field
+    // name) never marks that other control invalid.
     const id = `field-${escapeHtml(field.name)}`;
     const errorId = `${id}-error`;
     parts.push(`<div>`);
@@ -282,7 +285,7 @@ export function renderForm(options: {
       );
     } else {
       parts.push(
-        `<input type="${field.type ?? "text"}" id="${id}" name="${escapeHtml(field.name)}" value="${escapeHtml(value)}"${required}${invalid}>`,
+        `<input type="${inputType(field, value)}" id="${id}" name="${escapeHtml(field.name)}" value="${escapeHtml(value)}"${required}${invalid}>`,
       );
     }
     if (error !== undefined) {
@@ -293,6 +296,20 @@ export function renderForm(options: {
   parts.push(`<button type="submit">${escapeHtml(options.submitLabel ?? "Save")}</button>`);
   parts.push("</form>");
   return parts.join("\n");
+}
+
+/**
+ * The input type a control is rendered with. A date control shows a value that
+ * is not a well-formed `YYYY-MM-DD` date as plain text, so a browser that
+ * sanitises an invalid date input to empty still shows exactly what was
+ * submitted and a resubmission carries it back for correction. An empty or well
+ * formed value keeps the date control; a well formed but impossible date such
+ * as `2026-02-30` is still shown in a date control, where a browser displays it
+ * unchanged.
+ */
+function inputType(field: FieldSpec, value: string): string {
+  if (field.type !== "date") return field.type ?? "text";
+  return value === "" || /^\d{4}-\d{2}-\d{2}$/.test(value) ? "date" : "text";
 }
 
 /** A fixed internal redirect: a status and a destination chosen by the server. */

@@ -199,6 +199,14 @@ function parseForm(document: string): ParsedForm {
   return { action: unescapeHtml(action[1]), controls };
 }
 
+/** The markup of one page section, from its heading to the section's end. */
+function sectionOf(body: string, title: string): string {
+  const start = body.indexOf(`<h2>${escapeHtml(title)}</h2>`);
+  if (start < 0) return "";
+  const end = body.indexOf("</section>", start);
+  return body.slice(start, end < 0 ? undefined : end);
+}
+
 /**
  * The control a field's error is associated with: the input, textarea or select
  * that carries `aria-invalid="true"` and an `aria-describedby` that names a
@@ -1228,8 +1236,97 @@ describe("hierarchy pages", () => {
       // The client's one primary action is creating an engagement; the empty
       // project list names what is missing rather than guessing a project.
       assert.match(overview.body, /<section><h2>Engagements<\/h2><p class="primary-action"><a href="[^"]+">New engagement<\/a>/);
-      assert.match(overview.body, /<section><h2>Projects<\/h2><ul><li><a href="\/projects\/[^"]+">Prototype<\/a> \(completed · Discovery\)<\/li><\/ul>/);
+      // The project's status is a text badge in the project list, and its
+      // engagement is named in the same badge.
+      assert.match(overview.body, /<section><h2>Projects<\/h2><ul><li><a href="\/projects\/[^"]+">Prototype<\/a> <span class="badge">completed · Discovery<\/span><\/li><\/ul>/);
+      // The engagement list shows its status as a text badge too.
+      assert.match(overview.body, /<section><h2>Engagements<\/h2>[\s\S]*<li><a href="\/engagements\/[^"]+">Discovery<\/a> <span class="badge">active<\/span><\/li>/);
       assert.doesNotMatch(overview.body, /No projects yet\./);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("gives every empty client section a valid next step and asks for an engagement", async () => {
+    const server = await running();
+    try {
+      const client = await server.store.createClient({ name: "Acme" });
+
+      // A client with no engagement: every empty work and history section
+      // offers creating the client's first engagement, and the guidance asks
+      // the user to choose or create one. Nothing links to a guessed parent.
+      const empty = await send(server.origin, { path: `/clients/${client.id}` });
+      assert.equal(empty.status, 200);
+      assert.match(empty.body, /Choose an engagement to add them from its page\./);
+      const createEngagement = '<a href="/clients/' + client.id + '/engagements/new">New engagement</a>';
+      for (const title of ["Current tasks (open or in progress)", "Open blockers", "Open questions", "Decisions"]) {
+        const section = sectionOf(empty.body, title);
+        assert.ok(section.includes("No "), title);
+        assert.ok(section.includes(createEngagement), title);
+      }
+      // The meeting history's empty state names the missing meetings and
+      // offers creating the client's first engagement as the next step.
+      const emptyHistory = sectionOf(empty.body, "Meeting history");
+      assert.match(emptyHistory, /No meetings recorded yet\./);
+      assert.ok(emptyHistory.includes(createEngagement));
+      assert.match(sectionOf(empty.body, "Next steps"), /No open follow-ups\./);
+      assert.match(sectionOf(empty.body, "Next steps"), /No open waiting items\./);
+      assert.ok(sectionOf(empty.body, "Next steps").includes(createEngagement));
+      assert.ok(!empty.body.includes("/engagements//"));
+
+      // A client with engagements: the empty sections ask the user to choose
+      // an engagement and link to a real engagement page, not directly to an
+      // engagement's creation forms.
+      const engagement = await server.store.createEngagement({ clientId: client.id, name: "Discovery" });
+      const filled = await send(server.origin, { path: `/clients/${client.id}` });
+      assert.equal(filled.status, 200);
+      for (const title of ["Current tasks (open or in progress)", "Open blockers", "Open questions", "Decisions"]) {
+        const section = sectionOf(filled.body, title);
+        assert.ok(section.includes("Choose an engagement"), title);
+        assert.ok(section.includes('<a href="/engagements/' + engagement.id + '">'), title);
+        assert.ok(!section.includes("/tasks/new"), title);
+        assert.ok(!section.includes("/items/new"), title);
+      }
+      const history = sectionOf(filled.body, "Meeting history");
+      assert.match(history, /No meetings recorded yet\./);
+      assert.ok(history.includes('<a href="/engagements/' + engagement.id + '">Choose an engagement</a>'));
+      assert.ok(!history.includes('/engagements/' + engagement.id + '/meetings/new'));
+      assert.ok(!filled.body.includes("/engagements//"));
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("shows stored statuses in hierarchy lists as escaped text badges", async () => {
+    const server = await running();
+    try {
+      const client = await server.store.createClient({ name: "Acme" });
+      const engagement = await server.store.createEngagement({
+        clientId: client.id,
+        name: "Discovery",
+        status: "on_hold",
+      });
+      const project = await server.store.createProject({
+        engagementId: engagement.id,
+        name: "Prototype",
+        status: "planned",
+      });
+      const before = JSON.stringify(server.store.snapshot());
+
+      // The client overview's engagement and project lists each show a status
+      // badge beside their link, and the project's badge names its engagement.
+      const overview = await send(server.origin, { path: `/clients/${client.id}` });
+      const engagements = sectionOf(overview.body, "Engagements");
+      assert.match(engagements, /<li><a href="\/engagements\/[^"]+">Discovery<\/a> <span class="badge">on_hold<\/span><\/li>/);
+      const projects = sectionOf(overview.body, "Projects");
+      assert.match(projects, /<li><a href="\/projects\/[^"]+">Prototype<\/a> <span class="badge">planned · Discovery<\/span><\/li>/);
+      // The engagement page's project list shows the status badge too.
+      const engagementPage = await send(server.origin, { path: `/engagements/${engagement.id}` });
+      assert.match(
+        sectionOf(engagementPage.body, "Projects"),
+        /<li><a href="\/projects\/[^"]+">Prototype<\/a> <span class="badge">planned<\/span><\/li>/,
+      );
+      assert.equal(JSON.stringify(server.store.snapshot()), before);
     } finally {
       await server.close();
     }
@@ -1327,6 +1424,37 @@ describe("hierarchy pages", () => {
       assert.equal(snapshot.projects[0].name, "Prototype again");
       assert.equal(snapshot.projects[0].objectives, "project objectives");
       assert.equal(snapshot.projects[0].status, "planned");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("keeps an identity refusal in the summary even when it quotes a visible field name", async () => {
+    const server = await running();
+    try {
+      const client = await server.store.createClient({ name: "Acme", background: "old" });
+      const before = JSON.stringify(server.store.snapshot());
+
+      // The message names the identity (`submitted client id`), and the value
+      // it quotes is a visible field name (background). That quoted word is not
+      // a field reference: the refusal stays in the summary and no visible
+      // control is marked invalid.
+      const reply = await send(server.origin, {
+        method: "POST",
+        path: `/clients/${client.id}/edit`,
+        form: { id: "background", name: "Renamed", background: "new background" },
+      });
+      assert.equal(reply.status, 400);
+      assert.match(reply.body, /The submitted client id does not match this URL/);
+      assert.equal((reply.body.match(/aria-invalid="true"/g) ?? []).length, 0);
+      assert.equal(invalidControl(reply.body, "background"), null);
+      assert.equal(invalidControl(reply.body, "name"), null);
+      // The correction keeps every submitted visible value.
+      const form = parseForm(reply.body);
+      assert.equal(form.action, `/clients/${client.id}/edit`);
+      assert.equal(form.controls.get("name"), "Renamed");
+      assert.equal(form.controls.get("background"), "new background");
+      assert.equal(JSON.stringify(server.store.snapshot()), before);
     } finally {
       await server.close();
     }

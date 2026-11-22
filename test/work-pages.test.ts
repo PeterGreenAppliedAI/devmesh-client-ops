@@ -767,6 +767,346 @@ describe("work pages: tasks", () => {
     }
   });
 
+  it("refuses isolated client, engagement and project parent mismatches on create", async () => {
+    const server = await running();
+    try {
+      const h = await hierarchy(server.store);
+      const taskBase = { title: "T", status: "open", priority: "normal", owner: "", dueDate: "", context: "", projectId: "" };
+      const itemBase = { kind: "question", title: "I", context: "", state: "open", projectId: "" };
+
+      // A create that names a different engagement without a conflicting
+      // record id, for both tasks and items, writes nothing.
+      for (const [path, form, url] of [
+        [
+          `/engagements/${h.engagement.id}/tasks/new`,
+          { ...taskBase, engagementId: h.sibling.id },
+          /not the parent engagement of this form/,
+        ],
+        [
+          `/engagements/${h.engagement.id}/items/new`,
+          { ...itemBase, engagementId: h.sibling.id },
+          /not the parent engagement of this form/,
+        ],
+        // A client id that names a different client is refused on its own.
+        [
+          `/engagements/${h.engagement.id}/tasks/new`,
+          { ...taskBase, clientId: h.otherClient.id },
+          /not the client of this engagement/,
+        ],
+        [
+          `/engagements/${h.engagement.id}/items/new`,
+          { ...itemBase, clientId: h.otherClient.id },
+          /not the client of this engagement/,
+        ],
+        // A present blank client id is refused too.
+        [
+          `/engagements/${h.engagement.id}/tasks/new`,
+          { ...taskBase, engagementId: h.engagement.id, clientId: "" },
+          /not the client of this engagement/,
+        ],
+        [
+          `/engagements/${h.engagement.id}/items/new`,
+          { ...itemBase, engagementId: h.engagement.id, clientId: "" },
+          /not the client of this engagement/,
+        ],
+      ] as const) {
+        const before = JSON.stringify(server.store.snapshot());
+        const reply = await send(server.origin, { method: "POST", path, form });
+        assert.equal(reply.status, 400, `${path} ${JSON.stringify(form)}`);
+        assert.match(reply.body, url, path);
+        // The conflict is on a hidden parent link, so no visible control is
+        // marked invalid and the correction still posts the URL parent.
+        assert.equal((reply.body.match(/aria-invalid="true"/g) ?? []).length, 0, path);
+        assert.equal(parseForm(reply.body).controls.get("engagementId"), h.engagement.id, path);
+        assert.equal(JSON.stringify(server.store.snapshot()), before, path);
+      }
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("refuses project-scoped creation parent mismatches for tasks and items", async () => {
+    const server = await running();
+    try {
+      const h = await hierarchy(server.store);
+      const taskBase = { title: "Project scoped", status: "open", priority: "normal", owner: "", dueDate: "", context: "", projectId: h.project.id };
+      const itemBase = { kind: "question", title: "Item project scoped", context: "", state: "open", projectId: h.project.id };
+
+      // The URL project's engagement is the parent of the form. Matching and
+      // omitted parents create under it; another engagement or a blank one is a
+      // correctable 400 that writes nothing.
+      const matchingTask = await send(server.origin, {
+        method: "POST",
+        path: `/projects/${h.project.id}/tasks/new`,
+        form: { engagementId: h.engagement.id, ...taskBase },
+      });
+      assert.match(redirectTarget(matchingTask), /^\/tasks\/task-\d+$/);
+      const omittedItem = await send(server.origin, {
+        method: "POST",
+        path: `/projects/${h.project.id}/items/new`,
+        form: itemBase,
+      });
+      assert.match(redirectTarget(omittedItem), /^\/items\/item-\d+$/);
+
+      for (const [path, form] of [
+        [`/projects/${h.project.id}/tasks/new`, { ...taskBase, engagementId: h.sibling.id }],
+        [`/projects/${h.project.id}/tasks/new`, { ...taskBase, engagementId: "" }],
+        [`/projects/${h.project.id}/items/new`, { ...itemBase, engagementId: h.sibling.id }],
+        [`/projects/${h.project.id}/items/new`, { ...itemBase, engagementId: "" }],
+      ] as const) {
+        const before = JSON.stringify(server.store.snapshot());
+        const reply = await send(server.origin, { method: "POST", path, form });
+        assert.equal(reply.status, 400, `${path} ${JSON.stringify(form)}`);
+        assert.match(reply.body, /not the parent engagement of this form/, path);
+        // The correction keeps the URL engagement in its hidden control.
+        assert.equal(parseForm(reply.body).controls.get("engagementId"), h.engagement.id, path);
+        assert.equal(JSON.stringify(server.store.snapshot()), before, path);
+      }
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("settles a parent mismatch before any invalid submitted project or invalid field", async () => {
+    const server = await running();
+    try {
+      const h = await hierarchy(server.store);
+      const before = JSON.stringify(server.store.snapshot());
+
+      // A parent mismatch wins over an unknown submitted project: the message
+      // is about the parent and the submission is refused before the project
+      // is resolved. It also wins over an invalid visible field.
+      for (const [path, form] of [
+        [
+          `/engagements/${h.engagement.id}/tasks/new`,
+          { title: "T", status: "open", priority: "normal", owner: "", dueDate: "", context: "", projectId: "project-99", engagementId: h.sibling.id },
+        ],
+        [
+          `/engagements/${h.engagement.id}/items/new`,
+          { kind: "question", title: "I", context: "", state: "open", projectId: "project-99", engagementId: h.sibling.id },
+        ],
+        [
+          `/engagements/${h.engagement.id}/tasks/new`,
+          { title: "", status: "not-a-status", priority: "normal", owner: "", dueDate: "not-a-date", context: "", projectId: "", engagementId: h.sibling.id },
+        ],
+        [
+          `/engagements/${h.engagement.id}/items/new`,
+          { kind: "question", title: "", context: "", state: "not-a-state", projectId: "", engagementId: h.sibling.id },
+        ],
+        [
+          `/engagements/${h.engagement.id}/tasks/new`,
+          { title: "T", status: "open", priority: "normal", owner: "", dueDate: "", context: "", projectId: "project-99", clientId: h.otherClient.id },
+        ],
+      ] as const) {
+        const reply = await send(server.origin, { method: "POST", path, form });
+        assert.equal(reply.status, 400, path);
+        assert.match(reply.body, /not the (parent engagement|client) of this/, path);
+        assert.doesNotMatch(reply.body, /is not a project of this engagement/, path);
+        assert.doesNotMatch(reply.body, /must be one of/, path);
+        assert.doesNotMatch(reply.body, /must be a YYYY-MM-DD date/, path);
+        // A quoted submitted value that reads like a field never marks it.
+        assert.equal((reply.body.match(/aria-invalid="true"/g) ?? []).length, 0, path);
+      }
+      assert.equal(JSON.stringify(server.store.snapshot()), before);
+
+      // Conflict precedence on edit: a differing submitted id wins over both a
+      // parent mismatch and an invalid visible field.
+      const task = await server.store.createTask({
+        clientId: h.client.id,
+        engagementId: h.engagement.id,
+        title: "Precedence",
+      });
+      const editBefore = JSON.stringify(server.store.snapshot());
+      const precedence = await send(server.origin, {
+        method: "POST",
+        path: `/tasks/${task.id}/edit`,
+        form: { id: "task-99", title: "", engagementId: h.sibling.id, clientId: h.otherClient.id },
+      });
+      assert.equal(precedence.status, 400);
+      assert.match(precedence.body, /does not match this URL/);
+      assert.doesNotMatch(precedence.body, /not the parent engagement/);
+      assert.doesNotMatch(precedence.body, /not the client of this engagement/);
+      assert.doesNotMatch(precedence.body, /must be nonblank/);
+      assert.equal(JSON.stringify(server.store.snapshot()), editBefore);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("keeps omitted fields on a corrected edit for tasks and items", async () => {
+    const server = await running();
+    try {
+      const h = await hierarchy(server.store);
+      const task = await server.store.createTask({
+        clientId: h.client.id,
+        engagementId: h.engagement.id,
+        title: "Omit task",
+        status: "in_progress",
+        priority: "high",
+        owner: "Owner",
+        dueDate: "2026-01-02",
+        context: "Keep context",
+      });
+      const item = await server.store.createItem({
+        clientId: h.client.id,
+        engagementId: h.engagement.id,
+        kind: "blocker",
+        title: "Omit item",
+        context: "Keep item context",
+        state: "open",
+      });
+      const before = JSON.stringify(server.store.snapshot());
+
+      // A blank title with every other field omitted: the correction shows the
+      // submitted blank title and the stored values of the omitted controls.
+      const invalidTask = await send(server.origin, {
+        method: "POST",
+        path: `/tasks/${task.id}/edit`,
+        form: { id: task.id, title: "" },
+      });
+      assert.equal(invalidTask.status, 400);
+      assert.equal((invalidTask.body.match(/aria-invalid="true"/g) ?? []).length, 1);
+      const taskForm = parseForm(invalidTask.body);
+      assert.equal(taskForm.controls.get("title"), "");
+      assert.equal(taskForm.controls.get("status"), "in_progress");
+      assert.equal(taskForm.controls.get("priority"), "high");
+      assert.equal(taskForm.controls.get("owner"), "Owner");
+      assert.equal(taskForm.controls.get("dueDate"), "2026-01-02");
+      assert.equal(taskForm.controls.get("context"), "Keep context");
+
+      const invalidItem = await send(server.origin, {
+        method: "POST",
+        path: `/items/${item.id}/edit`,
+        form: { id: item.id, title: "" },
+      });
+      assert.equal(invalidItem.status, 400);
+      assert.equal((invalidItem.body.match(/aria-invalid="true"/g) ?? []).length, 1);
+      const itemForm = parseForm(invalidItem.body);
+      assert.equal(itemForm.controls.get("title"), "");
+      assert.equal(itemForm.controls.get("kind"), "blocker");
+      assert.equal(itemForm.controls.get("state"), "open");
+      assert.equal(itemForm.controls.get("context"), "Keep item context");
+
+      // The refused submissions saved nothing.
+      assert.equal(JSON.stringify(server.store.snapshot()), before);
+
+      // Correcting the title on the rendered form and resubmitting saves only
+      // the submitted fields and keeps every omitted one.
+      taskForm.controls.set("title", "Corrected task");
+      for (const name of ["status", "priority", "owner", "dueDate", "context"]) {
+        taskForm.controls.delete(name);
+      }
+      taskForm.controls.delete("projectId");
+      const corrected = await send(server.origin, {
+        method: "POST",
+        path: taskForm.action,
+        form: Object.fromEntries(taskForm.controls),
+      });
+      assert.match(redirectTarget(corrected), /^\/tasks\/task-\d+$/);
+      const storedTask = server.store.snapshot().tasks.find((candidate) => candidate.id === task.id);
+      assert.ok(storedTask !== undefined);
+      assert.equal(storedTask.title, "Corrected task");
+      assert.equal(storedTask.status, "in_progress");
+      assert.equal(storedTask.priority, "high");
+      assert.equal(storedTask.owner, "Owner");
+      assert.equal(storedTask.dueDate, "2026-01-02");
+      assert.equal(storedTask.context, "Keep context");
+
+      itemForm.controls.set("title", "Corrected item");
+      itemForm.controls.delete("context");
+      itemForm.controls.delete("projectId");
+      const correctedItem = await send(server.origin, {
+        method: "POST",
+        path: itemForm.action,
+        form: Object.fromEntries(itemForm.controls),
+      });
+      assert.match(redirectTarget(correctedItem), /^\/items\/item-\d+$/);
+      const storedItem = server.store.snapshot().items.find((candidate) => candidate.id === item.id);
+      assert.ok(storedItem !== undefined);
+      assert.equal(storedItem.title, "Corrected item");
+      assert.equal(storedItem.kind, "blocker");
+      assert.equal(storedItem.state, "open");
+      assert.equal(storedItem.context, "Keep item context");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("associates a project error but keeps an unassignable project in the summary", async () => {
+    const server = await running();
+    try {
+      const h = await hierarchy(server.store);
+
+      // A select project that does not exist is the form's own visible choice,
+      // so its control is marked invalid with its own message.
+      for (const [path, form, base] of [
+        [
+          `/engagements/${h.engagement.id}/tasks/new`,
+          { title: "T", status: "open", priority: "normal", owner: "", dueDate: "", context: "", projectId: "project-99" },
+          /tasks\/task-/,
+        ],
+        [
+          `/engagements/${h.engagement.id}/items/new`,
+          { kind: "question", title: "I", context: "", state: "open", projectId: "project-99" },
+          /items\/item-/,
+        ],
+      ] as const) {
+        const reply = await send(server.origin, {
+          method: "POST",
+          path,
+          form: { engagementId: h.engagement.id, ...form },
+        });
+        assert.equal(reply.status, 400, path);
+        const marked = reply.body.match(/aria-invalid="true"/g) ?? [];
+        assert.equal(marked.length, 1, path);
+        assert.match(
+          reply.body,
+          /<select[^>]*\sid="field-projectId"[^>]*\saria-invalid="true"[^>]*\saria-describedby="field-projectId-error"/,
+          path,
+        );
+        // The rejected value stays selected and escaped.
+        assert.match(reply.body, /<option value="project-99" selected>project-99 \(not a valid choice\)<\/option>/, path);
+        // The summary carries the same message as the associated control.
+        const inline = /<p id="field-projectId-error">([^<]*)<\/p>/.exec(reply.body);
+        assert.ok(inline !== null, path);
+        assert.ok(reply.body.includes(`<li>${inline[1]}</li>`), path);
+      }
+
+      // A project of another engagement reaches the store's own refusal. It is
+      // a correctable error with the submitted project kept and selected, and
+      // the message is associated with the project control it names. Nothing
+      // is written.
+      const before = JSON.stringify(server.store.snapshot());
+      const unassignable = await send(server.origin, {
+        method: "POST",
+        path: `/engagements/${h.engagement.id}/tasks/new`,
+        form: {
+          engagementId: h.engagement.id,
+          title: "Unassignable",
+          status: "open",
+          priority: "low",
+          owner: "",
+          dueDate: "",
+          context: "",
+          projectId: h.siblingProject.id,
+        },
+      });
+      assert.equal(unassignable.status, 400);
+      assert.match(unassignable.body, /does not belong to engagementId/);
+      const unassignableMarked = unassignable.body.match(/aria-invalid="true"/g) ?? [];
+      assert.equal(unassignableMarked.length, 1);
+      assert.match(
+        unassignable.body,
+        /<select[^>]*\sid="field-projectId"[^>]*\saria-invalid="true"[^>]*\saria-describedby="field-projectId-error"/,
+      );
+      assert.match(unassignable.body, new RegExp(`<option value="${h.siblingProject.id}" selected>`));
+      assert.equal(parseForm(unassignable.body).controls.get("title"), "Unassignable");
+      assert.equal(JSON.stringify(server.store.snapshot()), before);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("refuses a nonexistent submitted project as a correctable error, not a 404", async () => {
     const server = await running();
     try {

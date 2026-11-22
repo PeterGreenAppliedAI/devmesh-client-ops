@@ -589,13 +589,14 @@ describe("workspace integration: linked overview and restart", () => {
       const engagementSection = sectionOf(overview.body, "Engagements");
       assert.match(engagementSection, new RegExp(`href="/engagements/${alpha}"`));
       assert.match(engagementSection, new RegExp(`href="/engagements/${beta}"`));
-      assert.match(engagementSection, /<a href="\/engagements\/[^"]+">Alpha<\/a> \(active\)/);
-      assert.match(engagementSection, /<a href="\/engagements\/[^"]+">Beta<\/a> \(on_hold\)/);
+      // The status is a text badge beside the link, escaped from stored text.
+      assert.match(engagementSection, /<a href="\/engagements\/[^"]+">Alpha<\/a> <span class="badge">active<\/span>/);
+      assert.match(engagementSection, /<a href="\/engagements\/[^"]+">Beta<\/a> <span class="badge">on_hold<\/span>/);
       const projectSection = sectionOf(overview.body, "Projects");
       assert.match(projectSection, new RegExp(`href="/projects/${alphaProject}"`));
       assert.match(projectSection, new RegExp(`href="/projects/${betaProject}"`));
-      assert.match(projectSection, /<a href="\/projects\/[^"]+">Alpha project<\/a> \(active · Alpha\)/);
-      assert.match(projectSection, /<a href="\/projects\/[^"]+">Beta project<\/a> \(active · Beta\)/);
+      assert.match(projectSection, /<a href="\/projects\/[^"]+">Alpha project<\/a> <span class="badge">active · Alpha<\/span>/);
+      assert.match(projectSection, /<a href="\/projects\/[^"]+">Beta project<\/a> <span class="badge">active · Beta<\/span>/);
 
       // Current tasks: exactly the open and in-progress tasks, with and without
       // dates, and never the completed ones.

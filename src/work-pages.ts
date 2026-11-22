@@ -299,21 +299,26 @@ export function profileFields(fields: readonly FieldSpec[], record: object): str
   return displayList(displayValues(fields, record));
 }
 
-/** One linked list entry: where it links and what it says. */
+/** One linked list entry: where it links, what it says and its text badges. */
 export interface ListEntry {
   readonly href: string;
   readonly label: string;
-  readonly note?: string;
+  /** Stored text shown as escaped text badges beside the link. */
+  readonly badges?: readonly string[];
 }
 
-/** Render a list of links, or a sentence when there are none. */
+/**
+ * Render a list of links, or a sentence when there are none. A list entry's
+ * badges (a stored status, for example) are shown as escaped text badges beside
+ * its link, so a state is readable at a glance without markup of its own.
+ */
 export function childList(items: readonly ListEntry[]): string {
   if (items.length === 0) return "<p>None yet.</p>";
   return `<ul>${items
-    .map(
-      (item) =>
-        `<li>${link(item.href, item.label)}${item.note === undefined ? "" : ` (${escapeHtml(item.note)})`}</li>`,
-    )
+    .map((item) => {
+      const badges = (item.badges ?? []).map((text) => ` ${badge(text)}`).join("");
+      return `<li>${link(item.href, item.label)}${badges}</li>`;
+    })
     .join("")}</ul>`;
 }
 
@@ -704,19 +709,26 @@ function reportedFieldErrors(
     if (field.hidden !== true) visible.set(field.name, field);
   }
   const errors: FieldError[] = [];
-  // A record-qualified name is preferred; a bare field name is matched only
-  // when every part of it names a visible control.
-  for (const match of message.matchAll(/\b([A-Za-z_][\w.\[\]]*)\b/g)) {
-    const parts = match[1].replace(/\[[0-9]+\]/g, "").split(".");
-    const candidates =
-      parts.length > 1 ? parts.slice(1) : parts;
-    if (!candidates.every((part) => visible.has(part))) continue;
-    for (const name of candidates) {
-      if (errors.some((error) => error.field === name)) continue;
-      const field = visible.get(name);
-      if (field === undefined) continue;
-      const error: FieldError = { field: name, message };
-      const value = values[name] ?? field.value;
+  // A field is named only by its actual identity: a word such as `task.title`,
+  // `item.state` or `projectId` that is either qualified by the record or equal
+  // to a visible control's name. A quoted submitted value is not a field
+  // reference, so the message `Submitted engagementId "title" is not the
+  // parent engagement of this form` is about the hidden parent link and never
+  // marks the visible title control invalid. A hidden identity or parent name
+  // names no visible control and stays in the summary alone.
+  const parts = message.split(/[:\s]+/).filter((word) => word !== "");
+  const name = parts.find((word) => {
+    const dotted = word.replace(/[[][0-9]+[]]/g, "");
+    const field = dotted.includes(".") ? dotted.slice(dotted.indexOf(".") + 1) : dotted;
+    return visible.has(field);
+  });
+  if (name !== undefined) {
+    const dotted = name.replace(/[[][0-9]+[]]/g, "");
+    const fieldName = dotted.includes(".") ? dotted.slice(dotted.indexOf(".") + 1) : dotted;
+    const field = visible.get(fieldName);
+    if (field !== undefined) {
+      const error: FieldError = { field: fieldName, message };
+      const value = values[fieldName] ?? field.value;
       errors.push(value === undefined ? error : { ...error, value });
     }
   }
@@ -972,7 +984,7 @@ export function workRoutes(store: Store): WorkRoutes {
     if (project === undefined) {
       // The submitted project is the form's own visible choice, so the refusal
       // is associated with that control; the summary carries the same message.
-      throw new ValidationError(`projectId ${JSON.stringify(projectId)} is not a project of this engagement`);
+      throw new ValidationError(`projectId: ${JSON.stringify(projectId)} is not a project of this engagement`);
     }
     return { ...scope, project };
   }

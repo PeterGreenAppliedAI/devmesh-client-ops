@@ -199,14 +199,17 @@ export function meetingList(meetings: readonly Meeting[]): string {
  * A meeting history section with the primary creation action for the given
  * scope. An empty `newHref` means the section has no single creation scope (a
  * client-wide history): creation happens under a chosen engagement or project,
- * from those pages, so no link is offered rather than one that guesses a
- * parent. An empty history names the missing meetings and, where the scope has
- * a creation link, offers it as the valid next step.
+ * so no direct creation link is offered rather than one that guesses a
+ * parent. An empty history names the missing meetings and offers its valid
+ * next step: the scope's own creation link when it has one, otherwise the
+ * `nextStep` the caller supplies (for a client-wide history, the client's
+ * engagement choice). Without either, the sentence stands alone.
  */
 export function meetingSection(
   title: string,
   newHref: string,
   meetings: readonly Meeting[],
+  nextStep?: { readonly href: string; readonly label: string },
 ): PageSection {
   const body: string[] = [];
   if (newHref !== "") body.push(primaryAction(newHref, "New meeting"));
@@ -214,7 +217,7 @@ export function meetingSection(
     body.push(
       emptyState(
         "No meetings recorded yet.",
-        newHref === "" ? undefined : { href: newHref, label: "New meeting" },
+        newHref !== "" ? { href: newHref, label: "New meeting" } : nextStep,
       ),
     );
   } else {
@@ -337,16 +340,24 @@ function reportedFieldErrors(
     if (field.hidden !== true) visible.set(field.name, field);
   }
   const errors: FieldError[] = [];
-  for (const match of message.matchAll(/\b([A-Za-z_][\w.\[\]]*)\b/g)) {
-    const parts = match[1].replace(/\[[0-9]+\]/g, "").split(".");
-    const candidates = parts.length > 1 ? parts.slice(1) : parts;
-    if (!candidates.every((part) => visible.has(part))) continue;
-    for (const name of candidates) {
-      if (errors.some((error) => error.field === name)) continue;
-      const field = visible.get(name);
-      if (field === undefined) continue;
-      const value = values[name] ?? field.value;
-      errors.push(value === undefined ? { field: name, message } : { field: name, message, value });
+  // A field is named only by its actual identity: a word such as
+  // `meeting.date` or `projectId` that is either qualified by the record or
+  // equal to a visible control's name. A quoted submitted value is not a
+  // field reference, so a message about a hidden identity or parent link never
+  // marks a visible control invalid.
+  const words = message.split(/[:\s]+/).filter((word) => word !== "");
+  const name = words.find((word) => {
+    const dotted = word.replace(/[[][0-9]+[]]/g, "");
+    const field = dotted.includes(".") ? dotted.slice(dotted.indexOf(".") + 1) : dotted;
+    return visible.has(field);
+  });
+  if (name !== undefined) {
+    const dotted = name.replace(/[[][0-9]+[]]/g, "");
+    const fieldName = dotted.includes(".") ? dotted.slice(dotted.indexOf(".") + 1) : dotted;
+    const field = visible.get(fieldName);
+    if (field !== undefined) {
+      const value = values[fieldName] ?? field.value;
+      errors.push(value === undefined ? { field: fieldName, message } : { field: fieldName, message, value });
     }
   }
   return errors;
@@ -573,7 +584,7 @@ export function meetingRoutes(store: Store): MeetingRoutes {
     if (project === undefined) {
       // The submitted project is the form's own visible choice, so the refusal
       // is associated with that control; the summary carries the same message.
-      throw new ValidationError(`projectId ${JSON.stringify(projectId)} is not a project of this engagement`);
+      throw new ValidationError(`projectId: ${JSON.stringify(projectId)} is not a project of this engagement`);
     }
     return { ...scope, project };
   }
