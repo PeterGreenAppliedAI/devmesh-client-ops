@@ -833,6 +833,13 @@ describe("layout: presentation", () => {
       assert.ok(laptop.includes("grid-template-columns:16rem minmax(0,1fr)"));
       // A narrow phone still reflows without clipping actions.
       assert.ok(style.includes("@media (max-width:400px)"));
+      // Long unbroken stored names wrap instead of overflowing the sidebar or
+      // the viewport into the content and its actions.
+      assert.match(rule(style, ".primary-nav a"), /overflow-wrap:anywhere/);
+      assert.match(rule(style, ".breadcrumb li"), /overflow-wrap:anywhere/);
+      assert.match(rule(style, "main"), /overflow-wrap:anywhere/);
+      assert.match(rule(style, ".content"), /min-width:0/);
+      assert.match(rule(style, "input,textarea,select"), /max-width:100%/);
       // No fixed overlay covers the main content or an action.
       assert.ok(!/position:fixed/.test(style));
     } finally {
