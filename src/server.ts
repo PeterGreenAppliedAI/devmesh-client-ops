@@ -227,10 +227,11 @@ function sendLayoutPage(
     return;
   }
   const layout = layoutContextFor(requestPath, store.snapshot());
-  // `renderPage` builds the wrapped page with the standard page headers, the
-  // same headers the page carried before it was wrapped.
+  // Replace the document with the shell but keep the page's own response
+  // headers: only the markup is rebuilt here, so a route that returned its own
+  // headers through `Page` keeps them at the response boundary.
   const rendered = renderPage(page.title, page.body, layout);
-  sendPage(res, status, rendered);
+  sendPage(res, status, { ...rendered, headers: page.headers });
 }
 
 /**

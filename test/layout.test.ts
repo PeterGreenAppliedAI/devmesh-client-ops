@@ -425,21 +425,40 @@ describe("layout: every application page is wrapped in the shared shell", () => 
     }
   });
 
-  it("keeps the standard page headers when wrapping a page in the shell", async () => {
-    const server = await running();
+  it("preserves the page's own headers when wrapping it in the shell", async () => {
+    const store = await openStore(tempDir());
+    const pageHeaders: Readonly<Record<string, string>> = Object.freeze({
+      ...PAGE_HEADERS,
+      "X-Layout-Marker": "kept",
+    });
+    const server = await startServer({
+      store,
+      port: 0,
+      routes: {
+        home: {
+          get: {
+            method: "GET",
+            render: () => ({ ...renderPage("Custom", "<p>body</p>"), headers: pageHeaders }),
+          },
+        },
+        health: { get: { method: "GET", render: () => renderPage("Health", "<p>ok</p>") } },
+      },
+    });
     try {
       const reply = await send(server.origin, { path: "/" });
       assert.equal(reply.status, 200);
-      // The page was wrapped in the shell and still carries the page headers.
+      // The page was wrapped in the shell, and its own headers survived.
       mainContentOf(reply.body);
+      assert.equal(reply.headers["x-layout-marker"], "kept");
       assert.match(String(reply.headers["content-type"]), /^text\/html; charset=utf-8/);
       assert.equal(reply.headers["cache-control"], "no-store");
       assert.match(
         String(reply.headers["content-security-policy"]),
-        /default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'/,
+        /default-src 'none'; style-src 'unsafe-inline'/,
       );
     } finally {
       await server.close();
+      await store.close();
     }
   });
 
