@@ -860,6 +860,22 @@ describe("layout: presentation", () => {
         contrast(declaration(current, "color"), declaration(current, "background")) >= 4.5,
         "active client contrast",
       );
+      // The visited override keeps the current client readable on its background.
+      const currentVisited = rule(
+        style,
+        ".primary-nav a[aria-current=page]:link,.primary-nav a[aria-current=page]:visited",
+      );
+      assert.ok(
+        contrast(declaration(currentVisited, "color"), declaration(current, "background")) >= 4.5,
+        "visited active client contrast",
+      );
+
+      // The skip link keeps white text on its blue background once visited.
+      const skipLinks = rule(style, ".skip-link:link,.skip-link:visited");
+      assert.ok(
+        contrast(declaration(skipLinks, "color"), declaration(skipLinks, "background")) >= 4.5,
+        "skip link contrast",
+      );
 
       const button = rule(style, "button");
       assert.ok(
