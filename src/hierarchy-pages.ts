@@ -29,6 +29,30 @@ import type {
   Snapshot,
   Store,
 } from "./store.ts";
+import {
+  childList,
+  countList,
+  describeItem,
+  describeTask,
+  engagementOnlyWork,
+  link,
+  openItemCount,
+  pageWith,
+  profileFields,
+  projectWork,
+  taskStatusCounts,
+  workSection,
+  workList,
+  type PageSection,
+} from "./work-pages.ts";
+
+/** The linked list entries of a set of records, for `workList`. */
+function workEntries<T extends { readonly id: string; readonly title: string }>(
+  records: readonly T[],
+  describe: (record: T) => string,
+): readonly { readonly id: string; readonly title: string; readonly detail: string }[] {
+  return records.map((record) => ({ id: record.id, title: record.title, detail: describe(record) }));
+}
 
 /** A route's result: a page, or a fixed internal redirect after a write. */
 export type HierarchyResult = Page | Redirect;
@@ -236,58 +260,9 @@ const PROJECT_FIELDS: readonly FieldSpec[] = [
   { name: "status", label: "Status", type: "select", options: STATUS_OPTIONS },
 ];
 
-/** One page section: a heading and a body, so later sections can be appended. */
-export interface PageSection {
-  readonly title: string;
-  readonly body: string;
-}
-
-/** Render a page from its title, fixed navigation links and section list. */
-function pageWith(
-  title: string,
-  links: readonly { readonly label: string; readonly href: string }[],
-  sections: readonly PageSection[],
-): Page {
-  const nav = links
-    .map((link) => `<a href="${escapeHtml(link.href)}">${escapeHtml(link.label)}</a>`)
-    .join("");
-  const body = sections
-    .map(
-      (section) =>
-        `<section><h2>${escapeHtml(section.title)}</h2>${section.body}</section>`,
-    )
-    .join("\n");
-  return renderPage(title, `<nav>${nav}</nav>\n${body}`);
-}
-
-/** A stored value shown as escaped text, with a placeholder when blank. */
-function showValue(value: string): string {
-  return value === "" ? "<em>(none)</em>" : escapeHtml(value);
-}
-
-/** Render every profile field of a record, escaped. */
-function profileFields(fields: readonly FieldSpec[], record: object): string {
-  const values = record as Readonly<Record<string, string | undefined>>;
-  const rows = fields.map(
-    (field) => `<dt>${escapeHtml(field.label)}</dt><dd>${showValue(values[field.name] ?? "")}</dd>`,
-  );
-  return `<dl>${rows.join("")}</dl>`;
-}
-
-function link(path: string, label: string): string {
-  return `<a href="${escapeHtml(path)}">${escapeHtml(label)}</a>`;
-}
-
-/** Render a list of child links, or a sentence when there are none. */
-function childList(items: readonly { readonly href: string; readonly label: string; readonly note?: string }[]): string {
-  if (items.length === 0) return "<p>None yet.</p>";
-  return `<ul>${items
-    .map(
-      (item) =>
-        `<li>${link(item.href, item.label)}${item.note === undefined ? "" : ` (${escapeHtml(item.note)})`}</li>`,
-    )
-    .join("")}</ul>`;
-}
+// The page, form and list helpers now live in `work-pages.ts` so the work
+// pages and the hierarchy pages render with the same escaped helpers.
+export type { PageSection } from "./work-pages.ts";
 
 function clientsListPage(snapshot: Snapshot): Page {
   const items = snapshot.clients.map((client) => ({
@@ -334,7 +309,7 @@ function clientShowPage(client: Client, snapshot: Snapshot): Page {
   );
 }
 
-function engagementShowPage(engagement: Engagement, snapshot: Snapshot): Page {
+function engagementShowPage(engagement: Engagement, snapshot: Snapshot, store: Store): Page {
   const client = findRecord(snapshot.clients, engagement.clientId, "client");
   const projects = snapshot.projects
     .filter((project) => project.engagementId === engagement.id)
@@ -343,6 +318,51 @@ function engagementShowPage(engagement: Engagement, snapshot: Snapshot): Page {
       label: project.name,
       note: project.status,
     }));
+  const clientId = client.id;
+  const engagementId = engagement.id;
+  const newTaskHref = `/engagements/${encodeURIComponent(engagementId)}/tasks/new`;
+  const newItemHref = `/engagements/${encodeURIComponent(engagementId)}/items/new`;
+
+  // Engagement-only work: tasks and items that belong to no project. Each
+  // project's own work is shown beside it, so a project task is never listed
+  // twice and every project list is a separate, explicit selection.
+  const only = engagementOnlyWork(store, clientId, engagementId);
+  const sections: PageSection[] = [
+    { title: "Profile", body: profileFields(ENGAGEMENT_FIELDS, engagement) },
+    {
+      title: "Projects",
+      body: [
+        `<p>${link(`/engagements/${encodeURIComponent(engagementId)}/projects/new`, "New project")}</p>`,
+        childList(projects),
+      ].join("\n"),
+    },
+    {
+      title: "Engagement-only work",
+      body: [
+        workSection("Tasks without a project", "/tasks", newTaskHref, workEntries(only.tasks, describeTask)),
+        workSection("Work items without a project", "/items", newItemHref, workEntries(only.items, describeItem)),
+      ]
+        .map((section) => `<h3>${escapeHtml(section.title)}</h3>${section.body}`)
+        .join("\n"),
+    },
+  ];
+
+  for (const project of snapshot.projects.filter((candidate) => candidate.engagementId === engagementId)) {
+    const work = projectWork(store, clientId, engagementId, project.id);
+    sections.push({
+      title: `Project ${project.name}`,
+      body: [
+        `<p>${link(`/projects/${encodeURIComponent(project.id)}`, "Open project")}</p>`,
+        `<h3>Tasks</h3>`,
+        workList("/tasks", workEntries(work.tasks, describeTask)),
+        `<h3>Work items</h3>`,
+        workList("/items", workEntries(work.items, describeItem)),
+        `<h3>Counts</h3>${countList(taskStatusCounts(store, clientId, { engagementId, projectId: project.id }))}`,
+        `<p>Open work items: ${escapeHtml(String(openItemCount(store, clientId, { engagementId, projectId: project.id })))}</p>`,
+      ].join("\n"),
+    });
+  }
+
   return pageWith(
     engagement.name,
     [
@@ -351,22 +371,14 @@ function engagementShowPage(engagement: Engagement, snapshot: Snapshot): Page {
       { label: client.name, href: `/clients/${encodeURIComponent(client.id)}` },
       { label: "Edit engagement", href: `/engagements/${encodeURIComponent(engagement.id)}/edit` },
     ],
-    [
-      { title: "Profile", body: profileFields(ENGAGEMENT_FIELDS, engagement) },
-      {
-        title: "Projects",
-        body: [
-          `<p>${link(`/engagements/${encodeURIComponent(engagement.id)}/projects/new`, "New project")}</p>`,
-          childList(projects),
-        ].join("\n"),
-      },
-    ],
+    sections,
   );
 }
 
-function projectShowPage(project: Project, snapshot: Snapshot): Page {
+function projectShowPage(project: Project, snapshot: Snapshot, store: Store): Page {
   const engagement = findRecord(snapshot.engagements, project.engagementId, "engagement");
   const client = findRecord(snapshot.clients, engagement.clientId, "client");
+  const work = projectWork(store, client.id, engagement.id, project.id);
   return pageWith(
     project.name,
     [
@@ -376,7 +388,28 @@ function projectShowPage(project: Project, snapshot: Snapshot): Page {
       { label: engagement.name, href: `/engagements/${encodeURIComponent(engagement.id)}` },
       { label: "Edit project", href: `/projects/${encodeURIComponent(project.id)}/edit` },
     ],
-    [{ title: "Profile", body: profileFields(PROJECT_FIELDS, project) }],
+    [
+      { title: "Profile", body: profileFields(PROJECT_FIELDS, project) },
+      workSection(
+        "Tasks",
+        "/tasks",
+        `/projects/${encodeURIComponent(project.id)}/tasks/new`,
+        workEntries(work.tasks, describeTask),
+      ),
+      workSection(
+        "Work items",
+        "/items",
+        `/projects/${encodeURIComponent(project.id)}/items/new`,
+        workEntries(work.items, describeItem),
+      ),
+      {
+        title: "Counts",
+        body: [
+          `<h3>Tasks by status</h3>${countList(taskStatusCounts(store, client.id, { engagementId: engagement.id, projectId: project.id }))}`,
+          `<p>Open work items: ${escapeHtml(String(openItemCount(store, client.id, { engagementId: engagement.id, projectId: project.id })))}</p>`,
+        ].join("\n"),
+      },
+    ],
   );
 }
 
@@ -725,7 +758,11 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
       get: {
         method: "GET",
         render: (request) =>
-          engagementShowPage(findRecord(snapshot().engagements, idFromPath(request.path), "engagement"), snapshot()),
+          engagementShowPage(
+            findRecord(snapshot().engagements, idFromPath(request.path), "engagement"),
+            snapshot(),
+            store,
+          ),
       },
     },
     engagementsEdit: {
@@ -787,7 +824,11 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
       get: {
         method: "GET",
         render: (request) =>
-          projectShowPage(findRecord(snapshot().projects, idFromPath(request.path), "project"), snapshot()),
+          projectShowPage(
+            findRecord(snapshot().projects, idFromPath(request.path), "project"),
+            snapshot(),
+            store,
+          ),
       },
     },
     projectsEdit: {
