@@ -1346,6 +1346,23 @@ describe("work pages: tasks", () => {
       assert.equal(itemForm.controls.get("title"), "Item unknown project");
       assert.equal(itemForm.controls.get("context"), "keep");
       assert.equal(JSON.stringify(server.store.snapshot()), beforeEdit);
+
+      // A work item edit is associated the same way: the store's missing-record
+      // refusal for a nonexistent supplied project points at the item select.
+      const invalidItemEdit = await send(server.origin, {
+        method: "POST",
+        path: `/items/${server.store.snapshot().items[0].id}/edit`,
+        form: { id: server.store.snapshot().items[0].id, projectId: "project-99" },
+      });
+      assert.equal(invalidItemEdit.status, 400);
+      assert.match(invalidItemEdit.body, /role="alert"><p>No project with id &quot;project-99&quot;<\/p>/);
+      assert.equal((invalidItemEdit.body.match(/aria-invalid="true"/g) ?? []).length, 1);
+      assert.equal(invalidControls(invalidItemEdit.body).length, 1);
+      assert.equal(invalidControls(invalidItemEdit.body)[0].field, "projectId");
+      const itemEditInline = /<p id="field-projectId-error">([^<]*)<\/p>/.exec(invalidItemEdit.body);
+      assert.ok(itemEditInline !== null);
+      assert.ok(invalidItemEdit.body.includes(`<li>${itemEditInline[1]}</li>`));
+      assert.equal(JSON.stringify(server.store.snapshot()), beforeEdit);
     } finally {
       await server.close();
     }

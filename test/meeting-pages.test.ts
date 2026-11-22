@@ -982,9 +982,10 @@ describe("meeting pages: editing", () => {
       // An unknown submitted project on an edit is a correctable 400, not a
       // 404: the submitter can pick a real project and resubmit. The edit save
       // goes through the store with the supplied project rather than the create
-      // path's project lookup, so the store's own message about the missing
-      // record names no visible control: it stays in the summary and marks
-      // nothing invalid.
+      // path's project lookup. The refusal names the submitted project itself,
+      // so the presentation boundary associates it with the project select:
+      // the control is marked invalid, its own message carries the text and the
+      // summary carries the same text. The rejected project stays selected.
       const unknownEdit = await send(server.origin, {
         method: "POST",
         path: `/meetings/${meeting.id}/edit`,
@@ -1000,9 +1001,18 @@ describe("meeting pages: editing", () => {
       assert.doesNotMatch(unknownEdit.body, /Not found/);
       assert.match(String(unknownEdit.headers["content-type"]), /^text\/html/);
       assert.match(unknownEdit.body, /role="alert"><p>No project with id &quot;project-99&quot;<\/p>/);
-      assert.equal((unknownEdit.body.match(/aria-invalid="true"/g) ?? []).length, 0);
-      assert.equal(invalidControls(unknownEdit.body).length, 0);
-      assert.doesNotMatch(unknownEdit.body, /id="field-projectId"[^>]*aria-invalid/);
+      assert.equal((unknownEdit.body.match(/aria-invalid="true"/g) ?? []).length, 1);
+      const editMarked = invalidControls(unknownEdit.body);
+      assert.equal(editMarked.length, 1);
+      assert.equal(editMarked[0].field, "projectId");
+      assert.match(
+        unknownEdit.body,
+        /<select[^>]*\sid="field-projectId"[^>]*\saria-invalid="true"[^>]*\saria-describedby="field-projectId-error"/,
+      );
+      const editInline = /<p id="field-projectId-error">([^<]*)<\/p>/.exec(unknownEdit.body);
+      assert.ok(editInline !== null);
+      assert.equal(editInline[1], "No project with id &quot;project-99&quot;");
+      assert.ok(unknownEdit.body.includes(`<li>${editInline[1]}</li>`));
       assert.match(unknownEdit.body, /<option value="project-99" selected>project-99 \(not a valid choice\)<\/option>/);
       const unknownEditForm = parseForm(unknownEdit.body);
       assert.equal(unknownEditForm.controls.get("title"), "Unknown project");
@@ -1072,6 +1082,9 @@ describe("meeting pages: editing", () => {
       });
       assert.equal(editClientTamper.status, 400);
       assert.match(editClientTamper.body, /not the client of this engagement/);
+      // The message names the hidden client link, not a visible control.
+      assert.equal((editClientTamper.body.match(/aria-invalid="true"/g) ?? []).length, 0);
+      assert.equal(invalidControls(editClientTamper.body).length, 0);
       assert.equal(JSON.stringify(server.store.snapshot()), afterUnknownFix);
 
       // The stored parents still come from the record, never the form, and the

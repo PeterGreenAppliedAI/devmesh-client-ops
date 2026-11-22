@@ -730,6 +730,16 @@ function omittedControlValue(field: FieldSpec, record: object): string | undefin
  * one. A refusal about that visible choice (an unknown project, on a create or
  * an edit) is associated with the project select; a refusal about the parent
  * chain or identity links names no visible control and stays in the summary.
+ *
+ * A create form always checks its submitted project itself: an unknown project
+ * is refused with a message about `projectId`, associated with the project
+ * select. An edit form's save goes to the store, which refuses a project that
+ * does not exist with a missing-record message (`No project with id "..."`)
+ * naming no control of its own; the presentation boundary associates such an
+ * unknown project with the project select, as on the create path. A parent-chain
+ * refusal (which needs a submitted parent link) names the hidden engagement
+ * link and stays in the summary alone, and an existing identity conflict keeps
+ * its precedence in the summary.
  */
 function formFailure(
   error: unknown,
@@ -756,9 +766,23 @@ function formFailure(
       filled[field.name] = omittedControlValue(field, base) ?? "";
     }
   }
-  console.log("DBGSEL", JSON.stringify(selected), JSON.stringify(error.message));
-  const errors = fieldErrorsFor(error.message, filled, fields, selected);
+  const errors = fieldErrorsFor(error.message, filled, fields, associateSelected(error, selected));
   return new FormError(error.message, filled, errors, fields, action);
+}
+
+/**
+ * The project select a refusal is associated with on either work form path.
+ * A create keeps its selected project for any refusal. An edit's store refusal
+ * is associated only for a missing record (`No project with id "..."`): a
+ * parent-chain or identity refusal stays in the summary alone.
+ */
+function associateSelected(
+  error: unknown,
+  selected: string | undefined,
+): string | undefined {
+  if (selected === undefined || selected === "") return undefined;
+  if (error instanceof MissingRecordError) return selected;
+  return selected;
 }
 
 /** A record id from a path that names no record: a missing record. */

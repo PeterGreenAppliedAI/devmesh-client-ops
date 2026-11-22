@@ -235,7 +235,11 @@ export function renderFormSummary(summary: string, errors: readonly FieldError[]
  * parent link) in text that the user did not submit is about that link, so it
  * reports no visible control and stays in the summary alone: an unassignable
  * project message (`projectId "p" does not belong to engagementId "e"`)
- * names the hidden engagement link, not the project select.
+ * names the hidden engagement link, not the project select. A hidden control is
+ * named only by its qualified form (`task.id`): an identity link is never
+ * named by a bare message word, because an incidental word such as `id` in
+ * `No project with id "p"` is ordinary text, not a field reference. A parent
+ * link may still be named bare, as its refusals do (`engagementId "e"`).
  */
 export function namedVisibleField(
   message: string,
@@ -249,7 +253,13 @@ export function namedVisibleField(
   }
   const unquotedWords = wordsOutsideQuotes(message);
   // The hidden controls named in the message's own text (never a quoted value).
-  const namesHidden = unquotedWords.some((word) => hidden.has(fieldName(word)));
+  // A hidden control whose qualified name is named (`task.id`) is about that
+  // control; the message then reports no visible control and stays in the
+  // summary alone.
+  const namesHidden = unquotedWords.some((word) => {
+    const name = hiddenName(word);
+    return name !== undefined && hidden.has(name);
+  });
   for (const word of unquotedWords) {
     const name = fieldName(word);
     // A hidden control has no visible field of its own, and a message about
@@ -267,6 +277,17 @@ function fieldName(word: string): string {
   const unquoted = word.replace(/[[][0-9]+[]]/g, "").replace(/[:;,]$/, "");
   if (unquoted === "") return "";
   return unquoted.includes(".") ? unquoted.slice(unquoted.lastIndexOf(".") + 1) : unquoted;
+}
+
+/** The hidden control a message word names, if it names one: a qualified name
+ * (`task.id`) names it, and so does a bare parent link (`engagementId`), as the
+ * parent refusals name it. A bare `id` is not a reference: it is an incidental
+ * word of ordinary text (`No project with id "p"`). */
+function hiddenName(word: string): string | undefined {
+  const cleaned = word.replace(/[[][0-9]+[]]/g, "").replace(/[:;,]$/, "");
+  if (cleaned === "") return undefined;
+  if (cleaned.includes(".")) return fieldName(cleaned);
+  return cleaned === "id" ? undefined : cleaned;
 }
 
 /**
@@ -332,14 +353,15 @@ export function fieldErrorsFor(
   selectedField?: string,
 ): readonly FieldError[] {
   const named = namedVisibleField(message, fields);
-  if (named !== undefined && named !== selectedField) {
-    return [fieldErrorFor(named, message, values, fields)];
-  }
+  if (named !== undefined) return [fieldErrorFor(named, message, values, fields)];
   if (selectedField === undefined) return [];
   const field = fields.find((candidate) => candidate.name === selectedField && candidate.hidden !== true);
   if (field === undefined) return [];
   const value = values[selectedField];
-  if (!namesSubmittedChoice(message, field, value)) return [];
+  if (namesSubmittedChoice(message, field, value)) {
+    return [fieldErrorFor(selectedField, message, values, fields)];
+  }
+  if (!quotesSubmittedValue(message, value)) return [];
   return [fieldErrorFor(selectedField, message, values, fields)];
 }
 
@@ -370,18 +392,41 @@ function namesSubmittedChoice(message: string, field: FieldSpec, value: string |
   if (quotedReference(message, value) === undefined) return false;
   const hidden = new Set(["id", "clientId", "engagementId", "projectId"]);
   hidden.delete(field.name);
-  const linked = wordsOutsideQuotes(message).some((word) => hidden.has(fieldName(word)));
+  const linked = wordsOutsideQuotes(message).some((word) => {
+    const name = hiddenName(word);
+    return name !== undefined && hidden.has(name);
+  });
   return !linked;
 }
 
 /**
- * The text of the first complete quoted value in a message that equals `value`,
- * as written; undefined when no quoted value equals it. Quoted values are read
+ * True when a refusal message quotes the submitted value of the visible control
+ * as the value it cannot find or match, outside any field reference: the
+ * message's own text quotes exactly that value as one complete quoted value
+ * (`No project with id "project-99"`), and names no hidden parent link. Then the
+ * value the user selected is the problem, so the presentation boundary
+ * associates the message with that select. A message about a hidden parent link
+ * (a parent chain that needs a submitted parent) names that link and stays in
+ * the summary alone.
+ */
+function quotesSubmittedValue(message: string, value: string | undefined): boolean {
+  if (value === undefined || value === "") return false;
+  if (quotedReference(message, value) === undefined) return false;
+  const parents = new Set(["clientId", "engagementId"]);
+  const linked = wordsOutsideQuotes(message).some((word) => {
+    const name = hiddenName(word);
+    return name !== undefined && parents.has(name);
+  });
+  return !linked;
+}
+
+/** The text of the first complete quoted value in a message that equals
+ * `value`, as written; undefined when no quoted value equals it. Quoted values are read
  * the same way the message text treats them as value text rather than field
  * references.
  */
 function quotedReference(message: string, value: string): string | undefined {
-  const opens = /(?:^|[\s:(])("|'|`)/g;
+  const opens = /("|'|`)/g;
   for (let match = opens.exec(message); match !== null; match = opens.exec(message)) {
     const quote = match[1];
     let raw = "";
