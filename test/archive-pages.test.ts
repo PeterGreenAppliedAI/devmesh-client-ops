@@ -1378,6 +1378,83 @@ describe("archived forms keep their notice on a correctable refusal", () => {
       await server.close();
     }
   });
+  it("keeps the URL scope's notice when a create selects a project from another engagement", async () => {
+    const server = await running();
+    try {
+      const s = await seed(server.store);
+      // A project that exists but belongs to the sibling engagement, so the
+      // store refuses its selection as a correctable 400.
+      const foreign = await server.store.createProject({ engagementId: s.siblingEngagement.id, name: "Foreign <project>" });
+      await server.store.setArchived("engagement", s.engagement.id, true);
+      for (const path of [`/engagements/${s.engagement.id}/tasks/new`, `/engagements/${s.engagement.id}/items/new`]) {
+        const reply = await send(server.origin, {
+          method: "POST",
+          path,
+          form: { engagementId: s.engagement.id, title: "", projectId: foreign.id },
+        });
+        assert.equal(reply.status, 400, path);
+        assert.ok(
+          reply.body.includes("This record is archived"),
+          `${path} keeps the archived engagement's notice on a cross-engagement selection`,
+        );
+        assert.ok(
+          reply.body.includes("It is hidden through an archived ancestor"),
+          `${path} shows the ancestor reason, not the foreign project's notice`,
+        );
+      }
+      const meetingReply = await send(server.origin, {
+        method: "POST",
+        path: `/engagements/${s.engagement.id}/meetings/new`,
+        form: { engagementId: s.engagement.id, title: "", date: "", projectId: foreign.id },
+      });
+      assert.equal(meetingReply.status, 400);
+      assert.ok(meetingReply.body.includes("This record is archived"), "the meeting create keeps the engagement's notice");
+      assert.ok(meetingReply.body.includes("It is hidden through an archived ancestor"));
+      // The foreign project still exists and nothing was written for the scope.
+      assert.equal(server.store.snapshot().projects.some((project) => project.id === foreign.id), true);
+      assert.equal(server.store.snapshot().tasks.length, 1);
+      assert.equal(server.store.snapshot().items.length, 1);
+      assert.equal(server.store.snapshot().meetings.length, 1);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("keeps the URL project's notice when a project-scoped create selects a foreign project", async () => {
+    const server = await running();
+    try {
+      const s = await seed(server.store);
+      const foreign = await server.store.createProject({ engagementId: s.siblingEngagement.id, name: "Foreign <project>" });
+      // Only the URL project is archived: the notice must come from it, never
+      // from the foreign selected project.
+      await server.store.setArchived("project", s.project.id, true);
+      for (const path of [`/projects/${s.project.id}/tasks/new`, `/projects/${s.project.id}/items/new`]) {
+        const reply = await send(server.origin, {
+          method: "POST",
+          path,
+          form: { engagementId: s.engagement.id, title: "", projectId: foreign.id },
+        });
+        assert.equal(reply.status, 400, path);
+        assert.ok(reply.body.includes("This record is archived"), `${path} keeps the URL project's notice`);
+        assert.ok(
+          reply.body.includes("This record carries its own archive flag."),
+          `${path} names the URL project, not the foreign selection`,
+        );
+      }
+      const meetingReply = await send(server.origin, {
+        method: "POST",
+        path: `/projects/${s.project.id}/meetings/new`,
+        form: { engagementId: s.engagement.id, title: "", date: "", projectId: foreign.id },
+      });
+      assert.equal(meetingReply.status, 400);
+      assert.ok(meetingReply.body.includes("This record carries its own archive flag."));
+      assert.equal(server.store.snapshot().tasks.length, 1);
+      assert.equal(server.store.snapshot().items.length, 1);
+      assert.equal(server.store.snapshot().meetings.length, 1);
+    } finally {
+      await server.close();
+    }
+  });
 });
 
 describe("a corrected form error keeps an attached notice above the form", () => {

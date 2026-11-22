@@ -522,10 +522,14 @@ export function meetingRoutes(store: Store): MeetingRoutes {
       // engagement derived from the URL project as its parent. The URL project
       // stays the parent; the submitted project is resolved separately.
       const projectId = decodeId(parts[1] ?? "", "project");
-      const scope = projectScope(snap, projectId);
+      const projectScopeResult = projectScope(snap, projectId);
+      // The create form's scope is the engagement only (a blank project selector
+      // creates engagement-only work); the URL project is reported separately so
+      // a refusal still shows its notice.
+      const scope = { client: projectScopeResult.client, engagement: projectScopeResult.engagement };
       return {
-        scope: { client: scope.client, engagement: scope.engagement },
-        project: scope.project,
+        scope,
+        project: projectScopeResult.project,
         parent: { name: "engagementId", id: scope.engagement.id },
         conflict: submittedParentConflict(form, scope),
       };
@@ -583,18 +587,43 @@ export function meetingRoutes(store: Store): MeetingRoutes {
       // is associated with that control; the summary carries the same message.
       throw new ValidationError(`projectId: ${JSON.stringify(projectId)} is not a project of this engagement`);
     }
+    if (project.engagementId !== scope.engagement.id) {
+      // An existing project of another engagement is not this form's choice: the
+      // store owns that refusal and its message, so the selection is left
+      // unattached and the notice keeps coming from the URL scope instead of
+      // the foreign project.
+      return scope;
+    }
     return { ...scope, project };
   }
 
   /**
-   * The archive notice a refused meeting create shows. A valid selected
-   * project is the nearest scope of the new meeting, so its notice is shown
-   * when it is archived, even if the engagement is active; otherwise the URL
-   * parent's notice (the engagement, or the project of a project-scoped
-   * create) is shown.
+   * The archive notice a creation form, and a refused create, shows: the URL
+   * parent's notice, i.e. the project of a project-scoped create, otherwise the
+   * engagement. Deriving it from the URL scope, never from the submitted
+   * project selector, keeps existing validation refusals (an unknown or
+   * cross-engagement selection) unchanged while still marking an archived
+   * scope's page.
    */
-  function createNotice(snap: Snapshot, scope: CreateScope, project: Project | undefined): string {
-    if (project !== undefined) return archiveNotice(snap, project);
+  function createFormNotice(
+    snap: Snapshot,
+    scope: CreateScope,
+    selected: Project | undefined,
+    selectedId: string,
+  ): string {
+    // A selected project is the record's effective parent only when it exists,
+    // belongs to the authoritative engagement and the submission chose it (a
+    // blank selector leaves the record engagement-only). An unknown, blank or
+    // cross-engagement selection keeps the URL parent's notice, so a refusal
+    // about that selection does not lose the page's archive notice.
+    if (
+      selected !== undefined &&
+      selectedId !== "" &&
+      selected.engagementId === scope.engagement.id
+    ) {
+      return archiveNotice(snap, selected);
+    }
+    if (scope.project !== undefined) return archiveNotice(snap, scope.project);
     return archiveNotice(snap, scope.engagement);
   }
 
@@ -636,9 +665,7 @@ export function meetingRoutes(store: Store): MeetingRoutes {
       : `/engagements/${encodeURIComponent(scope.engagement.id)}`;
     // A creation form under an archived scope still works; its notice names the
     // archived parent so the user knows the new record will inherit its hiding.
-    const hiddenParent = scope.project !== undefined
-      ? archiveNotice(snap, scope.project)
-      : archiveNotice(snap, scope.engagement);
+    const hiddenParent = createFormNotice(snap, scope, undefined, "");
     return newPage(title, createAction(scope), fields, values, cancelHref, hiddenParent);
   }
 
@@ -646,7 +673,7 @@ export function meetingRoutes(store: Store): MeetingRoutes {
     const snap = snapshot();
     // The URL parent is resolved first and stays a 404 when it is missing, and
     // a submitted parent that differs from it is refused.
-    const { scope, project: urlProject, parent, conflict } = postedParent(snap, request.path, request.form);
+    const { scope, parent, conflict } = postedParent(snap, request.path, request.form);
     const action = createAction(scope);
     // The creation fields already carry the hidden engagement and client
     // parents, so a refusal keeps every submitted visible value and the form
@@ -680,7 +707,7 @@ export function meetingRoutes(store: Store): MeetingRoutes {
       const meeting = await store.createMeeting(input as MeetingCreate);
       return redirect(`/meetings/${encodeURIComponent(meeting.id)}`);
     } catch (error) {
-      const failure = formFailure(error, values, fields, action, undefined, createNotice(snap, scope, selected.project ?? urlProject));
+      const failure = formFailure(error, values, fields, action, undefined, createFormNotice(snap, scope, selected.project, text(request.form, "projectId")));
       if (failure !== null) throw failure;
       throw error;
     }
