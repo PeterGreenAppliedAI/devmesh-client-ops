@@ -230,11 +230,19 @@ export function namedVisibleField(
   fields: readonly FieldSpec[],
 ): string | undefined {
   const visible = new Set<string>();
+  const parentLinks = new Set<string>();
   for (const field of fields) {
-    if (field.hidden !== true) visible.add(field.name);
+    if (field.hidden === true) parentLinks.add(field.name);
+    else visible.add(field.name);
   }
-  // A quoted submitted value is skipped whole: its first word opens the quote
-  // and no word is a field reference until the closing quote is seen.
+  // A message about a parent chain (naming an identity or parent link together
+  // with a visible link, such as `projectId "x" does not belong to
+  // engagementId "y"`) is about the links and never reports a visible control.
+  const namesParentLink = message
+    .split(/\s+/)
+    .some((word) => parentLinks.has(word.replace(/[[][0-9]+[]]/g, "").replace(/[:;,]$/, "")));
+  // A quoted submitted value is skipped whole: everything between its opening
+  // quote and the matching closing quote is a value, never a field reference.
   let quoted: string | null = null;
   for (const raw of message.split(/\s+/)) {
     const word = raw.replace(/[[][0-9]+[]]/g, "");
@@ -242,16 +250,21 @@ export function namedVisibleField(
       if (word.includes(quoted)) quoted = null;
       continue;
     }
-    if (word === "" || word.startsWith("\"") || word.startsWith("'") || word.startsWith("`")) {
-      const quote = word[0];
-      if (word.length > 1 && word.slice(1).includes(quote)) continue;
-      quoted = quote;
+    if (word.startsWith("\"") || word.startsWith("'") || word.startsWith("`")) {
+      // A word that opens a quoted value holds no field reference; a name that
+      // introduces the value (such as `engagementId "x"`) is the word before
+      // it, which the loop has already read.
+      if (word.length === 1 || !word.slice(1).includes(word[0])) quoted = word[0];
       continue;
     }
     // A qualified name (`task.title`, `task.dueDate:`) names the part after
-    // its record prefix; a bare word must be a visible control's exact name.
-    const unquoted = word.replace(/^["']|["']$/g, "").replace(/[:;,]$/, "");
+    // its record prefix; a bare word must be a control's exact name.
+    const unquoted = word.replace(/[:;,]$/, "");
+    if (unquoted === "") continue;
     const name = unquoted.includes(".") ? unquoted.slice(unquoted.lastIndexOf(".") + 1) : unquoted;
+    // A parent link has no visible control, and a parent-chain message names
+    // no single control, so both stay in the summary alone.
+    if (parentLinks.has(name) || namesParentLink) continue;
     if (visible.has(name)) return name;
   }
   return undefined;

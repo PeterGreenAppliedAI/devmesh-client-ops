@@ -1132,8 +1132,9 @@ describe("work pages: tasks", () => {
 
       // A project of another engagement reaches the store's own refusal. It is
       // a correctable error with the submitted project kept and selected, and
-      // the message is associated with the project control it names. Nothing
-      // is written.
+      // the parent-chain message is about the hidden engagement and client
+      // links, not the project select: it stays in the summary and marks no
+      // control invalid. Nothing is written.
       const before = JSON.stringify(server.store.snapshot());
       const unassignable = await send(server.origin, {
         method: "POST",
@@ -1151,12 +1152,9 @@ describe("work pages: tasks", () => {
       });
       assert.equal(unassignable.status, 400);
       assert.match(unassignable.body, /does not belong to engagementId/);
-      const unassignableMarked = unassignable.body.match(/aria-invalid="true"/g) ?? [];
-      assert.equal(unassignableMarked.length, 1);
-      assert.match(
-        unassignable.body,
-        /<select[^>]*\sid="field-projectId"[^>]*\saria-invalid="true"[^>]*\saria-describedby="field-projectId-error"/,
-      );
+      assert.equal((unassignable.body.match(/aria-invalid="true"/g) ?? []).length, 0);
+      assert.doesNotMatch(unassignable.body, /id="field-projectId"[^>]*aria-invalid/);
+      assert.doesNotMatch(unassignable.body, /<p id=|<ul><li>[^<]*<\/li><\/ul>/);
       assert.match(unassignable.body, new RegExp(`<option value="${h.siblingProject.id}" selected>`));
       assert.equal(parseForm(unassignable.body).controls.get("title"), "Unassignable");
       assert.equal(JSON.stringify(server.store.snapshot()), before);
@@ -1700,19 +1698,18 @@ describe("work pages: project-scoped creation", () => {
       assert.match(crossProject.body, /does not belong to engagementId/);
       assert.equal(JSON.stringify(server.store.snapshot()), beforeCross);
       // The correction form posts to the URL project's engagement and keeps the
-      // submitted values, showing the rejected project selected, and marks the
-      // project control invalid with its own message.
+      // submitted values, showing the rejected project selected. The message
+      // is about the hidden parent chain rather than the project select, so it
+      // stays in the summary and no visible control is marked invalid.
       const correction = parseForm(crossProject.body);
       assert.equal(correction.action, `/engagements/${h.engagement.id}/tasks/new`);
       assert.equal(correction.controls.get("engagementId"), h.engagement.id);
       assert.equal(correction.controls.get("title"), "Cross project");
       assert.equal(correction.controls.get("owner"), "keep");
       assert.match(crossProject.body, new RegExp(`<option value="${h.siblingProject.id}" selected>`));
-      assert.match(
-        crossProject.body,
-        /<select id="field-projectId" name="projectId" aria-invalid="true" aria-describedby="field-projectId-error">/,
-      );
-      assert.match(crossProject.body, /<p id="field-projectId-error">projectId [^<]*does not belong to engagementId/);
+      assert.equal((crossProject.body.match(/aria-invalid="true"/g) ?? []).length, 0);
+      assert.doesNotMatch(crossProject.body, /id="field-projectId"[^>]*aria-invalid/);
+      assert.match(crossProject.body, /role="alert"><p>projectId [^<]*does not belong to engagementId[^<]*<\/p>/);
 
       // A nonexistent URL project is not found, and nothing is written.
       const beforeMissing = JSON.stringify(server.store.snapshot());
