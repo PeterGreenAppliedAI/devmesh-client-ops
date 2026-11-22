@@ -671,6 +671,72 @@ describe("canonical origin and Host checks", () => {
     }
   });
 
+  it("serves the six-section dashboard at home from the server's injectable clock", async () => {
+    const calls = newCalls();
+    const store = instrumentedStore(await openStore(tempDir()), calls);
+    // Seed a small cross-client workspace through the real store; every write
+    // is counted, so the read below can assert it made none.
+    const alpha = await store.createClient({ name: "Alpha <client>" });
+    const beta = await store.createClient({ name: "Beta" });
+    const alphaEngagement = await store.createEngagement({ clientId: alpha.id, name: "Alpha delivery" });
+    const betaEngagement = await store.createEngagement({ clientId: beta.id, name: "Beta delivery" });
+    const overdue = await store.createTask({
+      clientId: alpha.id, engagementId: alphaEngagement.id, title: "Overdue <task>", dueDate: "2026-11-21",
+    });
+    const dueSoon = await store.createTask({
+      clientId: alpha.id, engagementId: alphaEngagement.id, title: "Due soon", status: "in_progress", dueDate: "2026-11-29",
+    });
+    const done = await store.createTask({
+      clientId: alpha.id, engagementId: alphaEngagement.id, title: "Done", status: "done", dueDate: "2026-11-20",
+    });
+    const blocker = await store.createItem({
+      clientId: alpha.id, engagementId: alphaEngagement.id, kind: "blocker", title: "Blocker", state: "open",
+    });
+    const archivedItem = await store.createItem({
+      clientId: beta.id, engagementId: betaEngagement.id, kind: "question", title: "Hidden question", state: "open",
+    });
+    await store.setArchived("client", beta.id, true);
+    const writesBeforeRender = calls.mutations;
+
+    // The fixed clock names the server's local calendar day 2026-11-22.
+    const fixedClock = new Date(2026, 10, 22, 12, 0, 0);
+    const app = appRoutes(store, { now: () => fixedClock });
+    const routes = instrumented({ ...app }, calls);
+    const server = await startServer({ store, port: 0, routes });
+    try {
+      const home = await send(server.origin, {});
+      assert.equal(home.status, 200);
+      assert.match(String(home.headers["content-type"]), /^text\/html; charset=utf-8/);
+      assert.equal(home.headers["cache-control"], "no-store");
+      assert.match(String(home.headers["content-security-policy"]), /default-src 'none'/);
+      assert.ok(home.body.includes("2026-11-22"));
+      const sectionOf = (title: string): string => {
+        const at = home.body.indexOf(`<h2>${title}</h2>`);
+        assert.ok(at >= 0, title);
+        return home.body.slice(at, home.body.indexOf("</section>", at));
+      };
+      // Yesterday is overdue, today+7 is due soon, done is excluded.
+      assert.match(sectionOf("Overdue tasks"), new RegExp(`href="/tasks/${overdue.id}"`));
+      assert.ok(!sectionOf("Overdue tasks").includes(`href="/tasks/${done.id}"`));
+      assert.match(sectionOf("Tasks due soon"), new RegExp(`href="/tasks/${dueSoon.id}"`));
+      assert.ok(sectionOf("Tasks due soon").includes("2026-11-22 to 2026-11-29"));
+      // An open blocker is shown; the question on the archived client is not.
+      assert.match(sectionOf("Open blockers"), new RegExp(`href="/items/${blocker.id}"`));
+      assert.ok(!sectionOf("Open questions").includes(`href="/items/${archivedItem.id}"`));
+      assert.ok(sectionOf("Open questions").includes("Nothing needs attention here."));
+      assert.match(sectionOf("Open questions"), /href="\/clients"/);
+      // Escaped, linked ancestry and the record's own link.
+      assert.ok(!home.body.includes("<client>"));
+      assert.ok(home.body.includes("Alpha &lt;client&gt;"));
+      // Serving the dashboard is a read: no mutation ran.
+      assert.equal(calls.mutations, writesBeforeRender);
+      assert.equal(calls.get, 1);
+    } finally {
+      await server.close();
+      await store.close();
+    }
+  });
+
   it("offers no POST route for the home or health pages", async () => {
     const fixture = await newFixture();
     try {

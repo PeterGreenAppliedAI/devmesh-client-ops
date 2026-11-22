@@ -1176,26 +1176,54 @@ describe("overviews and rollups agree with the lists", () => {
     }
   });
 
-  it("counts only visible records on the home page, including meetings", async () => {
+  it("hides effectively archived work from the home dashboard", async () => {
     const server = await running();
     try {
       const s = await seed(server.store);
-      const before = await send(server.origin, { path: "/" });
-      assert.equal(before.status, 200);
-      assert.match(before.body, /clients 2, engagements 2, projects 1, tasks 1, items 1, meetings 1\./);
-      // Archive the client: all its records, the meetings included, stop
-      // counting; the unrelated client still does.
+      // The seeded task has no due date, and the item is an open blocker with
+      // no date, so each appears in exactly one dashboard section while the
+      // record is active. Effectively archived records leave those sections,
+      // exactly as they are left out of every list, tally and history.
+      const dashboardRows = (body: string): string => {
+        const sections = ["Overdue tasks", "Tasks due soon", "Open blockers"]
+          .map((title) => {
+            const at = body.indexOf(`<h2>${title}</h2>`);
+            return at < 0 ? "" : body.slice(at, body.indexOf("</section>", at));
+          })
+          .join("");
+        return sections;
+      };
+      // A successful home response carries every named section, so the absence
+      // checks below cannot pass on an error page.
+      const sixSections = (reply: Reply): string => {
+        assert.equal(reply.status, 200);
+        for (const title of [
+          "Overdue tasks",
+          "Tasks due soon",
+          "Open blockers",
+          "Open questions",
+          "Open commitments",
+          "Open waiting items",
+        ]) {
+          assert.ok(reply.body.includes(`<h2>${title}</h2>`), `dashboard has the ${title} section`);
+        }
+        return dashboardRows(reply.body);
+      };
+
+      const before = sixSections(await send(server.origin, { path: "/" }));
+      // An undated task never appears; the open blocker is linked.
+      assert.ok(!before.includes(`href="/tasks/${s.task.id}"`));
+      assert.ok(before.includes(`href="/items/${s.item.id}"`));
+
+      // Archiving the client hides the item through its inherited archive.
       await server.store.setArchived("client", s.client.id, true);
-      const after = await send(server.origin, { path: "/" });
-      assert.match(
-        after.body,
-        /clients 1, engagements 0, projects 0, tasks 0, items 0, meetings 0\./,
-        "the home rollup hides effective archives",
-      );
-      // Restoring the client brings them back into the counts.
+      const after = sixSections(await send(server.origin, { path: "/" }));
+      assert.ok(!after.includes(`href="/items/${s.item.id}"`), "the dashboard hides effective archives");
+
+      // Restoring the client brings the item back into its section.
       await server.store.setArchived("client", s.client.id, false);
-      const restored = await send(server.origin, { path: "/" });
-      assert.match(restored.body, /clients 2, engagements 2, projects 1, tasks 1, items 1, meetings 1\./);
+      const restored = sixSections(await send(server.origin, { path: "/" }));
+      assert.ok(restored.includes(`href="/items/${s.item.id}"`));
     } finally {
       await server.close();
     }

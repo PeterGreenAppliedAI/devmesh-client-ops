@@ -25,8 +25,7 @@ import { matchWorkPath, routeForWorkPattern, workRoutes, type WorkPath } from ".
 import type { WorkRoute } from "./work-pages.ts";
 import { matchMeetingPath, meetingRoutes, routeForMeetingPattern, type MeetingPath } from "./meeting-pages.ts";
 import type { MeetingRoute } from "./meeting-pages.ts";
-import { archivedRoutes, archiveRoutes, matchArchivePath, visibleRecords, type ArchivePath, type ArchiveRoute } from "./archive-pages.ts";
-import { escapeHtml, renderPage } from "./html.ts";
+import { archivedRoutes, archiveRoutes, matchArchivePath, type ArchivePath, type ArchiveRoute } from "./archive-pages.ts";
 import { openStore, type Store } from "./store.ts";
 
 export function health(): { status: "ok" } {
@@ -131,41 +130,14 @@ export interface HierarchyPathMatch {
  * Build the full route table served by the application: the home and health
  * shell from `appRoutes`, plus the hierarchy routes registered under their
  * canonical list/detail paths.
- */
-/**
- * Build the full route table served by the application: the home and health
- * shell from `appRoutes`, plus the hierarchy routes registered under their
- * canonical list/detail paths.
  *
- * Home is the shell's own read-only page. Its record counts are a normal
- * rollup, so they count only the visible records: effectively archived records
- * (including meetings hidden through an archived parent) are left out, exactly
- * as they are left out of every list, tally and history. The page itself is
- * unchanged; only the counts it is handed are filtered here, through the one
- * selection every active view uses.
+ * Home is the shell's own read-only dashboard (`appRoutes` renders it), so no
+ * home route is overridden here. The dashboard excludes effectively archived
+ * records (including records hidden through an archived parent) exactly as
+ * every list, tally and history does.
  */
 export function registerRoutes(store: Store): Routes {
-  const shell = appRoutes(store);
-  const home: Route = {
-    method: "GET",
-    render() {
-      const snapshot = store.snapshot();
-      const count = (records: readonly object[]): string => escapeHtml(String(records.length));
-      const body = [
-        '<nav><a href="/">Home</a><a href="/health">Health</a></nav>',
-        `<p>This shell reads the workspace and changes nothing. Records: ${[
-          `clients ${count(visibleRecords(snapshot, snapshot.clients))}`,
-          `engagements ${count(visibleRecords(snapshot, snapshot.engagements))}`,
-          `projects ${count(visibleRecords(snapshot, snapshot.projects))}`,
-          `tasks ${count(visibleRecords(snapshot, snapshot.tasks))}`,
-          `items ${count(visibleRecords(snapshot, snapshot.items))}`,
-          `meetings ${count(visibleRecords(snapshot, snapshot.meetings))}`,
-        ].join(", ")}.`,
-      ].join("\n");
-      return renderPage("Client operations", body);
-    },
-  };
-  const base: Routes = { ...shell, home: { get: home } };
+  const base: Routes = appRoutes(store);
   const hierarchy = hierarchyRoutes(store);
   const work = workRoutes(store);
   const meetings = meetingRoutes(store);

@@ -21,6 +21,7 @@ import {
   type Page,
   type Redirect,
 } from "./html.ts";
+import { renderDashboard } from "./dashboard.ts";
 import { health } from "./index.ts";
 import {
   layoutContextFor,
@@ -565,29 +566,27 @@ function errorResponse(error: unknown): RouteResult {
 }
 
 /**
- * The minimal home and health shell. Home is a read-only page: it reports the
- * workspace counts from `store.snapshot()` and links to Health. It offers no
- * form and no route that creates, changes or deletes a workspace record.
- * Health answers a fixed page from `health()`. Both are GET routes; POST to
- * either is refused by the shell before any handler runs.
+ * The home and health shell. Home is a read-only dashboard: it renders the six
+ * attention sections (overdue tasks, tasks due soon, open blockers, open
+ * questions, open commitments and open waiting items) from one snapshot, with
+ * the reference day taken from the server's local calendar. It offers no form
+ * and no route that creates, changes or deletes a workspace record, and the
+ * dashboard render never writes. Health answers a fixed page from `health()`.
+ * Both are GET routes; POST to either is refused by the shell before any
+ * handler runs.
+ *
+ * The clock is injectable so a test can fix the reference day; the real routes
+ * read the server's local calendar at render time and never store it.
  */
-export function appRoutes(store: Store): Routes {
+export function appRoutes(
+  store: Store,
+  options: { readonly now?: () => Date } = {},
+): Routes {
+  const clock = options.now ?? (() => new Date());
   const home: Route = {
     method: "GET",
     render() {
-      const snapshot = store.snapshot();
-      const body = [
-        '<nav><a href="/">Home</a><a href="/health">Health</a></nav>',
-        `<p>This shell reads the workspace and changes nothing. Records: ${[
-          `clients ${escapeHtml(String(snapshot.clients.length))}`,
-          `engagements ${escapeHtml(String(snapshot.engagements.length))}`,
-          `projects ${escapeHtml(String(snapshot.projects.length))}`,
-          `tasks ${escapeHtml(String(snapshot.tasks.length))}`,
-          `items ${escapeHtml(String(snapshot.items.length))}`,
-          `meetings ${escapeHtml(String(snapshot.meetings.length))}`,
-        ].join(", ")}.</p>`,
-      ].join("\n");
-      return renderPage("Client operations", body);
+      return renderDashboard(store.snapshot(), clock());
     },
   };
 
