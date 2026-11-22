@@ -163,6 +163,28 @@ function parseForm(document: string): ParsedForm {
   return { action: unescapeHtml(action[1]), controls };
 }
 
+
+/**
+ * The visible controls a page associates with a field error: each control
+ * carrying `aria-invalid="true"` with an `aria-describedby` naming a message
+ * element of the same text as the control's own error paragraph.
+ */
+function invalidControls(
+  document: string,
+): readonly { readonly field: string; readonly describedBy: string }[] {
+  const found: { field: string; describedBy: string }[] = [];
+  for (const match of document.matchAll(
+    /<(?:input|textarea|select)[^>]*\sid="field-(?<field>[^"]+)"[^>]*\saria-invalid="true"[^>]*\saria-describedby="(?<described>[^"]+)"/g,
+  )) {
+    if (match.groups === undefined) continue;
+    const message = new RegExp(`<p id="${match.groups.described}">([^<]*)<\\/p>`).exec(document);
+    assert.ok(message !== null, `${match.groups.field} has a message`);
+    assert.ok(document.includes(`<li>${message[1]}</li>`), `${match.groups.field} stays in the summary`);
+    found.push({ field: match.groups.field, describedBy: match.groups.described });
+  }
+  return found;
+}
+
 /**
  * A client with two engagements (one sibling of the other) and one project
  * each, plus a second client with its own engagement and meeting.
@@ -231,6 +253,8 @@ describe("meeting pages: creation", () => {
         form: Object.fromEntries(form.controls),
       });
       assert.match(redirectTarget(created), /^\/meetings\/meeting-\d+$/);
+      // The submitted client parent matches the URL's client, so it is accepted
+      // and the stored record keeps the parent the form named.
 
       const stored = server.store.snapshot().meetings[0];
       assert.equal(stored.title, "Plan <review>");
@@ -290,6 +314,9 @@ describe("meeting pages: creation", () => {
       const h = await hierarchy(server.store);
       const before = JSON.stringify(server.store.snapshot());
 
+      const renderedCreate = parseForm(
+        (await send(server.origin, { path: `/engagements/${h.engagement.id}/meetings/new` })).body,
+      );
       for (const [title, date] of [
         ["", "2026-02-28"],
         ["   ", "2026-02-28"],
@@ -298,10 +325,15 @@ describe("meeting pages: creation", () => {
         ["Meeting", "2026-13-01"],
         ["Meeting", "not a date"],
       ] as const) {
+        const controls = new Map(renderedCreate.controls);
+        controls.set("title", title);
+        controls.set("date", date);
+        controls.set("notes", "keep notes");
+        controls.set("projectId", h.project.id);
         const reply = await send(server.origin, {
           method: "POST",
           path: `/engagements/${h.engagement.id}/meetings/new`,
-          form: { engagementId: h.engagement.id, title, date, notes: "keep notes", projectId: h.project.id },
+          form: Object.fromEntries(controls),
         });
         assert.equal(reply.status, 400, `${title} ${date}`);
         assert.match(String(reply.headers["content-type"]), /^text\/html/);
@@ -313,14 +345,34 @@ describe("meeting pages: creation", () => {
         assert.equal(correction.controls.get("date"), date);
         assert.equal(correction.controls.get("notes"), "keep notes");
         assert.equal(correction.controls.get("projectId"), h.project.id);
+        // The failing visible field is marked invalid and describes itself with
+        // a message of its own, which the summary also carries.
+        const fields = title.trim() === "" ? ["title"] : ["date"];
+        // Exactly the failing controls are invalid, whether or not they are
+        // described: the independent count keeps an extra marked control from
+        // slipping in unnoticed, alongside the association check below.
+        assert.equal((reply.body.match(/aria-invalid="true"/g) ?? []).length, fields.length, `${title} ${date}`);
+        assert.equal(invalidControls(reply.body).length, fields.length, `${title} ${date}`);
+        for (const failing of fields) {
+          const associated = invalidControls(reply.body).find((control) => control.field === failing);
+          assert.ok(associated !== undefined, `${title} ${date} marks ${failing}`);
+          const inline = new RegExp(`<p id="${associated.describedBy}">([^<]*)<\\/p>`).exec(reply.body);
+          assert.ok(inline !== null, `${title} ${date}`);
+          assert.ok(reply.body.includes(`<li>${inline[1]}</li>`), `${title} ${date} summary`);
+        }
       }
       assert.equal(JSON.stringify(server.store.snapshot()), before);
 
       // Correcting the values and resubmitting the rendered form redirects.
+      const invalidValues = new Map(renderedCreate.controls);
+      invalidValues.set("title", "");
+      invalidValues.set("date", "2026-02-30");
+      invalidValues.set("notes", "<keep>");
+      invalidValues.set("projectId", h.project.id);
       const invalid = await send(server.origin, {
         method: "POST",
         path: `/engagements/${h.engagement.id}/meetings/new`,
-        form: { engagementId: h.engagement.id, title: "", date: "2026-02-30", notes: "<keep>", projectId: h.project.id },
+        form: Object.fromEntries(invalidValues),
       });
       const form = parseForm(invalid.body);
       assert.match(invalid.body, /<textarea[^>]*>.*&lt;keep&gt;.*<\/textarea>/);
@@ -341,22 +393,285 @@ describe("meeting pages: creation", () => {
     }
   });
 
+  it("renders a rejected date as plain text that shows and resubmits the exact value", async () => {
+    const server = await running();
+    try {
+      const h = await hierarchy(server.store);
+      const before = JSON.stringify(server.store.snapshot());
+
+      // A valid date (and an empty one) keeps the browser's date control.
+      const createPage = await send(server.origin, {
+        path: `/engagements/${h.engagement.id}/meetings/new`,
+      });
+      assert.match(createPage.body, /<input type="date" id="field-date" name="date" value=""/);
+      assert.doesNotMatch(createPage.body, /<input type="date"[^>]*aria-invalid/);
+      // An invalid date is rendered as a text control, because a browser
+      // sanitises an invalid value on a date input to empty. The exact
+      // submitted text stays visible and in the value a resubmission sends.
+      for (const badDate of ["not a date", "2026-2-30", "05/05/2026", "20260230"]) {
+        const reply = await send(server.origin, {
+          method: "POST",
+          path: `/engagements/${h.engagement.id}/meetings/new`,
+          form: { engagementId: h.engagement.id, title: "Dated", date: badDate, notes: "keep", projectId: "" },
+        });
+        assert.equal(reply.status, 400, badDate);
+        assert.match(
+          reply.body,
+          new RegExp(`<input type="text" id="field-date" name="date" value="${escapeHtml(badDate)}" required[^>]*aria-invalid="true"`),
+          badDate,
+        );
+        // The exact text is the control's submitted value.
+        assert.equal(parseForm(reply.body).controls.get("date"), badDate, badDate);
+        // A valid stored date keeps the date control on an edit correction.
+        assert.equal(JSON.stringify(server.store.snapshot()), before, badDate);
+      }
+
+      // A well formed but impossible date is rendered as a text control too: a
+      // browser's date control sanitises a date outside the calendar (such as
+      // the day after a month's end) to empty, so it would not keep the value.
+      for (const impossibleDate of ["2026-02-30", "2026-13-01", "2023-02-29", "2026-04-31"]) {
+        const impossible = await send(server.origin, {
+          method: "POST",
+          path: `/engagements/${h.engagement.id}/meetings/new`,
+          form: { engagementId: h.engagement.id, title: "Dated", date: impossibleDate, notes: "", projectId: "" },
+        });
+        assert.equal(impossible.status, 400, impossibleDate);
+        assert.match(
+          impossible.body,
+          new RegExp(`<input type="text" id="field-date" name="date" value="${escapeHtml(impossibleDate)}" required[^>]*aria-invalid="true"`),
+          impossibleDate,
+        );
+        assert.equal(parseForm(impossible.body).controls.get("date"), impossibleDate, impossibleDate);
+        assert.match(impossible.body, /must be a real calendar date/, impossibleDate);
+        assert.equal(JSON.stringify(server.store.snapshot()), before, impossibleDate);
+      }
+
+      // A year-zero day the store refuses (`0000-02-30` is not a real day) is
+      // still rendered as text: a browser's date control sanitises `0000-MM-DD`
+      // to empty, so the value would not survive as text on a date control.
+      for (const refusedZero of ["0000-02-30"]) {
+        const zero = await send(server.origin, {
+          method: "POST",
+          path: `/engagements/${h.engagement.id}/meetings/new`,
+          form: { engagementId: h.engagement.id, title: "Zero", date: refusedZero, notes: "keep", projectId: "" },
+        });
+        assert.equal(zero.status, 400, refusedZero);
+        assert.match(
+          zero.body,
+          new RegExp(`<input type="text" id="field-date" name="date" value="${escapeHtml(refusedZero)}" required aria-invalid="true"`),
+          refusedZero,
+        );
+        assert.equal(parseForm(zero.body).controls.get("date"), refusedZero, refusedZero);
+        assert.match(zero.body, /must be a real calendar date/, refusedZero);
+        assert.equal(parseForm(zero.body).controls.get("notes"), "keep", refusedZero);
+        assert.equal(JSON.stringify(server.store.snapshot()), before, refusedZero);
+      }
+
+      // A leap day of a leap year is a real date and keeps the date control,
+      // which shows it exactly as written.
+      const leapDay = await send(server.origin, {
+        method: "POST",
+        path: `/engagements/${h.engagement.id}/meetings/new`,
+        form: { engagementId: h.engagement.id, title: "", date: "2024-02-29", notes: "", projectId: "" },
+      });
+      assert.equal(leapDay.status, 400);
+      assert.match(leapDay.body, /<input type="date" id="field-date" name="date" value="2024-02-29" required>/);
+      assert.equal(parseForm(leapDay.body).controls.get("date"), "2024-02-29");
+
+      // A valid date is rendered as a date control again.
+      const meeting = await server.store.createMeeting({
+        clientId: h.client.id,
+        engagementId: h.engagement.id,
+        title: "Valid",
+        date: "2026-01-02",
+      });
+      const validEdit = await send(server.origin, {
+        method: "POST",
+        path: `/meetings/${meeting.id}/edit`,
+        form: { id: meeting.id, title: "", date: meeting.date },
+      });
+      assert.equal(validEdit.status, 400);
+      assert.match(validEdit.body, /<input type="date" id="field-date" name="date" value="2026-01-02" required/);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("associates only the visible field it names, never a quoted submitted value", async () => {
+    const server = await running();
+    try {
+      const h = await hierarchy(server.store);
+      const before = JSON.stringify(server.store.snapshot());
+
+      // A blank title with notes submitted as a field-like word: the message
+      // names the title, and the quoted value in no message marks notes.
+      const reply = await send(server.origin, {
+        method: "POST",
+        path: `/engagements/${h.engagement.id}/meetings/new`,
+        form: { engagementId: h.engagement.id, title: "", date: "2026-01-01", notes: "notes", projectId: "" },
+      });
+      assert.equal(reply.status, 400);
+      const marked = reply.body.match(/aria-invalid="true"/g) ?? [];
+      assert.equal(marked.length, 1);
+      assert.match(
+        reply.body,
+        /<input[^>]*\sid="field-title"[^>]*\saria-invalid="true"[^>]*\saria-describedby="field-title-error"/,
+      );
+      assert.doesNotMatch(reply.body, /id="field-notes"[^>]*aria-invalid/);
+      assert.equal(parseForm(reply.body).controls.get("notes"), "notes");
+
+      // A tampered parent quoting a visible field name (notes) names the
+      // hidden client link, not the notes control: the message stays in the
+      // summary, and the quoted word marks no control invalid.
+      const parentTamper = await send(server.origin, {
+        method: "POST",
+        path: `/engagements/${h.engagement.id}/meetings/new`,
+        form: { clientId: "notes", title: "T", date: "2026-01-01", notes: "keep", projectId: "" },
+      });
+      assert.equal(parentTamper.status, 400);
+      assert.match(parentTamper.body, /not the client of this engagement/);
+      assert.equal(invalidControls(parentTamper.body).length, 0);
+      assert.equal(parseForm(parentTamper.body).controls.get("notes"), "keep");
+
+      // An engagement parent tampered to a bare visible field name (title) is a
+      // problem with the hidden engagement link, so the summary carries it and
+      // no visible control is marked invalid.
+      const engagementTamper = await send(server.origin, {
+        method: "POST",
+        path: `/engagements/${h.engagement.id}/meetings/new`,
+        form: { engagementId: "title", title: "T", date: "2026-01-01", notes: "", projectId: "" },
+      });
+      assert.equal(engagementTamper.status, 400);
+      assert.match(engagementTamper.body, /not the parent engagement of this form/);
+      assert.equal(invalidControls(engagementTamper.body).length, 0);
+
+      // A parent value quoting a visible field name together with other words
+      // (`projectId` quoted inside the engagement value) is still a value: the
+      // message names the hidden engagement link, and the quoted project does
+      // not mark the project select invalid.
+      const quotedProject = await send(server.origin, {
+        method: "POST",
+        path: `/engagements/${h.engagement.id}/meetings/new`,
+        form: { engagementId: "x projectId y", title: "T", date: "2026-01-01", notes: "", projectId: "" },
+      });
+      assert.equal(quotedProject.status, 400);
+      assert.match(quotedProject.body, /not the parent engagement of this form/);
+      assert.equal((quotedProject.body.match(/aria-invalid="true"/g) ?? []).length, 0);
+      assert.doesNotMatch(quotedProject.body, /id="field-projectId"[^>]*aria-invalid/);
+      assert.equal(parseForm(quotedProject.body).controls.get("projectId"), "");
+
+      // A parent value carrying an escaped quote (`x\" notes`) is one complete
+      // quoted value through to its closing quote, so the notes control after
+      // it is never named.
+      const escapedQuote = await send(server.origin, {
+        method: "POST",
+        path: `/engagements/${h.engagement.id}/meetings/new`,
+        form: { clientId: "x\\\" notes", title: "T", date: "2026-01-01", notes: "keep", projectId: "" },
+      });
+      assert.equal(escapedQuote.status, 400);
+      assert.match(escapedQuote.body, /not the client of this engagement/);
+      assert.equal((escapedQuote.body.match(/aria-invalid="true"/g) ?? []).length, 0);
+      assert.doesNotMatch(escapedQuote.body, /id="field-notes"[^>]*aria-invalid/);
+      assert.equal(parseForm(escapedQuote.body).controls.get("notes"), "keep");
+      assert.equal(JSON.stringify(server.store.snapshot()), before);
+      assert.equal(JSON.stringify(server.store.snapshot()), before);
+
+      // An existing identity conflict takes precedence over a parent mismatch
+      // and over any invalid visible field.
+      const meeting = await server.store.createMeeting({
+        clientId: h.client.id,
+        engagementId: h.engagement.id,
+        title: "Keep",
+        date: "2026-01-02",
+        notes: "old",
+      });
+      const editBefore = JSON.stringify(server.store.snapshot());
+      const precedence = await send(server.origin, {
+        method: "POST",
+        path: `/meetings/${meeting.id}/edit`,
+        form: { id: "meeting-99", title: "", date: "bad", engagementId: h.sibling.id, notes: "new" },
+      });
+      assert.equal(precedence.status, 400);
+      assert.match(precedence.body, /does not match this URL/);
+      assert.doesNotMatch(precedence.body, /not the parent engagement/);
+      assert.doesNotMatch(precedence.body, /must be nonblank/);
+      assert.equal((precedence.body.match(/aria-invalid="true"/g) ?? []).length, 0);
+      assert.equal(JSON.stringify(server.store.snapshot()), editBefore);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("keeps omitted fields on a corrected meeting edit", async () => {
+    const server = await running();
+    try {
+      const h = await hierarchy(server.store);
+      const meeting = await server.store.createMeeting({
+        clientId: h.client.id,
+        engagementId: h.engagement.id,
+        title: "Omit",
+        date: "2026-01-02",
+        notes: "Keep notes",
+        projectId: h.project.id,
+      });
+      const before = JSON.stringify(server.store.snapshot());
+
+      // A blank title with every other field omitted shows the submitted blank
+      // title and the stored values of the omitted controls.
+      const invalid = await send(server.origin, {
+        method: "POST",
+        path: `/meetings/${meeting.id}/edit`,
+        form: { id: meeting.id, title: "" },
+      });
+      assert.equal(invalid.status, 400);
+      const form = parseForm(invalid.body);
+      assert.equal(form.action, `/meetings/${meeting.id}/edit`);
+      assert.equal(form.controls.get("title"), "");
+      assert.equal(form.controls.get("date"), "2026-01-02");
+      assert.equal(form.controls.get("notes"), "Keep notes");
+      assert.equal(form.controls.get("projectId"), h.project.id);
+      assert.equal((invalid.body.match(/aria-invalid="true"/g) ?? []).length, 1);
+      assert.equal(JSON.stringify(server.store.snapshot()), before);
+
+      // Correcting the title on the rendered form and resubmitting the whole
+      // correction form saves it and keeps every value it carries, including
+      // the stored values the original submission omitted.
+      form.controls.set("title", "Corrected");
+      const corrected = await send(server.origin, {
+        method: "POST",
+        path: form.action,
+        form: Object.fromEntries(form.controls),
+      });
+      assert.match(redirectTarget(corrected), /^\/meetings\/meeting-\d+$/);
+      const stored = server.store.snapshot().meetings.find((candidate) => candidate.id === meeting.id);
+      assert.ok(stored !== undefined);
+      assert.equal(stored.title, "Corrected");
+      assert.equal(stored.date, "2026-01-02");
+      assert.equal(stored.notes, "Keep notes");
+      assert.equal(stored.projectId, h.project.id);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("rejects tampered parents from the path parent and leaves the data unchanged", async () => {
     const server = await running();
     try {
       const h = await hierarchy(server.store);
       const before = JSON.stringify(server.store.snapshot());
 
+      const renderedForm = parseForm(
+        (await send(server.origin, { path: `/engagements/${h.engagement.id}/meetings/new` })).body,
+      );
+      const tamperedControls = new Map(renderedForm.controls);
+      tamperedControls.set("title", "Tampered");
+      tamperedControls.set("date", "2026-05-05");
+      tamperedControls.set("notes", "keep me");
+      tamperedControls.set("projectId", h.siblingProject.id);
       const tamperedCreate = await send(server.origin, {
         method: "POST",
         path: `/engagements/${h.engagement.id}/meetings/new`,
-        form: {
-          engagementId: h.engagement.id,
-          title: "Tampered",
-          date: "2026-05-05",
-          notes: "keep me",
-          projectId: h.siblingProject.id,
-        },
+        form: Object.fromEntries(tamperedControls),
       });
       assert.equal(tamperedCreate.status, 400);
       assert.match(tamperedCreate.body, /role="alert"/);
@@ -377,6 +692,22 @@ describe("meeting pages: creation", () => {
       });
       assert.equal(unknownProject.status, 400);
       assert.doesNotMatch(unknownProject.body, /Not found/);
+      // The rejected project is the form's own visible choice: its select is
+      // marked invalid and points at the message the summary also carries.
+      assert.equal((unknownProject.body.match(/aria-invalid="true"/g) ?? []).length, 1);
+      assert.equal(invalidControls(unknownProject.body).length, 1);
+      assert.equal(invalidControls(unknownProject.body)[0].field, "projectId");
+      assert.match(
+        unknownProject.body,
+        /<select[^>]*\sid="field-projectId"[^>]*\saria-invalid="true"[^>]*\saria-describedby="field-projectId-error"/,
+      );
+      assert.match(
+        unknownProject.body,
+        /<option value="project-99" selected>project-99 \(not a valid choice\)<\/option>/,
+      );
+      const unknownCorrection = parseForm(unknownProject.body);
+      assert.equal(unknownCorrection.controls.get("title"), "Unknown");
+      assert.equal(unknownCorrection.controls.get("date"), "2026-05-05");
       assert.equal(JSON.stringify(server.store.snapshot()), before);
 
       // A tampered parent id in the form is refused: the engagement and client
@@ -616,7 +947,10 @@ describe("meeting pages: editing", () => {
       assert.equal(correction.action, `/meetings/${meeting.id}/edit`);
       assert.equal(correction.controls.get("id"), meeting.id);
       assert.equal(correction.controls.get("title"), "");
+      // The rejected date keeps its exact submitted text in a text control, so
+      // a browser does not sanitise it to empty on redisplay.
       assert.equal(correction.controls.get("date"), "2026-02-30");
+      assert.match(invalid.body, /<input type="text" id="field-date" name="date" value="2026-02-30" required/);
       assert.equal(correction.controls.get("notes"), "keep <me>");
       assert.match(invalid.body, /<textarea[^>]*>keep &lt;me&gt;<\/textarea>/);
 
@@ -645,6 +979,139 @@ describe("meeting pages: editing", () => {
       assert.equal(editCorrection.controls.get("title"), "Hijacked");
       assert.equal(JSON.stringify(server.store.snapshot()), beforeEdit);
 
+      // An unknown submitted project on an edit is a correctable 400, not a
+      // 404: the submitter can pick a real project and resubmit. The edit save
+      // goes through the store with the supplied project rather than the create
+      // path's project lookup. The refusal names the submitted project itself,
+      // so the presentation boundary associates it with the project select:
+      // the control is marked invalid, its own message carries the text and the
+      // summary carries the same text. The rejected project stays selected.
+      const unknownEdit = await send(server.origin, {
+        method: "POST",
+        path: `/meetings/${meeting.id}/edit`,
+        form: {
+          id: meeting.id,
+          title: "Unknown project",
+          date: "2026-03-03",
+          notes: "keep",
+          projectId: "project-99",
+        },
+      });
+      assert.equal(unknownEdit.status, 400);
+      assert.doesNotMatch(unknownEdit.body, /Not found/);
+      assert.match(String(unknownEdit.headers["content-type"]), /^text\/html/);
+      assert.match(unknownEdit.body, /role="alert"><p>No project with id &quot;project-99&quot;<\/p>/);
+      assert.equal((unknownEdit.body.match(/aria-invalid="true"/g) ?? []).length, 1);
+      const editMarked = invalidControls(unknownEdit.body);
+      assert.equal(editMarked.length, 1);
+      assert.equal(editMarked[0].field, "projectId");
+      assert.match(
+        unknownEdit.body,
+        /<select[^>]*\sid="field-projectId"[^>]*\saria-invalid="true"[^>]*\saria-describedby="field-projectId-error"/,
+      );
+      const editInline = /<p id="field-projectId-error">([^<]*)<\/p>/.exec(unknownEdit.body);
+      assert.ok(editInline !== null);
+      assert.equal(editInline[1], "No project with id &quot;project-99&quot;");
+      assert.ok(unknownEdit.body.includes(`<li>${editInline[1]}</li>`));
+      assert.match(unknownEdit.body, /<option value="project-99" selected>project-99 \(not a valid choice\)<\/option>/);
+      const unknownEditForm = parseForm(unknownEdit.body);
+      assert.equal(unknownEditForm.controls.get("title"), "Unknown project");
+      assert.equal(unknownEditForm.controls.get("date"), "2026-03-03");
+      assert.equal(unknownEditForm.controls.get("notes"), "keep");
+      assert.equal(JSON.stringify(server.store.snapshot()), beforeEdit);
+      // Correcting the project on the rendered form and resubmitting saves the
+      // change while the record's other fields are kept.
+      unknownEditForm.controls.set("projectId", h.secondProject.id);
+      const unknownFixed = await send(server.origin, {
+        method: "POST",
+        path: unknownEditForm.action,
+        form: Object.fromEntries(unknownEditForm.controls),
+      });
+      assert.equal(redirectTarget(unknownFixed), `/meetings/${meeting.id}`);
+      const unknownStored = server.store.snapshot().meetings.find(
+        (candidate) => candidate.id === meeting.id,
+      );
+      assert.ok(unknownStored !== undefined);
+      assert.equal(unknownStored.title, "Unknown project");
+      assert.equal(unknownStored.projectId, h.secondProject.id);
+      assert.equal(unknownStored.date, "2026-03-03");
+      const afterUnknownFix = JSON.stringify(server.store.snapshot());
+      assert.notEqual(afterUnknownFix, beforeEdit);
+
+      // The project error is associated with the project control itself, even
+      // when another visible value holds the same text: the title is sent as
+      // the rejected project, appears before the select, and stays unmarked.
+      const collisionEdit = await send(server.origin, {
+        method: "POST",
+        path: `/meetings/${meeting.id}/edit`,
+        form: { id: meeting.id, title: "project-99", projectId: "project-99" },
+      });
+      assert.equal(collisionEdit.status, 400);
+      assert.match(collisionEdit.body, /role="alert"><p>No project with id &quot;project-99&quot;<\/p>/);
+      assert.equal((collisionEdit.body.match(/aria-invalid="true"/g) ?? []).length, 1);
+      const collisionMarked = invalidControls(collisionEdit.body);
+      assert.equal(collisionMarked.length, 1);
+      assert.equal(collisionMarked[0].field, "projectId");
+      assert.doesNotMatch(collisionEdit.body, /id="field-title"[^>]*aria-invalid/);
+      const collisionForm = parseForm(collisionEdit.body);
+      assert.equal(collisionForm.controls.get("title"), "project-99");
+      assert.equal(collisionForm.controls.get("projectId"), "project-99");
+
+      // An invalid project holding characters the message has to escape (a
+      // quote, a backslash, a newline, a tab) still matches its own
+      // JSON-encoded refusal and points at the select, kept for correction.
+      for (const value of ['meet-"99', "back\\slash", "trailing\\", "line\nbreak", "tab\tvalue"]) {
+        const escaped = await send(server.origin, {
+          method: "POST",
+          path: `/meetings/${meeting.id}/edit`,
+          form: { id: meeting.id, title: "Escaped meeting", projectId: value },
+        });
+        assert.equal(escaped.status, 400, JSON.stringify(value));
+        assert.doesNotMatch(escaped.body, /Not found/);
+        assert.equal((escaped.body.match(/aria-invalid="true"/g) ?? []).length, 1, JSON.stringify(value));
+        const escapedMarked = invalidControls(escaped.body);
+        assert.equal(escapedMarked.length, 1, JSON.stringify(value));
+        assert.equal(escapedMarked[0].field, "projectId", JSON.stringify(value));
+        assert.match(
+          escaped.body,
+          /<select[^>]*\sid="field-projectId"[^>]*\saria-invalid="true"[^>]*\saria-describedby="field-projectId-error"/,
+          JSON.stringify(value),
+        );
+        const escapedInline = /<p id="field-projectId-error">([^<]*)<\/p>/.exec(escaped.body);
+        assert.ok(escapedInline !== null, JSON.stringify(value));
+        assert.ok(escaped.body.includes(`<li>${escapedInline[1]}</li>`), JSON.stringify(value));
+        const escapedForm = parseForm(escaped.body);
+        assert.equal(escapedForm.controls.get("projectId"), value, JSON.stringify(value));
+        assert.equal(escapedForm.controls.get("title"), "Escaped meeting", JSON.stringify(value));
+      }
+
+      // A project of another engagement on an edit reaches the store's own
+      // refusal. It is a correctable 400 that keeps the submitted values, and
+      // the parent-chain message is about the hidden engagement and client
+      // links, not the project select, so it stays in the summary and marks no
+      // control invalid. Nothing is written.
+      const unassignableEdit = await send(server.origin, {
+        method: "POST",
+        path: `/meetings/${meeting.id}/edit`,
+        form: {
+          id: meeting.id,
+          title: "Unassignable",
+          date: "2026-03-03",
+          notes: "keep",
+          projectId: h.siblingProject.id,
+        },
+      });
+      assert.equal(unassignableEdit.status, 400);
+      assert.match(unassignableEdit.body, /does not belong to engagementId/);
+      assert.equal((unassignableEdit.body.match(/aria-invalid="true"/g) ?? []).length, 0);
+      assert.doesNotMatch(unassignableEdit.body, /id="field-projectId"[^>]*aria-invalid/);
+      assert.match(
+        unassignableEdit.body,
+        new RegExp(`<option value="${h.siblingProject.id}" selected>`),
+      );
+      assert.equal(parseForm(unassignableEdit.body).controls.get("title"), "Unassignable");
+      assert.equal(JSON.stringify(server.store.snapshot()), afterUnknownFix);
+
       // A conflicting submitted id is refused on a form for the URL record.
       const conflicting = await send(server.origin, {
         method: "POST",
@@ -653,7 +1120,7 @@ describe("meeting pages: editing", () => {
       });
       assert.equal(conflicting.status, 400);
       assert.match(conflicting.body, /does not match this URL/);
-      assert.equal(JSON.stringify(server.store.snapshot()), beforeEdit);
+      assert.equal(JSON.stringify(server.store.snapshot()), afterUnknownFix);
 
       // A tampered engagement on an edit is refused even though the other
       // fields are valid and changed: the record does not move and the rest of
@@ -673,7 +1140,7 @@ describe("meeting pages: editing", () => {
       assert.equal(editEngagementTamper.status, 400);
       assert.match(editEngagementTamper.body, /role="alert"/);
       assert.match(editEngagementTamper.body, /not the parent engagement of this form/);
-      assert.equal(JSON.stringify(server.store.snapshot()), beforeEdit);
+      assert.equal(JSON.stringify(server.store.snapshot()), afterUnknownFix);
 
       // A tampered client on an edit is refused the same way.
       const editClientTamper = await send(server.origin, {
@@ -689,15 +1156,18 @@ describe("meeting pages: editing", () => {
       });
       assert.equal(editClientTamper.status, 400);
       assert.match(editClientTamper.body, /not the client of this engagement/);
-      assert.equal(JSON.stringify(server.store.snapshot()), beforeEdit);
+      // The message names the hidden client link, not a visible control.
+      assert.equal((editClientTamper.body.match(/aria-invalid="true"/g) ?? []).length, 0);
+      assert.equal(invalidControls(editClientTamper.body).length, 0);
+      assert.equal(JSON.stringify(server.store.snapshot()), afterUnknownFix);
 
       // The stored parents still come from the record, never the form, and the
       // rejected submissions did not change anything.
       const storedAfterTamper = server.store.snapshot().meetings[0];
       assert.equal(storedAfterTamper.clientId, h.client.id);
       assert.equal(storedAfterTamper.engagementId, h.engagement.id);
-      assert.equal(storedAfterTamper.title, "Fixed");
-      assert.equal(storedAfterTamper.date, "2026-02-28");
+      assert.equal(storedAfterTamper.title, "Unknown project");
+      assert.equal(storedAfterTamper.date, "2026-03-03");
       assert.notEqual(before, beforeEdit);
     } finally {
       await server.close();
@@ -960,6 +1430,11 @@ describe("meeting pages: client overview", () => {
       assert.equal(emptyPage.status, 200);
       assert.match(emptyPage.body, /No engagements yet\./);
       assert.match(emptyPage.body, /No current tasks\./);
+      assert.match(emptyPage.body, /No decisions recorded yet\./);
+      // A client with no engagement is told to choose or create one before it
+      // can add work, and the engagement's own page is the only next step.
+      assert.match(emptyPage.body, /choose an engagement/i);
+      assert.ok(!emptyPage.body.includes("/engagements//"));
       assert.match(emptyPage.body, /No open follow-ups\./);
       assert.match(emptyPage.body, /No open commitments\./);
       assert.match(emptyPage.body, /No open waiting items\./);

@@ -589,25 +589,44 @@ describe("workspace integration: linked overview and restart", () => {
       const engagementSection = sectionOf(overview.body, "Engagements");
       assert.match(engagementSection, new RegExp(`href="/engagements/${alpha}"`));
       assert.match(engagementSection, new RegExp(`href="/engagements/${beta}"`));
-      assert.match(engagementSection, /<a href="\/engagements\/[^"]+">Alpha<\/a> \(active\)/);
-      assert.match(engagementSection, /<a href="\/engagements\/[^"]+">Beta<\/a> \(on_hold\)/);
+      // The status is a text badge beside the link, escaped from stored text.
+      assert.match(engagementSection, /<a href="\/engagements\/[^"]+">Alpha<\/a> <span class="badge">active<\/span>/);
+      assert.match(engagementSection, /<a href="\/engagements\/[^"]+">Beta<\/a> <span class="badge">on_hold<\/span>/);
       const projectSection = sectionOf(overview.body, "Projects");
       assert.match(projectSection, new RegExp(`href="/projects/${alphaProject}"`));
       assert.match(projectSection, new RegExp(`href="/projects/${betaProject}"`));
-      assert.match(projectSection, /<a href="\/projects\/[^"]+">Alpha project<\/a> \(active · Alpha\)/);
-      assert.match(projectSection, /<a href="\/projects\/[^"]+">Beta project<\/a> \(active · Beta\)/);
+      // The status is the badge; the project's engagement is a link after it,
+      // so a stored name is never read as part of the status.
+      assert.match(
+        projectSection,
+        new RegExp(
+          `<a href="/projects/[^"]+">Alpha project</a> <span class="badge">active</span> · <a href="/engagements/${alpha}">Alpha</a>`,
+        ),
+      );
+      assert.match(
+        projectSection,
+        new RegExp(
+          `<a href="/projects/[^"]+">Beta project</a> <span class="badge">active</span> · <a href="/engagements/${beta}">Beta</a>`,
+        ),
+      );
 
       // Current tasks: exactly the open and in-progress tasks, with and without
       // dates, and never the completed ones.
       const current = currentTasks(overview.body);
+      // Each task card links to its detail page and, separately, to its edit
+      // workflow; only the detail links are the current task list here.
       assert.deepEqual(
-        [...current.matchAll(/href="\/tasks\/([^"]+)"/g)].map((match) => match[1]),
+        [...current.matchAll(/href="\/tasks\/([^"/]+)"/g)].map((match) => match[1]),
         [ids.tasks[0], ids.tasks[1], ids.tasks[2]],
       );
+      for (const id of [ids.tasks[0], ids.tasks[1], ids.tasks[2]]) {
+        assert.match(current, new RegExp(`href="/tasks/${id}/edit"`));
+      }
       assert.ok(!current.includes(`href="/tasks/${ids.tasks[3]}"`)); // done from the start
       assert.ok(!current.includes("Beta done task"));
-      assert.match(current, /status open/);
-      assert.match(current, /status in_progress/);
+      // The task status and priority are shown as text badges beside the title.
+      assert.match(current, /<a href="\/tasks\/[^"]+">[^<]*<\/a> <span class="badge">open<\/span> <span class="badge">high<\/span>/);
+      assert.match(current, /<span class="badge">in_progress<\/span>/);
       assert.ok(current.includes(escapeHtml("Alpha engagement task")));
       assert.ok(current.includes(escapeHtml("Alpha project task")));
 
@@ -618,7 +637,9 @@ describe("workspace integration: linked overview and restart", () => {
       // here as well; Alpha's closed blocker is gone.
       const betaBlocker = ids.items[9];
       assert.match(blockers, new RegExp(`href="/items/${betaBlocker}"`));
-      assert.equal(blockers.split("<li>").length - 1, 1);
+      // There is exactly one blocker card, and it links its record once.
+      assert.equal(blockers.split('class="card"').length - 1, 1);
+      assert.equal(blockers.split(`href="/items/${betaBlocker}"`).length - 1, 1);
       const questions = sectionOf(overview.body, "Open questions");
       assert.match(questions, new RegExp(`href="/items/${ids.items[1]}"`));
       assert.ok(!questions.includes(`href="/items/${ids.items[7]}"`)); // beta question
@@ -628,15 +649,16 @@ describe("workspace integration: linked overview and restart", () => {
       // Beta's), and no other kind of item.
       const decisions = sectionOf(overview.body, "Decisions");
       assert.deepEqual(
-        [...decisions.matchAll(/href="\/items\/([^"]+)"/g)].map((match) => match[1]),
+        [...decisions.matchAll(/href="\/items\/([^"/]+)"/g)].map((match) => match[1]),
         [ids.items[0], ids.items[6], ids.items[7]],
       );
-      assert.match(decisions, /kind decision, closed/);
-      assert.match(decisions, /kind decision, open/);
+      // A decision's kind and state are text badges in its card.
+      assert.match(decisions, /<span class="badge">decision<\/span> <span class="badge">closed<\/span>/);
+      assert.match(decisions, /<span class="badge">decision<\/span> <span class="badge">open<\/span>/);
       // The closed decision is reachable and shows its closed state.
       const closedDecisionPage = await send(base, { path: `/items/${ids.items[6]}` });
       assert.equal(closedDecisionPage.status, 200);
-      assert.match(closedDecisionPage.body, /<dd>closed<\/dd>/);
+      assert.match(closedDecisionPage.body, /<dd><span class="badge">closed<\/span><\/dd>/);
 
       // Next steps: three identifiable groups, each with its own heading and
       // list, containing only this client's open items of that kind.
@@ -765,10 +787,10 @@ describe("workspace integration: linked overview and restart", () => {
       // Every listed record links somewhere reachable.
       const closedBlocker = await send(base, { path: `/items/${ids.items[2]}` });
       assert.equal(closedBlocker.status, 200);
-      assert.match(closedBlocker.body, /<dd>closed<\/dd>/);
+      assert.match(closedBlocker.body, /<dd><span class="badge">closed<\/span><\/dd>/);
       const closedDecisionAfterBlockers = await send(base, { path: `/items/${ids.items[6]}` });
       assert.equal(closedDecisionAfterBlockers.status, 200);
-      assert.match(closedDecisionAfterBlockers.body, /<dd>closed<\/dd>/);
+      assert.match(closedDecisionAfterBlockers.body, /<dd><span class="badge">closed<\/span><\/dd>/);
 
       // -- A task completed after the overviews were read. -------------------
       // Completing a task is a state change the overview's current-task list
@@ -783,7 +805,7 @@ describe("workspace integration: linked overview and restart", () => {
       assert.equal(overviewAfter.status, 200);
       const currentAfter = currentTasks(overviewAfter.body);
       assert.deepEqual(
-        [...currentAfter.matchAll(/href="\/tasks\/([^"]+)"/g)].map((match) => match[1]),
+        [...currentAfter.matchAll(/href="\/tasks\/([^"/]+)"/g)].map((match) => match[1]),
         [ids.tasks[0], ids.tasks[1]],
       );
       const completedTaskPage = await send(base, { path: `/tasks/${ids.tasks[2]}` });
@@ -870,7 +892,7 @@ describe("workspace integration: linked overview and restart", () => {
       );
       // Current tasks after the restart exclude the completed task.
       assert.deepEqual(
-        [...currentTasks(overview.body).matchAll(/href="\/tasks\/([^"]+)"/g)].map((match) => match[1]),
+        [...currentTasks(overview.body).matchAll(/href="\/tasks\/([^"/]+)"/g)].map((match) => match[1]),
         [ids.tasks[0], ids.tasks[1]],
       );
       const clientHistory = sectionOf(overview.body, "Meeting history");
@@ -888,10 +910,10 @@ describe("workspace integration: linked overview and restart", () => {
       // still linked from the restarted overview, together with the open ones.
       const restartedDecisions = sectionOf(overview.body, "Decisions");
       assert.deepEqual(
-        [...restartedDecisions.matchAll(/href="\/items\/([^"]+)"/g)].map((match) => match[1]),
+        [...restartedDecisions.matchAll(/href="\/items\/([^"/]+)"/g)].map((match) => match[1]),
         [ids.items[0], ids.items[6], ids.items[7]],
       );
-      assert.match(restartedDecisions, /kind decision, closed/);
+      assert.match(restartedDecisions, /<span class="badge">decision<\/span> <span class="badge">closed<\/span>/);
       // The completed and closed work is still reachable in the record lists.
       const restartedAlpha = await send(app.url, { path: `/engagements/${ids.engagements[0]}` });
       assert.match(restartedAlpha.body, new RegExp(`href="/tasks/${ids.tasks[2]}"`));

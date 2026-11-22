@@ -9,6 +9,7 @@
  */
 import {
   escapeHtml,
+  fieldErrorsFor,
   FormError,
   redirect,
   renderForm,
@@ -36,6 +37,12 @@ import {
   countList,
   describeItem,
   describeTask,
+  clientGuidance,
+  emptyState,
+  groupedSections,
+  itemBadges,
+  primaryAction,
+  taskBadges,
   engagementOnlyWork,
   link,
   openItemCount,
@@ -47,8 +54,8 @@ import {
   itemEntries,
   workSection,
   workList,
-  type ListEntry,
   type PageSection,
+  type WorkEntry,
 } from "./work-pages.ts";
 import {
   clientMeetings,
@@ -57,12 +64,18 @@ import {
   projectMeetings,
 } from "./meeting-pages.ts";
 
-/** The linked list entries of a set of records, for `workList`. */
+/** The card entries of a set of records, for `workList`. */
 function workEntries<T extends { readonly id: string; readonly title: string }>(
   records: readonly T[],
   describe: (record: T) => string,
-): readonly { readonly id: string; readonly title: string; readonly detail: string }[] {
-  return records.map((record) => ({ id: record.id, title: record.title, detail: describe(record) }));
+  badges: (record: T) => readonly string[],
+): readonly WorkEntry[] {
+  return records.map((record) => ({
+    id: record.id,
+    title: record.title,
+    badges: badges(record),
+    detail: describe(record),
+  }));
 }
 
 /** A route's result: a page, or a fixed internal redirect after a write. */
@@ -262,13 +275,25 @@ const CLIENT_FIELDS: readonly FieldSpec[] = [
 const ENGAGEMENT_FIELDS: readonly FieldSpec[] = [
   { name: "name", label: "Name", required: true },
   { name: "objectives", label: "Objectives", type: "textarea" },
-  { name: "status", label: "Status", type: "select", options: STATUS_OPTIONS },
+  {
+    name: "status",
+    label: "Status",
+    type: "select",
+    options: STATUS_OPTIONS,
+    presentation: { badge: true },
+  },
 ];
 
 const PROJECT_FIELDS: readonly FieldSpec[] = [
   { name: "name", label: "Name", required: true },
   { name: "objectives", label: "Objectives", type: "textarea" },
-  { name: "status", label: "Status", type: "select", options: STATUS_OPTIONS },
+  {
+    name: "status",
+    label: "Status",
+    type: "select",
+    options: STATUS_OPTIONS,
+    presentation: { badge: true },
+  },
 ];
 
 // The page, form and list helpers now live in `work-pages.ts` so the work
@@ -292,44 +317,76 @@ function clientsListPage(snapshot: Snapshot): Page {
   );
 }
 
-/** A linked list section: a creation link (when given) and the entries. */
+/**
+ * A linked list section: the page's one primary creation action (when given),
+ * then the entries. When there are none, the empty state names what is missing
+ * and offers the same creation action as the valid next step, or the scope's
+ * own next step when the section cannot create its records directly (a
+ * client's project list asks for an engagement first).
+ */
 function listSection(
   title: string,
-  items: readonly { readonly href: string; readonly label: string; readonly note?: string }[],
+  items: readonly { readonly href: string; readonly label: string; readonly badges?: readonly string[] }[],
   options: {
     readonly newHref?: string;
     readonly newLabel?: string;
     readonly empty?: string;
+    readonly nextStep?: { readonly href: string; readonly label: string };
   } = {},
 ): PageSection {
   const body: string[] = [];
   if (options.newHref !== undefined && options.newLabel !== undefined) {
-    body.push(`<p>${link(options.newHref, options.newLabel)}</p>`);
+    body.push(primaryAction(options.newHref, options.newLabel));
   }
   if (items.length === 0 && options.empty !== undefined) {
-    body.push(`<p>${escapeHtml(options.empty)}</p>`);
+    body.push(
+      emptyState(
+        options.empty,
+        options.newHref !== undefined && options.newLabel !== undefined
+          ? { href: options.newHref, label: options.newLabel }
+          : options.nextStep,
+      ),
+    );
   } else {
     body.push(childList(items));
   }
   return { title, body: body.join("\n") };
 }
 
-/** The linked list entries of a set of tasks, with their edit workflow. */
-function taskEntryList(tasks: readonly Task[]): readonly ListEntry[] {
-  return tasks.map((task) => ({
-    href: `/tasks/${encodeURIComponent(task.id)}`,
-    label: task.title,
-    note: describeTask(task),
-  }));
+/**
+ * A card list section: the rendered cards, or an empty state that names what is
+ * missing and points the user at the valid next step for this scope: opening
+ * one of the client's engagements (where the work is created), or creating the
+ * client's first engagement. The client overview never guesses a parent, so the
+ * next step is an engagement page or its creation form, not a creation URL
+ * under a guessed parent.
+ */
+function cardSection(
+  title: string,
+  cards: string,
+  options: {
+    readonly empty: string;
+    readonly nextStep?: { readonly href: string; readonly label: string };
+  },
+): PageSection {
+  const rendered = cards.trim();
+  // A card list renders its cards, or its own placeholder sentence when it has
+  // no entries; the placeholder is replaced by this section's empty state.
+  const hasCards = rendered.includes("<li");
+  return {
+    title,
+    body: hasCards ? rendered : emptyState(options.empty, options.nextStep),
+  };
 }
 
-/** The linked list entries of a set of work items, with their edit workflow. */
-function itemEntryList(items: readonly WorkItem[]): readonly ListEntry[] {
-  return items.map((item) => ({
-    href: `/items/${encodeURIComponent(item.id)}`,
-    label: item.title,
-    note: describeItem(item),
-  }));
+/** The card list of a set of tasks, showing their status and priority badges. */
+function taskCardList(tasks: readonly Task[]): string {
+  return workList("/tasks", taskEntries(tasks));
+}
+
+/** The card list of a set of work items, showing their kind and state badges. */
+function itemCardList(items: readonly WorkItem[]): string {
+  return workList("/items", itemEntries(items));
 }
 
 /**
@@ -351,14 +408,21 @@ function clientShowPage(client: Client, snapshot: Snapshot, store: Store): Page 
   const engagementItems = engagements.map((engagement) => ({
     href: `/engagements/${encodeURIComponent(engagement.id)}`,
     label: engagement.name,
-    note: engagement.status,
+    badges: [engagement.status],
   }));
+  const engagementById = new Map(engagements.map((engagement) => [engagement.id, engagement]));
   const projectItems = projects.map((project) => {
-    const engagement = engagements.find((candidate) => candidate.id === project.engagementId);
+    const engagement = engagementById.get(project.engagementId);
     return {
       href: `/projects/${encodeURIComponent(project.id)}`,
       label: project.name,
-      note: [project.status, engagement?.name].filter((part) => part !== undefined).join(" · "),
+      // The project's own status is the badge; its engagement is a separate
+      // link, so a stored name can never be read as part of the status.
+      badges: [project.status],
+      trailing:
+        engagement === undefined
+          ? undefined
+          : link(`/engagements/${encodeURIComponent(engagement.id)}`, engagement.name),
     };
   });
 
@@ -367,26 +431,39 @@ function clientShowPage(client: Client, snapshot: Snapshot, store: Store): Page 
   const questions = items.filter((item) => item.kind === "question" && item.state === "open");
   const decisions = items.filter((item) => item.kind === "decision");
   const openItems = (kind: "follow_up" | "commitment" | "waiting") =>
-    itemEntryList(items.filter((item) => item.kind === kind && item.state === "open"));
+    items.filter((item) => item.kind === kind && item.state === "open");
+
+  // Every empty list on the client overview points at its own valid next step:
+  // choosing one of this client's engagements, where the work is created. A
+  // client without an engagement is pointed at creating one. The client never
+  // guesses a parent by opening the first engagement, so the choice is a link
+  // to the client's engagement list (or to the client's new-engagement form),
+  // never directly to an engagement page or a creation form under a guessed
+  // parent.
+  const nextStep: { readonly href: string; readonly label: string } =
+    engagements.length === 0
+      ? { href: `/clients/${encodeURIComponent(clientId)}/engagements/new`, label: "New engagement" }
+      : { href: `/clients/${encodeURIComponent(clientId)}`, label: "Choose an engagement" };
 
   // The next steps are grouped by kind, each group with its own heading and
-  // list (or its own empty sentence), so a follow-up, a commitment and a
-  // waiting item are never merged into one undifferentiated list. Closed items
-  // are excluded from every group; they stay reachable through their own
-  // lists on the engagement and project pages.
-  const nextStepGroups: readonly { readonly title: string; readonly entries: readonly ListEntry[] }[] = [
-    { title: "Open follow-ups", entries: openItems("follow_up") },
-    { title: "Open commitments", entries: openItems("commitment") },
-    { title: "Open waiting items", entries: openItems("waiting") },
+  // list (or its own empty state), so a follow-up, a commitment and a waiting
+  // item are never merged into one undifferentiated list. Closed items are
+  // excluded from every group; they stay reachable through their own lists on
+  // the engagement and project pages.
+  const nextStepGroups: readonly { readonly title: string; readonly empty: string; readonly items: readonly WorkItem[] }[] = [
+    { title: "Open follow-ups", empty: "No open follow-ups.", items: openItems("follow_up") },
+    { title: "Open commitments", empty: "No open commitments.", items: openItems("commitment") },
+    { title: "Open waiting items", empty: "No open waiting items.", items: openItems("waiting") },
   ];
-  const nextStepsBody = nextStepGroups
-    .map((group) => {
-      const body: string[] = [];
-      if (group.entries.length === 0) body.push(`<p>No ${group.title.toLowerCase()}.</p>`);
-      else body.push(childList(group.entries));
-      return `<h3>${escapeHtml(group.title)}</h3>${body.join("\n")}`;
-    })
-    .join("\n");
+  const nextStepsBody = groupedSections(
+    nextStepGroups.map((group) => ({
+      title: group.title,
+      body:
+        group.items.length === 0
+          ? emptyState(group.empty, nextStep)
+          : itemCardList(group.items),
+    })),
+  );
 
   // Derived engagement counts: an engagement's tally is selected by its own
   // scope, which includes its project-linked records once. Summing project
@@ -412,28 +489,44 @@ function clientShowPage(client: Client, snapshot: Snapshot, store: Store): Page 
         newLabel: "New engagement",
         empty: "No engagements yet.",
       }),
-      listSection("Projects", projectItems, { empty: "No projects yet." }),
+      listSection("Projects", projectItems, { empty: "No projects yet.", nextStep }),
+      {
+        title: "Adding work",
+        body: clientGuidance(
+          engagements.map((engagement) => ({
+            href: `/engagements/${encodeURIComponent(engagement.id)}`,
+            label: engagement.name,
+          })),
+        ),
+      },
       {
         title: "Engagement counts",
         body:
           engagements.length === 0
-            ? "<p>No engagements yet.</p>"
+            ? emptyState("No engagement counts yet.", {
+                href: `/clients/${encodeURIComponent(clientId)}/engagements/new`,
+                label: "New engagement",
+              })
             : `<ul>${countLines.join("")}</ul>`,
       },
-      listSection("Current tasks (open or in progress)", taskEntryList(currentTasks), {
+      cardSection("Current tasks (open or in progress)", taskCardList(currentTasks), {
         empty: "No current tasks.",
+        nextStep,
       }),
-      listSection("Open blockers", itemEntryList(blockers), {
+      cardSection("Open blockers", itemCardList(blockers), {
         empty: "No open blockers.",
+        nextStep,
       }),
-      listSection("Open questions", itemEntryList(questions), {
+      cardSection("Open questions", itemCardList(questions), {
         empty: "No open questions.",
+        nextStep,
       }),
-      listSection("Decisions", itemEntryList(decisions), {
+      cardSection("Decisions", itemCardList(decisions), {
         empty: "No decisions recorded yet.",
+        nextStep,
       }),
       { title: "Next steps", body: nextStepsBody },
-      meetingSection("Meeting history", "", clientMeetings(store, clientId)),
+      meetingSection("Meeting history", "", clientMeetings(store, clientId), nextStep),
     ],
   );
 }
@@ -445,12 +538,13 @@ function engagementShowPage(engagement: Engagement, snapshot: Snapshot, store: S
     .map((project) => ({
       href: `/projects/${encodeURIComponent(project.id)}`,
       label: project.name,
-      note: project.status,
+      badges: [project.status],
     }));
   const clientId = client.id;
   const engagementId = engagement.id;
   const newTaskHref = `/engagements/${encodeURIComponent(engagementId)}/tasks/new`;
   const newItemHref = `/engagements/${encodeURIComponent(engagementId)}/items/new`;
+  const projectNewHref = `/engagements/${encodeURIComponent(engagementId)}/projects/new`;
 
   // Engagement-only work: tasks and items that belong to no project. Each
   // project's own work is shown beside it, so a project task is never listed
@@ -461,16 +555,18 @@ function engagementShowPage(engagement: Engagement, snapshot: Snapshot, store: S
     {
       title: "Projects",
       body: [
-        `<p>${link(`/engagements/${encodeURIComponent(engagementId)}/projects/new`, "New project")}</p>`,
-        childList(projects),
+        primaryAction(projectNewHref, "New project"),
+        projects.length === 0
+          ? emptyState("No projects yet.", { href: projectNewHref, label: "New project" })
+          : childList(projects),
       ].join("\n"),
     },
     {
       title: "Engagement-only work",
       body: [
         ...[
-          workSection("Tasks without a project", "/tasks", newTaskHref, workEntries(only.tasks, describeTask)),
-          workSection("Work items without a project", "/items", newItemHref, workEntries(only.items, describeItem)),
+          workSection("Tasks without a project", "/tasks", newTaskHref, workEntries(only.tasks, describeTask, taskBadges)),
+          workSection("Work items without a project", "/items", newItemHref, workEntries(only.items, describeItem, itemBadges)),
         ].map((section) => `<h3>${escapeHtml(section.title)}</h3>${section.body}`),
         `<h3>Counts</h3>${countList(taskStatusCounts(store, clientId, { engagementId }))}`,
         `<p>Open work items: ${escapeHtml(String(openItemCount(store, clientId, { engagementId })))}</p>`,
@@ -493,9 +589,9 @@ function engagementShowPage(engagement: Engagement, snapshot: Snapshot, store: S
       body: [
         `<p>${link(`/projects/${encodeURIComponent(project.id)}`, "Open project")}</p>`,
         `<h3>Tasks</h3>`,
-        workList("/tasks", workEntries(work.tasks, describeTask)),
+        workList("/tasks", workEntries(work.tasks, describeTask, taskBadges)),
         `<h3>Work items</h3>`,
-        workList("/items", workEntries(work.items, describeItem)),
+        workList("/items", workEntries(work.items, describeItem, itemBadges)),
         `<h3>Counts</h3>${countList(taskStatusCounts(store, clientId, { engagementId, projectId: project.id }))}`,
         `<p>Open work items: ${escapeHtml(String(openItemCount(store, clientId, { engagementId, projectId: project.id })))}</p>`,
       ].join("\n"),
@@ -533,13 +629,13 @@ function projectShowPage(project: Project, snapshot: Snapshot, store: Store): Pa
         "Tasks",
         "/tasks",
         `/projects/${encodeURIComponent(project.id)}/tasks/new`,
-        workEntries(work.tasks, describeTask),
+        workEntries(work.tasks, describeTask, taskBadges),
       ),
       workSection(
         "Work items",
         "/items",
         `/projects/${encodeURIComponent(project.id)}/items/new`,
-        workEntries(work.items, describeItem),
+        workEntries(work.items, describeItem, itemBadges),
       ),
       {
         title: "Counts",
@@ -603,13 +699,16 @@ function submissionFields(
   return [...hidden, ...base];
 }
 
+
 /**
  * Build a correctable form error from a store refusal. The submitted values are
  * kept exactly as posted (an explicitly empty value stays empty), and every
  * field the submission omitted is filled from `record` when the edit names a
  * stored record, so the form the user corrects and resubmits carries the
  * current record instead of blank controls. A create has no record, so its
- * omitted controls stay blank.
+ * omitted controls stay blank. The store's validation message names the field
+ * and the reason; it is shown as the form summary, and is associated with each
+ * visible control it names.
  */
 function formFailure(
   error: unknown,
@@ -632,9 +731,8 @@ function formFailure(
       filled[field.name] = base[field.name];
     }
   }
-  // The store's validation message names the field and the reason; it is shown
-  // as the form summary so every submitted value can be corrected in place.
-  return new FormError(error.message, filled, [], fields, action);
+  const errors = fieldErrorsFor(error.message, filled, fields);
+  return new FormError(error.message, filled, errors, fields, action);
 }
 
 function text(form: Readonly<Record<string, string>>, name: string): string {
