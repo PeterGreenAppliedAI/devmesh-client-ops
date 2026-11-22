@@ -682,6 +682,51 @@ describe("archived discovery page", () => {
     }
   });
 
+  it("renders the stored ancestry of explicit entries and inherited entries with active intermediates", async () => {
+    const server = await running();
+    try {
+      const s = await seed(server.store);
+      // Only the client is archived, so the task is hidden through an active
+      // engagement and project: its full ancestry is still rendered.
+      await server.store.setArchived("client", s.client.id, true);
+      const inherited = archivedGroups(server.store.snapshot())
+        .find((group) => group.family === "tasks")!
+        .entries[0];
+      assert.equal(inherited.inheritedOnly, true);
+      const trailing = String(inherited.entry.trailing);
+      for (const [path, name] of [
+        [`/clients/${s.client.id}`, s.client.name],
+        [`/engagements/${s.engagement.id}`, s.engagement.name],
+        [`/projects/${s.project.id}`, s.project.name],
+      ] as const) {
+        assert.ok(trailing.includes(`href="${path}"`), `ancestry links ${path}`);
+        assert.ok(trailing.includes(escapeHtml(name)), `ancestry labels ${path}`);
+      }
+      // The restoration link is the archived client only; the active
+      // intermediates are shown but are not restoration targets.
+      assert.match(trailing, /restore archived ancestors there/);
+      assert.ok(trailing.indexOf(`href="/clients/${s.client.id}"`) < trailing.indexOf("restore archived ancestors there"));
+      assert.equal(inherited.reason, `client:${s.client.id}`);
+
+      // An explicitly archived task also renders its stored ancestry, even
+      // though none of it is a restoration target for it.
+      await server.store.setArchived("client", s.client.id, false);
+      await server.store.setArchived("task", s.task.id, true);
+      const own = archivedGroups(server.store.snapshot())
+        .find((group) => group.family === "tasks")!
+        .entries[0];
+      assert.equal(own.inheritedOnly, false);
+      assert.equal(own.entry.href, `/tasks/${s.task.id}`);
+      const ownTrailing = String(own.entry.trailing);
+      assert.ok(ownTrailing.includes(`Client: <a href="/clients/${s.client.id}">`), "explicit entry shows its client ancestry");
+      assert.ok(ownTrailing.includes(`Engagement: <a href="/engagements/${s.engagement.id}">`), "explicit entry shows its engagement ancestry");
+      assert.ok(ownTrailing.includes(`Project: <a href="/projects/${s.project.id}">`), "explicit entry shows its project ancestry");
+      assert.ok(!ownTrailing.includes("restore archived ancestors there"), "an explicit entry has no restoration link");
+    } finally {
+      await server.close();
+    }
+  });
+
   it("shows an explanatory empty state with a Clients link when nothing is archived", async () => {
     const server = await running();
     try {
@@ -1053,10 +1098,17 @@ describe("restoring ancestors preserves child flags", () => {
       const page = await send(server.origin, { path: "/archived" });
       assert.equal(page.status, 200);
       assert.match(page.body, new RegExp(`href="/tasks/${s.task.id}"`));
-      // The restored client is no longer an archived entry: it is not in the
-      // main content of the discovery page, only in the global navigation.
-      const main = page.body.slice(page.body.indexOf('<main id="main">'), page.body.indexOf("</main>"));
-      assert.ok(!main.includes(`href="/clients/${s.client.id}"`), "the restored client is no longer archived");
+      // The restored client is no longer an archived entry; it may still be
+      // named as the archived task's stored ancestry, never as its own entry.
+      assert.ok(
+        !after.some((group) => group.family === "clients"),
+        "the restored client is no longer an archived entry",
+      );
+      assert.match(
+        page.body,
+        new RegExp(`<li><a href="/tasks/${s.task.id}">[\\s\\S]*?Client: <a href="/clients/${s.client.id}">`),
+        "the task's stored ancestry names the client it links to",
+      );
     } finally {
       await server.close();
     }
@@ -1276,9 +1328,33 @@ describe("archived forms keep their notice on a correctable refusal", () => {
         assert.equal(reply.status, 400, path);
         assert.ok(reply.body.includes("This record is archived"), `${path} keeps the parent's notice`);
       }
-      // The same holds for a refused meeting create under the archived project:
-      // the notice names the archived ancestor.
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("keeps the selected archived project's notice when the ancestors are active", async () => {
+    const server = await running();
+    try {
+      const s = await seed(server.store);
+      // Only the project is archived: its client and engagement stay active,
+      // so an archived project is the nearest archive of a create selecting it.
       await server.store.setArchived("project", s.project.id, true);
+      for (const path of [`/engagements/${s.engagement.id}/tasks/new`, `/engagements/${s.engagement.id}/items/new`]) {
+        const reply = await send(server.origin, {
+          method: "POST",
+          path,
+          form: { engagementId: s.engagement.id, title: "", projectId: s.project.id },
+        });
+        assert.equal(reply.status, 400, path);
+        assert.ok(reply.body.includes("This record is archived"), `${path} keeps the selected project's notice`);
+        // The notice marks the selected project as carrying the archive flag.
+        assert.ok(
+          reply.body.includes("This record carries its own archive flag."),
+          `${path} names the selected archived project`,
+        );
+      }
+      // A project-scoped meeting create keeps the project's notice too.
       const meetingCreate = await send(server.origin, {
         method: "POST",
         path: `/projects/${s.project.id}/meetings/new`,
@@ -1286,7 +1362,18 @@ describe("archived forms keep their notice on a correctable refusal", () => {
       });
       assert.equal(meetingCreate.status, 400);
       assert.ok(meetingCreate.body.includes("This record is archived"));
-      assert.match(meetingCreate.body, new RegExp(`href="/projects/${s.project.id}"`));
+      assert.ok(meetingCreate.body.includes("This record carries its own archive flag."));
+      // A project-scoped create under an active engagement keeps the URL
+      // project's notice even when the submission omits the project selector.
+      for (const path of [`/projects/${s.project.id}/tasks/new`, `/projects/${s.project.id}/items/new`]) {
+        const omitted = await send(server.origin, {
+          method: "POST",
+          path,
+          form: { engagementId: s.engagement.id, title: "" },
+        });
+        assert.equal(omitted.status, 400, path);
+        assert.ok(omitted.body.includes("This record is archived"), `${path} keeps the URL project's notice`);
+      }
     } finally {
       await server.close();
     }

@@ -427,13 +427,36 @@ function reasonText(reason: string): string {
 /** The archived ancestor's family by hierarchy position: client, engagement, project. */
 const ANCESTOR_FAMILIES: readonly ArchiveFamily[] = ["clients", "engagements", "projects"];
 
+/** The label of an ancestry position: the family the ancestor belongs to. */
+function ancestorLabel(family: ArchiveFamily): string {
+  return family === "clients" ? "Client" : family === "engagements" ? "Engagement" : "Project";
+}
+
 /**
- * The detail links of a record's current stored archived ancestors, most
- * significant first (client, engagement, project). An inherited-only entry
- * carries these so its ancestry is visible and each ancestor can be opened for
- * restoration. It is empty for a record archived by its own flag.
+ * The record's current stored ancestry, most significant first (client,
+ * engagement, project), as one text chain. Every entry renders its stored
+ * ancestry, whether it carries its own archive flag or is hidden only through
+ * ancestors, and each ancestor's name links to its own detail page. The chain
+ * is escaped markup; a record with no stored ancestors has none.
  */
-function ancestryLinks(snapshot: Snapshot, record: ArchiveRecord): readonly ListEntry[] {
+function ancestryChain(snapshot: Snapshot, record: ArchiveRecord): string {
+  const parts: string[] = [];
+  for (const [index, ancestor] of ancestorsOf(snapshot, record).entries()) {
+    const family = ANCESTOR_FAMILIES[index];
+    const name = (ancestor as { readonly name?: string }).name ?? ancestor.id;
+    parts.push(`${ancestorLabel(family)}: ${link(detailPath(family, ancestor.id), name)}`);
+  }
+  return parts.join(" · ");
+}
+
+/**
+ * The current stored archived ancestors of a record, most significant first.
+ * These are the restoration targets for an inherited-only entry: opening one
+ * offers restoration, and restoring it can reveal this record. A record archived
+ * by its own flag has no restoration targets here; restoring its own flag is
+ * offered on its own detail page.
+ */
+function archivedAncestorLinks(snapshot: Snapshot, record: ArchiveRecord): readonly ListEntry[] {
   const links: ListEntry[] = [];
   for (const [index, ancestor] of ancestorsOf(snapshot, record).entries()) {
     if (!hasArchivedFlag(ancestor)) continue;
@@ -493,20 +516,21 @@ export function archivedGroups(snapshot: Snapshot): readonly {
     // to the ancestor's heading, so the groups are the families' own archives.
     const group = byFamily.get(candidate.family);
     if (group === undefined) return;
-    // An inherited-only entry keeps its own detail link and adds a link to each
-    // current stored archived ancestor, where restoration is offered.
-    const ancestry = ownFlag ? [] : ancestryLinks(snapshot, record);
+    // Every entry renders its stored ancestry; an inherited-only entry also
+    // links each current stored archived ancestor as a restoration target.
+    const chain = ancestryChain(snapshot, record);
+    const restore = ownFlag ? [] : archivedAncestorLinks(snapshot, record);
+    const trailing = [
+      chain,
+      restore.length === 0
+        ? ""
+        : `${restore.map((ancestor) => link(ancestor.href, ancestor.label)).join(", ")} — restore archived ancestors there`,
+    ].filter((part) => part !== "").join(" · ");
     const entry: ListEntry = {
       href: candidate.href,
       label: candidate.label,
       badges: [...(candidate.badges ?? []), reasonText(reason)],
-      ...(ancestry.length === 0
-        ? {}
-        : {
-            trailing: `${ancestry
-              .map((ancestor) => link(ancestor.href, ancestor.label))
-              .join(", ")} — restore archived ancestors there`,
-          }),
+      ...(trailing === "" ? {} : { trailing }),
     };
     group.entries.push({
       family: candidate.family,

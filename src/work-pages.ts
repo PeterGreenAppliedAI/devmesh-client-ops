@@ -928,6 +928,8 @@ export function workRoutes(store: Store): WorkRoutes {
     form: Readonly<Record<string, string>>,
   ): {
     readonly scope: CreateScope;
+    /** The project the URL path names, when it names one; the parent only. */
+    readonly project?: Project;
     readonly parent: { readonly name: "engagementId"; readonly id: string };
     readonly conflict: ValidationError | null;
   } {
@@ -945,11 +947,12 @@ export function workRoutes(store: Store): WorkRoutes {
     if (parts[0] === "projects") {
       // The project form posts to the engagement's new endpoint, with the
       // engagement derived from the URL project as its parent. The URL project
-      // is the parent only; it does not preselect the submitted project.
+      // stays the parent; the submitted project is resolved separately.
       const projectId = decodeId(parts[1] ?? "", "project");
       const scope = projectScope(snap, projectId);
       return {
         scope: { client: scope.client, engagement: scope.engagement },
+        project: scope.project,
         parent: { name: "engagementId", id: scope.engagement.id },
         conflict: submittedParentConflict(form, scope),
       };
@@ -1014,6 +1017,18 @@ export function workRoutes(store: Store): WorkRoutes {
     return { ...scope, project };
   }
 
+  /**
+   * The archive notice a refused create shows. A valid selected project is the
+   * nearest scope of the new record, so its notice is shown when it is
+   * archived, even if the engagement is active; otherwise the URL parent's
+   * notice (the engagement, or the project of a project-scoped create) is
+   * shown. Both derive hiding from the current stored links.
+   */
+  function createNotice(snap: Snapshot, scope: CreateScope, project: Project | undefined): string {
+    if (project !== undefined) return archiveNotice(snap, project);
+    return archiveNotice(snap, scope.engagement);
+  }
+
   function newPage(
     title: string,
     action: string,
@@ -1076,10 +1091,14 @@ export function workRoutes(store: Store): WorkRoutes {
   async function createTask(request: WorkRequest): Promise<WorkPage> {
     const snap = snapshot();
     // The URL parent is resolved first and stays a 404 when it is missing.
-    const { scope, parent, conflict } = postedParent(snap, request.path, request.form);
+    const { scope, project: urlProject, parent, conflict } = postedParent(snap, request.path, request.form);
     const action = createAction(scope, "tasks");
     const fields = createFields(snap, scope, "tasks");
     const values = suppliedValues(request.form, fields);
+    // The selected project, when the submission gave a valid one, is resolved
+    // inside the boundary; it stays available to the correction form so a
+    // refused create keeps the selected project's archive notice.
+    let selected: CreateScope = scope;
     try {
       // A supplied parent that differs from the URL parent is settled before any
       // submitted project is read, so a tampered request is refused without
@@ -1088,7 +1107,7 @@ export function workRoutes(store: Store): WorkRoutes {
       // The optional selected project is resolved inside the boundary: an
       // unknown project is a correctable error, a blank one creates
       // engagement-only work.
-      const selected = withSelectedProject(snap, scope, text(request.form, "projectId"));
+      selected = withSelectedProject(snap, scope, text(request.form, "projectId"));
       const input = {
         ...taskEdit(values, true),
         clientId: scope.client.id,
@@ -1107,7 +1126,7 @@ export function workRoutes(store: Store): WorkRoutes {
         values["projectId"],
         snap,
         "tasks",
-        archiveNotice(snap, scope.engagement),
+        createNotice(snap, scope, selected.project ?? urlProject),
       );
       if (failure !== null) throw failure;
       throw error;
@@ -1117,10 +1136,14 @@ export function workRoutes(store: Store): WorkRoutes {
   async function createItem(request: WorkRequest): Promise<WorkPage> {
     const snap = snapshot();
     // The URL parent is resolved first and stays a 404 when it is missing.
-    const { scope, parent, conflict } = postedParent(snap, request.path, request.form);
+    const { scope, project: urlProject, parent, conflict } = postedParent(snap, request.path, request.form);
     const action = createAction(scope, "items");
     const fields = createFields(snap, scope, "items");
     const values = suppliedValues(request.form, fields);
+    // The selected project, when the submission gave a valid one, is resolved
+    // inside the boundary; it stays available to the correction form so a
+    // refused create keeps the selected project's archive notice.
+    let selected: CreateScope = scope;
     try {
       // A supplied parent that differs from the URL parent is settled before any
       // submitted project is read, so a tampered request is refused without
@@ -1129,7 +1152,7 @@ export function workRoutes(store: Store): WorkRoutes {
       // The optional selected project is resolved inside the boundary: an
       // unknown project is a correctable error, a blank one creates
       // engagement-only work.
-      const selected = withSelectedProject(snap, scope, text(request.form, "projectId"));
+      selected = withSelectedProject(snap, scope, text(request.form, "projectId"));
       const input = {
         ...itemEdit(values, true),
         clientId: scope.client.id,
@@ -1148,7 +1171,7 @@ export function workRoutes(store: Store): WorkRoutes {
         values["projectId"],
         snap,
         "items",
-        archiveNotice(snap, scope.engagement),
+        createNotice(snap, scope, selected.project ?? urlProject),
       );
       if (failure !== null) throw failure;
       throw error;
