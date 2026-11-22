@@ -584,7 +584,13 @@ export function meetingRoutes(store: Store): MeetingRoutes {
     }
   }
 
-  /** The stored record an edit names, and its immutable parents. */
+  /**
+   * The stored record an edit names, and its immutable parents. The client and
+   * engagement of the record are authoritative: a submitted parent id that
+   * differs from them is a tampered parent and is refused, while an omitted
+   * parent control is not tampering. The edit's fields are the meeting form's
+   * fields, so a submitted parent id is checked here rather than saved.
+   */
   function editTarget(request: MeetingRequest): {
     readonly snap: Snapshot;
     readonly record: Meeting;
@@ -610,7 +616,10 @@ export function meetingRoutes(store: Store): MeetingRoutes {
       conflict:
         submitted !== undefined && submitted !== "" && submitted !== record.id
           ? new ValidationError("The submitted meeting id does not match this URL")
-          : null,
+          : submittedParentConflict(request.form, {
+              client: findRecord(snap.clients, engagement.clientId, "client"),
+              engagement,
+            }),
     };
   }
 
@@ -620,6 +629,8 @@ export function meetingRoutes(store: Store): MeetingRoutes {
     const values = suppliedValues(request.form, target.fields);
     const stored = meetingFormValues(meeting);
     try {
+      // The record's own parents are immutable, so a tampered parent is refused
+      // before the store sees the edit; the rest of the submission is not saved.
       if (target.conflict !== null) throw target.conflict;
       await store.updateMeeting(meeting.id, meetingEdit(values, false));
       return redirect(`/meetings/${encodeURIComponent(meeting.id)}`);

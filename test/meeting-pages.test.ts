@@ -654,6 +654,50 @@ describe("meeting pages: editing", () => {
       assert.equal(conflicting.status, 400);
       assert.match(conflicting.body, /does not match this URL/);
       assert.equal(JSON.stringify(server.store.snapshot()), beforeEdit);
+
+      // A tampered engagement on an edit is refused even though the other
+      // fields are valid and changed: the record does not move and the rest of
+      // the submission is not saved.
+      const editEngagementTamper = await send(server.origin, {
+        method: "POST",
+        path: `/meetings/${meeting.id}/edit`,
+        form: {
+          id: meeting.id,
+          engagementId: h.sibling.id,
+          title: "Moved engagement",
+          date: "2026-04-04",
+          notes: "should not save",
+          projectId: h.project.id,
+        },
+      });
+      assert.equal(editEngagementTamper.status, 400);
+      assert.match(editEngagementTamper.body, /role="alert"/);
+      assert.match(editEngagementTamper.body, /not the parent engagement of this form/);
+      assert.equal(JSON.stringify(server.store.snapshot()), beforeEdit);
+
+      // A tampered client on an edit is refused the same way.
+      const editClientTamper = await send(server.origin, {
+        method: "POST",
+        path: `/meetings/${meeting.id}/edit`,
+        form: {
+          id: meeting.id,
+          clientId: h.otherClient.id,
+          title: "Moved client",
+          date: "2026-04-04",
+          notes: "should not save",
+        },
+      });
+      assert.equal(editClientTamper.status, 400);
+      assert.match(editClientTamper.body, /not the client of this engagement/);
+      assert.equal(JSON.stringify(server.store.snapshot()), beforeEdit);
+
+      // The stored parents still come from the record, never the form, and the
+      // rejected submissions did not change anything.
+      const storedAfterTamper = server.store.snapshot().meetings[0];
+      assert.equal(storedAfterTamper.clientId, h.client.id);
+      assert.equal(storedAfterTamper.engagementId, h.engagement.id);
+      assert.equal(storedAfterTamper.title, "Fixed");
+      assert.equal(storedAfterTamper.date, "2026-02-28");
       assert.notEqual(before, beforeEdit);
     } finally {
       await server.close();
