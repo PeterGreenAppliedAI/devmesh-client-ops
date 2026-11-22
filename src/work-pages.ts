@@ -667,11 +667,17 @@ export function workRoutes(store: Store): WorkRoutes {
     return { client, engagement, project };
   }
 
-  /** The scope a creation POST selects: a parent in the path, or a hidden parent. */
-  function postedScope(
+  /**
+   * The parent a creation POST names: the client and engagement derived from
+   * the URL alone, never from the submitted form, so a tampered parent id is
+   * ignored. This resolves only the parent; the optional selected project is
+   * resolved separately, inside the correction boundary, so an unknown or
+   * cross-engagement project becomes a correctable form error. A nonexistent
+   * URL parent (or URL project) is a missing record and stays a 404.
+   */
+  function postedParent(
     snap: Snapshot,
     path: string,
-    form: Readonly<Record<string, string>>,
   ): { readonly scope: CreateScope; readonly parent: { name: string; id: string } } {
     const pathname = path.split("?")[0];
     const parts = pathname.split("/").slice(1);
@@ -683,15 +689,13 @@ export function workRoutes(store: Store): WorkRoutes {
       };
     }
     if (parts[0] === "projects") {
-      // The project is the parent the path names: it is resolved from the URL,
-      // never from the submitted form, so a tampered parent id is ignored. The
-      // project form posts to the engagement's new endpoint, with the
-      // engagement derived from the URL project as its parent. A project
-      // selected by the submission must be one of that engagement's projects.
+      // The project form posts to the engagement's new endpoint, with the
+      // engagement derived from the URL project as its parent. The URL project
+      // is the parent only; it does not preselect the submitted project.
       const projectId = decodeId(parts[1] ?? "", "project");
       const scope = projectScope(snap, projectId);
       return {
-        scope: withSelectedProject(snap, scope, text(form, "projectId")),
+        scope: { client: scope.client, engagement: scope.engagement },
         parent: { name: "engagementId", id: scope.engagement.id },
       };
     }
@@ -765,20 +769,25 @@ export function workRoutes(store: Store): WorkRoutes {
 
   async function createTask(request: WorkRequest): Promise<WorkPage> {
     const snap = snapshot();
-    const { scope, parent } = postedScope(snap, request.path, request.form);
+    // The URL parent is resolved first and stays a 404 when it is missing.
+    const { scope, parent } = postedParent(snap, request.path);
     const action = createAction(scope, "tasks");
     const fields: readonly FieldSpec[] = [
       { name: parent.name, label: parent.name, hidden: true, value: parent.id },
       ...taskFields(projectChoices(snap, scope.engagement.id)).filter((field) => field.name !== "id"),
     ];
     const values = suppliedValues(request.form, fields);
-    const input = {
-      ...taskEdit(values, true),
-      clientId: scope.client.id,
-      engagementId: scope.engagement.id,
-    };
-    if (scope.project !== undefined) input.projectId = scope.project.id;
     try {
+      // The optional selected project is resolved inside the boundary: an
+      // unknown project is a correctable error, a blank one creates
+      // engagement-only work.
+      const selected = withSelectedProject(snap, scope, text(request.form, "projectId"));
+      const input = {
+        ...taskEdit(values, true),
+        clientId: scope.client.id,
+        engagementId: scope.engagement.id,
+      };
+      if (selected.project !== undefined) input.projectId = selected.project.id;
       const task = await store.createTask(input as TaskCreate);
       return redirect(`/tasks/${encodeURIComponent(task.id)}`);
     } catch (error) {
@@ -790,20 +799,25 @@ export function workRoutes(store: Store): WorkRoutes {
 
   async function createItem(request: WorkRequest): Promise<WorkPage> {
     const snap = snapshot();
-    const { scope, parent } = postedScope(snap, request.path, request.form);
+    // The URL parent is resolved first and stays a 404 when it is missing.
+    const { scope, parent } = postedParent(snap, request.path);
     const action = createAction(scope, "items");
     const fields: readonly FieldSpec[] = [
       { name: parent.name, label: parent.name, hidden: true, value: parent.id },
       ...itemFields(projectChoices(snap, scope.engagement.id)).filter((field) => field.name !== "id"),
     ];
     const values = suppliedValues(request.form, fields);
-    const input = {
-      ...itemEdit(values, true),
-      clientId: scope.client.id,
-      engagementId: scope.engagement.id,
-    };
-    if (scope.project !== undefined) input.projectId = scope.project.id;
     try {
+      // The optional selected project is resolved inside the boundary: an
+      // unknown project is a correctable error, a blank one creates
+      // engagement-only work.
+      const selected = withSelectedProject(snap, scope, text(request.form, "projectId"));
+      const input = {
+        ...itemEdit(values, true),
+        clientId: scope.client.id,
+        engagementId: scope.engagement.id,
+      };
+      if (selected.project !== undefined) input.projectId = selected.project.id;
       const item = await store.createItem(input as WorkItemCreate);
       return redirect(`/items/${encodeURIComponent(item.id)}`);
     } catch (error) {

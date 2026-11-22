@@ -615,6 +615,134 @@ describe("work pages: tasks", () => {
     }
   });
 
+  it("treats an unknown or cross-engagement project on project-scoped creation as correctable", async () => {
+    const server = await running();
+    try {
+      const h = await hierarchy(server.store);
+
+      // An unknown project submitted to an existing URL project's create form
+      // is a correctable field problem, not a 404, and nothing is written.
+      const before = JSON.stringify(server.store.snapshot());
+      const unknownTask = await send(server.origin, {
+        method: "POST",
+        path: `/projects/${h.project.id}/tasks/new`,
+        form: {
+          engagementId: h.engagement.id,
+          title: "Unknown under project URL",
+          status: "open",
+          priority: "high",
+          owner: "keep owner",
+          dueDate: "2027-01-02",
+          context: "keep context",
+          projectId: "project-99",
+        },
+      });
+      assert.equal(unknownTask.status, 400);
+      assert.match(String(unknownTask.headers["content-type"]), /^text\/html/);
+      assert.match(unknownTask.body, /role="alert"/);
+      assert.doesNotMatch(unknownTask.body, /Not found/);
+      const taskForm = parseForm(unknownTask.body);
+      assert.equal(taskForm.action, `/engagements/${h.engagement.id}/tasks/new`);
+      assert.equal(taskForm.controls.get("title"), "Unknown under project URL");
+      assert.equal(taskForm.controls.get("owner"), "keep owner");
+      assert.equal(taskForm.controls.get("context"), "keep context");
+      assert.equal(taskForm.controls.get("dueDate"), "2027-01-02");
+      assert.match(unknownTask.body, /<option value="project-99" selected>project-99 \(not a valid choice\)<\/option>/);
+      assert.equal(JSON.stringify(server.store.snapshot()), before);
+
+      // The same holds for an item on a project-scoped create URL.
+      const unknownItem = await send(server.origin, {
+        method: "POST",
+        path: `/projects/${h.project.id}/items/new`,
+        form: {
+          engagementId: h.engagement.id,
+          kind: "question",
+          title: "Unknown item under project URL",
+          context: "keep item context",
+          state: "open",
+          projectId: "project-99",
+        },
+      });
+      assert.equal(unknownItem.status, 400);
+      assert.doesNotMatch(unknownItem.body, /Not found/);
+      const itemForm = parseForm(unknownItem.body);
+      assert.equal(itemForm.controls.get("title"), "Unknown item under project URL");
+      assert.equal(itemForm.controls.get("context"), "keep item context");
+      assert.equal(JSON.stringify(server.store.snapshot()), before);
+
+      // Correcting either rendered form and resubmitting saves it.
+      taskForm.controls.set("projectId", h.secondProject.id);
+      const corrected = await send(server.origin, {
+        method: "POST",
+        path: taskForm.action,
+        form: Object.fromEntries(taskForm.controls),
+      });
+      assert.match(redirectTarget(corrected), /^\/tasks\/task-\d+$/);
+      const stored = server.store.snapshot().tasks[0];
+      assert.equal(stored.title, "Unknown under project URL");
+      assert.equal(stored.projectId, h.secondProject.id);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("creates engagement-only work from a project-scoped form with a blank project", async () => {
+    const server = await running();
+    try {
+      const h = await hierarchy(server.store);
+
+      // A project-scoped create URL derives the parent engagement, but a blank
+      // submitted project means no project link: the URL project is not applied.
+      const taskFormPage = await send(server.origin, { path: `/projects/${h.project.id}/tasks/new` });
+      const taskForm = parseForm(taskFormPage.body);
+      taskForm.controls.set("title", "No project task");
+      taskForm.controls.set("projectId", "");
+      const created = await send(server.origin, {
+        method: "POST",
+        path: taskForm.action,
+        form: Object.fromEntries(taskForm.controls),
+      });
+      assert.match(redirectTarget(created), /^\/tasks\/task-\d+$/);
+      const task = server.store.snapshot().tasks[0];
+      assert.equal(task.title, "No project task");
+      assert.equal(task.engagementId, h.engagement.id);
+      assert.equal(task.projectId, undefined);
+      assert.equal("projectId" in task, false);
+
+      // The same direct HTTP submission for an item on a project-scoped URL.
+      const itemFormPage = await send(server.origin, { path: `/projects/${h.project.id}/items/new` });
+      const itemForm = parseForm(itemFormPage.body);
+      itemForm.controls.set("title", "No project item");
+      itemForm.controls.set("projectId", "");
+      const createdItem = await send(server.origin, {
+        method: "POST",
+        path: itemForm.action,
+        form: Object.fromEntries(itemForm.controls),
+      });
+      assert.match(redirectTarget(createdItem), /^\/items\/item-\d+$/);
+      const item = server.store.snapshot().items[0];
+      assert.equal(item.title, "No project item");
+      assert.equal(item.engagementId, h.engagement.id);
+      assert.equal(item.projectId, undefined);
+      assert.equal("projectId" in item, false);
+
+      // A selected project on the same URL is still honoured.
+      const inProject = parseForm((await send(server.origin, { path: `/projects/${h.secondProject.id}/tasks/new` })).body);
+      inProject.controls.set("title", "In second project");
+      const placed = await send(server.origin, {
+        method: "POST",
+        path: inProject.action,
+        form: Object.fromEntries(inProject.controls),
+      });
+      assert.match(redirectTarget(placed), /^\/tasks\/task-\d+$/);
+      const placedTask = server.store.snapshot().tasks.find((candidate) => candidate.title === "In second project");
+      assert.ok(placedTask !== undefined);
+      assert.equal(placedTask.projectId, h.secondProject.id);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("refuses a conflicting submitted task id on an edit URL", async () => {
     const server = await running();
     try {
