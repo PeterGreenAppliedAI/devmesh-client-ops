@@ -131,6 +131,20 @@ async function open(directory: string): Promise<Application> {
 }
 
 /**
+ * The main content region of a rendered page: everything inside the single
+ * `<main id="main">` landmark, so a record's scope can be checked without
+ * the global shell's client navigation, which deliberately lists every active
+ * client on every page.
+ */
+function mainContentOf(body: string): string {
+  const start = body.indexOf('<main id="main">');
+  assert.ok(start >= 0, "page has a main landmark");
+  const end = body.indexOf("</main>", start);
+  assert.ok(end >= 0, "the main landmark is closed");
+  return body.slice(start, end);
+}
+
+/**
  * A section of a rendered page, from the heading tag that names it to the
  * section's closing tag. Anchoring on the heading tag keeps a section from
  * being confused with a link to the same title elsewhere on the page.
@@ -687,12 +701,23 @@ describe("workspace integration: linked overview and restart", () => {
         assert.ok(clientOrder[index - 1] < clientOrder[index], "newest first");
       }
 
-      // The sibling client's records never leak into this overview.
+      // The sibling client's records never leak into this overview's main
+      // content. The global shell deliberately lists every active client in its
+      // navigation, so the whole document carries the sibling client's name;
+      // the isolation assertion is scoped to the main landmark.
+      const overviewMain = mainContentOf(overview.body);
       for (const marker of ["Other client", "Other engagement", "Other project", "Other task", "Other follow-up", "Other meeting"]) {
-        assert.ok(!overview.body.includes(marker), marker);
+        assert.ok(!overviewMain.includes(marker), marker);
       }
-      assert.ok(!overview.body.includes(`href="/meetings/${ids.otherMeeting}"`));
-      assert.ok(!overview.body.includes(`href="/items/${ids.otherItem}"`));
+      assert.ok(!overviewMain.includes(`href="/meetings/${ids.otherMeeting}"`));
+      assert.ok(!overviewMain.includes(`href="/items/${ids.otherItem}"`));
+      // The global client navigation does carry the sibling client, escaped and
+      // linked, exactly as the owner's decision requires.
+      assert.ok(overview.body.includes(escapeHtml("Other client")));
+      assert.match(
+        overview.body,
+        new RegExp(`<nav class="primary-nav" aria-label="Primary"><ul>[\\s\\S]*href="/clients/${ids.otherClient}"`),
+      );
 
       // -- The engagement history: direct and project meetings once each. ----
       const alphaPage = await send(base, { path: `/engagements/${alpha}` });
@@ -779,8 +804,8 @@ describe("workspace integration: linked overview and restart", () => {
       assert.match(sectionOf(emptyOverview.body, "Next steps"), /No open waiting items\./);
       assert.match(sectionOf(emptyOverview.body, "Meeting history"), /No meetings recorded yet\./);
       assert.ok(!emptyOverview.body.includes("/engagements//"));
-      // That client is not part of the first client's overview.
-      assert.ok(!overview.body.includes("Empty client"));
+      // That client is not part of the first client's overview main content.
+      assert.ok(!mainContentOf(overview.body).includes("Empty client"));
 
       // The state as it stands before the restart, after the accepted writes.
       beforeRestart = JSON.stringify(await observe(base, ids));
@@ -873,10 +898,13 @@ describe("workspace integration: linked overview and restart", () => {
       assert.match(restartedAlpha.body, new RegExp(`href="/items/${ids.items[2]}"`));
       assert.match(restartedAlpha.body, new RegExp(`href="/items/${ids.items[6]}"`));
 
-      // The sibling client is still isolated after restart.
+      // The sibling client is still isolated in the main content after restart,
+      // while the global navigation still links to it.
+      const restartedOverviewMain = mainContentOf(overview.body);
       for (const marker of ["Other client", "Other meeting"]) {
-        assert.ok(!overview.body.includes(marker), marker);
+        assert.ok(!restartedOverviewMain.includes(marker), marker);
       }
+      assert.ok(overview.body.includes(escapeHtml("Other client")));
       const otherOverview = await send(app.url, { path: `/clients/${ids.otherClient}` });
       assert.match(otherOverview.body, new RegExp(`href="/meetings/${ids.otherMeeting}"`));
       assert.ok(!otherOverview.body.includes("Alpha kickoff"));

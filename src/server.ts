@@ -22,6 +22,11 @@ import {
   type Redirect,
 } from "./html.ts";
 import { health } from "./index.ts";
+import {
+  layoutContextFor,
+  layoutContextForFormError,
+  type LayoutContext,
+} from "./layout.ts";
 import { MissingRecordError, ValidationError, type Store } from "./store.ts";
 
 export { escapeHtml, FormError, redirect, renderForm, renderFormError, renderPage } from "./html.ts";
@@ -179,16 +184,70 @@ function sendRedirect(res: ServerResponse, target: Redirect): void {
   send(res, 303, "", "text/plain; charset=utf-8", target.headers);
 }
 
-function sendRouteResult(res: ServerResponse, result: RouteResult): void {
+function sendRouteResult(
+  res: ServerResponse,
+  result: RouteResult,
+  requestPath: string,
+  store: Store,
+): void {
   if ("location" in result) {
     sendRedirect(res, result);
     return;
   }
   if ("html" in result) {
-    sendPage(res, 200, result);
+    sendLayoutPage(res, 200, result, requestPath, store);
     return;
   }
   send(res, result.status, result.body, "text/plain; charset=utf-8", result.headers);
+}
+
+/**
+ * Send an HTML page from a route inside the shared application shell.
+ *
+ * A page rendered with explicit layout context is sent as rendered. A page
+ * rendered by `renderPage` without context carries its title and body, so the
+ * boundary builds the layout from the accepted route path and the full
+ * authoritative snapshot (read-only) and renders the shell around the same
+ * body. A bare `html` result from a caller that supplied no title or body is
+ * sent unchanged, preserving the existing behaviour of raw route results.
+ *
+ * A snapshot or layout failure is not caught here: it propagates as an
+ * unexpected failure, so the shell answers it with the generic 500 rather than
+ * a page that claims a layout it could not read.
+ */
+function sendLayoutPage(
+  res: ServerResponse,
+  status: number,
+  page: Page,
+  requestPath: string,
+  store: Store,
+): void {
+  if (page.layout !== undefined || page.title === undefined || page.body === undefined) {
+    sendPage(res, status, page);
+    return;
+  }
+  const layout = layoutContextFor(requestPath, store.snapshot());
+  const rendered = renderPage(page.title, page.body, layout);
+  sendPage(res, status, rendered);
+}
+
+/**
+ * Render a correctable form error inside the shared shell. The layout uses the
+ * record's authoritative context from the URL, or, for a collection-create
+ * refusal whose path names no parent, the validated parent id the corrected
+ * form carries as a hidden control.
+ */
+function renderFormErrorWithLayout(
+  error: FormError,
+  requestPath: string,
+  store: Store,
+): Page {
+  const layout: LayoutContext = layoutContextForFormError(
+    error.fields,
+    requestPath,
+    store.snapshot(),
+  );
+  return renderFormError(error, "Check the form", layout);
 }
 
 /**
@@ -414,7 +473,7 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
       }
 
       const result = await route.render({ method, path, origin: canonical, form });
-      sendRouteResult(res, result);
+      sendRouteResult(res, result, path, options.store);
     } catch (error) {
       if (error instanceof Rejection && error.status === 413) {
         // The body was refused before it was fully read; answer, then close the
@@ -422,6 +481,15 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
         res.setHeader("Connection", "close");
       }
       const status = errorStatus(error);
+      if (error instanceof FormError) {
+        // A correctable form problem is still an application HTML page, so it
+        // is wrapped in the shell like any other page. The layout is built from
+        // the accepted request path and the current snapshot; a snapshot or
+        // layout failure propagates and becomes the generic 500.
+        const page = renderFormErrorWithLayout(error, path, options.store);
+        sendPage(res, status, page);
+        return;
+      }
       const result = errorResponse(error);
       if ("location" in result) {
         throw new Error("An error response cannot be a redirect");
@@ -484,7 +552,6 @@ function dispatch(routes: Routes, path: string, method: "GET" | "POST"): Route |
 }
 
 function errorResponse(error: unknown): RouteResult {
-  if (error instanceof FormError) return renderFormError(error);
   const status = errorStatus(error);
   if (status === 500) return response(500, GENERIC_FAILURE);
   if (error instanceof Rejection) return response(status, rejectionMessage(status));
