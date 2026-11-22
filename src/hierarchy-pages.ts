@@ -368,9 +368,25 @@ function clientShowPage(client: Client, snapshot: Snapshot, store: Store): Page 
   const decisions = items.filter((item) => item.kind === "decision");
   const openItems = (kind: "follow_up" | "commitment" | "waiting") =>
     itemEntryList(items.filter((item) => item.kind === kind && item.state === "open"));
-  const engagementId = engagements[0]?.id ?? "";
-  const scopedNew = (family: "tasks" | "items" | "meetings") =>
-    `/engagements/${encodeURIComponent(engagementId)}/${family}/new`;
+
+  // The next steps are grouped by kind, each group with its own heading and
+  // list (or its own empty sentence), so a follow-up, a commitment and a
+  // waiting item are never merged into one undifferentiated list. Closed items
+  // are excluded from every group; they stay reachable through their own
+  // lists on the engagement and project pages.
+  const nextStepGroups: readonly { readonly title: string; readonly entries: readonly ListEntry[] }[] = [
+    { title: "Open follow-ups", entries: openItems("follow_up") },
+    { title: "Open commitments", entries: openItems("commitment") },
+    { title: "Open waiting items", entries: openItems("waiting") },
+  ];
+  const nextStepsBody = nextStepGroups
+    .map((group) => {
+      const body: string[] = [];
+      if (group.entries.length === 0) body.push(`<p>No ${group.title.toLowerCase()}.</p>`);
+      else body.push(childList(group.entries));
+      return `<h3>${escapeHtml(group.title)}</h3>${body.join("\n")}`;
+    })
+    .join("\n");
 
   // Derived engagement counts: an engagement's tally is selected by its own
   // scope, which includes its project-linked records once. Summing project
@@ -405,35 +421,19 @@ function clientShowPage(client: Client, snapshot: Snapshot, store: Store): Page 
             : `<ul>${countLines.join("")}</ul>`,
       },
       listSection("Current tasks (open or in progress)", taskEntryList(currentTasks), {
-        newHref: scopedNew("tasks"),
-        newLabel: "New task",
         empty: "No current tasks.",
       }),
       listSection("Open blockers", itemEntryList(blockers), {
-        newHref: scopedNew("items"),
-        newLabel: "New item",
         empty: "No open blockers.",
       }),
       listSection("Open questions", itemEntryList(questions), {
-        newHref: scopedNew("items"),
-        newLabel: "New item",
         empty: "No open questions.",
       }),
       listSection("Decisions", itemEntryList(decisions), {
-        newHref: scopedNew("items"),
-        newLabel: "New item",
         empty: "No decisions recorded yet.",
       }),
-      listSection("Next steps", [...openItems("follow_up"), ...openItems("commitment"), ...openItems("waiting")], {
-        newHref: scopedNew("items"),
-        newLabel: "New item",
-        empty: "No open follow-ups, commitments or waiting items.",
-      }),
-      meetingSection(
-        "Meeting history",
-        `/engagements/${encodeURIComponent(engagementId)}/meetings/new`,
-        engagementId === "" ? [] : clientMeetings(store, clientId),
-      ),
+      { title: "Next steps", body: nextStepsBody },
+      meetingSection("Meeting history", "", clientMeetings(store, clientId)),
     ],
   );
 }

@@ -155,11 +155,85 @@ function recordCounts(reply: Reply): Record<string, number> {
   return counts;
 }
 
+/**
+ * The part of `body` from the first occurrence of `start` to the next occurrence
+ * of `end`, so one group inside a section can be inspected without the groups
+ * that follow it. When `end` does not occur the slice runs to the end.
+ */
+function partOf(body: string, start: string, end: string): string {
+  const from = body.indexOf(start);
+  assert.ok(from >= 0, `page contains ${start}`);
+  const to = body.indexOf(end, from + start.length);
+  return body.slice(from, to < 0 ? undefined : to);
+}
+
 /** The count shown for a labelled tally row inside the given text. */
 function countFor(text: string, label: string): number {
   const match = new RegExp(`<li>[^<]*(?:<a[^>]*>[^<]*</a>)?${label}: (\\d+)</li>`).exec(text);
   assert.ok(match !== null, `no count for ${label}`);
   return Number(match[1]);
+}
+
+/** One observed page: where it was read and the response it gave. */
+interface ObservedPage {
+  readonly path: string;
+  readonly status: number;
+  readonly body: string;
+}
+
+/**
+ * The committed state as it is visible over HTTP: the home page's record
+ * counts, the detail page of every known record, and every engagement, project
+ * and client page (which carry the histories, the counts and the project
+ * links). A hostile write that changed a title, a date, a notes field, a kind,
+ * a state, a parent link or a project link changes one of these pages even when
+ * the number of records stays the same, so comparing the pages compares record
+ * values, not just collection sizes.
+ */
+async function observe(
+  base: string,
+  ids: {
+    readonly client: string;
+    readonly otherClient: string;
+    readonly emptyClient: string;
+    readonly engagements: readonly string[];
+    readonly projects: readonly string[];
+    readonly tasks: readonly string[];
+    readonly items: readonly string[];
+    readonly meetings: readonly string[];
+    readonly otherEngagement: string;
+    readonly otherProject: string;
+    readonly otherMeeting: string;
+    readonly otherTask: string;
+    readonly otherItem: string;
+  },
+): Promise<{
+  readonly counts: Record<string, number>;
+  readonly pages: readonly ObservedPage[];
+}> {
+  const counts = recordCounts(await send(base, { path: "/" }));
+  const paths = [
+    ...ids.tasks.map((id) => `/tasks/${id}`),
+    ...ids.items.map((id) => `/items/${id}`),
+    ...ids.meetings.map((id) => `/meetings/${id}`),
+    `/tasks/${ids.otherTask}`,
+    `/items/${ids.otherItem}`,
+    `/meetings/${ids.otherMeeting}`,
+    `/clients/${ids.client}`,
+    `/clients/${ids.otherClient}`,
+    `/clients/${ids.emptyClient}`,
+    ...ids.engagements.map((id) => `/engagements/${id}`),
+    `/engagements/${ids.otherEngagement}`,
+    ...ids.projects.map((id) => `/projects/${id}`),
+    `/projects/${ids.otherProject}`,
+  ];
+  const pages: ObservedPage[] = [];
+  for (const path of paths) {
+    const reply = await send(base, { path });
+    assert.equal(reply.status, 200, `${path} is a readable record or page`);
+    pages.push({ path, status: reply.status, body: reply.body });
+  }
+  return { counts, pages };
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +255,7 @@ describe("workspace integration: linked overview and restart", () => {
       items: [] as string[],
       meetings: [] as string[],
       otherClient: "",
+      emptyClient: "",
       otherEngagement: "",
       otherProject: "",
       otherMeeting: "",
@@ -239,11 +314,17 @@ describe("workspace integration: linked overview and restart", () => {
         const reply = await send(base, { method: "POST", path: form.action, form: Object.fromEntries(form.controls) });
         return redirectTarget(reply).split("/").pop() as string;
       };
+      // Two tasks stay current (one open, one in progress) so the overview's
+      // current-task list has something to show; the third is completed later
+      // and must leave that list while staying reachable.
       ids.tasks.push(await postTask(`/engagements/${alpha}/tasks/new`, {
         title: "Alpha engagement task", status: "open", priority: "high", owner: "Dana", dueDate: "2026-06-30", context: "no project",
       }));
       ids.tasks.push(await postTask(`/projects/${alphaProject}/tasks/new`, {
         title: "Alpha project task", status: "in_progress", priority: "normal", owner: "Lee", dueDate: "", context: "project work",
+      }));
+      ids.tasks.push(await postTask(`/engagements/${alpha}/tasks/new`, {
+        title: "Alpha finishing task", status: "open", priority: "low", owner: "", dueDate: "", context: "completing now",
       }));
       ids.tasks.push(await postTask(`/engagements/${beta}/tasks/new`, {
         title: "Beta done task", status: "done", priority: "low", owner: "", dueDate: "2025-12-31", context: "finished",
@@ -268,9 +349,10 @@ describe("workspace integration: linked overview and restart", () => {
           kind, title: `Alpha ${kind}`, context: `${kind} context`, state: "open",
         }));
       }
-      // A closed decision in the alpha project, and one item per kind in beta.
+      // A decision in the alpha project, closed later, and one item per kind
+      // in beta.
       ids.items.push(await postItem(`/projects/${alphaProject}/items/new`, {
-        kind: "decision", title: "Alpha closed decision", context: "decided", state: "open",
+        kind: "decision", title: "Alpha project decision", context: "decided", state: "open",
       }));
       for (const kind of kinds) {
         ids.items.push(await postItem(`/engagements/${beta}/items/new`, {
@@ -315,11 +397,25 @@ describe("workspace integration: linked overview and restart", () => {
       closeItem.controls.set("state", "closed");
       const closed = await send(base, { method: "POST", path: closeItem.action, form: Object.fromEntries(closeItem.controls) });
       assert.equal(redirectTarget(closed), `/items/${ids.items[2]}`);
+      // The overview must exclude it from the open blockers; it stays linked
+      // from the engagement's own work-item list.
+      assert.ok(closeItem.controls.has("title"));
 
-      const completeTask = parseForm((await send(base, { path: `/tasks/${ids.tasks[0]}/edit` })).body);
+      const completeTask = parseForm((await send(base, { path: `/tasks/${ids.tasks[2]}/edit` })).body);
+      assert.equal(completeTask.controls.get("status"), "open");
       completeTask.controls.set("status", "done");
       const completed = await send(base, { method: "POST", path: completeTask.action, form: Object.fromEntries(completeTask.controls) });
-      assert.equal(redirectTarget(completed), `/tasks/${ids.tasks[0]}`);
+      assert.equal(redirectTarget(completed), `/tasks/${ids.tasks[2]}`);
+
+      // Close the alpha project's decision: a closed decision must still be
+      // reachable (it is listed as a decision) while a closed follow-up is not
+      // in the next steps.
+      const projectDecisionIndex = 6;
+      const closeDecision = parseForm((await send(base, { path: `/items/${ids.items[projectDecisionIndex]}/edit` })).body);
+      assert.equal(closeDecision.controls.get("kind"), "decision");
+      closeDecision.controls.set("state", "closed");
+      const closedDecision = await send(base, { method: "POST", path: closeDecision.action, form: Object.fromEntries(closeDecision.controls) });
+      assert.equal(redirectTarget(closedDecision), `/items/${ids.items[projectDecisionIndex]}`);
 
       const editMeeting = parseForm((await send(base, { path: `/meetings/${alphaEngagementMeeting}/edit` })).body);
       assert.equal(editMeeting.controls.get("date"), "2026-01-15");
@@ -352,32 +448,46 @@ describe("workspace integration: linked overview and restart", () => {
         title: "Other meeting", date: "2026-04-01", notes: "", projectId: ids.otherProject,
       });
 
+      // -- A client with no engagements, for its empty states. ---------------
+      const emptyClientForm = parseForm((await send(base, { path: "/clients/new" })).body);
+      emptyClientForm.controls.set("name", "Empty client");
+      const emptyClient = await send(base, { method: "POST", path: "/clients/new", form: Object.fromEntries(emptyClientForm.controls) });
+      ids.emptyClient = redirectTarget(emptyClient).split("/").pop() as string;
+
       // -- Rejected hostile requests leave the data unchanged. ---------------
-      // The application holds the store's writer lock, so the snapshot is read
-      // through the application's own route: the home page reports the exact
-      // record counts the store holds.
-      beforeRestart = JSON.stringify(recordCounts(await send(base, { path: "/" })));
-      const hostile: Array<[string, Record<string, string>]> = [
+      // The complete committed state, captured over HTTP before any hostile
+      // request: the home page counts, every record detail page (title, date,
+      // notes, kind, state, parents and project link) and the three histories.
+      // Collection sizes alone could not detect a changed field or parent link,
+      // so the comparison is of record values and full page snapshots.
+      beforeRestart = JSON.stringify(await observe(base, ids));
+      const hostile: Array<[string, Record<string, string>, number]> = [
         // A tampered cross-engagement project on a meeting create.
-        [`/engagements/${alpha}/meetings/new`, { title: "Hijack", date: "2026-01-01", notes: "", projectId: betaProject }],
-        // A tampered parent id: the URL parent wins, but an invalid date refuses.
-        [`/engagements/${alpha}/meetings/new`, { engagementId: beta, clientId: ids.otherClient, title: "Bad date", date: "2023-02-29", notes: "" }],
+        [`/engagements/${alpha}/meetings/new`, { title: "Hijack", date: "2026-01-01", notes: "", projectId: betaProject }, 400],
+        // A tampered parent on a meeting create: refused, not rewritten.
+        [`/engagements/${alpha}/meetings/new`, { engagementId: beta, clientId: ids.otherClient, title: "Parent tamper", date: "2026-05-05", notes: "" }, 400],
+        // A tampered parent with an invalid date is refused either way.
+        [`/engagements/${alpha}/meetings/new`, { engagementId: beta, title: "Bad date", date: "2023-02-29", notes: "" }, 400],
         // A tampered project on a task create.
-        [`/engagements/${alpha}/tasks/new`, { title: "Hijack task", status: "open", priority: "high", owner: "", dueDate: "", context: "", projectId: betaProject }],
-        // A cross-engagement project on a meeting edit.
-        [`/meetings/${alphaProjectMeeting}/edit`, { id: alphaProjectMeeting, title: "Moved", date: "2026-05-05", notes: "", projectId: betaProject }],
+        [`/engagements/${alpha}/tasks/new`, { title: "Hijack task", status: "open", priority: "high", owner: "", dueDate: "", context: "", projectId: betaProject }, 400],
+        // A cross-engagement project on a meeting edit: the record must not move.
+        [`/meetings/${alphaProjectMeeting}/edit`, { id: alphaProjectMeeting, title: "Moved", date: "2026-05-05", notes: "", projectId: betaProject }, 400],
         // A blank title on a meeting create.
-        [`/engagements/${alpha}/meetings/new`, { title: " ", date: "2026-05-05", notes: "" }],
+        [`/engagements/${alpha}/meetings/new`, { title: " ", date: "2026-05-05", notes: "" }, 400],
+        // A hostile request that names another record's id on an edit.
+        [`/meetings/${alphaEngagementMeeting}/edit`, { id: alphaProjectMeeting, title: "Crossed", date: "2026-05-05", notes: "" }, 400],
+        // A tampered parent on a project-scoped meeting create.
+        [`/projects/${alphaProject}/meetings/new`, { engagementId: beta, title: "Project parent tamper", date: "2026-05-05", notes: "", projectId: alphaProject }, 400],
       ];
-      for (const [path, form] of hostile) {
+      for (const [path, form, status] of hostile) {
         const reply = await send(base, { method: "POST", path, form });
-        assert.equal(reply.status, 400, `${path} ${JSON.stringify(form)}`);
+        assert.equal(reply.status, status, `${path} ${JSON.stringify(form)}`);
         assert.match(String(reply.headers["content-type"]), /^text\/html/);
         assert.match(reply.body, /role="alert"/);
         assert.equal(
-          JSON.stringify(recordCounts(await send(base, { path: "/" }))),
+          JSON.stringify(await observe(base, ids)),
           beforeRestart,
-          `${path} must not mutate`,
+          `${path} must not mutate any record or page`,
         );
       }
       // A cross-origin POST is refused before any handler runs.
@@ -388,52 +498,112 @@ describe("workspace integration: linked overview and restart", () => {
         form: { title: "Cross origin", date: "2026-01-01", notes: "" },
       });
       assert.equal(foreign.status, 403);
-      assert.equal(JSON.stringify(recordCounts(await send(base, { path: "/" }))), beforeRestart);
+      assert.equal(JSON.stringify(await observe(base, ids)), beforeRestart);
 
       // -- The client overview. ----------------------------------------------
       const overview = await send(base, { path: `/clients/${ids.client}` });
       assert.equal(overview.status, 200);
-      // Profile, engagements/statuses/projects, each linked.
-      assert.ok(overview.body.includes(escapeHtml("Acme <Ltd>")));
-      assert.match(overview.body, new RegExp(`href="/engagements/${alpha}"`));
-      assert.match(overview.body, new RegExp(`href="/engagements/${beta}"`));
-      assert.match(overview.body, /<a href="\/engagements\/[^"]+">Alpha<\/a> \(active\)/);
-      assert.match(overview.body, /<a href="\/engagements\/[^"]+">Beta<\/a> \(on_hold\)/);
-      assert.match(overview.body, new RegExp(`href="/projects/${alphaProject}"`));
-      assert.match(overview.body, new RegExp(`href="/projects/${betaProject}"`));
 
-      // Current tasks: the open and in-progress tasks, not closed ones.
-      const current = sectionOf(overview.body, "Current tasks");
+      // Profile: every non-name value submitted above is shown, escaped.
+      const profile = sectionOf(overview.body, "Profile");
+      for (const value of [
+        "Acme <Ltd>",
+        "Founded < 1990 & grew",
+        'Ada "Lovelace" <ada@example.test>',
+        "Board & 'staff'",
+        "Must <work> offline",
+        "Ship <v1> & learn",
+      ]) {
+        assert.ok(profile.includes(escapeHtml(value)), value);
+        assert.ok(!profile.includes(value), `${value} is escaped`);
+      }
+
+      // Engagements with their statuses and projects, each linked.
+      const engagementSection = sectionOf(overview.body, "Engagements");
+      assert.match(engagementSection, new RegExp(`href="/engagements/${alpha}"`));
+      assert.match(engagementSection, new RegExp(`href="/engagements/${beta}"`));
+      assert.match(engagementSection, /<a href="\/engagements\/[^"]+">Alpha<\/a> \(active\)/);
+      assert.match(engagementSection, /<a href="\/engagements\/[^"]+">Beta<\/a> \(on_hold\)/);
+      const projectSection = sectionOf(overview.body, "Projects");
+      assert.match(projectSection, new RegExp(`href="/projects/${alphaProject}"`));
+      assert.match(projectSection, new RegExp(`href="/projects/${betaProject}"`));
+      assert.match(projectSection, /<a href="\/projects\/[^"]+">Alpha project<\/a> \(active · Alpha\)/);
+      assert.match(projectSection, /<a href="\/projects\/[^"]+">Beta project<\/a> \(active · Beta\)/);
+
+      // Current tasks: the open and in-progress tasks, not completed ones.
+      const current = partOf(sectionOf(overview.body, "Current tasks"), "Current tasks (open or in progress)", "</section>");
+      assert.match(current, new RegExp(`href="/tasks/${ids.tasks[0]}"`)); // open
       assert.match(current, new RegExp(`href="/tasks/${ids.tasks[1]}"`)); // in progress
-      assert.ok(!current.includes(`href="/tasks/${ids.tasks[0]}"`)); // completed
-      assert.ok(!current.includes(`href="/tasks/${ids.tasks[2]}"`)); // done
+      assert.ok(!current.includes(`href="/tasks/${ids.tasks[2]}"`)); // newly completed
+      assert.ok(!current.includes(`href="/tasks/${ids.tasks[3]}"`)); // done from the start
+      assert.ok(!current.includes("Alpha finishing task"));
       assert.ok(!current.includes("Beta done task"));
+      assert.equal(current.split("<li>").length - 1, 2);
+      assert.match(current, /status open/);
+      assert.match(current, /status in_progress/);
 
       // Open blockers and questions; the closed blocker is gone from them.
       const blockers = sectionOf(overview.body, "Open blockers");
       assert.ok(!blockers.includes(`href="/items/${ids.items[2]}"`));
+      // Beta's open blocker belongs to the same client, so it is listed once
+      // here as well; Alpha's closed blocker is gone.
+      const betaBlocker = ids.items[9];
+      assert.match(blockers, new RegExp(`href="/items/${betaBlocker}"`));
+      assert.equal(blockers.split("<li>").length - 1, 1);
       const questions = sectionOf(overview.body, "Open questions");
       assert.match(questions, new RegExp(`href="/items/${ids.items[1]}"`));
+      assert.ok(!questions.includes(`href="/items/${ids.items[7]}"`)); // beta question
 
-      // Decisions include the closed project decision (still reachable).
+      // Decisions include the closed project decision, still linked.
       const decisions = sectionOf(overview.body, "Decisions");
       assert.match(decisions, new RegExp(`href="/items/${ids.items[0]}"`));
       assert.match(decisions, new RegExp(`href="/items/${ids.items[6]}"`));
+      const closedDecisionPage = await send(base, { path: `/items/${ids.items[6]}` });
+      assert.equal(closedDecisionPage.status, 200);
+      assert.match(closedDecisionPage.body, /closed/);
 
-      // Next steps: open follow-ups, commitments and waiting items, linked.
+      // Next steps: three identifiable groups, each with its own heading and
+      // list, containing only this client's open items of that kind.
       const nextSteps = sectionOf(overview.body, "Next steps");
-      assert.match(nextSteps, new RegExp(`href="/items/${ids.items[3]}"`)); // commitment
-      assert.match(nextSteps, new RegExp(`href="/items/${ids.items[4]}"`)); // waiting
-      assert.match(nextSteps, new RegExp(`href="/items/${ids.items[5]}"`)); // follow-up
+      const followUps = partOf(nextSteps, escapeHtml("Open follow-ups"), escapeHtml("Open commitments"));
+      const commitments = partOf(nextSteps, escapeHtml("Open commitments"), escapeHtml("Open waiting items"));
+      const waiting = partOf(nextSteps, escapeHtml("Open waiting items"), "</section>");
+      assert.match(followUps, new RegExp(`href="/items/${ids.items[5]}"`));
+      assert.ok(!followUps.includes(`href="/items/${ids.items[3]}"`));
+      assert.match(commitments, new RegExp(`href="/items/${ids.items[3]}"`));
+      assert.ok(!commitments.includes(`href="/items/${ids.items[4]}"`));
+      assert.match(waiting, new RegExp(`href="/items/${ids.items[4]}"`));
+      // Each next-step item is listed exactly once across the three groups.
+      for (const index of [3, 4, 5]) {
+        assert.equal(nextSteps.split(`href="/items/${ids.items[index]}"`).length - 1, 1, `item ${index}`);
+      }
+      // Closed items never appear in the next steps.
+      assert.ok(!nextSteps.includes(`href="/items/${ids.items[2]}"`));
+      assert.ok(!nextSteps.includes(`href="/items/${ids.items[6]}"`));
+      // The overview offers no client-level creation shortcut: creation is
+      // scoped under a chosen engagement or project, and the sections have no
+      // "New task" or "New item" link.
+      assert.ok(!overview.body.includes("New task"));
+      assert.ok(!overview.body.includes("New item"));
+      assert.ok(!overview.body.includes("/engagements//"));
 
-      // Derived engagement counts. Alpha tasks: the engagement task (now done)
-      // and the project task (in progress) = 1 done, 1 in progress, 0 open; the
-      // closed and completed work still counts once each, never twice.
-      const counts = sectionOf(overview.body, "Engagement counts");
+      // Derived engagement counts. Alpha tasks: the open engagement task, the
+      // in-progress project task and the newly completed engagement task = 1
+      // open, 1 in progress, 1 done. Beta: its single done task. Engagement
+      // project tasks are counted once, in their engagement's scope.
+      const counts = partOf(sectionOf(overview.body, "Engagement counts"), escapeHtml("Engagement counts"), "</section>");
       const alphaCounts = counts.slice(counts.indexOf(`href="/engagements/${alpha}"`), counts.indexOf(`href="/engagements/${beta}"`));
-      assert.equal(countFor(alphaCounts, "open"), 0);
+      assert.equal(countFor(alphaCounts, "open"), 1);
       assert.equal(countFor(alphaCounts, "in_progress"), 1);
       assert.equal(countFor(alphaCounts, "done"), 1);
+      // Alpha's counted tasks split into its two engagement-only tasks (one
+      // now done) and its one project task, each counted once.
+      const alphaStored = [ids.tasks[0], ids.tasks[1], ids.tasks[2]];
+      assert.equal(alphaStored.length, 3);
+      assert.equal(
+        countFor(alphaCounts, "open") + countFor(alphaCounts, "in_progress") + countFor(alphaCounts, "done"),
+        3,
+      );
       const betaCounts = counts.slice(counts.indexOf(`href="/engagements/${beta}"`));
       assert.equal(countFor(betaCounts, "open"), 0);
       assert.equal(countFor(betaCounts, "in_progress"), 0);
@@ -497,13 +667,37 @@ describe("workspace integration: linked overview and restart", () => {
       // Closed and completed work stays reachable through its record lists.
       const alphaRecord = await send(base, { path: `/engagements/${alpha}` });
       assert.match(alphaRecord.body, new RegExp(`href="/tasks/${ids.tasks[0]}"`));
+      assert.match(alphaRecord.body, new RegExp(`href="/tasks/${ids.tasks[2]}"`));
+      assert.match(alphaRecord.body, new RegExp(`href="/tasks/${ids.tasks[1]}"`));
       assert.match(alphaRecord.body, new RegExp(`href="/items/${ids.items[2]}"`));
+      assert.match(alphaRecord.body, new RegExp(`href="/items/${ids.items[6]}"`));
+      // Alpha's finished and engagement-only work appears in the engagement-only
+      // group, its project task and project decision in the project's section.
+      assert.ok(!alphaRecord.body.includes(`href="/tasks/${ids.tasks[3]}"`), "beta task is not Alpha's");
       const betaRecord = await send(base, { path: `/engagements/${beta}` });
-      assert.match(betaRecord.body, new RegExp(`href="/tasks/${ids.tasks[2]}"`));
+      assert.match(betaRecord.body, new RegExp(`href="/tasks/${ids.tasks[3]}"`));
       // Every listed record links somewhere reachable.
       const closedBlocker = await send(base, { path: `/items/${ids.items[2]}` });
       assert.equal(closedBlocker.status, 200);
       assert.ok(closedBlocker.body.includes("closed"));
+      const completedTaskPage = await send(base, { path: `/tasks/${ids.tasks[2]}` });
+      assert.equal(completedTaskPage.status, 200);
+      assert.ok(completedTaskPage.body.includes("done"));
+
+      // A client with no engagements shows meaningful empty states and offers
+      // no creation shortcuts that would guess a parent.
+      const emptyOverview = await send(base, { path: `/clients/${ids.emptyClient}` });
+      assert.equal(emptyOverview.status, 200);
+      assert.match(emptyOverview.body, /No engagements yet\./);
+      assert.match(emptyOverview.body, /No projects yet\./);
+      assert.match(partOf(sectionOf(emptyOverview.body, "Current tasks"), "Current tasks (open or in progress)", "</section>"), /No current tasks\./);
+      assert.match(sectionOf(emptyOverview.body, "Next steps"), /No open follow-ups\./);
+      assert.match(sectionOf(emptyOverview.body, "Next steps"), /No open commitments\./);
+      assert.match(sectionOf(emptyOverview.body, "Next steps"), /No open waiting items\./);
+      assert.match(sectionOf(emptyOverview.body, "Meeting history"), /No meetings recorded yet\./);
+      assert.ok(!emptyOverview.body.includes("/engagements//"));
+      // That client is not part of the first client's overview.
+      assert.ok(!overview.body.includes("Empty client"));
     } finally {
       await app.close();
     }
@@ -511,14 +705,16 @@ describe("workspace integration: linked overview and restart", () => {
     // -- Restart: a fresh application and store over the same directory. ----
     app = await open(dir);
     try {
-      // The data survived the restart unchanged: the home page counts match and
-      // a fresh store opened over the directory reads back the same records.
-      assert.equal(JSON.stringify(recordCounts(await send(app.url, { path: "/" }))), beforeRestart);
+      // The data survived the restart unchanged: a fresh store opened over the
+      // directory reads back the same record counts, record pages and linked
+      // views as before the restart.
+      assert.equal(JSON.stringify(await observe(app.url, ids)), beforeRestart);
 
       const clientId = ids.client;
       const overview = await send(app.url, { path: `/clients/${clientId}` });
       assert.equal(overview.status, 200);
-      // The edited meeting values survived and appear in both histories.
+      // The edited meeting values survived and appear in the client-wide and
+      // the engagement histories.
       assert.ok(overview.body.includes(escapeHtml("2026-01-20 — Alpha kickoff (edited)")));
       const engagementPage = await send(app.url, { path: `/engagements/${ids.engagements[0]}` });
       assert.ok(sectionOf(engagementPage.body, "Meeting history").includes(escapeHtml("2026-01-20 — Alpha kickoff (edited)")));
@@ -526,20 +722,28 @@ describe("workspace integration: linked overview and restart", () => {
       assert.equal(meetingDetail.status, 200);
       assert.ok(meetingDetail.body.includes(escapeHtml("Alpha kickoff (edited)")));
       assert.ok(meetingDetail.body.includes(escapeHtml("Edited & kept")));
-      // The state changes survived too.
       assert.ok(meetingDetail.body.includes("2026-01-20"));
+
+      // The state changes (a closed decision, a closed blocker, a completed
+      // task) survived.
+      const closedDecisionPage = await send(app.url, { path: `/items/${ids.items[6]}` });
+      assert.match(closedDecisionPage.body, /closed/);
       const closedBlocker = await send(app.url, { path: `/items/${ids.items[2]}` });
       assert.ok(closedBlocker.body.includes("closed"));
-      const completedTask = await send(app.url, { path: `/tasks/${ids.tasks[0]}` });
+      const completedTask = await send(app.url, { path: `/tasks/${ids.tasks[2]}` });
       assert.ok(completedTask.body.includes("done"));
 
       // Histories and counts after restart match those before.
-      const counts = sectionOf(overview.body, "Engagement counts");
+      const counts = partOf(sectionOf(overview.body, "Engagement counts"), escapeHtml("Engagement counts"), "</section>");
       const alphaCounts = counts.slice(counts.indexOf(`href="/engagements/${ids.engagements[0]}"`), counts.indexOf(`href="/engagements/${ids.engagements[1]}"`));
+      assert.equal(countFor(alphaCounts, "open"), 1);
       assert.equal(countFor(alphaCounts, "done"), 1);
       assert.equal(countFor(alphaCounts, "in_progress"), 1);
       const clientHistory = sectionOf(overview.body, "Meeting history");
       assert.equal(clientHistory.split(`href="/meetings/${ids.meetings[1]}"`).length - 1, 1);
+      // Next steps groups survive too.
+      const nextSteps = sectionOf(overview.body, "Next steps");
+      assert.match(sectionOf(nextSteps, "Open follow-ups"), new RegExp(`href="/items/${ids.items[5]}"`));
 
       // The sibling client is still isolated after restart.
       for (const marker of ["Other client", "Other meeting"]) {
@@ -548,6 +752,7 @@ describe("workspace integration: linked overview and restart", () => {
       const otherOverview = await send(app.url, { path: `/clients/${ids.otherClient}` });
       assert.match(otherOverview.body, new RegExp(`href="/meetings/${ids.otherMeeting}"`));
       assert.ok(!otherOverview.body.includes("Alpha kickoff"));
+      assert.ok(!otherOverview.body.includes(`href="/items/${ids.items[0]}"`));
     } finally {
       await app.close();
     }

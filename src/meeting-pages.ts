@@ -4,12 +4,13 @@
  * engagement and project pages. Every page is server-rendered HTML built from
  * the store's snapshot; every write goes through the validated store methods,
  * so an invalid submission, a tampered parent link or a cross-engagement
- * project is refused by the store and never reaches disk.
+ * project is refused before it reaches disk.
  *
  * The client and engagement a meeting belongs to are derived from the parent in
- * the route path, never taken from the submitted form. The only link a form
- * chooses is the optional project, and the choices offered are exactly the
- * projects of the engagement the meeting belongs to.
+ * the route path, never taken from the submitted form; a submitted parent id
+ * that differs from the path's parent is refused. The only link a form chooses
+ * is the optional project, and the choices offered are exactly the projects of
+ * the engagement the meeting belongs to.
  */
 import {
   escapeHtml,
@@ -190,16 +191,21 @@ export function meetingList(meetings: readonly Meeting[]): string {
     .join("")}</ul>`;
 }
 
-/** A meeting history section with a creation link for the given scope. */
+/**
+ * A meeting history section with a creation link for the given scope. An empty
+ * `newHref` means the section has no single creation scope (a client-wide
+ * history): creation happens under a chosen engagement or project, from those
+ * pages, so no link is offered rather than one that guesses a parent.
+ */
 export function meetingSection(
   title: string,
   newHref: string,
   meetings: readonly Meeting[],
 ): PageSection {
-  return {
-    title,
-    body: [`<p>${link(newHref, "New meeting")}</p>`, meetingList(meetings)].join("\n"),
-  };
+  const body: string[] = [];
+  if (newHref !== "") body.push(`<p>${link(newHref, "New meeting")}</p>`);
+  body.push(meetingList(meetings));
+  return { title, body: body.join("\n") };
 }
 
 // ---------------------------------------------------------------------------
@@ -412,24 +418,30 @@ export function meetingRoutes(store: Store): MeetingRoutes {
   }
 
   /**
-   * The parent a creation POST names: the client and engagement derived from
-   * the URL alone, never from the submitted form, so a tampered parent id is
-   * ignored. This resolves only the parent; the optional selected project is
-   * resolved separately, inside the correction boundary, so an unknown or
-   * cross-engagement project becomes a correctable form error. A nonexistent
-   * URL parent (or URL project) is a missing record and stays a 404.
+   * The parent a creation POST names: the client and engagement are derived
+   * from the URL path alone and are authoritative. The submitted form may carry
+   * parent ids for the hidden controls it was rendered with, but it may not
+   * change them: a submitted engagement id (or client id) that differs from
+   * the parent in the path is a tampered parent and is refused, leaving the
+   * data unchanged. This resolves only the parent; the optional selected
+   * project is resolved separately, inside the correction boundary, so an
+   * unknown or cross-engagement project becomes a correctable form error. A
+   * nonexistent URL parent (or URL project) is a missing record and stays a 404.
    */
   function postedParent(
     snap: Snapshot,
     path: string,
-  ): { readonly scope: CreateScope; readonly parent: { name: string; id: string } } {
+    form: Readonly<Record<string, string>>,
+  ): { readonly scope: CreateScope; readonly parent: { name: string; id: string }; readonly conflict: ValidationError | null } {
     const pathname = path.split("?")[0];
     const parts = pathname.split("/").slice(1);
     if (parts[0] === "engagements") {
       const engagementId = decodeId(parts[1] ?? "", "engagement");
+      const scope = engagementScope(snap, engagementId);
       return {
-        scope: engagementScope(snap, engagementId),
+        scope,
         parent: { name: "engagementId", id: engagementId },
+        conflict: submittedParentConflict(form, scope, engagementId),
       };
     }
     if (parts[0] === "projects") {
@@ -441,9 +453,36 @@ export function meetingRoutes(store: Store): MeetingRoutes {
       return {
         scope: { client: scope.client, engagement: scope.engagement },
         parent: { name: "engagementId", id: scope.engagement.id },
+        conflict: submittedParentConflict(form, scope, scope.engagement.id),
       };
     }
     throw new MissingRecordError("No parent for that path");
+  }
+
+  /**
+   * Check that a submitted parent id, when present, names the parent the URL
+   * chose. An omitted control is fine (a client that does not resubmit hidden
+   * fields cannot tamper); a present but different value is refused, and so is
+   * a submitted client id that names a different client. The URL parent stays
+   * authoritative either way. The problem is reported as invalid input on the
+   * correction form by `createMeeting`.
+   */
+  function submittedParentConflict(
+    form: Readonly<Record<string, string>>,
+    scope: CreateScope,
+    engagementId: string,
+  ): ValidationError | null {
+    if (Object.hasOwn(form, "engagementId") && form["engagementId"] !== engagementId) {
+      return new ValidationError(
+        `Submitted engagementId ${JSON.stringify(form["engagementId"])} is not the parent engagement of this form`,
+      );
+    }
+    if (Object.hasOwn(form, "clientId") && form["clientId"] !== scope.client.id) {
+      return new ValidationError(
+        `Submitted clientId ${JSON.stringify(form["clientId"])} is not the client of this engagement`,
+      );
+    }
+    return null;
   }
 
   /** The action a creation POST writes to: the parent engagement's new endpoint. */
@@ -502,8 +541,9 @@ export function meetingRoutes(store: Store): MeetingRoutes {
 
   async function createMeeting(request: MeetingRequest): Promise<MeetingPage> {
     const snap = snapshot();
-    // The URL parent is resolved first and stays a 404 when it is missing.
-    const { scope, parent } = postedParent(snap, request.path);
+    // The URL parent is resolved first and stays a 404 when it is missing, and
+    // a submitted parent that differs from it is refused.
+    const { scope, parent, conflict } = postedParent(snap, request.path, request.form);
     const action = createAction(scope);
     const fields: readonly FieldSpec[] = [
       { name: parent.name, label: parent.name, hidden: true, value: parent.id },
@@ -511,6 +551,7 @@ export function meetingRoutes(store: Store): MeetingRoutes {
     ];
     const values = suppliedValues(request.form, fields);
     try {
+      if (conflict !== null) throw conflict;
       // The optional selected project is resolved inside the boundary: an
       // unknown project is a correctable error, a blank one records an
       // engagement-only meeting.

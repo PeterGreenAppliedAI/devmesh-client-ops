@@ -379,24 +379,76 @@ describe("meeting pages: creation", () => {
       assert.doesNotMatch(unknownProject.body, /Not found/);
       assert.equal(JSON.stringify(server.store.snapshot()), before);
 
-      // A tampered parent id in the form is ignored: the URL parent wins.
+      // A tampered parent id in the form is refused: the engagement and client
+      // are derived from the URL parent, and a submission that names a
+      // different engagement (or client) is rejected, not silently rewritten.
       const parentTamper = await send(server.origin, {
         method: "POST",
         path: `/engagements/${h.engagement.id}/meetings/new`,
         form: {
           engagementId: h.sibling.id,
-          clientId: h.otherClient.id,
           title: "Parent tamper",
           date: "2026-05-05",
           notes: "",
           projectId: "",
         },
       });
-      const parentId = idOf(parentTamper);
-      const parentStored = server.store.snapshot().meetings.find((candidate) => candidate.id === parentId);
-      assert.ok(parentStored !== undefined);
-      assert.equal(parentStored.engagementId, h.engagement.id);
-      assert.equal(parentStored.clientId, h.client.id);
+      assert.equal(parentTamper.status, 400);
+      assert.match(String(parentTamper.headers["content-type"]), /^text\/html/);
+      assert.match(parentTamper.body, /role="alert"/);
+      assert.match(parentTamper.body, /not the parent engagement of this form/);
+      // The submitted values are kept on the correction form, which still posts
+      // to the URL parent's endpoint with the URL parent in its hidden control.
+      const parentCorrection = parseForm(parentTamper.body);
+      assert.equal(parentCorrection.action, `/engagements/${h.engagement.id}/meetings/new`);
+      assert.equal(parentCorrection.controls.get("engagementId"), h.engagement.id);
+      assert.equal(parentCorrection.controls.get("title"), "Parent tamper");
+      assert.equal(parentCorrection.controls.get("date"), "2026-05-05");
+      assert.equal(JSON.stringify(server.store.snapshot()), before);
+
+      // A tampered client id is refused the same way.
+      const clientTamper = await send(server.origin, {
+        method: "POST",
+        path: `/engagements/${h.engagement.id}/meetings/new`,
+        form: {
+          engagementId: h.engagement.id,
+          clientId: h.otherClient.id,
+          title: "Client tamper",
+          date: "2026-05-05",
+          notes: "",
+        },
+      });
+      assert.equal(clientTamper.status, 400);
+      assert.match(clientTamper.body, /not the client of this engagement/);
+      assert.equal(JSON.stringify(server.store.snapshot()), before);
+
+      // A tampered parent through a project-scoped path is refused too.
+      const projectParentTamper = await send(server.origin, {
+        method: "POST",
+        path: `/projects/${h.project.id}/meetings/new`,
+        form: {
+          engagementId: h.sibling.id,
+          title: "Project parent tamper",
+          date: "2026-05-05",
+          notes: "",
+          projectId: h.project.id,
+        },
+      });
+      assert.equal(projectParentTamper.status, 400);
+      assert.match(projectParentTamper.body, /not the parent engagement of this form/);
+      assert.equal(JSON.stringify(server.store.snapshot()), before);
+
+      // The stored parent ids are still derived from the URL, never the form.
+      const created = await send(server.origin, {
+        method: "POST",
+        path: `/engagements/${h.engagement.id}/meetings/new`,
+        form: { title: "Legit", date: "2026-05-05", notes: "" },
+      });
+      const createdId = idOf(created);
+      const createdStored = server.store.snapshot().meetings.find((candidate) => candidate.id === createdId);
+      assert.ok(createdStored !== undefined);
+      assert.equal(createdStored.engagementId, h.engagement.id);
+      assert.equal(createdStored.clientId, h.client.id);
     } finally {
       await server.close();
     }
@@ -750,6 +802,82 @@ describe("meeting pages: guards", () => {
       assert.equal(routeForMeetingPattern(routes, "/meetings/:id", "POST"), undefined);
     } finally {
       await store.close();
+    }
+  });
+});
+
+describe("meeting pages: client overview", () => {
+  it("groups open next steps by kind, lists decisions including closed ones and shows empty states", async () => {
+    const server = await running();
+    try {
+      const h = await hierarchy(server.store);
+      const base = { clientId: h.client.id, engagementId: h.engagement.id };
+      const followUp = await server.store.createItem({ ...base, kind: "follow_up", title: "Follow", state: "open" });
+      const commitment = await server.store.createItem({ ...base, kind: "commitment", title: "Commit", state: "open" });
+      const waiting = await server.store.createItem({ ...base, kind: "waiting", title: "Wait", state: "open" });
+      const closedWaiting = await server.store.createItem({ ...base, kind: "waiting", title: "Old wait", state: "closed" });
+      const openDecision = await server.store.createItem({ ...base, kind: "decision", title: "Decide", state: "open" });
+      // A sibling client's items and meetings never appear in this overview.
+      const other = await server.store.createItem({
+        clientId: h.otherClient.id,
+        engagementId: h.otherEngagement.id,
+        kind: "follow_up",
+        title: "Other follow",
+        state: "open",
+      });
+
+      const page = await send(server.origin, { path: `/clients/${h.client.id}` });
+      assert.equal(page.status, 200);
+      const nextStepsAt = page.body.indexOf("Next steps");
+      assert.ok(nextStepsAt >= 0);
+      const nextSteps = page.body.slice(nextStepsAt, page.body.indexOf("</section>", nextStepsAt));
+      // Each kind is its own labelled group, with only that kind inside it.
+      const group = (start: string, end: string): string => {
+        const from = nextSteps.indexOf(start);
+        assert.ok(from >= 0, start);
+        const to = end === "" ? nextSteps.length : nextSteps.indexOf(end, from + start.length);
+        return nextSteps.slice(from, to < 0 ? undefined : to);
+      };
+      const followUps = group("Open follow-ups", "Open commitments");
+      const commitments = group("Open commitments", "Open waiting items");
+      const waitings = group("Open waiting items", "");
+      assert.match(followUps, new RegExp(`href="/items/${followUp.id}"`));
+      assert.ok(!followUps.includes(`href="/items/${commitment.id}"`));
+      assert.ok(!followUps.includes(`href="/items/${waiting.id}"`));
+      assert.match(commitments, new RegExp(`href="/items/${commitment.id}"`));
+      assert.ok(!commitments.includes(`href="/items/${followUp.id}"`));
+      assert.match(waitings, new RegExp(`href="/items/${waiting.id}"`));
+      assert.ok(!waitings.includes(`href="/items/${followUp.id}"`));
+      // The closed waiting item is not in the open groups.
+      assert.ok(!nextSteps.includes(`href="/items/${closedWaiting.id}"`));
+      // The other client's follow-up is not in this overview.
+      assert.ok(!page.body.includes("Other follow"));
+      assert.ok(!page.body.includes(`href="/items/${other.id}"`));
+      // Decisions include the open decision.
+      const decisionsAt = page.body.indexOf("Decisions");
+      const decisions = page.body.slice(decisionsAt, page.body.indexOf("</section>", decisionsAt));
+      assert.match(decisions, new RegExp(`href="/items/${openDecision.id}"`));
+
+      // The overview offers no client-level creation shortcut: no guessed
+      // parent links, so creation stays scoped under a chosen engagement or
+      // project.
+      assert.ok(!page.body.includes("/engagements//"));
+      assert.ok(!page.body.includes("New task"));
+      assert.ok(!page.body.includes("New item"));
+
+      // A client with no engagements: every section shows an empty state.
+      const empty = await server.store.createClient({ name: "Empty" });
+      const emptyPage = await send(server.origin, { path: `/clients/${empty.id}` });
+      assert.equal(emptyPage.status, 200);
+      assert.match(emptyPage.body, /No engagements yet\./);
+      assert.match(emptyPage.body, /No current tasks\./);
+      assert.match(emptyPage.body, /No open follow-ups\./);
+      assert.match(emptyPage.body, /No open commitments\./);
+      assert.match(emptyPage.body, /No open waiting items\./);
+      assert.match(emptyPage.body, /No meetings recorded yet\./);
+      assert.ok(!emptyPage.body.includes("/engagements//"));
+    } finally {
+      await server.close();
     }
   });
 });
