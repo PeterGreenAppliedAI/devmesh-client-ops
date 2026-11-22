@@ -231,6 +231,8 @@ describe("meeting pages: creation", () => {
         form: Object.fromEntries(form.controls),
       });
       assert.match(redirectTarget(created), /^\/meetings\/meeting-\d+$/);
+      // The submitted client parent matches the URL's client, so it is accepted
+      // and the stored record keeps the parent the form named.
 
       const stored = server.store.snapshot().meetings[0];
       assert.equal(stored.title, "Plan <review>");
@@ -290,6 +292,9 @@ describe("meeting pages: creation", () => {
       const h = await hierarchy(server.store);
       const before = JSON.stringify(server.store.snapshot());
 
+      const renderedCreate = parseForm(
+        (await send(server.origin, { path: `/engagements/${h.engagement.id}/meetings/new` })).body,
+      );
       for (const [title, date] of [
         ["", "2026-02-28"],
         ["   ", "2026-02-28"],
@@ -298,10 +303,15 @@ describe("meeting pages: creation", () => {
         ["Meeting", "2026-13-01"],
         ["Meeting", "not a date"],
       ] as const) {
+        const controls = new Map(renderedCreate.controls);
+        controls.set("title", title);
+        controls.set("date", date);
+        controls.set("notes", "keep notes");
+        controls.set("projectId", h.project.id);
         const reply = await send(server.origin, {
           method: "POST",
           path: `/engagements/${h.engagement.id}/meetings/new`,
-          form: { engagementId: h.engagement.id, title, date, notes: "keep notes", projectId: h.project.id },
+          form: Object.fromEntries(controls),
         });
         assert.equal(reply.status, 400, `${title} ${date}`);
         assert.match(String(reply.headers["content-type"]), /^text\/html/);
@@ -317,10 +327,15 @@ describe("meeting pages: creation", () => {
       assert.equal(JSON.stringify(server.store.snapshot()), before);
 
       // Correcting the values and resubmitting the rendered form redirects.
+      const invalidControls = new Map(renderedCreate.controls);
+      invalidControls.set("title", "");
+      invalidControls.set("date", "2026-02-30");
+      invalidControls.set("notes", "<keep>");
+      invalidControls.set("projectId", h.project.id);
       const invalid = await send(server.origin, {
         method: "POST",
         path: `/engagements/${h.engagement.id}/meetings/new`,
-        form: { engagementId: h.engagement.id, title: "", date: "2026-02-30", notes: "<keep>", projectId: h.project.id },
+        form: Object.fromEntries(invalidControls),
       });
       const form = parseForm(invalid.body);
       assert.match(invalid.body, /<textarea[^>]*>.*&lt;keep&gt;.*<\/textarea>/);
@@ -347,16 +362,18 @@ describe("meeting pages: creation", () => {
       const h = await hierarchy(server.store);
       const before = JSON.stringify(server.store.snapshot());
 
+      const renderedForm = parseForm(
+        (await send(server.origin, { path: `/engagements/${h.engagement.id}/meetings/new` })).body,
+      );
+      const tamperedControls = new Map(renderedForm.controls);
+      tamperedControls.set("title", "Tampered");
+      tamperedControls.set("date", "2026-05-05");
+      tamperedControls.set("notes", "keep me");
+      tamperedControls.set("projectId", h.siblingProject.id);
       const tamperedCreate = await send(server.origin, {
         method: "POST",
         path: `/engagements/${h.engagement.id}/meetings/new`,
-        form: {
-          engagementId: h.engagement.id,
-          title: "Tampered",
-          date: "2026-05-05",
-          notes: "keep me",
-          projectId: h.siblingProject.id,
-        },
+        form: Object.fromEntries(tamperedControls),
       });
       assert.equal(tamperedCreate.status, 400);
       assert.match(tamperedCreate.body, /role="alert"/);
@@ -960,6 +977,11 @@ describe("meeting pages: client overview", () => {
       assert.equal(emptyPage.status, 200);
       assert.match(emptyPage.body, /No engagements yet\./);
       assert.match(emptyPage.body, /No current tasks\./);
+      assert.match(emptyPage.body, /No decisions recorded yet\./);
+      // A client with no engagement is told to choose or create one before it
+      // can add work, and the engagement's own page is the only next step.
+      assert.match(emptyPage.body, /choose an engagement/i);
+      assert.ok(!emptyPage.body.includes("/engagements//"));
       assert.match(emptyPage.body, /No open follow-ups\./);
       assert.match(emptyPage.body, /No open commitments\./);
       assert.match(emptyPage.body, /No open waiting items\./);

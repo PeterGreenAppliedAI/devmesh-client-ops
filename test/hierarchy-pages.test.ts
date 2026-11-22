@@ -199,6 +199,28 @@ function parseForm(document: string): ParsedForm {
   return { action: unescapeHtml(action[1]), controls };
 }
 
+/**
+ * The control a field's error is associated with: the input, textarea or select
+ * that carries `aria-invalid="true"` and an `aria-describedby` that names a
+ * message element with the same text as the field error.
+ */
+function invalidControl(
+  body: string,
+  field: string,
+): { readonly control: string; readonly describedBy: string } | null {
+  const match = new RegExp(
+    `<(?<tag>input|textarea|select)[^>]*\\sid="field-${field}"[^>]*\\saria-invalid="true"[^>]*\\saria-describedby="(?<described>[^"]+)"`,
+  ).exec(body);
+  if (match === null || match.groups === undefined) return null;
+  return { control: match[0], describedBy: match.groups.described };
+}
+
+/** The message paragraph with the given id, when the page has one. */
+function messageWithId(body: string, id: string): string | null {
+  const match = new RegExp(`<p id="${id}">([\\s\\S]*?)</p>`).exec(body);
+  return match === null ? null : match[1];
+}
+
 /** Reverse `escapeHtml` for a parsed attribute or text value. */
 function unescapeHtml(value: string): string {
   return value
@@ -1070,6 +1092,143 @@ describe("hierarchy pages", () => {
         assert.equal(redirectTarget(corrected), item.path.replace(/\/edit$/, ""), item.path);
         item.check(server.store.snapshot());
       }
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("associates each reported visible-field error with its control and keeps identity errors in the summary", async () => {
+    const server = await running();
+    try {
+      const profile = {
+        name: "Acme",
+        background: "background",
+        contacts: "contact",
+        stakeholders: "stakeholder",
+        requirements: "requirement",
+        objectives: "objectives",
+      };
+      const client = await server.store.createClient(profile);
+      const engagement = await server.store.createEngagement({
+        clientId: client.id,
+        name: "Discovery",
+        status: "active",
+      });
+      const project = await server.store.createProject({
+        engagementId: engagement.id,
+        name: "Prototype",
+        status: "planned",
+      });
+
+      // Inline errors: a blank name, a rejected enum and an explicit empty enum
+      // each mark the visible control invalid and describe it with its message.
+      const inline = [
+        {
+          path: `/clients/${client.id}/edit`,
+          fields: { name: "   " },
+          expected: { field: "name" },
+          message: /client.name must be nonblank/,
+        },
+        {
+          path: `/engagements/${engagement.id}/edit`,
+          fields: { status: "nope" },
+          expected: { field: "status" },
+          message: /engagement.status must be one of planned, active, on_hold, completed/,
+        },
+        {
+          path: `/projects/${project.id}/edit`,
+          fields: { status: "" },
+          expected: { field: "status" },
+          message: /project.status must be one of planned, active, on_hold, completed/,
+        },
+      ] as const;
+      for (const item of inline) {
+        const before = JSON.stringify(server.store.snapshot());
+        const reply = await send(server.origin, {
+          method: "POST",
+          path: item.path,
+          form: { id: item.path.split("/")[2], ...item.fields },
+        });
+        assert.equal(reply.status, 400, item.path);
+        // The summary alert names the problem, and the control is associated
+        // with a message of its own that carries the same text.
+        assert.match(reply.body, /<div role="alert"><p>[^<]*<\/p><ul>/);
+        const associated = invalidControl(reply.body, item.expected.field);
+        assert.ok(associated !== null, `${item.path} marks ${item.expected.field} invalid`);
+        const message = messageWithId(reply.body, associated.describedBy);
+        assert.ok(message !== null, `${item.path} gives ${item.expected.field} a message`);
+        assert.match(message, item.message, item.path);
+        assert.ok(reply.body.includes(`<li>${message}<\/li>`), `${item.path} keeps it in the summary`);
+        // The submitted value is kept for correction.
+        const { controls } = parseForm(reply.body);
+        for (const [field, value] of Object.entries(item.fields)) {
+          assert.equal(controls.get(field), value, `${item.path} keeps ${field}`);
+        }
+        assert.equal(JSON.stringify(server.store.snapshot()), before, item.path);
+      }
+
+      // The submitted value the form actually holds is also reported by the
+      // form error's field errors for the visible control only.
+      const emptyStatus = await send(server.origin, {
+        method: "POST",
+        path: `/engagements/${engagement.id}/edit`,
+        form: { status: "nope" },
+      });
+      assert.equal(emptyStatus.status, 400);
+      assert.match(emptyStatus.body, /<option value="nope" selected>nope \(not a valid choice\)<\/option>/);
+      // A control that is not reported is not marked invalid.
+      assert.match(emptyStatus.body, /<input type="text" id="field-name" name="name" value="Discovery" required>/);
+
+      // Hidden identity errors stay in the summary: a conflicting submitted id
+      // has no control of its own, so no visible control is marked invalid.
+      const conflict = await send(server.origin, {
+        method: "POST",
+        path: `/clients/${client.id}/edit`,
+        form: { id: "client-99", name: "Corrected" },
+      });
+      assert.equal(conflict.status, 400);
+      assert.match(conflict.body, /The submitted client id does not match this URL/);
+      assert.match(conflict.body, /<div role="alert"><p>The submitted client id does not match this URL<\/p>/);
+      assert.equal(invalidControl(conflict.body, "id"), null);
+      assert.equal((conflict.body.match(/aria-invalid="true"/g) ?? []).length, 0);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("shows status as a text badge on detail pages, escaped from stored text", async () => {
+    const server = await running();
+    try {
+      const client = await server.store.createClient({ name: "Acme" });
+      const engagement = await server.store.createEngagement({
+        clientId: client.id,
+        name: "Discovery",
+        status: "active",
+      });
+      const project = await server.store.createProject({
+        engagementId: engagement.id,
+        name: "Prototype",
+        status: "completed",
+      });
+      for (const [path, status] of [
+        [`/engagements/${engagement.id}`, "active"],
+        [`/projects/${project.id}`, "completed"],
+      ] as const) {
+        const page = await send(server.origin, { path });
+        assert.equal(page.status, 200, path);
+        // The status is its own labelled value, shown as escaped text in a badge.
+        assert.match(page.body, new RegExp(`<dt>Status<\\/dt><dd><span class="badge">${status}<\\/span><\\/dd>`), path);
+      }
+      // A client page groups its sections and asks the user to choose an
+      // engagement before adding work.
+      const overview = await send(server.origin, { path: `/clients/${client.id}` });
+      assert.equal(overview.status, 200);
+      assert.match(overview.body, /<section><h2>Adding work<\/h2><p>Tasks, work items and meetings are created under an engagement/);
+      assert.match(overview.body, new RegExp(`href="/engagements/${engagement.id}"`));
+      // The client's one primary action is creating an engagement; the empty
+      // project list names what is missing rather than guessing a project.
+      assert.match(overview.body, /<section><h2>Engagements<\/h2><p class="primary-action"><a href="[^"]+">New engagement<\/a>/);
+      assert.match(overview.body, /<section><h2>Projects<\/h2><p>No projects yet\.<\/p>/);
     } finally {
       await server.close();
     }

@@ -18,6 +18,7 @@ import {
   redirect,
   renderForm,
   renderPage,
+  type FieldError,
   type FieldSpec,
   type Page,
   type Redirect,
@@ -34,9 +35,12 @@ import type {
   Store,
 } from "./store.ts";
 import {
+  displayList,
+  displayValues,
+  emptyState,
   link,
   pageWith,
-  profileFields,
+  primaryAction,
   showValue,
   type PageSection,
 } from "./work-pages.ts";
@@ -180,22 +184,24 @@ export function projectMeetings(
   return [...store.listMeetings({ clientId, engagementId, projectId })].sort(byDateThenId);
 }
 
-/** Render a list of meetings with detail and edit links, or an empty state. */
+/** Render a list of meetings as cards with detail and edit links, or an empty state. */
 export function meetingList(meetings: readonly Meeting[]): string {
   if (meetings.length === 0) return "<p>No meetings recorded yet.</p>";
-  return `<ul>${meetings
+  return `<ul class="card-list">${meetings
     .map((meeting) => {
       const href = `/meetings/${encodeURIComponent(meeting.id)}`;
-      return `<li>${link(href, `${meeting.date} — ${meeting.title}`)} ${link(`${href}/edit`, "Edit")}</li>`;
+      return `<li class="card">${link(href, `${meeting.date} — ${meeting.title}`)} ${link(`${href}/edit`, "Edit")}</li>`;
     })
     .join("")}</ul>`;
 }
 
 /**
- * A meeting history section with a creation link for the given scope. An empty
- * `newHref` means the section has no single creation scope (a client-wide
- * history): creation happens under a chosen engagement or project, from those
- * pages, so no link is offered rather than one that guesses a parent.
+ * A meeting history section with the primary creation action for the given
+ * scope. An empty `newHref` means the section has no single creation scope (a
+ * client-wide history): creation happens under a chosen engagement or project,
+ * from those pages, so no link is offered rather than one that guesses a
+ * parent. An empty history names the missing meetings and, where the scope has
+ * a creation link, offers it as the valid next step.
  */
 export function meetingSection(
   title: string,
@@ -203,8 +209,17 @@ export function meetingSection(
   meetings: readonly Meeting[],
 ): PageSection {
   const body: string[] = [];
-  if (newHref !== "") body.push(`<p>${link(newHref, "New meeting")}</p>`);
-  body.push(meetingList(meetings));
+  if (newHref !== "") body.push(primaryAction(newHref, "New meeting"));
+  if (meetings.length === 0) {
+    body.push(
+      emptyState(
+        "No meetings recorded yet.",
+        newHref === "" ? undefined : { href: newHref, label: "New meeting" },
+      ),
+    );
+  } else {
+    body.push(meetingList(meetings));
+  }
   return { title, body: body.join("\n") };
 }
 
@@ -234,10 +249,21 @@ function projectOptions(
   ];
 }
 
-/** The controls of a meeting form: the base fields, the project select, the id. */
-function meetingFields(projects: readonly Project[], id = ""): readonly FieldSpec[] {
+/**
+ * The controls of a meeting form: the record id, parent engagement and parent
+ * client (all hidden and server-chosen, so a corrected resubmission names the
+ * same record and parents) and the base fields with the project select.
+ */
+function meetingFields(
+  projects: readonly Project[],
+  id = "",
+  engagementId = "",
+  clientId = "",
+): readonly FieldSpec[] {
   return [
     { name: "id", label: "Id", hidden: true, value: id },
+    { name: "engagementId", label: "Engagement", hidden: true, value: engagementId },
+    { name: "clientId", label: "Client", hidden: true, value: clientId },
     ...MEETING_FIELDS,
     { name: "projectId", label: "Project", type: "select", options: projectOptions(projects) },
   ];
@@ -295,11 +321,45 @@ function meetingEdit(values: Readonly<Record<string, string>>, create: boolean):
 }
 
 /**
- * Build a correctable form error from a store refusal. The submitted values are
- * kept exactly as posted; every control the submission omitted is filled from
- * the stored record, so a corrected form carries the current record rather than
+ * The visible controls a refusal message names, so the message can be
+ * associated with each control it is about. A message such as
+ * `meeting.date must be a YYYY-MM-DD date` names a visible control; one that
+ * names no visible control (an identity or parent link, or a record the form
+ * cannot name) stays in the summary alone.
+ */
+function reportedFieldErrors(
+  message: string,
+  values: Readonly<Record<string, string>>,
+  fields: readonly FieldSpec[],
+): readonly FieldError[] {
+  const visible = new Map<string, FieldSpec>();
+  for (const field of fields) {
+    if (field.hidden !== true) visible.set(field.name, field);
+  }
+  const errors: FieldError[] = [];
+  for (const match of message.matchAll(/\b([A-Za-z_][\w.\[\]]*)\b/g)) {
+    const parts = match[1].replace(/\[[0-9]+\]/g, "").split(".");
+    const candidates = parts.length > 1 ? parts.slice(1) : parts;
+    if (!candidates.every((part) => visible.has(part))) continue;
+    for (const name of candidates) {
+      if (errors.some((error) => error.field === name)) continue;
+      const field = visible.get(name);
+      if (field === undefined) continue;
+      const value = values[name] ?? field.value;
+      errors.push(value === undefined ? { field: name, message } : { field: name, message, value });
+    }
+  }
+  return errors;
+}
+
+/**
+ * Build a correctable form error from a refusal. The submitted values are kept
+ * exactly as posted; every control the submission omitted is filled from the
+ * stored record, so a corrected form carries the current record rather than
  * blank controls and an edit never blanks what it did not touch. A hidden
- * control keeps its server-chosen value.
+ * control keeps its server-chosen value. The refusal's message names the form's
+ * problems in the summary and, for every visible control it names, associates
+ * the message with that control.
  */
 function formFailure(
   error: unknown,
@@ -322,7 +382,8 @@ function formFailure(
       filled[field.name] = base[field.name];
     }
   }
-  return new FormError(error.message, filled, [], fields, action);
+  const errors = reportedFieldErrors(error.message, filled, fields);
+  return new FormError(error.message, filled, errors, fields, action);
 }
 
 /** A record id from a path that names no record: a missing record. */
@@ -508,7 +569,12 @@ export function meetingRoutes(store: Store): MeetingRoutes {
     projectId: string,
   ): CreateScope {
     if (projectId === "") return scope;
-    const project = findRecord(snap.projects, projectId, "project");
+    const project = snap.projects.find((candidate) => candidate.id === projectId);
+    if (project === undefined) {
+      // The submitted project is the form's own visible choice, so the refusal
+      // is associated with that control; the summary carries the same message.
+      throw new ValidationError(`projectId ${JSON.stringify(projectId)} is not a project of this engagement`);
+    }
     return { ...scope, project };
   }
 
@@ -534,10 +600,12 @@ export function meetingRoutes(store: Store): MeetingRoutes {
    * endpoint with the engagement id as its hidden parent.
    */
   function createForm(title: string, snap: Snapshot, scope: CreateScope): Page {
-    const fields: readonly FieldSpec[] = [
-      { name: "engagementId", label: "Engagement", hidden: true, value: scope.engagement.id },
-      ...meetingFields(projectChoices(snap, scope.engagement.id)).filter((field) => field.name !== "id"),
-    ];
+    const fields = meetingFields(
+      projectChoices(snap, scope.engagement.id),
+      "",
+      scope.engagement.id,
+      scope.client.id,
+    ).filter((field) => field.name !== "id");
     const values = createMeetingValues();
     if (scope.project !== undefined) values.projectId = scope.project.id;
     const cancelHref = scope.project !== undefined
@@ -552,19 +620,20 @@ export function meetingRoutes(store: Store): MeetingRoutes {
     // a submitted parent that differs from it is refused.
     const { scope, parent, conflict } = postedParent(snap, request.path, request.form);
     const action = createAction(scope);
-    const fields: readonly FieldSpec[] = [
-      { name: parent.name, label: parent.name, hidden: true, value: parent.id },
-      ...meetingFields(projectChoices(snap, scope.engagement.id)).filter((field) => field.name !== "id"),
-    ];
-    // The parent conflict is settled before any selector resolves the
-    // submitted project, so a tampered request is refused without reading it.
-    if (conflict !== null) {
-      const failure = formFailure(conflict, suppliedValues(request.form, fields), fields, action);
-      if (failure !== null) throw failure;
-      throw conflict;
-    }
+    // The creation fields already carry the hidden engagement and client
+    // parents, so a refusal keeps every submitted visible value and the form
+    // has exactly one control per name.
+    const fields = meetingFields(
+      projectChoices(snap, scope.engagement.id),
+      "",
+      parent.id,
+      scope.client.id,
+    ).filter((field) => field.name !== "id");
     const values = suppliedValues(request.form, fields);
     try {
+      // The parent conflict is settled before any selector resolves the
+      // submitted project, so a tampered request is refused without reading it.
+      if (conflict !== null) throw conflict;
       // The optional selected project is resolved inside the boundary: an
       // unknown project is a correctable error, a blank one records an
       // engagement-only meeting.
@@ -604,8 +673,21 @@ export function meetingRoutes(store: Store): MeetingRoutes {
     const id = decodeId(idFromPath(request.path), "meeting");
     const record = findRecord(snap.meetings, id, "meeting");
     const engagement = findRecord(snap.engagements, record.engagementId, "engagement");
-    const fields = meetingFields(projectChoices(snap, engagement.id), id);
+    const client = findRecord(snap.clients, engagement.clientId, "client");
+    const fields = meetingFields(projectChoices(snap, engagement.id), id, engagement.id, client.id);
+    // An existing identity conflict takes precedence: a submitted id that
+    // differs from the URL record is refused before any parent is compared.
     const submitted = request.form["id"];
+    let conflict: ValidationError | null =
+      submitted !== undefined && submitted !== "" && submitted !== record.id
+        ? new ValidationError("The submitted meeting id does not match this URL")
+        : null;
+    if (conflict === null) {
+      // The record's own parents are immutable: a supplied parent that differs
+      // from them (a blank one included) is refused, even though the other
+      // fields are valid.
+      conflict = submittedParentConflict(request.form, { client, engagement });
+    }
     return {
       snap,
       record,
@@ -613,13 +695,7 @@ export function meetingRoutes(store: Store): MeetingRoutes {
       fields,
       action: `/meetings/${encodeURIComponent(record.id)}/edit`,
       id: record.id,
-      conflict:
-        submitted !== undefined && submitted !== "" && submitted !== record.id
-          ? new ValidationError("The submitted meeting id does not match this URL")
-          : submittedParentConflict(request.form, {
-              client: findRecord(snap.clients, engagement.clientId, "client"),
-              engagement,
-            }),
+      conflict,
     };
   }
 
@@ -686,8 +762,11 @@ export function meetingRoutes(store: Store): MeetingRoutes {
       [
         {
           title: "Meeting",
+          body: displayList(displayValues(MEETING_PROFILE_FIELDS, profile)),
+        },
+        {
+          title: "Identity and parents",
           body: [
-            profileFields(MEETING_PROFILE_FIELDS, profile),
             `<p>Client: ${link(`/clients/${encodeURIComponent(client.id)}`, client.name)}</p>`,
             `<p>Engagement: ${link(`/engagements/${encodeURIComponent(engagement.id)}`, engagement.name)}</p>`,
             `<p>Project: ${project === undefined ? showValue("") : link(`/projects/${encodeURIComponent(project.id)}`, project.name)}</p>`,

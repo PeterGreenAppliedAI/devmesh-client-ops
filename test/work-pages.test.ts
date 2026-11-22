@@ -317,6 +317,10 @@ describe("work pages: tasks", () => {
       const form = parseForm(editPage.body);
       assert.equal(form.action, `/tasks/${task.id}/edit`);
       assert.equal(form.controls.get("id"), task.id);
+      // The record id and immutable parents travel as hidden controls, so the
+      // edit names the same record and the same parent engagement and client.
+      assert.equal(form.controls.get("engagementId"), h.engagement.id);
+      assert.equal(form.controls.get("clientId"), h.client.id);
       // The form starts from the stored record, including its project.
       assert.equal(form.controls.get("title"), "Original");
       assert.equal(form.controls.get("status"), "open");
@@ -446,7 +450,8 @@ describe("work pages: tasks", () => {
       assert.equal(editCorrection.controls.get("title"), "Hijacked");
       assert.equal(JSON.stringify(server.store.snapshot()), beforeEdit);
 
-      // A tampered parent id in a form is ignored: the path's engagement wins.
+      // A supplied parent that differs from the URL parent is refused on a
+      // create, and nothing is written.
       const parentTamper = await send(server.origin, {
         method: "POST",
         path: `/engagements/${h.engagement.id}/tasks/new`,
@@ -456,17 +461,23 @@ describe("work pages: tasks", () => {
           title: "Parent tamper",
           status: "open",
           priority: "normal",
-          owner: "",
+          owner: "keep parent owner",
           dueDate: "",
           context: "",
           projectId: "",
         },
       });
-      const parentId = idOf(parentTamper);
-      const parentStored = server.store.snapshot().tasks.find((candidate) => candidate.id === parentId);
-      assert.ok(parentStored !== undefined);
-      assert.equal(parentStored.engagementId, h.engagement.id);
-      assert.equal(parentStored.clientId, h.client.id);
+      assert.equal(parentTamper.status, 400);
+      assert.match(String(parentTamper.headers["content-type"]), /^text\/html/);
+      assert.match(parentTamper.body, /not the parent engagement of this form/);
+      // The submitted values are kept on the correction form, which still posts
+      // to the URL parent's endpoint with the URL parent in its hidden control.
+      const parentCorrection = parseForm(parentTamper.body);
+      assert.equal(parentCorrection.action, `/engagements/${h.engagement.id}/tasks/new`);
+      assert.equal(parentCorrection.controls.get("engagementId"), h.engagement.id);
+      assert.equal(parentCorrection.controls.get("title"), "Parent tamper");
+      assert.equal(parentCorrection.controls.get("owner"), "keep parent owner");
+      assert.equal(JSON.stringify(server.store.snapshot()), beforeEdit);
     } finally {
       await server.close();
     }
@@ -1007,7 +1018,9 @@ describe("work pages: project-scoped creation", () => {
       const h = await hierarchy(server.store);
 
       // A POST to project A's URL cannot create work under engagement B by
-      // submitting B's ids: the URL project is the parent and B is ignored.
+      // submitting B's ids: the URL project's engagement is the parent and B is
+      // refused before any write.
+      const beforeParent = JSON.stringify(server.store.snapshot());
       const crossParent = await send(server.origin, {
         method: "POST",
         path: `/projects/${h.project.id}/tasks/new`,
@@ -1022,12 +1035,25 @@ describe("work pages: project-scoped creation", () => {
           projectId: h.project.id,
         },
       });
-      const createdId = idOf(crossParent);
-      const created = server.store.snapshot().tasks.find((task) => task.id === createdId);
-      assert.ok(created !== undefined);
-      assert.equal(created.engagementId, h.engagement.id);
-      assert.equal(created.clientId, h.client.id);
-      assert.equal(created.projectId, h.project.id);
+      assert.equal(crossParent.status, 400);
+      assert.match(crossParent.body, /not the parent engagement of this form/);
+      assert.equal(JSON.stringify(server.store.snapshot()), beforeParent);
+      const crossParentCorrection = parseForm(crossParent.body);
+      assert.equal(crossParentCorrection.action, `/engagements/${h.engagement.id}/tasks/new`);
+      assert.equal(crossParentCorrection.controls.get("engagementId"), h.engagement.id);
+      assert.equal(crossParentCorrection.controls.get("title"), "Wrong parent");
+      assert.equal(crossParentCorrection.controls.get("projectId"), h.project.id);
+      // The corrected resubmission saves under the URL project's engagement.
+      const created = idOf(await send(server.origin, {
+        method: "POST",
+        path: crossParentCorrection.action,
+        form: Object.fromEntries(crossParentCorrection.controls),
+      }));
+      const createdTask = server.store.snapshot().tasks.find((task) => task.id === created);
+      assert.ok(createdTask !== undefined);
+      assert.equal(createdTask.engagementId, h.engagement.id);
+      assert.equal(createdTask.clientId, h.client.id);
+      assert.equal(createdTask.projectId, h.project.id);
 
       // A selected project from a different engagement is refused.
       const beforeCross = JSON.stringify(server.store.snapshot());
@@ -1035,7 +1061,7 @@ describe("work pages: project-scoped creation", () => {
         method: "POST",
         path: `/projects/${h.project.id}/tasks/new`,
         form: {
-          engagementId: h.sibling.id,
+          engagementId: h.engagement.id,
           title: "Cross project",
           status: "open",
           priority: "normal",
@@ -1049,13 +1075,19 @@ describe("work pages: project-scoped creation", () => {
       assert.match(crossProject.body, /does not belong to engagementId/);
       assert.equal(JSON.stringify(server.store.snapshot()), beforeCross);
       // The correction form posts to the URL project's engagement and keeps the
-      // submitted values, showing the rejected project selected.
+      // submitted values, showing the rejected project selected, and marks the
+      // project control invalid with its own message.
       const correction = parseForm(crossProject.body);
       assert.equal(correction.action, `/engagements/${h.engagement.id}/tasks/new`);
       assert.equal(correction.controls.get("engagementId"), h.engagement.id);
       assert.equal(correction.controls.get("title"), "Cross project");
       assert.equal(correction.controls.get("owner"), "keep");
       assert.match(crossProject.body, new RegExp(`<option value="${h.siblingProject.id}" selected>`));
+      assert.match(
+        crossProject.body,
+        /<select id="field-projectId" name="projectId" aria-invalid="true" aria-describedby="field-projectId-error">/,
+      );
+      assert.match(crossProject.body, /<p id="field-projectId-error">projectId [^<]*does not belong to engagementId/);
 
       // A nonexistent URL project is not found, and nothing is written.
       const beforeMissing = JSON.stringify(server.store.snapshot());

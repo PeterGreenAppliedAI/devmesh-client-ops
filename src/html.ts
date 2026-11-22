@@ -151,11 +151,39 @@ export function renderFormError(
   return renderPage(title, body, layout);
 }
 
+/**
+ * Presentation metadata for a stored field: whether it is an identity or
+ * parent link (shown from the record, never submitted for change) and, for a
+ * status, state or enum value, whether it is shown as a text badge.
+ *
+ * The metadata is deliberately optional. A field without it is an ordinary
+ * editable value; a field with `identity` is rendered as read-only text beside
+ * the record and never as a control.
+ */
+export interface FieldPresentation {
+  /** True for an id or a parent link: identity and parent fields. */
+  readonly identity?: boolean;
+  /** True for a value that is useful to show as a text badge. */
+  readonly badge?: boolean;
+}
+
+/**
+ * One typed value read from a stored record for display: its label, the
+ * stored text and whether it is shown as a badge. Rendering escapes the text.
+ */
+export interface DisplayValue {
+  readonly label: string;
+  readonly value: string;
+  readonly badge?: boolean;
+}
+
 /** Definition of one form control. */
 export interface FieldSpec {
   readonly name: string;
   readonly label: string;
   readonly type?: "text" | "textarea" | "select" | "date";
+  /** Presentation metadata; absent for an ordinary editable value. */
+  readonly presentation?: FieldPresentation;
   /** Options for a select control. */
   readonly options?: readonly { readonly value: string; readonly label: string }[];
   /** Value shown when the form is first displayed. */
@@ -170,10 +198,30 @@ export interface FieldSpec {
 }
 
 /**
+ * The problem summary of a form: one alert for the whole form. It names every
+ * reported field problem, including one attached to a visible control, and the
+ * identity or parent problems that have no control of their own. When the form
+ * has no field problems it carries the form's own message.
+ */
+export function renderFormSummary(summary: string, errors: readonly FieldError[] = []): string {
+  const parts: string[] = [summary];
+  for (const error of errors) parts.push(error.message);
+  return `<div role="alert"><p>${escapeHtml(summary)}</p>${
+    errors.length === 0
+      ? ""
+      : `<ul>${errors.map((error) => `<li>${escapeHtml(error.message)}</li>`).join("")}</ul>`
+  }</div>`;
+}
+
+/**
  * Render a form that posts to a fixed internal destination. The action is an
  * escaped route, the method is POST, and every control shows the submitted
- * value (or the initial value) escaped. Field errors appear next to their
- * control with `aria-invalid` set, so the user can correct them.
+ * value (or the initial value) escaped. One alert summarises the form's
+ * problems. A reported problem for a visible field also marks that control
+ * `aria-invalid="true"` and points it at its own message with
+ * `aria-describedby`, so the control and its correction are associated. The
+ * error for a name that has no visible control (an identity or parent link
+ * that is shown from the record, never submitted) stays in the summary alone.
  */
 export function renderForm(options: {
   readonly action: string;
@@ -187,7 +235,7 @@ export function renderForm(options: {
   const errors = options.errors ?? [];
   const parts: string[] = [];
   if (options.summary !== undefined) {
-    parts.push(`<p role="alert">${escapeHtml(options.summary)}</p>`);
+    parts.push(renderFormSummary(options.summary, errors));
   }
   parts.push(`<form method="post" action="${escapeHtml(options.action)}">`);
   for (const field of options.fields) {
@@ -204,9 +252,11 @@ export function renderForm(options: {
     }
     const error = errors.find((candidate) => candidate.field === field.name);
     const id = `field-${escapeHtml(field.name)}`;
+    const errorId = `${id}-error`;
     parts.push(`<div>`);
     parts.push(`<label for="${id}">${escapeHtml(field.label)}</label>`);
-    const invalid = error === undefined ? "" : ' aria-invalid="true"';
+    const invalid =
+      error === undefined ? "" : ` aria-invalid="true" aria-describedby="${errorId}"`;
     const required = field.required ? " required" : "";
     if (field.type === "textarea") {
       parts.push(
@@ -236,7 +286,7 @@ export function renderForm(options: {
       );
     }
     if (error !== undefined) {
-      parts.push(`<p role="alert">${escapeHtml(error.message)}</p>`);
+      parts.push(`<p id="${errorId}">${escapeHtml(error.message)}</p>`);
     }
     parts.push(`</div>`);
   }
