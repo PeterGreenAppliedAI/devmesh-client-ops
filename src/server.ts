@@ -298,6 +298,28 @@ export function canonicalOrigin(port: number): { origin: string; authority: stri
   return { origin: url.origin, authority: url.host.toLowerCase() };
 }
 
+/**
+ * The two accepted aliases for the loopback listener: the IPv4 literal a
+ * browser is given by the printed canonical URL, and the `localhost` name.
+ */
+const LOOPBACK_ALIASES = ["127.0.0.1", "localhost"] as const;
+
+/**
+ * The accepted authorities and origins, one per loopback alias, derived from
+ * the bound port alone through one URL serialization each (a default port is
+ * dropped by both origin and authority). No forwarded header or request suffix
+ * contributes to this list: it is the fixed loopback aliases at the bound port.
+ * A Host is accepted only when it equals one alias's authority, and a supplied
+ * Origin only when it equals that same alias's origin, so a mixed pair is
+ * refused.
+ */
+export function allowedOrigins(port: number): ReadonlyArray<{ origin: string; authority: string }> {
+  return LOOPBACK_ALIASES.map((host) => {
+    const url = new URL(`http://${host}:${port}`);
+    return { origin: url.origin, authority: url.host.toLowerCase() };
+  });
+}
+
 /** True when a header was supplied once; Node folds duplicates into a joined string. */
 function singleHeader(message: IncomingMessage, name: string): string | undefined {
   const value = message.headers[name];
@@ -411,14 +433,14 @@ function rejectionMessage(status: number): string {
 export async function startServer(options: ServerOptions): Promise<StartedServer> {
   const { routes } = options;
   let canonical = "";
-  let canonicalAuthority = "";
+  let allowed: ReadonlyArray<{ origin: string; authority: string }> = [];
 
-  // The canonical origin and authority are both derived from the listening
-  // port through `canonicalOrigin`, so the origin the shell compares an
-  // Origin header against and the authority it compares a Host header against
-  // are serialized the same way, including default-port normalization.
+  // The canonical origin printed to the user is derived from the listening
+  // port through `canonicalOrigin`. The accepted authorities and origins are
+  // derived from the same bound port through `allowedOrigins`, one entry per
+  // loopback alias, so each Origin is compared only with the Origin of the
+  // Host alias the request actually carried.
   const originFor = (port: number): string => canonicalOrigin(port).origin;
-  const authorityFor = (port: number): string => canonicalOrigin(port).authority;
 
   const server = createServer((req, res) => {
     void handle(req, res).catch(() => {
@@ -432,11 +454,18 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
     const host = singleHeader(req, "host");
     const origin = singleHeader(req, "origin");
     // Forwarded host/protocol headers are ignored outright: no proxy is trusted.
-    if (host === undefined || parseAuthority(host) !== canonicalAuthority) {
+    // The Host must be one of the accepted loopback authorities at the bound
+    // port; its matching Origin (if supplied) must be that same alias's HTTP
+    // origin, so a mixed localhost/127.0.0.1 pair is refused.
+    const authority = host === undefined ? null : parseAuthority(host);
+    const accepted = authority === null
+      ? undefined
+      : allowed.find((entry) => entry.authority === authority);
+    if (accepted === undefined) {
       send(res, 403, "Forbidden.\n", "text/plain; charset=utf-8");
       return;
     }
-    if (origin !== undefined && origin !== canonical) {
+    if (origin !== undefined && origin !== accepted.origin) {
       send(res, 403, "Forbidden.\n", "text/plain; charset=utf-8");
       return;
     }
@@ -518,7 +547,7 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
   }
   const boundPort = (address as AddressInfo).port;
   canonical = originFor(boundPort);
-  canonicalAuthority = authorityFor(boundPort);
+  allowed = allowedOrigins(boundPort);
 
   return {
     origin: canonical,
