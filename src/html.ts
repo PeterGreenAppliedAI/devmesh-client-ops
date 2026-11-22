@@ -335,35 +335,35 @@ function wordsOutsideQuotes(message: string): readonly string[] {
  * control (a hidden identity or parent link, or a record the form cannot
  * name) reports nothing and stays in the summary alone.
  *
- * `selectedValue` is the value a visible control was submitted with when a
- * form boundary already knows the refusal is about that choice (the project
- * select). It is used only when the message names no visible control of its
- * own and quotes exactly that submitted value in its own text, outside any
- * quoted value (`No project with id "project-99"`). Then the problem is
- * associated with that control, so an unknown value the user selected on the
- * form points at the choice that has to be corrected. It never overrides a
- * message that names a visible control, and a message about a hidden identity
- * or parent link (a submitted parent mismatch, an unassignable parent chain)
- * names a different value or a hidden link, so it stays in the summary alone.
+ * `selected` names the control a form boundary already knows the refusal is
+ * about, by its field identity (the project select), together with the value
+ * the submission gave it. It is used only when the message names no visible
+ * control of its own and its own text (outside every quoted value) quotes
+ * exactly that submitted value as a complete reference (`No project with id
+ * "project-99"`). The value is compared as the text the message carries, so
+ * the store's JSON-encoded form (`\"`, `\\`, `\n`, `\t`) matches a value
+ * that contains a quote, a backslash or a newline. Then the problem is
+ * associated with that control, whatever other control happens to hold the
+ * same text, so an unknown value the user selected points at the choice that
+ * has to be corrected. It never overrides a message that names a visible
+ * control, and a message about a hidden identity or parent link (a submitted
+ * parent mismatch, an unassignable parent chain) names a different value or a
+ * hidden link, so it stays in the summary alone.
  */
 export function fieldErrorsFor(
   message: string,
   values: Readonly<Record<string, string>>,
   fields: readonly FieldSpec[],
-  selectedValue?: string,
+  selected?: { readonly field: string; readonly value: string },
 ): readonly FieldError[] {
   const named = namedVisibleField(message, fields);
   if (named !== undefined) return [fieldErrorFor(named, message, values, fields)];
-  if (selectedValue === undefined || selectedValue === "") return [];
-  // The selected value belongs to the one visible control that was submitted
-  // with it; a message about the choice is associated with that control.
-  const field = fields.find(
-    (candidate) => candidate.hidden !== true && values[candidate.name] === selectedValue,
-  );
+  if (selected === undefined || selected.value === "") return [];
+  // A selected control that is not a visible control of this form (a hidden
+  // link, or a name the form does not carry) has no control to associate.
+  const field = fields.find((candidate) => candidate.name === selected.field && candidate.hidden !== true);
   if (field === undefined) return [];
-  if (!namesSubmittedChoice(message, field, selectedValue) && !quotesSubmittedValue(message, selectedValue)) {
-    return [];
-  }
+  if (!quotesSubmittedValue(message, selected.value)) return [];
   return [fieldErrorFor(field.name, message, values, fields)];
 }
 
@@ -380,39 +380,19 @@ function fieldErrorFor(
 }
 
 /**
- * True when a refusal message quotes the submitted value of the visible
- * control as its problem: the message's own text (outside every quoted value)
- * names that control, and the submitted value appears as one complete quoted
- * value (`projectId: "project-99" is not a project of this engagement`). A
- * message about a hidden identity or parent link (a submitted parent mismatch,
- * a parent chain) names a link rather than the control; such a message and a
- * message that quotes another value never mark the control invalid and stay in
- * the summary alone.
+ * True when a refusal message quotes the submitted value of the selected
+ * control as the value it cannot find or match, outside any field reference:
+ * the message's own text quotes exactly that value as one complete quoted
+ * value (`No project with id "project-99"`) and names no hidden parent link.
+ * The quoted text is decoded the way the message wrote it (the store writes
+ * it with `JSON.stringify`), so an invalid value holding a double quote, a
+ * backslash, a newline or a tab still matches its own serialized message.
+ * Then the value the user selected is the problem, so the presentation
+ * boundary associates the message with that control. A message about a hidden
+ * parent link (a parent chain that needs a submitted parent) names that link
+ * and stays in the summary alone.
  */
-function namesSubmittedChoice(message: string, field: FieldSpec, value: string | undefined): boolean {
-  if (value === undefined || value === "") return false;
-  if (quotedReference(message, value) === undefined) return false;
-  const hidden = new Set(["id", "clientId", "engagementId", "projectId"]);
-  hidden.delete(field.name);
-  const linked = wordsOutsideQuotes(message).some((word) => {
-    const name = hiddenName(word);
-    return name !== undefined && hidden.has(name);
-  });
-  return !linked;
-}
-
-/**
- * True when a refusal message quotes the submitted value of the visible control
- * as the value it cannot find or match, outside any field reference: the
- * message's own text quotes exactly that value as one complete quoted value
- * (`No project with id "project-99"`), and names no hidden parent link. Then the
- * value the user selected is the problem, so the presentation boundary
- * associates the message with that select. A message about a hidden parent link
- * (a parent chain that needs a submitted parent) names that link and stays in
- * the summary alone.
- */
-function quotesSubmittedValue(message: string, value: string | undefined): boolean {
-  if (value === undefined || value === "") return false;
+function quotesSubmittedValue(message: string, value: string): boolean {
   if (quotedReference(message, value) === undefined) return false;
   const parents = new Set(["clientId", "engagementId"]);
   const linked = wordsOutsideQuotes(message).some((word) => {
@@ -422,18 +402,15 @@ function quotesSubmittedValue(message: string, value: string | undefined): boole
   return !linked;
 }
 
-/** The text of the first quoted reference in a message that carries `value`,
- * as written; undefined when no quoted reference carries it. A quoted
- * reference is a complete quoted value that is delimited as a value in the
- * message: it opens at a quote character that begins a word and closes at the
- * matching quote before a word boundary, so the value appears as a whole
+/** The quoted reference in a message that carries `value`; undefined when no
+ * quoted reference carries it. A quoted reference is a complete quoted value
+ * that is delimited as a value in the message: it opens at a quote character
+ * that begins a word and closes at the matching quote (escaped quotes belong
+ * to the value) before a word boundary, so the value appears as a whole
  * (`"project-99"`, `"project-99" is not a project`) and never as a fragment
  * of a longer value (`"project-99x"`). A reference is not required to be the
  * whole quoted value, so a message that qualifies a value (`"project-99" (not
- * a project)`) still carries it. Quoted text is read the same way the message
- * text treats it as value text rather than field references, escaped quotes
- * included.
- */
+ * a project)`) still carries it. */
 function quotedReference(message: string, value: string): string | undefined {
   if (value === "") return undefined;
   const opens = /("|'|`)/g;
@@ -458,12 +435,60 @@ function quotedReference(message: string, value: string): string | undefined {
       }
       raw += char;
     }
-    if (closed && raw === value && (end + 1 === message.length || /\s/.test(message[end + 1]))) {
-      return raw;
-    }
+    if (!closed || (end + 1 !== message.length && !/\s/.test(message[end + 1]))) continue;
+    if (decodedQuotedText(raw, quote) === value) return raw;
   }
   return undefined;
 }
+
+/**
+ * The value a quoted reference carries, decoded the way the message's writer
+ * encoded it. A message that carries JSON (the store's `JSON.stringify`)
+ * quotes its values with a double quote and escapes `\"`, `\\`, `\/`,
+ * `\b`, `\f`, `\n`, `\r`, `\t` and `\uXXXX`; other escapes are left as
+ * written. A single-quoted or backtick-quoted reference carries its text as
+ * written, escaped quotes included.
+ */
+function decodedQuotedText(raw: string, quote: string): string {
+  if (quote !== "\"") return raw;
+  let decoded = "";
+  let index = 0;
+  while (index < raw.length) {
+    const char = raw[index];
+    if (char !== "\\") {
+      decoded += char;
+      index += 1;
+      continue;
+    }
+    const next = raw[index + 1];
+    const simple = JSON_ESCAPES[next];
+    if (simple !== undefined) {
+      decoded += simple;
+      index += 2;
+      continue;
+    }
+    if (next === "u" && /^[0-9a-fA-F]{4}$/.test(raw.slice(index + 2, index + 6))) {
+      decoded += String.fromCharCode(Number.parseInt(raw.slice(index + 2, index + 6), 16));
+      index += 6;
+      continue;
+    }
+    decoded += char + (next ?? "");
+    index += next === undefined ? 1 : 2;
+  }
+  return decoded;
+}
+
+/** The JSON escapes a double-quoted reference may carry, decoded. */
+const JSON_ESCAPES: Readonly<Record<string, string>> = Object.freeze({
+  '"': '"',
+  "\\": "\\",
+  "/": "/",
+  b: "\b",
+  f: "\f",
+  n: "\n",
+  r: "\r",
+  t: "\t",
+});
 
 /**
  * Render a form that posts to a fixed internal destination. The action is an

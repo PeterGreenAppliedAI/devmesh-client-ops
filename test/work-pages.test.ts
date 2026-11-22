@@ -1648,6 +1648,153 @@ describe("work pages: tasks", () => {
     }
   });
 
+  it("associates the project error with the project control even when a visible value collides", async () => {
+    const server = await running();
+    try {
+      const h = await hierarchy(server.store);
+      const task = await server.store.createTask({
+        clientId: h.client.id,
+        engagementId: h.engagement.id,
+        title: "Collision target",
+        owner: "owner",
+        context: "context",
+        projectId: h.project.id,
+      });
+      const item = await server.store.createItem({
+        clientId: h.client.id,
+        engagementId: h.engagement.id,
+        kind: "question",
+        title: "Item collision target",
+        context: "context",
+        state: "open",
+        projectId: h.project.id,
+      });
+      const before = JSON.stringify(server.store.snapshot());
+
+      // The title the submission sends is the same text as the rejected
+      // project. The title appears before the project select, so a lookup by
+      // equal submitted values would mark the title instead: the association
+      // must name the project control itself.
+      const collisionEdit = await send(server.origin, {
+        method: "POST",
+        path: `/tasks/${task.id}/edit`,
+        form: { id: task.id, title: "project-99", projectId: "project-99" },
+      });
+      assert.equal(collisionEdit.status, 400);
+      assert.match(collisionEdit.body, /role="alert"><p>No project with id &quot;project-99&quot;<\/p>/);
+      assert.equal((collisionEdit.body.match(/aria-invalid="true"/g) ?? []).length, 1);
+      const collisionMarked = invalidControls(collisionEdit.body);
+      assert.equal(collisionMarked.length, 1);
+      assert.equal(collisionMarked[0].field, "projectId");
+      assert.doesNotMatch(collisionEdit.body, /id="field-title"[^>]*aria-invalid/);
+      assert.match(
+        collisionEdit.body,
+        /<select[^>]*\sid="field-projectId"[^>]*\saria-invalid="true"[^>]*\saria-describedby="field-projectId-error"/,
+      );
+      assert.match(collisionEdit.body, /<input type="text" id="field-title" name="title" value="project-99" required>/);
+      const collisionForm = parseForm(collisionEdit.body);
+      assert.equal(collisionForm.controls.get("title"), "project-99");
+      assert.equal(collisionForm.controls.get("projectId"), "project-99");
+      assert.equal(JSON.stringify(server.store.snapshot()), before);
+
+      // The same collision on a create, where the submitted title is kept and
+      // the project control carries the association.
+      const collisionCreate = await send(server.origin, {
+        method: "POST",
+        path: `/engagements/${h.engagement.id}/tasks/new`,
+        form: {
+          engagementId: h.engagement.id,
+          title: "project-99",
+          status: "open",
+          priority: "normal",
+          owner: "",
+          dueDate: "",
+          context: "",
+          projectId: "project-99",
+        },
+      });
+      assert.equal(collisionCreate.status, 400);
+      const createdMarked = invalidControls(collisionCreate.body);
+      assert.equal(createdMarked.length, 1);
+      assert.equal(createdMarked[0].field, "projectId");
+      assert.equal(JSON.stringify(server.store.snapshot()), before);
+
+      // An item edit collides with a retained stored title instead of a
+      // submitted one: only the project control is associated.
+      const retained = await server.store.updateItem(item.id, { title: "project-99" });
+      const retainedBefore = JSON.stringify(server.store.snapshot());
+      const retainedEdit = await send(server.origin, {
+        method: "POST",
+        path: `/items/${item.id}/edit`,
+        form: { id: item.id, projectId: "project-99" },
+      });
+      assert.equal(retainedEdit.status, 400);
+      const retainedMarked = invalidControls(retainedEdit.body);
+      assert.equal(retainedMarked.length, 1);
+      assert.equal(retainedMarked[0].field, "projectId");
+      assert.equal((retainedEdit.body.match(/aria-invalid="true"/g) ?? []).length, 1);
+      assert.doesNotMatch(retainedEdit.body, /id="field-title"[^>]*aria-invalid/);
+      const retainedForm = parseForm(retainedEdit.body);
+      assert.equal(retainedForm.controls.get("title"), "project-99");
+      assert.equal(retainedForm.controls.get("projectId"), "project-99");
+      assert.equal(JSON.stringify(server.store.snapshot()), retainedBefore);
+      assert.equal(retained.id, item.id);
+      assert.equal(retained.title, "project-99");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("associates an escaped unknown project value with the project control", async () => {
+    const server = await running();
+    try {
+      const h = await hierarchy(server.store);
+      const task = await server.store.createTask({
+        clientId: h.client.id,
+        engagementId: h.engagement.id,
+        title: "Escaped target",
+        owner: "",
+        context: "",
+        projectId: h.project.id,
+      });
+      const before = JSON.stringify(server.store.snapshot());
+
+      // The store writes the missing project with JSON.stringify, so a value
+      // holding a quote, a backslash, a newline or a tab appears escaped in the
+      // message. Each still matches its own escaped message and is associated
+      // with the select, kept selected and escaped in the correction form.
+      for (const value of ['project-"99', 'back\\slash', "line\nbreak", "tab\tvalue"]) {
+        const reply = await send(server.origin, {
+          method: "POST",
+          path: `/tasks/${task.id}/edit`,
+          form: { id: task.id, projectId: value },
+        });
+        assert.equal(reply.status, 400, JSON.stringify(value));
+        assert.doesNotMatch(reply.body, /Not found/);
+        assert.match(reply.body, /role="alert"><p>No project with id /, JSON.stringify(value));
+        assert.equal((reply.body.match(/aria-invalid="true"/g) ?? []).length, 1, JSON.stringify(value));
+        const marked = invalidControls(reply.body);
+        assert.equal(marked.length, 1, JSON.stringify(value));
+        assert.equal(marked[0].field, "projectId", JSON.stringify(value));
+        assert.match(
+          reply.body,
+          /<select[^>]*\sid="field-projectId"[^>]*\saria-invalid="true"[^>]*\saria-describedby="field-projectId-error"/,
+          JSON.stringify(value),
+        );
+        const inline = /<p id="field-projectId-error">([^<]*)<\/p>/.exec(reply.body);
+        assert.ok(inline !== null, JSON.stringify(value));
+        assert.ok(reply.body.includes(`<li>${inline[1]}</li>`), JSON.stringify(value));
+        // The rejected value is kept for correction and escaped.
+        const form = parseForm(reply.body);
+        assert.equal(form.controls.get("projectId"), value, JSON.stringify(value));
+        assert.equal(form.controls.get("title"), "Escaped target", JSON.stringify(value));
+        assert.equal(JSON.stringify(server.store.snapshot()), before, JSON.stringify(value));
+      }
+    } finally {
+      await server.close();
+    }
+  });
+
   it("refuses a conflicting submitted task id on an edit URL", async () => {
     const server = await running();
     try {

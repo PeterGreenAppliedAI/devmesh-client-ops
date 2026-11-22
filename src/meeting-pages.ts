@@ -354,12 +354,15 @@ function formFailure(
       filled[field.name] = base[field.name];
     }
   }
-  // The meeting's own project choice, when the submission selected one, is a
-  // visible control: a refusal about that value (an unknown project, on a
-  // create or an edit) is associated with it, while a refusal about the
-  // meeting's identity or parent chain names a hidden link and stays in the
-  // summary alone.
-  const selected = values["projectId"];
+  // The meeting's own project choice, when the submission gave one, is the
+  // visible project control, named by its field identity: a refusal about that
+  // value (an unknown project, on a create or an edit) is associated with it,
+  // while a refusal about the meeting's identity or parent chain names a hidden
+  // link and stays in the summary alone.
+  const selectedProject = values["projectId"];
+  const selected = selectedProject === undefined || selectedProject === ""
+    ? undefined
+    : { field: "projectId", value: selectedProject };
   const errors = fieldErrorsFor(error.message, filled, fields, selected);
   return new FormError(error.message, filled, errors, fields, action);
 }

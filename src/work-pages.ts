@@ -771,16 +771,17 @@ function formFailure(
 }
 
 /**
- * The project value a refusal may be associated with on either work form
- * path: the project the submission selected on the form, when it selected one.
- * `fieldErrorsFor` then associates the refusal with the project select only if
- * the message quotes exactly that value and names no hidden link, so an
- * unknown project (on a create or an edit) points at the select while a
- * parent-chain or identity refusal stays in the summary alone.
+ * The project control a refusal may be associated with on either work form
+ * path: the project select by its field identity, with the value the
+ * submission gave it, when it gave one. `fieldErrorsFor` then associates the
+ * refusal with that select only if the message quotes exactly that value and
+ * names no hidden link, so an unknown project (on a create or an edit) points
+ * at the select while a parent-chain or identity refusal stays in the summary
+ * alone.
  */
-function associateSelected(selected: string | undefined): string | undefined {
+function associateSelected(selected: string | undefined): { field: string; value: string } | undefined {
   if (selected === undefined || selected === "") return undefined;
-  return selected;
+  return { field: "projectId", value: selected };
 }
 
 /** A record id from a path that names no record: a missing record. */

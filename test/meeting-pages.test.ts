@@ -1038,6 +1038,53 @@ describe("meeting pages: editing", () => {
       const afterUnknownFix = JSON.stringify(server.store.snapshot());
       assert.notEqual(afterUnknownFix, beforeEdit);
 
+      // The project error is associated with the project control itself, even
+      // when another visible value holds the same text: the title is sent as
+      // the rejected project, appears before the select, and stays unmarked.
+      const collisionEdit = await send(server.origin, {
+        method: "POST",
+        path: `/meetings/${meeting.id}/edit`,
+        form: { id: meeting.id, title: "project-99", projectId: "project-99" },
+      });
+      assert.equal(collisionEdit.status, 400);
+      assert.match(collisionEdit.body, /role="alert"><p>No project with id &quot;project-99&quot;<\/p>/);
+      assert.equal((collisionEdit.body.match(/aria-invalid="true"/g) ?? []).length, 1);
+      const collisionMarked = invalidControls(collisionEdit.body);
+      assert.equal(collisionMarked.length, 1);
+      assert.equal(collisionMarked[0].field, "projectId");
+      assert.doesNotMatch(collisionEdit.body, /id="field-title"[^>]*aria-invalid/);
+      const collisionForm = parseForm(collisionEdit.body);
+      assert.equal(collisionForm.controls.get("title"), "project-99");
+      assert.equal(collisionForm.controls.get("projectId"), "project-99");
+
+      // An invalid project holding characters the message has to escape (a
+      // quote, a backslash, a newline, a tab) still matches its own
+      // JSON-encoded refusal and points at the select, kept for correction.
+      for (const value of ['meet-"99', "back\\slash", "line\nbreak", "tab\tvalue"]) {
+        const escaped = await send(server.origin, {
+          method: "POST",
+          path: `/meetings/${meeting.id}/edit`,
+          form: { id: meeting.id, title: "Escaped meeting", projectId: value },
+        });
+        assert.equal(escaped.status, 400, JSON.stringify(value));
+        assert.doesNotMatch(escaped.body, /Not found/);
+        assert.equal((escaped.body.match(/aria-invalid="true"/g) ?? []).length, 1, JSON.stringify(value));
+        const escapedMarked = invalidControls(escaped.body);
+        assert.equal(escapedMarked.length, 1, JSON.stringify(value));
+        assert.equal(escapedMarked[0].field, "projectId", JSON.stringify(value));
+        assert.match(
+          escaped.body,
+          /<select[^>]*\sid="field-projectId"[^>]*\saria-invalid="true"[^>]*\saria-describedby="field-projectId-error"/,
+          JSON.stringify(value),
+        );
+        const escapedInline = /<p id="field-projectId-error">([^<]*)<\/p>/.exec(escaped.body);
+        assert.ok(escapedInline !== null, JSON.stringify(value));
+        assert.ok(escaped.body.includes(`<li>${escapedInline[1]}</li>`), JSON.stringify(value));
+        const escapedForm = parseForm(escaped.body);
+        assert.equal(escapedForm.controls.get("projectId"), value, JSON.stringify(value));
+        assert.equal(escapedForm.controls.get("title"), "Escaped meeting", JSON.stringify(value));
+      }
+
       // A project of another engagement on an edit reaches the store's own
       // refusal. It is a correctable 400 that keeps the submitted values, and
       // the parent-chain message is about the hidden engagement and client
