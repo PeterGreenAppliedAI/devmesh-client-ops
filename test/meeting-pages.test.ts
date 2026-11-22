@@ -422,17 +422,36 @@ describe("meeting pages: creation", () => {
         assert.equal(JSON.stringify(server.store.snapshot()), before, badDate);
       }
 
-      // A well formed but impossible date is kept on the date control, which
-      // a browser displays as written; its exact text is still submitted.
-      const impossible = await send(server.origin, {
+      // A well formed but impossible date is rendered as a text control too: a
+      // browser's date control sanitises a date outside the calendar (such as
+      // the day after a month's end) to empty, so it would not keep the value.
+      for (const impossibleDate of ["2026-02-30", "2026-13-01", "2023-02-29", "2026-04-31"]) {
+        const impossible = await send(server.origin, {
+          method: "POST",
+          path: `/engagements/${h.engagement.id}/meetings/new`,
+          form: { engagementId: h.engagement.id, title: "Dated", date: impossibleDate, notes: "", projectId: "" },
+        });
+        assert.equal(impossible.status, 400, impossibleDate);
+        assert.match(
+          impossible.body,
+          new RegExp(`<input type="text" id="field-date" name="date" value="${escapeHtml(impossibleDate)}" required[^>]*aria-invalid="true"`),
+          impossibleDate,
+        );
+        assert.equal(parseForm(impossible.body).controls.get("date"), impossibleDate, impossibleDate);
+        assert.match(impossible.body, /must be a real calendar date/, impossibleDate);
+        assert.equal(JSON.stringify(server.store.snapshot()), before, impossibleDate);
+      }
+
+      // A leap day of a leap year is a real date and keeps the date control,
+      // which shows it exactly as written.
+      const leapDay = await send(server.origin, {
         method: "POST",
         path: `/engagements/${h.engagement.id}/meetings/new`,
-        form: { engagementId: h.engagement.id, title: "Dated", date: "2026-02-30", notes: "", projectId: "" },
+        form: { engagementId: h.engagement.id, title: "", date: "2024-02-29", notes: "", projectId: "" },
       });
-      assert.equal(impossible.status, 400);
-      assert.match(impossible.body, /<input type="date" id="field-date" name="date" value="2026-02-30" required/);
-      assert.equal(parseForm(impossible.body).controls.get("date"), "2026-02-30");
-      assert.match(impossible.body, /must be a real calendar date/);
+      assert.equal(leapDay.status, 400);
+      assert.match(leapDay.body, /<input type="date" id="field-date" name="date" value="2024-02-29" required>/);
+      assert.equal(parseForm(leapDay.body).controls.get("date"), "2024-02-29");
 
       // A valid date is rendered as a date control again.
       const meeting = await server.store.createMeeting({
@@ -858,7 +877,10 @@ describe("meeting pages: editing", () => {
       assert.equal(correction.action, `/meetings/${meeting.id}/edit`);
       assert.equal(correction.controls.get("id"), meeting.id);
       assert.equal(correction.controls.get("title"), "");
+      // The rejected date keeps its exact submitted text in a text control, so
+      // a browser does not sanitise it to empty on redisplay.
       assert.equal(correction.controls.get("date"), "2026-02-30");
+      assert.match(invalid.body, /<input type="text" id="field-date" name="date" value="2026-02-30" required/);
       assert.equal(correction.controls.get("notes"), "keep <me>");
       assert.match(invalid.body, /<textarea[^>]*>keep &lt;me&gt;<\/textarea>/);
 

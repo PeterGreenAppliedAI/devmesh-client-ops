@@ -362,17 +362,34 @@ export function renderForm(options: {
 }
 
 /**
- * The input type a control is rendered with. A date control shows a value that
- * is not a well-formed `YYYY-MM-DD` date as plain text, so a browser that
- * sanitises an invalid date input to empty still shows exactly what was
- * submitted and a resubmission carries it back for correction. An empty or well
- * formed value keeps the date control; a well formed but impossible date such
- * as `2026-02-30` is still shown in a date control, where a browser displays it
- * unchanged.
+ * The input type a control is rendered with. A rejected date is shown as plain
+ * text, so a browser never sanitises it to empty: the exact submitted text stays
+ * visible and a resubmission carries it back for correction. An empty value
+ * keeps the date control, and so does a real calendar date, which a browser
+ * keeps exactly as written.
  */
 function inputType(field: FieldSpec, value: string): string {
   if (field.type !== "date") return field.type ?? "text";
-  return value === "" || /^\d{4}-\d{2}-\d{2}$/.test(value) ? "date" : "text";
+  // A date control is used only for an empty value or a date that a browser
+  // keeps exactly as written: a well-formed `YYYY-MM-DD` day that is also a
+  // real calendar date. Any other submitted text uses a text control, so a
+  // rejected value such as `2026-02-30`, `2026-13-01` or `not a date` stays
+  // visible in its exact form and resubmits unchanged.
+  return value === "" || isCalendarDate(value) ? "date" : "text";
+}
+
+/** True for a well-formed `YYYY-MM-DD` value naming a real calendar day. */
+function isCalendarDate(value: string): boolean {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (match === null) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (month < 1 || month > 12) return false;
+  const daysInMonth = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+  const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  const limit = month === 2 && leap ? 29 : daysInMonth;
+  return day >= 1 && day <= limit;
 }
 
 /** A fixed internal redirect: a status and a destination chosen by the server. */
