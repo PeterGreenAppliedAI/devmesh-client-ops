@@ -40,6 +40,7 @@ import {
   type TaskStatus,
   type WorkItem,
 } from "./model.ts";
+import { requireArchiveArguments, type ArchiveKind } from "./archive.ts";
 
 export type {
   Client,
@@ -63,10 +64,12 @@ export {
   ValidationError,
 } from "./model.ts";
 
-/** Version 3 carries the hierarchy plus the work collections. */
-const SCHEMA_VERSION = 3;
+/** Version 4 carries the hierarchy, the work collections and archival flags. */
+const SCHEMA_VERSION = 4;
 /** Version 1 stored only the client/engagement/project hierarchy. */
 const LEGACY_SCHEMA_VERSION = 1;
+/** Version 3 stored the hierarchy and work collections, without archival flags. */
+const WORK_SCHEMA_VERSION = 3;
 const STORE_FILE = "workspace.json";
 const LOCK_FILE = "workspace.lock";
 const WORK_KEYS = ["tasks", "items", "meetings"] as const;
@@ -294,6 +297,17 @@ type Kind = (typeof collections)[CollectionKey]["kind"];
 type CounterKey = (typeof collections)[CollectionKey]["key"];
 const LEGACY_COLLECTION_KEYS = ["clients", "engagements", "projects"] as const;
 const COLLECTION_KEYS = [...LEGACY_COLLECTION_KEYS, ...WORK_KEYS] as const;
+/**
+ * The persisted collection for each archivable kind. Meetings are absent: they
+ * inherit visibility and never carry a flag.
+ */
+const ARCHIVE_COLLECTION_KEYS = {
+  client: "clients",
+  engagement: "engagements",
+  project: "projects",
+  task: "tasks",
+  item: "items",
+} satisfies Record<ArchiveKind, CounterKey>;
 
 interface State {
   clients: Client[];
@@ -423,18 +437,27 @@ function parseState(text: string): State {
   }
   const record = raw as Record<string, unknown>;
   const version = record.schemaVersion;
-  if (version !== SCHEMA_VERSION && version !== LEGACY_SCHEMA_VERSION) {
+  if (
+    version !== SCHEMA_VERSION &&
+    version !== WORK_SCHEMA_VERSION &&
+    version !== LEGACY_SCHEMA_VERSION
+  ) {
     throw new PersistenceError(
       `Unsupported stored schema version: ${JSON.stringify(version)}`,
     );
   }
-  // A version 1 snapshot predates the work collections; it is accepted as a
-  // document with empty task, item and meeting collections. Each version keeps
-  // the strict key rules of its own generation: version 1 must contain exactly
-  // the hierarchy keys, so a document that mentions a work collection or a
-  // work counter while claiming the old version is refused rather than guessed
-  // at. Version 3 must contain exactly the hierarchy plus the work collections.
+  // Version 1 snapshots predate the work collections; they are accepted as
+  // documents with empty task, item and meeting collections. Versions 1 and 3
+  // predate archival flags: they are accepted as active records, and no flag is
+  // invented for them. Each version keeps the strict key rules of its own
+  // generation: version 1 must contain exactly the hierarchy keys, so a
+  // document that mentions a work collection or a work counter while claiming
+  // the old version is refused rather than guessed at. Versions 3 and 4 must
+  // contain exactly the hierarchy plus the work collections. Only version 4
+  // may carry an `archived` field, and only as a boolean; `true` means archived
+  // and `false` means active, read exactly as an absent flag.
   const legacy = version === LEGACY_SCHEMA_VERSION;
+  const flagsAllowed = version === SCHEMA_VERSION;
   const allowedKeys = legacy ? LEGACY_STATE_KEYS : STATE_KEYS;
   for (const key of Object.keys(record)) {
     if (!(allowedKeys as readonly string[]).includes(key)) {
@@ -462,9 +485,17 @@ function parseState(text: string): State {
     }
     const seen = new Set<string>();
     const parsedItems = values.map((value, index) => {
-      let parsed: { id: string };
+      let parsed: { id: string; archived?: boolean };
       try {
         parsed = collection.parse(value, `${key}[${index}]`);
+        // Only schema 4 may carry archival flags; older documents are read
+        // strictly, so a flag on a version 1 or 3 record is refused rather
+        // than silently dropped. Meetings never carry a flag.
+        if (!flagsAllowed && parsed.archived !== undefined) {
+          throw new ValidationError(
+            `Stored schema version ${version} cannot contain an archived flag`,
+          );
+        }
       } catch (cause) {
         throw new PersistenceError(
           `Stored ${collection.kind} at ${key}[${index}] is invalid`,
@@ -817,6 +848,12 @@ export interface Store {
   updateItem(id: string, edit: WorkItemEdit): Promise<WorkItem>;
   createMeeting(input: MeetingCreate): Promise<Meeting>;
   updateMeeting(id: string, edit: MeetingEdit): Promise<Meeting>;
+  /**
+   * Set the archival flag on a client, engagement, project, task or work item.
+   * `true` archives the record, `false` removes the flag. Descendants are never
+   * changed; restoring a parent preserves independently archived children.
+   */
+  setArchived(kind: ArchiveKind, id: string, archived: boolean): Promise<void>;
   /** Tasks of a client, optionally narrowed to one engagement or project. */
   listTasks(filter: WorkFilter): readonly Task[];
   /** Work items of a client, optionally narrowed to one engagement or project. */
@@ -1270,6 +1307,35 @@ class StoreImpl implements Store {
         const updated = parseMeeting({ ...base, ...parents, ...changes });
         draft.meetings = draft.meetings.map((m) => (m.id === id ? updated : m));
         return updated;
+      }),
+    );
+  }
+
+  setArchived(kind: ArchiveKind, id: string, archived: boolean): Promise<void> {
+    // Archival is an ordinary mutation: it enters the queue first, so a closed
+    // or blocked store refuses it exactly as it refuses every other mutation.
+    // The arguments are then validated inside the queued operation, and only
+    // after that is the record looked up; a bad argument is refused without
+    // writing anything.
+    return this.enqueue(() =>
+      this.commit((draft) => {
+        const args = requireArchiveArguments(kind, id, archived);
+        const key = ARCHIVE_COLLECTION_KEYS[args.kind];
+        const items = draft[key];
+        const current = findRecord(
+          items as readonly { id: string }[],
+          args.id,
+          args.kind,
+        );
+        // Rebuild the record so `true` adds the flag and `false` drops it;
+        // every other field, including links and counters, is untouched. The
+        // record is parsed again so a rebuilt record is still strictly valid.
+        const rebuilt: Record<string, unknown> = { ...current };
+        if (args.archived) rebuilt.archived = true;
+        else delete rebuilt.archived;
+        const updated = collections[key].parse(rebuilt, args.kind);
+        const index = items.findIndex((item) => item.id === args.id);
+        (items as unknown[])[index] = updated;
       }),
     );
   }
