@@ -825,6 +825,64 @@ describe("work pages: tasks", () => {
     }
   });
 
+  it("keeps parent and identity refusals in the summary even when they quote a field name", async () => {
+    const server = await running();
+    try {
+      const h = await hierarchy(server.store);
+      const taskBase = { title: "Quoted", status: "open", priority: "normal", owner: "", dueDate: "", context: "", projectId: "" };
+      const itemBase = { kind: "question", title: "Quoted", context: "", state: "open", projectId: "" };
+
+      // A tampered parent whose value is a visible field name is still about
+      // the hidden parent link: the summary carries it, the named control is
+      // not marked invalid, and nothing is written.
+      for (const [path, form] of [
+        [`/engagements/${h.engagement.id}/tasks/new`, { ...taskBase, engagementId: "title" }],
+        [`/engagements/${h.engagement.id}/tasks/new`, { ...taskBase, clientId: "notes" }],
+        [`/engagements/${h.engagement.id}/items/new`, { ...itemBase, engagementId: "kind" }],
+        [`/engagements/${h.engagement.id}/items/new`, { ...itemBase, clientId: "context" }],
+      ] as const) {
+        const before = JSON.stringify(server.store.snapshot());
+        const reply = await send(server.origin, { method: "POST", path, form });
+        assert.equal(reply.status, 400, `${path} ${JSON.stringify(form)}`);
+        assert.match(reply.body, /not the (parent engagement|client) of this/, path);
+        assert.match(reply.body, /role="alert"/, path);
+        assert.equal((reply.body.match(/aria-invalid="true"/g) ?? []).length, 0, path);
+        assert.equal(JSON.stringify(server.store.snapshot()), before, path);
+      }
+
+      // The same holds on an edit: the hidden parent link refuses the write
+      // while the quoted field-name value marks no control invalid.
+      const task = await server.store.createTask({
+        clientId: h.client.id,
+        engagementId: h.engagement.id,
+        title: "Keep task",
+        owner: "keep",
+      });
+      const item = await server.store.createItem({
+        clientId: h.client.id,
+        engagementId: h.engagement.id,
+        kind: "blocker",
+        title: "Keep item",
+        context: "keep context",
+      });
+      const beforeEdit = JSON.stringify(server.store.snapshot());
+      for (const [path, form] of [
+        [`/tasks/${task.id}/edit`, { id: task.id, title: "Renamed", engagementId: "title" }],
+        [`/tasks/${task.id}/edit`, { id: task.id, title: "Renamed", clientId: "owner" }],
+        [`/items/${item.id}/edit`, { id: item.id, title: "Renamed item", engagementId: "kind" }],
+        [`/items/${item.id}/edit`, { id: item.id, title: "Renamed item", clientId: "context" }],
+      ] as const) {
+        const reply = await send(server.origin, { method: "POST", path, form });
+        assert.equal(reply.status, 400, `${path} ${JSON.stringify(form)}`);
+        assert.match(reply.body, /not the (parent engagement|client) of this/, path);
+        assert.equal((reply.body.match(/aria-invalid="true"/g) ?? []).length, 0, path);
+        assert.equal(JSON.stringify(server.store.snapshot()), beforeEdit, path);
+      }
+    } finally {
+      await server.close();
+    }
+  });
+
   it("refuses project-scoped creation parent mismatches for tasks and items", async () => {
     const server = await running();
     try {
