@@ -452,9 +452,9 @@ describe("layout: every application page is wrapped in the shared shell", () => 
       assert.equal(reply.headers["x-layout-marker"], "kept");
       assert.match(String(reply.headers["content-type"]), /^text\/html; charset=utf-8/);
       assert.equal(reply.headers["cache-control"], "no-store");
-      assert.match(
-        String(reply.headers["content-security-policy"]),
-        /default-src 'none'; style-src 'unsafe-inline'/,
+      assert.equal(
+        reply.headers["content-security-policy"],
+        "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
       );
     } finally {
       await server.close();
@@ -817,9 +817,9 @@ describe("layout: presentation", () => {
       assert.match(reply.body, /<aside class="sidebar">/);
       assert.equal((reply.body.match(/aria-label="Primary"/g) ?? []).length, 2);
       // The content security policy still forbids scripts and external assets.
-      assert.match(
-        String(reply.headers["content-security-policy"]),
-        /default-src 'none'; style-src 'unsafe-inline'/,
+      assert.equal(
+        reply.headers["content-security-policy"],
+        "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
       );
       assert.ok(!reply.body.includes("<script"));
       assert.ok(!reply.body.includes("<link"));
