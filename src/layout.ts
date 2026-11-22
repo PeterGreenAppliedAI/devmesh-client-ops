@@ -11,7 +11,8 @@
  * parent.
  *
  * Navigation lists the active (not effectively archived) clients, marks the
- * client of the current page, and always offers Home, Clients and New client.
+ * client of the current page, and always offers Home, Clients, New client and
+ * Archived.
  * The laptop sidebar is persistent; the phone top menu is a native `details`
  * control, so it opens and closes from the keyboard with no script (the
  * document's content security policy forbids scripts).
@@ -302,16 +303,22 @@ const LAYOUT_STYLE = [
   "textarea{min-height:5rem}",
   "button{margin-top:1rem;padding:.6rem 1rem;font:inherit;min-height:44px;cursor:pointer;border:1px solid #0b3a73;border-radius:4px;background:#0b4f9c;color:#ffffff}",
   "[role=alert]{color:#a40000;font-weight:600}",
+  ".archive-notice{border:1px solid #8a6d00;border-left-width:.4rem;background:#fff8e1;color:#3d2f00;padding:.5rem .75rem;margin:.75rem 0;border-radius:4px}",
   "@media (min-width:901px){.layout{grid-template-areas:'masthead masthead' 'sidebar content';grid-template-columns:16rem minmax(0,1fr);gap:0 2rem;padding:1rem 2rem}.masthead .phone-menu{display:none}.sidebar{display:block;grid-area:sidebar;padding-top:1rem}.sidebar .primary-nav ul{margin-top:0}}",
   "@media (max-width:400px){.layout{padding:0 .75rem 2rem}}",
 ].join("");
 
-/** The navigation links: Home, Clients, New client and every active client. */
+/**
+ * The navigation links: Home, Clients, New client, Archived and every active
+ * client. Archived is always offered, so a hidden record stays discoverable
+ * from any page and can be restored from there.
+ */
 function navigationItems(context: LayoutContext): string {
   const fixed = [
     { id: "", name: "Home", href: "/" },
     { id: "", name: "Clients", href: "/clients" },
     { id: "", name: "New client", href: "/clients/new" },
+    { id: "", name: "Archived", href: "/archived" },
   ];
   const clients = context.clients.map((client) => ({
     id: client.id,

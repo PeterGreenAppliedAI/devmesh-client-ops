@@ -12,6 +12,8 @@
  * is the optional project, and the choices offered are exactly the projects of
  * the engagement the meeting belongs to.
  */
+import { isEffectivelyArchived } from "./archive.ts";
+import { archiveNotice } from "./archive-pages.ts";
 import {
   escapeHtml,
   fieldErrorsFor,
@@ -162,7 +164,12 @@ function byDateThenId(a: Meeting, b: Meeting): number {
  * order. The store selects by the client, so no other client's meetings appear.
  */
 export function clientMeetings(store: Store, clientId: string): readonly Meeting[] {
-  return [...store.listMeetings({ clientId })].sort(byDateThenId);
+  // Effectively archived meetings (hidden through their parents) are left out of
+  // the history, exactly like archived work is left out of the lists.
+  const snapshot = store.snapshot();
+  return [...store.listMeetings({ clientId })]
+    .filter((meeting) => !isEffectivelyArchived(snapshot, meeting))
+    .sort(byDateThenId);
 }
 
 /**
@@ -171,7 +178,10 @@ export function clientMeetings(store: Store, clientId: string): readonly Meeting
  * engagement, so a sibling engagement's meetings never appear.
  */
 export function engagementMeetings(store: Store, clientId: string, engagementId: string): readonly Meeting[] {
-  return [...store.listMeetings({ clientId, engagementId })].sort(byDateThenId);
+  const snapshot = store.snapshot();
+  return [...store.listMeetings({ clientId, engagementId })]
+    .filter((meeting) => !isEffectivelyArchived(snapshot, meeting))
+    .sort(byDateThenId);
 }
 
 /** The meetings of one project's history: exactly the project's meetings. */
@@ -181,7 +191,10 @@ export function projectMeetings(
   engagementId: string,
   projectId: string,
 ): readonly Meeting[] {
-  return [...store.listMeetings({ clientId, engagementId, projectId })].sort(byDateThenId);
+  const snapshot = store.snapshot();
+  return [...store.listMeetings({ clientId, engagementId, projectId })]
+    .filter((meeting) => !isEffectivelyArchived(snapshot, meeting))
+    .sort(byDateThenId);
 }
 
 /** Render a list of meetings as cards with detail and edit links, or an empty state. */
@@ -242,13 +255,22 @@ const MEETING_PROFILE_FIELDS: readonly FieldSpec[] = [
   { name: "notes", label: "Notes" },
 ];
 
-/** The optional no-project choice, offered first so it is the default. */
+/**
+ * The optional no-project choice, offered first so it is the default, and every
+ * project of the engagement. An effectively archived project stays offered but
+ * is labelled as archived, so an existing meeting link is never silently
+ * dropped; the label is text, escaped on render.
+ */
 function projectOptions(
   projects: readonly Project[],
+  snapshot: Snapshot,
 ): readonly { readonly value: string; readonly label: string }[] {
   return [
     { value: "", label: "(no project)" },
-    ...projects.map((project) => ({ value: project.id, label: project.name })),
+    ...projects.map((project) => ({
+      value: project.id,
+      label: isEffectivelyArchived(snapshot, project) ? `${project.name} (archived)` : project.name,
+    })),
   ];
 }
 
@@ -259,6 +281,7 @@ function projectOptions(
  */
 function meetingFields(
   projects: readonly Project[],
+  snapshot: Snapshot,
   id = "",
   engagementId = "",
   clientId = "",
@@ -268,7 +291,7 @@ function meetingFields(
     { name: "engagementId", label: "Engagement", hidden: true, value: engagementId },
     { name: "clientId", label: "Client", hidden: true, value: clientId },
     ...MEETING_FIELDS,
-    { name: "projectId", label: "Project", type: "select", options: projectOptions(projects) },
+    { name: "projectId", label: "Project", type: "select", options: projectOptions(projects, snapshot) },
   ];
 }
 
@@ -565,11 +588,13 @@ export function meetingRoutes(store: Store): MeetingRoutes {
     fields: readonly FieldSpec[],
     values: Readonly<Record<string, string>>,
     cancelHref: string,
+    notice = "",
   ): Page {
     return renderPage(
       title,
       [
         `<nav>${link("/", "Home")}${link(cancelHref, "Cancel")}</nav>`,
+        notice,
         renderForm({ action, fields, values, submitLabel: "Create" }),
       ].join("\n"),
     );
@@ -583,6 +608,7 @@ export function meetingRoutes(store: Store): MeetingRoutes {
   function createForm(title: string, snap: Snapshot, scope: CreateScope): Page {
     const fields = meetingFields(
       projectChoices(snap, scope.engagement.id),
+      snap,
       "",
       scope.engagement.id,
       scope.client.id,
@@ -592,7 +618,12 @@ export function meetingRoutes(store: Store): MeetingRoutes {
     const cancelHref = scope.project !== undefined
       ? `/projects/${encodeURIComponent(scope.project.id)}`
       : `/engagements/${encodeURIComponent(scope.engagement.id)}`;
-    return newPage(title, createAction(scope), fields, values, cancelHref);
+    // A creation form under an archived scope still works; its notice names the
+    // archived parent so the user knows the new record will inherit its hiding.
+    const hiddenParent = scope.project !== undefined
+      ? archiveNotice(snap, scope.project)
+      : archiveNotice(snap, scope.engagement);
+    return newPage(title, createAction(scope), fields, values, cancelHref, hiddenParent);
   }
 
   async function createMeeting(request: MeetingRequest): Promise<MeetingPage> {
@@ -606,6 +637,7 @@ export function meetingRoutes(store: Store): MeetingRoutes {
     // has exactly one control per name.
     const fields = meetingFields(
       projectChoices(snap, scope.engagement.id),
+      snap,
       "",
       parent.id,
       scope.client.id,
@@ -655,7 +687,7 @@ export function meetingRoutes(store: Store): MeetingRoutes {
     const record = findRecord(snap.meetings, id, "meeting");
     const engagement = findRecord(snap.engagements, record.engagementId, "engagement");
     const client = findRecord(snap.clients, engagement.clientId, "client");
-    const fields = meetingFields(projectChoices(snap, engagement.id), id, engagement.id, client.id);
+    const fields = meetingFields(projectChoices(snap, engagement.id), snap, id, engagement.id, client.id);
     // An existing identity conflict takes precedence: a submitted id that
     // differs from the URL record is refused before any parent is compared.
     const submitted = request.form["id"];
@@ -708,6 +740,7 @@ export function meetingRoutes(store: Store): MeetingRoutes {
       "Edit meeting",
       [
         `<nav>${link("/", "Home")}${link(`/meetings/${encodeURIComponent(meeting.id)}`, "Cancel")}</nav>`,
+        archiveNotice(target.snap, meeting),
         renderForm({
           action: target.action,
           fields: target.fields,
@@ -741,6 +774,7 @@ export function meetingRoutes(store: Store): MeetingRoutes {
         { label: "Edit meeting", href: `/meetings/${encodeURIComponent(meeting.id)}/edit` },
       ],
       [
+        { title: "Archive", body: archiveNotice(snap, meeting) },
         {
           title: "Meeting",
           body: displayList(displayValues(MEETING_PROFILE_FIELDS, profile)),

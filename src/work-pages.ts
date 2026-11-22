@@ -24,6 +24,8 @@ import {
   type Page,
   type Redirect,
 } from "./html.ts";
+import { isEffectivelyArchived } from "./archive.ts";
+import { archiveControl, archiveNotice } from "./archive-pages.ts";
 import {
   ITEM_KINDS,
   ITEM_STATES,
@@ -414,11 +416,15 @@ export function taskStatusCounts(
   clientId: string,
   scope: WorkScope,
 ): readonly CountRow[] {
+  const snapshot = store.snapshot();
+  // Effectively archived tasks are hidden from the tally, exactly as they are
+  // hidden from the lists beside it, so the counts and the lists agree.
+  const tasks = store
+    .listTasks({ clientId, ...scope })
+    .filter((task) => !isEffectivelyArchived(snapshot, task));
   return TASK_STATUSES.map((status) => ({
     label: status,
-    count: store
-      .listTasks({ clientId, ...scope })
-      .filter((task) => task.status === status).length,
+    count: tasks.filter((task) => task.status === status).length,
   }));
 }
 
@@ -428,9 +434,10 @@ export function openItemCount(
   clientId: string,
   scope: WorkScope,
 ): number {
+  const snapshot = store.snapshot();
   return store
     .listItems({ clientId, ...scope })
-    .filter((item) => item.state === "open").length;
+    .filter((item) => item.state === "open" && !isEffectivelyArchived(snapshot, item)).length;
 }
 
 /** The tasks and items that belong to an engagement but to no project. */
@@ -439,12 +446,13 @@ export function engagementOnlyWork(
   clientId: string,
   engagementId: string,
 ): { readonly tasks: readonly Task[]; readonly items: readonly WorkItem[] } {
+  const snapshot = store.snapshot();
   const tasks = store
     .listTasks({ clientId, engagementId })
-    .filter((task) => task.projectId === undefined);
+    .filter((task) => task.projectId === undefined && !isEffectivelyArchived(snapshot, task));
   const items = store
     .listItems({ clientId, engagementId })
-    .filter((item) => item.projectId === undefined);
+    .filter((item) => item.projectId === undefined && !isEffectivelyArchived(snapshot, item));
   return { tasks, items };
 }
 
@@ -455,9 +463,14 @@ export function projectWork(
   engagementId: string,
   projectId: string,
 ): { readonly tasks: readonly Task[]; readonly items: readonly WorkItem[] } {
+  const snapshot = store.snapshot();
   return {
-    tasks: store.listTasks({ clientId, engagementId, projectId }),
-    items: store.listItems({ clientId, engagementId, projectId }),
+    tasks: store
+      .listTasks({ clientId, engagementId, projectId })
+      .filter((task) => !isEffectivelyArchived(snapshot, task)),
+    items: store
+      .listItems({ clientId, engagementId, projectId })
+      .filter((item) => !isEffectivelyArchived(snapshot, item)),
   };
 }
 
@@ -510,13 +523,22 @@ const STATE_OPTIONS = ITEM_STATES.map((state) => ({ value: state, label: state }
 // values show as text badges on a record page or in a list.
 const BADGE: FieldPresentation = Object.freeze({ badge: true });
 
-/** The optional no-project choice, offered first so it is the default. */
+/**
+ * The optional no-project choice, offered first so it is the default, and every
+ * project of the engagement. A project that is effectively archived stays
+ * offered but is labelled as archived, so an existing link can be kept or
+ * chosen rather than silently dropped; the label is text, escaped on render.
+ */
 function projectOptions(
   projects: readonly Project[],
+  snapshot: Snapshot,
 ): readonly { readonly value: string; readonly label: string }[] {
   return [
     { value: "", label: "(no project)" },
-    ...projects.map((project) => ({ value: project.id, label: project.name })),
+    ...projects.map((project) => ({
+      value: project.id,
+      label: isEffectivelyArchived(snapshot, project) ? `${project.name} (archived)` : project.name,
+    })),
   ];
 }
 
@@ -587,6 +609,7 @@ function itemFormValues(item: WorkItem): Record<string, string> {
  */
 function taskFields(
   projects: readonly Project[],
+  snapshot: Snapshot,
   id = "",
   engagementId = "",
   clientId?: string,
@@ -598,12 +621,13 @@ function taskFields(
       ? []
       : [{ name: "clientId", label: "Client", hidden: true, value: clientId }]),
     ...TASK_FIELDS,
-    { name: "projectId", label: "Project", type: "select", options: projectOptions(projects) },
+    { name: "projectId", label: "Project", type: "select", options: projectOptions(projects, snapshot) },
   ];
 }
 
 function itemFields(
   projects: readonly Project[],
+  snapshot: Snapshot,
   id = "",
   engagementId = "",
   clientId?: string,
@@ -615,7 +639,7 @@ function itemFields(
       ? []
       : [{ name: "clientId", label: "Client", hidden: true, value: clientId }]),
     ...ITEM_FIELDS,
-    { name: "projectId", label: "Project", type: "select", options: projectOptions(projects) },
+    { name: "projectId", label: "Project", type: "select", options: projectOptions(projects, snapshot) },
   ];
 }
 
@@ -986,11 +1010,13 @@ export function workRoutes(store: Store): WorkRoutes {
     fields: readonly FieldSpec[],
     values: Readonly<Record<string, string>>,
     cancelHref: string,
+    notice = "",
   ): Page {
     return renderPage(
       title,
       [
         `<nav>${link("/", "Home")}${link(cancelHref, "Cancel")}</nav>`,
+        notice,
         renderForm({ action, fields, values, submitLabel: "Create" }),
       ].join("\n"),
     );
@@ -1008,15 +1034,20 @@ export function workRoutes(store: Store): WorkRoutes {
     base: "tasks" | "items",
   ): Page {
     const all = base === "tasks"
-      ? taskFields(projectChoices(snap, scope.engagement.id), "", scope.engagement.id)
-      : itemFields(projectChoices(snap, scope.engagement.id), "", scope.engagement.id);
+      ? taskFields(projectChoices(snap, scope.engagement.id), snap, "", scope.engagement.id)
+      : itemFields(projectChoices(snap, scope.engagement.id), snap, "", scope.engagement.id);
     const fields: readonly FieldSpec[] = all.filter((field) => field.name !== "id");
     const values = base === "tasks" ? createTaskValues() : createItemValues();
     if (scope.project !== undefined) values.projectId = scope.project.id;
     const cancelHref = scope.project !== undefined
       ? `/projects/${encodeURIComponent(scope.project.id)}`
       : `/engagements/${encodeURIComponent(scope.engagement.id)}`;
-    return newPage(title, createAction(scope, base), fields, values, cancelHref);
+    // A creation form under an archived scope stays usable; the notice names
+    // the archived parent so the user knows the new record inherits its hiding.
+    const hiddenParent = scope.project !== undefined
+      ? archiveNotice(snap, scope.project)
+      : archiveNotice(snap, scope.engagement);
+    return newPage(title, createAction(scope, base), fields, values, cancelHref, hiddenParent);
   }
 
   /**
@@ -1027,8 +1058,8 @@ export function workRoutes(store: Store): WorkRoutes {
    */
   function createFields(snap: Snapshot, scope: CreateScope, base: "tasks" | "items"): readonly FieldSpec[] {
     const all = base === "tasks"
-      ? taskFields(projectChoices(snap, scope.engagement.id), "", scope.engagement.id)
-      : itemFields(projectChoices(snap, scope.engagement.id), "", scope.engagement.id);
+      ? taskFields(projectChoices(snap, scope.engagement.id), snap, "", scope.engagement.id)
+      : itemFields(projectChoices(snap, scope.engagement.id), snap, "", scope.engagement.id);
     return all.filter((field) => field.name !== "id");
   }
 
@@ -1116,8 +1147,8 @@ export function workRoutes(store: Store): WorkRoutes {
     const engagement = findRecord(snap.engagements, record.engagementId, "engagement");
     const client = findRecord(snap.clients, engagement.clientId, "client");
     const fields = family === "tasks"
-      ? taskFields(projectChoices(snap, engagement.id), id, engagement.id, client.id)
-      : itemFields(projectChoices(snap, engagement.id), id, engagement.id, client.id);
+      ? taskFields(projectChoices(snap, engagement.id), snap, id, engagement.id, client.id)
+      : itemFields(projectChoices(snap, engagement.id), snap, id, engagement.id, client.id);
     // An existing identity conflict takes precedence: a submitted id that
     // differs from the URL record is refused before any parent is compared.
     const submitted = request.form["id"];
@@ -1186,6 +1217,7 @@ export function workRoutes(store: Store): WorkRoutes {
       "Edit task",
       [
         `<nav>${link("/", "Home")}${link(`/tasks/${encodeURIComponent(task.id)}`, "Cancel")}</nav>`,
+        archiveNotice(snapshot(), task, { family: "tasks" }),
         renderForm({
           action: target.action,
           fields: target.fields,
@@ -1206,6 +1238,7 @@ export function workRoutes(store: Store): WorkRoutes {
       "Edit work item",
       [
         `<nav>${link("/", "Home")}${link(`/items/${encodeURIComponent(item.id)}`, "Cancel")}</nav>`,
+        archiveNotice(snapshot(), item, { family: "items" }),
         renderForm({
           action: target.action,
           fields: target.fields,
@@ -1242,6 +1275,10 @@ export function workRoutes(store: Store): WorkRoutes {
         { label: "Edit task", href: `/tasks/${encodeURIComponent(task.id)}/edit` },
       ],
       [
+        {
+          title: "Archive",
+          body: [archiveNotice(snap, task, { family: "tasks" }), archiveControl("tasks", task.id, task.archived === true)].join("\n"),
+        },
         {
           title: "Task",
           body: displayList(displayValues(TASK_PROFILE_FIELDS, profile)),
@@ -1281,6 +1318,10 @@ export function workRoutes(store: Store): WorkRoutes {
         { label: "Edit item", href: `/items/${encodeURIComponent(item.id)}/edit` },
       ],
       [
+        {
+          title: "Archive",
+          body: [archiveNotice(snap, item, { family: "items" }), archiveControl("items", item.id, item.archived === true)].join("\n"),
+        },
         {
           title: "Work item",
           body: displayList(displayValues(ITEM_PROFILE_FIELDS, profile)),

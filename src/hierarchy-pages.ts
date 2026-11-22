@@ -19,6 +19,7 @@ import {
   type Page,
   type Redirect,
 } from "./html.ts";
+import { isEffectivelyArchived } from "./archive.ts";
 import { ENGAGEMENT_STATUSES, MissingRecordError, ValidationError } from "./model.ts";
 import type {
   Client,
@@ -57,6 +58,7 @@ import {
   type PageSection,
   type WorkEntry,
 } from "./work-pages.ts";
+import { archiveControl, archiveNotice } from "./archive-pages.ts";
 import {
   clientMeetings,
   engagementMeetings,
@@ -301,10 +303,15 @@ const PROJECT_FIELDS: readonly FieldSpec[] = [
 export type { PageSection } from "./work-pages.ts";
 
 function clientsListPage(snapshot: Snapshot): Page {
-  const items = snapshot.clients.map((client) => ({
-    href: `/clients/${encodeURIComponent(client.id)}`,
-    label: client.name,
-  }));
+  // Effectively archived clients are hidden from the normal list; an archived
+  // client stays reachable through its own URL and the Archived page, which
+  // links every hidden record for discovery and restoration.
+  const items = snapshot.clients
+    .filter((client) => !isEffectivelyArchived(snapshot, client))
+    .map((client) => ({
+      href: `/clients/${encodeURIComponent(client.id)}`,
+      label: client.name,
+    }));
   return pageWith(
     "Clients",
     [
@@ -483,6 +490,10 @@ function clientShowPage(client: Client, snapshot: Snapshot, store: Store): Page 
       { label: "Edit client", href: `/clients/${encodeURIComponent(clientId)}/edit` },
     ],
     [
+      {
+        title: "Archive",
+        body: [archiveNotice(snapshot, client, { family: "clients" }), archiveControl("clients", client.id, client.archived === true)].join("\n"),
+      },
       { title: "Profile", body: profileFields(CLIENT_FIELDS, client) },
       listSection("Engagements", engagementItems, {
         newHref: `/clients/${encodeURIComponent(clientId)}/engagements/new`,
@@ -551,6 +562,10 @@ function engagementShowPage(engagement: Engagement, snapshot: Snapshot, store: S
   // twice and every project list is a separate, explicit selection.
   const only = engagementOnlyWork(store, clientId, engagementId);
   const sections: PageSection[] = [
+    {
+      title: "Archive",
+      body: [archiveNotice(snapshot, engagement, { family: "engagements" }), archiveControl("engagements", engagement.id, engagement.archived === true)].join("\n"),
+    },
     { title: "Profile", body: profileFields(ENGAGEMENT_FIELDS, engagement) },
     {
       title: "Projects",
@@ -624,6 +639,10 @@ function projectShowPage(project: Project, snapshot: Snapshot, store: Store): Pa
       { label: "Edit project", href: `/projects/${encodeURIComponent(project.id)}/edit` },
     ],
     [
+      {
+        title: "Archive",
+        body: [archiveNotice(snapshot, project, { family: "projects" }), archiveControl("projects", project.id, project.archived === true)].join("\n"),
+      },
       { title: "Profile", body: profileFields(PROJECT_FIELDS, project) },
       workSection(
         "Tasks",
@@ -679,9 +698,11 @@ function renderHierarchyForm(
   values: Readonly<Record<string, string>>,
   submitLabel: string,
   cancelHref: string,
+  notice = "",
 ): Page {
   const body = [
     `<nav>${link("/", "Home")}${link(cancelHref, "Cancel")}</nav>`,
+    notice,
     renderForm({ action, fields, values, submitLabel }),
   ].join("\n");
   return renderPage(title, body);
@@ -948,7 +969,8 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
       get: {
         method: "GET",
         render: (request) => {
-          const client = findRecord(snapshot().clients, idFromPath(request.path), "client");
+          const snap = snapshot();
+          const client = findRecord(snap.clients, idFromPath(request.path), "client");
           const fields = submissionFields(CLIENT_FIELDS, hiddenId(client.id));
           return renderHierarchyForm(
             "Edit client",
@@ -957,6 +979,7 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
             editFormValues({ ...client, id: client.id }),
             "Save",
             `/clients/${encodeURIComponent(client.id)}`,
+            archiveNotice(snap, client, { family: "clients" }),
           );
         },
       },
@@ -973,7 +996,8 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
       get: {
         method: "GET",
         render: (request) => {
-          const client = findRecord(snapshot().clients, idFromPath(request.path), "client");
+          const snap = snapshot();
+          const client = findRecord(snap.clients, idFromPath(request.path), "client");
           const fields = submissionFields(
             ENGAGEMENT_FIELDS,
             hiddenParent("clientId", client.id, "Client"),
@@ -987,6 +1011,7 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
             createFormValues(fields),
             "Create",
             `/clients/${encodeURIComponent(client.id)}`,
+            archiveNotice(snap, client, { family: "clients" }),
           );
         },
       },
@@ -1016,7 +1041,8 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
       get: {
         method: "GET",
         render: (request) => {
-          const engagement = findRecord(snapshot().engagements, idFromPath(request.path), "engagement");
+          const snap = snapshot();
+          const engagement = findRecord(snap.engagements, idFromPath(request.path), "engagement");
           const fields = submissionFields(ENGAGEMENT_FIELDS, hiddenId(engagement.id));
           return renderHierarchyForm(
             "Edit engagement",
@@ -1025,6 +1051,7 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
             editFormValues({ ...engagement, id: engagement.id }),
             "Save",
             `/engagements/${encodeURIComponent(engagement.id)}`,
+            archiveNotice(snap, engagement, { family: "engagements" }),
           );
         },
       },
@@ -1041,7 +1068,8 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
       get: {
         method: "GET",
         render: (request) => {
-          const engagement = findRecord(snapshot().engagements, idFromPath(request.path), "engagement");
+          const snap = snapshot();
+          const engagement = findRecord(snap.engagements, idFromPath(request.path), "engagement");
           const fields = submissionFields(
             PROJECT_FIELDS,
             hiddenParent("engagementId", engagement.id, "Engagement"),
@@ -1053,6 +1081,7 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
             createFormValues(fields),
             "Create",
             `/engagements/${encodeURIComponent(engagement.id)}`,
+            archiveNotice(snap, engagement, { family: "engagements" }),
           );
         },
       },
@@ -1082,7 +1111,8 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
       get: {
         method: "GET",
         render: (request) => {
-          const project = findRecord(snapshot().projects, idFromPath(request.path), "project");
+          const snap = snapshot();
+          const project = findRecord(snap.projects, idFromPath(request.path), "project");
           const fields = submissionFields(PROJECT_FIELDS, hiddenId(project.id));
           return renderHierarchyForm(
             "Edit project",
@@ -1091,6 +1121,7 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
             editFormValues({ ...project, id: project.id }),
             "Save",
             `/projects/${encodeURIComponent(project.id)}`,
+            archiveNotice(snap, project, { family: "projects" }),
           );
         },
       },
