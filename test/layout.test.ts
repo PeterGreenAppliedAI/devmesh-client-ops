@@ -412,6 +412,12 @@ describe("layout: every application page is wrapped in the shared shell", () => 
         assert.match(String(reply.headers["content-type"]), /^text\/html; charset=utf-8/);
         mainContentOf(reply.body);
         assert.deepEqual(ancestryOf(reply.body), [], `${path} has no invented ancestors`);
+        // The location header is still present, naming the current page alone.
+        assert.match(
+          reply.body,
+          /<header class="location"><nav class="breadcrumb" aria-label="Location"><ol><li><span aria-current="page">[^<]+<\/span><\/li><\/ol><\/nav><\/header>/,
+          `${path} has a location header`,
+        );
         const links = navLinks(reply.body);
         assert.ok(links.some((link) => link.href === "/" && link.label === "Home"));
         assert.ok(links.some((link) => link.href === "/clients" && link.label === "Clients"));
@@ -597,6 +603,11 @@ describe("layout: every application page is wrapped in the shared shell", () => 
       const newClient = await send(server.origin, { path: "/clients/new" });
       assert.equal(newClient.status, 200);
       assert.deepEqual(ancestryOf(newClient.body), []);
+      // The global New client page still has a location header, no ancestors.
+      assert.match(
+        newClient.body,
+        /<header class="location"><nav class="breadcrumb" aria-label="Location"><ol><li><span aria-current="page">New client<\/span><\/li><\/ol><\/nav><\/header>/,
+      );
     } finally {
       await server.close();
     }
@@ -683,6 +694,11 @@ describe("layout: every application page is wrapped in the shared shell", () => 
       });
       assert.equal(clientRefused.status, 400);
       assert.deepEqual(ancestryOf(clientRefused.body), []);
+      // A refused client create is still a global page with a location header.
+      assert.match(
+        clientRefused.body,
+        /<header class="location"><nav class="breadcrumb" aria-label="Location"><ol><li><span aria-current="page">[^<]+<\/span><\/li><\/ol><\/nav><\/header>/,
+      );
       mainContentOf(clientRefused.body);
     } finally {
       await server.close();

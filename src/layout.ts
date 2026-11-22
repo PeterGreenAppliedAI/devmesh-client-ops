@@ -332,9 +332,16 @@ function primaryNav(context: LayoutContext): string {
   return `<nav class="primary-nav" aria-label="Primary"><ul>${navigationItems(context)}</ul></nav>`;
 }
 
-/** The location header: the known ancestry chain, or nothing for a global page. */
-function locationHeader(context: LayoutContext): string {
-  if (context.ancestry.length === 0) return "";
+/**
+ * The location header: the known ancestry chain, or, for a global page, the
+ * page's own name. A global page has no ancestors, so its header carries the
+ * current location alone rather than an invented chain. The page title is
+ * escaped; a global page's location text is its title.
+ */
+function locationHeader(context: LayoutContext, title: string): string {
+  if (context.ancestry.length === 0) {
+    return `<header class="location"><nav class="breadcrumb" aria-label="Location"><ol><li><span aria-current="page">${escapeHtml(title)}</span></li></ol></nav></header>`;
+  }
   const items = context.ancestry
     .map(
       (link) =>
@@ -373,7 +380,7 @@ export function renderLayoutDocument(
     "</div>",
     `<aside class="sidebar">${nav}</aside>`,
     '<div class="content">',
-    locationHeader(context),
+    locationHeader(context, title),
     `<main id="main"><h1>${escapeHtml(title)}</h1>`,
     body,
     "</main>",
