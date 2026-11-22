@@ -12,6 +12,8 @@
  * is the optional project, and the choices offered are exactly the projects of
  * the engagement the meeting belongs to.
  */
+import { isEffectivelyArchived } from "./archive.ts";
+import { archiveNotice } from "./archive-pages.ts";
 import {
   escapeHtml,
   fieldErrorsFor,
@@ -162,7 +164,12 @@ function byDateThenId(a: Meeting, b: Meeting): number {
  * order. The store selects by the client, so no other client's meetings appear.
  */
 export function clientMeetings(store: Store, clientId: string): readonly Meeting[] {
-  return [...store.listMeetings({ clientId })].sort(byDateThenId);
+  // Effectively archived meetings (hidden through their parents) are left out of
+  // the history, exactly like archived work is left out of the lists.
+  const snapshot = store.snapshot();
+  return [...store.listMeetings({ clientId })]
+    .filter((meeting) => !isEffectivelyArchived(snapshot, meeting))
+    .sort(byDateThenId);
 }
 
 /**
@@ -171,7 +178,10 @@ export function clientMeetings(store: Store, clientId: string): readonly Meeting
  * engagement, so a sibling engagement's meetings never appear.
  */
 export function engagementMeetings(store: Store, clientId: string, engagementId: string): readonly Meeting[] {
-  return [...store.listMeetings({ clientId, engagementId })].sort(byDateThenId);
+  const snapshot = store.snapshot();
+  return [...store.listMeetings({ clientId, engagementId })]
+    .filter((meeting) => !isEffectivelyArchived(snapshot, meeting))
+    .sort(byDateThenId);
 }
 
 /** The meetings of one project's history: exactly the project's meetings. */
@@ -181,7 +191,10 @@ export function projectMeetings(
   engagementId: string,
   projectId: string,
 ): readonly Meeting[] {
-  return [...store.listMeetings({ clientId, engagementId, projectId })].sort(byDateThenId);
+  const snapshot = store.snapshot();
+  return [...store.listMeetings({ clientId, engagementId, projectId })]
+    .filter((meeting) => !isEffectivelyArchived(snapshot, meeting))
+    .sort(byDateThenId);
 }
 
 /** Render a list of meetings as cards with detail and edit links, or an empty state. */
@@ -242,13 +255,22 @@ const MEETING_PROFILE_FIELDS: readonly FieldSpec[] = [
   { name: "notes", label: "Notes" },
 ];
 
-/** The optional no-project choice, offered first so it is the default. */
+/**
+ * The optional no-project choice, offered first so it is the default, and every
+ * project of the engagement. An effectively archived project stays offered but
+ * is labelled as archived, so an existing meeting link is never silently
+ * dropped; the label is text, escaped on render.
+ */
 function projectOptions(
   projects: readonly Project[],
+  snapshot: Snapshot,
 ): readonly { readonly value: string; readonly label: string }[] {
   return [
     { value: "", label: "(no project)" },
-    ...projects.map((project) => ({ value: project.id, label: project.name })),
+    ...projects.map((project) => ({
+      value: project.id,
+      label: isEffectivelyArchived(snapshot, project) ? `${project.name} (archived)` : project.name,
+    })),
   ];
 }
 
@@ -259,6 +281,7 @@ function projectOptions(
  */
 function meetingFields(
   projects: readonly Project[],
+  snapshot: Snapshot,
   id = "",
   engagementId = "",
   clientId = "",
@@ -268,7 +291,7 @@ function meetingFields(
     { name: "engagementId", label: "Engagement", hidden: true, value: engagementId },
     { name: "clientId", label: "Client", hidden: true, value: clientId },
     ...MEETING_FIELDS,
-    { name: "projectId", label: "Project", type: "select", options: projectOptions(projects) },
+    { name: "projectId", label: "Project", type: "select", options: projectOptions(projects, snapshot) },
   ];
 }
 
@@ -339,6 +362,7 @@ function formFailure(
   fields: readonly FieldSpec[],
   action: string,
   record?: Readonly<Record<string, string>>,
+  notice = "",
 ): FormError | null {
   if (!(error instanceof ValidationError) && !(error instanceof MissingRecordError)) {
     return null;
@@ -364,7 +388,7 @@ function formFailure(
     ? undefined
     : { field: "projectId", value: selectedProject };
   const errors = fieldErrorsFor(error.message, filled, fields, selected);
-  return new FormError(error.message, filled, errors, fields, action);
+  return new FormError(error.message, filled, errors, fields, action).withNotice(notice);
 }
 
 /** A record id from a path that names no record: a missing record. */
@@ -477,6 +501,8 @@ export function meetingRoutes(store: Store): MeetingRoutes {
     form: Readonly<Record<string, string>>,
   ): {
     readonly scope: CreateScope;
+    /** The project the URL path names, when it names one; the parent only. */
+    readonly project?: Project;
     readonly parent: { readonly name: "engagementId"; readonly id: string };
     readonly conflict: ValidationError | null;
   } {
@@ -494,11 +520,16 @@ export function meetingRoutes(store: Store): MeetingRoutes {
     if (parts[0] === "projects") {
       // The project form posts to the engagement's new endpoint, with the
       // engagement derived from the URL project as its parent. The URL project
-      // is the parent only; it does not preselect the submitted project.
+      // stays the parent; the submitted project is resolved separately.
       const projectId = decodeId(parts[1] ?? "", "project");
-      const scope = projectScope(snap, projectId);
+      const projectScopeResult = projectScope(snap, projectId);
+      // The create form's scope is the engagement only (a blank project selector
+      // creates engagement-only work); the URL project is reported separately so
+      // a refusal still shows its notice.
+      const scope = { client: projectScopeResult.client, engagement: projectScopeResult.engagement };
       return {
-        scope: { client: scope.client, engagement: scope.engagement },
+        scope,
+        project: projectScopeResult.project,
         parent: { name: "engagementId", id: scope.engagement.id },
         conflict: submittedParentConflict(form, scope),
       };
@@ -556,10 +587,53 @@ export function meetingRoutes(store: Store): MeetingRoutes {
       // is associated with that control; the summary carries the same message.
       throw new ValidationError(`projectId: ${JSON.stringify(projectId)} is not a project of this engagement`);
     }
+    if (project.engagementId !== scope.engagement.id) {
+      // An existing project of another engagement is not this form's choice: the
+      // store owns that refusal and its message, so the selection is left
+      // unattached and the notice keeps coming from the URL scope instead of
+      // the foreign project.
+      return scope;
+    }
     return { ...scope, project };
   }
 
+  /** The archive notice of the URL scope: the project of a project-scoped
+   * create, otherwise the engagement. Each is resolved to its stored record so
+   * the notice names the archived parent it is derived from. */
+  function noticeText(snap: Snapshot, scope: CreateScope): string {
+    const direct = scope.project !== undefined ? scope.project : scope.engagement;
+    return archiveNotice(snap, direct);
+  }
+
+  /**
+   * The archive notice a creation form, and a refused create, shows, chosen
+   * from the submission's own project selector. A valid selected project of the
+   * authoritative engagement is the record's effective parent, so its notice is
+   * the one that matches the record the submission would create. An omitted
+   * selector takes the URL scope: a project-scoped create keeps the URL
+   * project's notice, otherwise the engagement's. A blank, unknown or
+   * cross-engagement selection is not a parent of any record under this
+   * engagement, so it keeps the URL scope's notice; the store still owns the
+   * refusal of that selection, and existing validation stays unchanged.
+   */
+  function createFormNotice(
+    snap: Snapshot,
+    scope: CreateScope,
+    selectedId: string,
+    urlProject?: Project,
+  ): string {
+    if (selectedId !== "") {
+      const selected = snap.projects.find((candidate) => candidate.id === selectedId);
+      if (selected !== undefined && selected.engagementId === scope.engagement.id) {
+        return archiveNotice(snap, selected);
+      }
+    }
+    return archiveNotice(snap, urlProject !== undefined ? urlProject : scope.engagement);
+  }
+
   function newPage(
+    snap: Snapshot,
+    scope: CreateScope,
     title: string,
     action: string,
     fields: readonly FieldSpec[],
@@ -570,6 +644,7 @@ export function meetingRoutes(store: Store): MeetingRoutes {
       title,
       [
         `<nav>${link("/", "Home")}${link(cancelHref, "Cancel")}</nav>`,
+        noticeText(snap, scope),
         renderForm({ action, fields, values, submitLabel: "Create" }),
       ].join("\n"),
     );
@@ -583,6 +658,7 @@ export function meetingRoutes(store: Store): MeetingRoutes {
   function createForm(title: string, snap: Snapshot, scope: CreateScope): Page {
     const fields = meetingFields(
       projectChoices(snap, scope.engagement.id),
+      snap,
       "",
       scope.engagement.id,
       scope.client.id,
@@ -592,25 +668,32 @@ export function meetingRoutes(store: Store): MeetingRoutes {
     const cancelHref = scope.project !== undefined
       ? `/projects/${encodeURIComponent(scope.project.id)}`
       : `/engagements/${encodeURIComponent(scope.engagement.id)}`;
-    return newPage(title, createAction(scope), fields, values, cancelHref);
+    // A creation form under an archived scope still works; its notice names the
+    // archived parent so the user knows the new record will inherit its hiding.
+    return newPage(snap, scope, title, createAction(scope), fields, values, cancelHref);
   }
 
   async function createMeeting(request: MeetingRequest): Promise<MeetingPage> {
     const snap = snapshot();
     // The URL parent is resolved first and stays a 404 when it is missing, and
     // a submitted parent that differs from it is refused.
-    const { scope, parent, conflict } = postedParent(snap, request.path, request.form);
+    const { scope, project: urlProject, parent, conflict } = postedParent(snap, request.path, request.form);
     const action = createAction(scope);
     // The creation fields already carry the hidden engagement and client
     // parents, so a refusal keeps every submitted visible value and the form
     // has exactly one control per name.
     const fields = meetingFields(
       projectChoices(snap, scope.engagement.id),
+      snap,
       "",
       parent.id,
       scope.client.id,
     ).filter((field) => field.name !== "id");
     const values = suppliedValues(request.form, fields);
+    // The selected project, when the submission gave a valid one, is resolved
+    // inside the boundary; it stays available to the correction form so a
+    // refused create keeps the selected project's archive notice.
+    let selected: CreateScope = scope;
     try {
       // The parent conflict is settled before any selector resolves the
       // submitted project, so a tampered request is refused without reading it.
@@ -618,7 +701,7 @@ export function meetingRoutes(store: Store): MeetingRoutes {
       // The optional selected project is resolved inside the boundary: an
       // unknown project is a correctable error, a blank one records an
       // engagement-only meeting.
-      const selected = withSelectedProject(snap, scope, text(request.form, "projectId"));
+      selected = withSelectedProject(snap, scope, text(request.form, "projectId"));
       const input = {
         ...meetingEdit(values, true),
         clientId: scope.client.id,
@@ -628,7 +711,14 @@ export function meetingRoutes(store: Store): MeetingRoutes {
       const meeting = await store.createMeeting(input as MeetingCreate);
       return redirect(`/meetings/${encodeURIComponent(meeting.id)}`);
     } catch (error) {
-      const failure = formFailure(error, values, fields, action);
+      const failure = formFailure(
+        error,
+        values,
+        fields,
+        action,
+        undefined,
+        createFormNotice(snap, scope, text(request.form, "projectId"), urlProject),
+      );
       if (failure !== null) throw failure;
       throw error;
     }
@@ -655,7 +745,7 @@ export function meetingRoutes(store: Store): MeetingRoutes {
     const record = findRecord(snap.meetings, id, "meeting");
     const engagement = findRecord(snap.engagements, record.engagementId, "engagement");
     const client = findRecord(snap.clients, engagement.clientId, "client");
-    const fields = meetingFields(projectChoices(snap, engagement.id), id, engagement.id, client.id);
+    const fields = meetingFields(projectChoices(snap, engagement.id), snap, id, engagement.id, client.id);
     // An existing identity conflict takes precedence: a submitted id that
     // differs from the URL record is refused before any parent is compared.
     const submitted = request.form["id"];
@@ -692,7 +782,14 @@ export function meetingRoutes(store: Store): MeetingRoutes {
       await store.updateMeeting(meeting.id, meetingEdit(values, false));
       return redirect(`/meetings/${encodeURIComponent(meeting.id)}`);
     } catch (error) {
-      const failure = formFailure(error, values, target.fields, target.action, stored);
+      const failure = formFailure(
+        error,
+        values,
+        target.fields,
+        target.action,
+        stored,
+        archiveNotice(target.snap, target.record),
+      );
       if (failure !== null) throw failure;
       throw error;
     }
@@ -708,6 +805,7 @@ export function meetingRoutes(store: Store): MeetingRoutes {
       "Edit meeting",
       [
         `<nav>${link("/", "Home")}${link(`/meetings/${encodeURIComponent(meeting.id)}`, "Cancel")}</nav>`,
+        archiveNotice(target.snap, meeting),
         renderForm({
           action: target.action,
           fields: target.fields,
@@ -741,6 +839,7 @@ export function meetingRoutes(store: Store): MeetingRoutes {
         { label: "Edit meeting", href: `/meetings/${encodeURIComponent(meeting.id)}/edit` },
       ],
       [
+        { title: "Archive", body: archiveNotice(snap, meeting) },
         {
           title: "Meeting",
           body: displayList(displayValues(MEETING_PROFILE_FIELDS, profile)),
