@@ -234,6 +234,7 @@ const INTERNAL_REDIRECT_PATTERNS: readonly RegExp[] = Object.freeze([
   /^\/projects\/[A-Za-z0-9_-]+$/,
   /^\/tasks\/[A-Za-z0-9_-]+$/,
   /^\/items\/[A-Za-z0-9_-]+$/,
+  /^\/meetings\/[A-Za-z0-9_-]+$/,
 ]);
 
 function isInternalPath(pathname: string): boolean {

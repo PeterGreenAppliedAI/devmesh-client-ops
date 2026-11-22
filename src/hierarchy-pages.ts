@@ -28,6 +28,8 @@ import type {
   ProjectCreate,
   Snapshot,
   Store,
+  Task,
+  WorkItem,
 } from "./store.ts";
 import {
   childList,
@@ -41,10 +43,19 @@ import {
   profileFields,
   projectWork,
   taskStatusCounts,
+  taskEntries,
+  itemEntries,
   workSection,
   workList,
+  type ListEntry,
   type PageSection,
 } from "./work-pages.ts";
+import {
+  clientMeetings,
+  engagementMeetings,
+  meetingSection,
+  projectMeetings,
+} from "./meeting-pages.ts";
 
 /** The linked list entries of a set of records, for `workList`. */
 function workEntries<T extends { readonly id: string; readonly title: string }>(
@@ -281,30 +292,148 @@ function clientsListPage(snapshot: Snapshot): Page {
   );
 }
 
-function clientShowPage(client: Client, snapshot: Snapshot): Page {
-  const engagements = snapshot.engagements
-    .filter((engagement) => engagement.clientId === client.id)
-    .map((engagement) => ({
-      href: `/engagements/${encodeURIComponent(engagement.id)}`,
-      label: engagement.name,
-      note: engagement.status,
-    }));
+/** A linked list section: a creation link (when given) and the entries. */
+function listSection(
+  title: string,
+  items: readonly { readonly href: string; readonly label: string; readonly note?: string }[],
+  options: {
+    readonly newHref?: string;
+    readonly newLabel?: string;
+    readonly empty?: string;
+  } = {},
+): PageSection {
+  const body: string[] = [];
+  if (options.newHref !== undefined && options.newLabel !== undefined) {
+    body.push(`<p>${link(options.newHref, options.newLabel)}</p>`);
+  }
+  if (items.length === 0 && options.empty !== undefined) {
+    body.push(`<p>${escapeHtml(options.empty)}</p>`);
+  } else {
+    body.push(childList(items));
+  }
+  return { title, body: body.join("\n") };
+}
+
+/** The linked list entries of a set of tasks, with their edit workflow. */
+function taskEntryList(tasks: readonly Task[]): readonly ListEntry[] {
+  return tasks.map((task) => ({
+    href: `/tasks/${encodeURIComponent(task.id)}`,
+    label: task.title,
+    note: describeTask(task),
+  }));
+}
+
+/** The linked list entries of a set of work items, with their edit workflow. */
+function itemEntryList(items: readonly WorkItem[]): readonly ListEntry[] {
+  return items.map((item) => ({
+    href: `/items/${encodeURIComponent(item.id)}`,
+    label: item.title,
+    note: describeItem(item),
+  }));
+}
+
+/**
+ * The client overview: the profile, the client's engagements with their
+ * statuses and projects, the work that needs attention, and the client-wide
+ * meeting history. Closed and completed records are not hidden: they stay
+ * reachable through their own lists, linked from the overview where they
+ * belong. Every selector is narrowed by this client id, so a sibling client's
+ * records never appear in the lists, histories or counts.
+ */
+function clientShowPage(client: Client, snapshot: Snapshot, store: Store): Page {
+  const clientId = client.id;
+  const engagements = snapshot.engagements.filter((engagement) => engagement.clientId === clientId);
+  const engagementIds = new Set(engagements.map((engagement) => engagement.id));
+  const projects = snapshot.projects.filter((project) => engagementIds.has(project.engagementId));
+  const tasks = store.listTasks({ clientId });
+  const items = store.listItems({ clientId });
+
+  const engagementItems = engagements.map((engagement) => ({
+    href: `/engagements/${encodeURIComponent(engagement.id)}`,
+    label: engagement.name,
+    note: engagement.status,
+  }));
+  const projectItems = projects.map((project) => {
+    const engagement = engagements.find((candidate) => candidate.id === project.engagementId);
+    return {
+      href: `/projects/${encodeURIComponent(project.id)}`,
+      label: project.name,
+      note: [project.status, engagement?.name].filter((part) => part !== undefined).join(" · "),
+    };
+  });
+
+  const currentTasks = tasks.filter((task) => task.status === "open" || task.status === "in_progress");
+  const blockers = items.filter((item) => item.kind === "blocker" && item.state === "open");
+  const questions = items.filter((item) => item.kind === "question" && item.state === "open");
+  const decisions = items.filter((item) => item.kind === "decision");
+  const openItems = (kind: "follow_up" | "commitment" | "waiting") =>
+    itemEntryList(items.filter((item) => item.kind === kind && item.state === "open"));
+
+  // The next steps are grouped by kind, each group with its own heading and
+  // list (or its own empty sentence), so a follow-up, a commitment and a
+  // waiting item are never merged into one undifferentiated list. Closed items
+  // are excluded from every group; they stay reachable through their own
+  // lists on the engagement and project pages.
+  const nextStepGroups: readonly { readonly title: string; readonly entries: readonly ListEntry[] }[] = [
+    { title: "Open follow-ups", entries: openItems("follow_up") },
+    { title: "Open commitments", entries: openItems("commitment") },
+    { title: "Open waiting items", entries: openItems("waiting") },
+  ];
+  const nextStepsBody = nextStepGroups
+    .map((group) => {
+      const body: string[] = [];
+      if (group.entries.length === 0) body.push(`<p>No ${group.title.toLowerCase()}.</p>`);
+      else body.push(childList(group.entries));
+      return `<h3>${escapeHtml(group.title)}</h3>${body.join("\n")}`;
+    })
+    .join("\n");
+
+  // Derived engagement counts: an engagement's tally is selected by its own
+  // scope, which includes its project-linked records once. Summing project
+  // tallies would count those twice, so only scope counts are shown.
+  const countLines = engagements.map(
+    (engagement) =>
+      `<li>${link(`/engagements/${encodeURIComponent(engagement.id)}`, engagement.name)}${countList(
+        taskStatusCounts(store, clientId, { engagementId: engagement.id }),
+      )}</li>`,
+  );
+
   return pageWith(
     client.name,
     [
       { label: "Home", href: "/" },
       { label: "Clients", href: "/clients" },
-      { label: "Edit client", href: `/clients/${encodeURIComponent(client.id)}/edit` },
+      { label: "Edit client", href: `/clients/${encodeURIComponent(clientId)}/edit` },
     ],
     [
       { title: "Profile", body: profileFields(CLIENT_FIELDS, client) },
+      listSection("Engagements", engagementItems, {
+        newHref: `/clients/${encodeURIComponent(clientId)}/engagements/new`,
+        newLabel: "New engagement",
+        empty: "No engagements yet.",
+      }),
+      listSection("Projects", projectItems, { empty: "No projects yet." }),
       {
-        title: "Engagements",
-        body: [
-          `<p>${link(`/clients/${encodeURIComponent(client.id)}/engagements/new`, "New engagement")}</p>`,
-          childList(engagements),
-        ].join("\n"),
+        title: "Engagement counts",
+        body:
+          engagements.length === 0
+            ? "<p>No engagements yet.</p>"
+            : `<ul>${countLines.join("")}</ul>`,
       },
+      listSection("Current tasks (open or in progress)", taskEntryList(currentTasks), {
+        empty: "No current tasks.",
+      }),
+      listSection("Open blockers", itemEntryList(blockers), {
+        empty: "No open blockers.",
+      }),
+      listSection("Open questions", itemEntryList(questions), {
+        empty: "No open questions.",
+      }),
+      listSection("Decisions", itemEntryList(decisions), {
+        empty: "No decisions recorded yet.",
+      }),
+      { title: "Next steps", body: nextStepsBody },
+      meetingSection("Meeting history", "", clientMeetings(store, clientId)),
     ],
   );
 }
@@ -348,6 +477,14 @@ function engagementShowPage(engagement: Engagement, snapshot: Snapshot, store: S
       ].join("\n"),
     },
   ];
+
+  sections.push(
+    meetingSection(
+      "Meeting history",
+      `/engagements/${encodeURIComponent(engagementId)}/meetings/new`,
+      engagementMeetings(store, clientId, engagementId),
+    ),
+  );
 
   for (const project of snapshot.projects.filter((candidate) => candidate.engagementId === engagementId)) {
     const work = projectWork(store, clientId, engagementId, project.id);
@@ -411,6 +548,11 @@ function projectShowPage(project: Project, snapshot: Snapshot, store: Store): Pa
           `<p>Open work items: ${escapeHtml(String(openItemCount(store, client.id, { engagementId: engagement.id, projectId: project.id })))}</p>`,
         ].join("\n"),
       },
+      meetingSection(
+        "Meeting history",
+        `/projects/${encodeURIComponent(project.id)}/meetings/new`,
+        projectMeetings(store, client.id, engagement.id, project.id),
+      ),
     ],
   );
 }
@@ -696,7 +838,12 @@ export function hierarchyRoutes(store: Store): HierarchyRoutes {
     clientsRecord: {
       get: {
         method: "GET",
-        render: (request) => clientShowPage(findRecord(snapshot().clients, idFromPath(request.path), "client"), snapshot()),
+        render: (request) =>
+          clientShowPage(
+            findRecord(snapshot().clients, idFromPath(request.path), "client"),
+            snapshot(),
+            store,
+          ),
       },
     },
     clientsEdit: {
