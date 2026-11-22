@@ -725,6 +725,11 @@ function omittedControlValue(field: FieldSpec, record: object): string | undefin
  * nonexistent project selected on the form) are both problems the user can
  * correct, so both become form errors. A missing URL parent or edit target is
  * resolved before the write and never reaches here.
+ *
+ * `selected` is the project the submission chose on the form, when it chose
+ * one. A refusal about that visible choice (an unknown project, on a create or
+ * an edit) is associated with the project select; a refusal about the parent
+ * chain or identity links names no visible control and stays in the summary.
  */
 function formFailure(
   error: unknown,
@@ -732,6 +737,7 @@ function formFailure(
   fields: readonly FieldSpec[],
   action: string,
   record?: Readonly<Record<string, string>>,
+  selected?: string,
 ): FormError | null {
   if (!(error instanceof ValidationError) && !(error instanceof MissingRecordError)) {
     return null;
@@ -750,7 +756,8 @@ function formFailure(
       filled[field.name] = omittedControlValue(field, base) ?? "";
     }
   }
-  const errors = fieldErrorsFor(error.message, filled, fields);
+  console.log("DBGSEL", JSON.stringify(selected), JSON.stringify(error.message));
+  const errors = fieldErrorsFor(error.message, filled, fields, selected);
   return new FormError(error.message, filled, errors, fields, action);
 }
 
@@ -1027,7 +1034,7 @@ export function workRoutes(store: Store): WorkRoutes {
       const task = await store.createTask(input as TaskCreate);
       return redirect(`/tasks/${encodeURIComponent(task.id)}`);
     } catch (error) {
-      const failure = formFailure(error, values, fields, action);
+      const failure = formFailure(error, values, fields, action, undefined, values["projectId"]);
       if (failure !== null) throw failure;
       throw error;
     }
@@ -1058,7 +1065,7 @@ export function workRoutes(store: Store): WorkRoutes {
       const item = await store.createItem(input as WorkItemCreate);
       return redirect(`/items/${encodeURIComponent(item.id)}`);
     } catch (error) {
-      const failure = formFailure(error, values, fields, action);
+      const failure = formFailure(error, values, fields, action, undefined, values["projectId"]);
       if (failure !== null) throw failure;
       throw error;
     }
@@ -1124,7 +1131,7 @@ export function workRoutes(store: Store): WorkRoutes {
       await store.updateTask(task.id, taskEdit(values, false));
       return redirect(`/tasks/${encodeURIComponent(task.id)}`);
     } catch (error) {
-      const failure = formFailure(error, values, target.fields, target.action, stored);
+      const failure = formFailure(error, values, target.fields, target.action, stored, values["projectId"]);
       if (failure !== null) throw failure;
       throw error;
     }
@@ -1140,7 +1147,7 @@ export function workRoutes(store: Store): WorkRoutes {
       await store.updateItem(item.id, itemEdit(values, false));
       return redirect(`/items/${encodeURIComponent(item.id)}`);
     } catch (error) {
-      const failure = formFailure(error, values, target.fields, target.action, stored);
+      const failure = formFailure(error, values, target.fields, target.action, stored, values["projectId"]);
       if (failure !== null) throw failure;
       throw error;
     }

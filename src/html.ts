@@ -313,18 +313,95 @@ function wordsOutsideQuotes(message: string): readonly string[] {
  * with the submitted value the form holds. A message that names no visible
  * control (a hidden identity or parent link, or a record the form cannot
  * name) reports nothing and stays in the summary alone.
+ *
+ * `selectedField` is the visible control a form boundary already knows the
+ * refusal is about: the one control whose submitted value the refusal names.
+ * It is used only when the message names no visible control of its own and
+ * quotes exactly that submitted value in its own text, outside any quoted
+ * value (`No project with id "project-99"`). Then the problem is associated
+ * with that control, so an unknown value the user selected on the form points
+ * at the choice that has to be corrected. It never overrides a message that
+ * names a visible control, and a message about a hidden identity or parent
+ * link (a submitted parent mismatch, an unassignable parent chain) names a
+ * different value or a hidden link, so it stays in the summary alone.
  */
 export function fieldErrorsFor(
   message: string,
   values: Readonly<Record<string, string>>,
   fields: readonly FieldSpec[],
+  selectedField?: string,
 ): readonly FieldError[] {
-  const fieldName = namedVisibleField(message, fields);
-  if (fieldName === undefined) return [];
-  const field = fields.find((candidate) => candidate.name === fieldName && candidate.hidden !== true);
+  const named = namedVisibleField(message, fields);
+  if (named !== undefined && named !== selectedField) {
+    return [fieldErrorFor(named, message, values, fields)];
+  }
+  if (selectedField === undefined) return [];
+  const field = fields.find((candidate) => candidate.name === selectedField && candidate.hidden !== true);
   if (field === undefined) return [];
-  const value = values[fieldName] ?? field.value;
-  return [value === undefined ? { field: fieldName, message } : { field: fieldName, message, value }];
+  const value = values[selectedField];
+  if (!namesSubmittedChoice(message, field, value)) return [];
+  return [fieldErrorFor(selectedField, message, values, fields)];
+}
+
+/** One field problem for a visible control, with the value the form holds. */
+function fieldErrorFor(
+  name: string,
+  message: string,
+  values: Readonly<Record<string, string>>,
+  fields: readonly FieldSpec[],
+): FieldError {
+  const field = fields.find((candidate) => candidate.name === name && candidate.hidden !== true);
+  const value = values[name] ?? field?.value;
+  return value === undefined ? { field: name, message } : { field: name, message, value };
+}
+
+/**
+ * True when a refusal message quotes the submitted value of the visible
+ * control as its problem: the message's own text (outside every quoted value)
+ * names that control, and the submitted value appears as one complete quoted
+ * value (`projectId: "project-99" is not a project of this engagement`). A
+ * message about a hidden identity or parent link (a submitted parent mismatch,
+ * a parent chain) names a link rather than the control; such a message and a
+ * message that quotes another value never mark the control invalid and stay in
+ * the summary alone.
+ */
+function namesSubmittedChoice(message: string, field: FieldSpec, value: string | undefined): boolean {
+  if (value === undefined || value === "") return false;
+  if (quotedReference(message, value) === undefined) return false;
+  const hidden = new Set(["id", "clientId", "engagementId", "projectId"]);
+  hidden.delete(field.name);
+  const linked = wordsOutsideQuotes(message).some((word) => hidden.has(fieldName(word)));
+  return !linked;
+}
+
+/**
+ * The text of the first complete quoted value in a message that equals `value`,
+ * as written; undefined when no quoted value equals it. Quoted values are read
+ * the same way the message text treats them as value text rather than field
+ * references.
+ */
+function quotedReference(message: string, value: string): string | undefined {
+  const opens = /(?:^|[\s:(])("|'|`)/g;
+  for (let match = opens.exec(message); match !== null; match = opens.exec(message)) {
+    const quote = match[1];
+    let raw = "";
+    let closed = false;
+    for (let index = match.index + match[0].length; index < message.length; index += 1) {
+      const char = message[index];
+      if (char === "\\" && message[index + 1] === quote) {
+        raw += char + quote;
+        index += 1;
+        continue;
+      }
+      if (char === quote) {
+        closed = true;
+        break;
+      }
+      raw += char;
+    }
+    if (closed && raw === value) return raw;
+  }
+  return undefined;
 }
 
 /**
