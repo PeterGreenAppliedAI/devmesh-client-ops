@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -253,23 +253,6 @@ async function observe(
   return { counts, pages };
 }
 
-/**
- * Remove one meeting from the store's persisted data file. The application is
- * closed first, so the file is the only copy of the data and no write races.
- * The file is read, edited and written whole; a missing or unexpected shape is
- * a test failure, not a silent reset.
- */
-function removeMeeting(directory: string, meetingId: string): void {
-  const file = readdirSync(directory).find((name) => name.endsWith(".json"));
-  assert.ok(file !== undefined, "the store wrote a data file");
-  const path = join(directory, file);
-  const data = JSON.parse(readFileSync(path, "utf8")) as { meetings: Array<{ id: string }> };
-  assert.ok(Array.isArray(data.meetings), "the data file holds meetings");
-  data.meetings = data.meetings.filter((meeting) => meeting.id !== meetingId);
-  assert.ok(!data.meetings.some((meeting) => meeting.id === meetingId), "probe meeting removed");
-  writeFileSync(path, JSON.stringify(data));
-}
-
 // ---------------------------------------------------------------------------
 // The workflow
 // ---------------------------------------------------------------------------
@@ -289,6 +272,7 @@ describe("workspace integration: linked overview and restart", () => {
       items: [] as string[],
       meetings: [] as string[],
       probe: "",
+      probeTitle: "",
       otherClient: "",
       emptyClient: "",
       otherEngagement: "",
@@ -540,9 +524,10 @@ describe("workspace integration: linked overview and restart", () => {
       // field corrected is accepted, and the observation changes in its existing
       // paths (the new meeting's count, the history links and the scoped pages),
       // so a snapshot that never changed would fail this test rather than pass
-      // silently. The probe meeting is then edited and removed, which the
-      // existing paths also observe, so the path list stays the same before and
-      // after the control and ids.probe is never a path in it.
+      // silently. There is no delete route for a meeting, so the probe stays
+      // stored for the rest of the workflow, including the restart below: the
+      // path list before and after the control is identical (ids.probe is never
+      // a path in it) and the probe's edited title is part of later snapshots.
       const legit = await send(base, {
         method: "POST",
         path: `/engagements/${alpha}/meetings/new`,
@@ -557,22 +542,11 @@ describe("workspace integration: linked overview and restart", () => {
       // Edit the probe so an accepted write of a changed title is observed.
       const probeEdit = parseForm((await send(base, { path: `/meetings/${ids.probe}/edit` })).body);
       probeEdit.controls.set("title", "Snapshot probe (edited)");
+      ids.probeTitle = "Snapshot probe (edited)";
       const probeEdited = await send(base, { method: "POST", path: probeEdit.action, form: Object.fromEntries(probeEdit.controls) });
       assert.equal(redirectTarget(probeEdited), `/meetings/${ids.probe}`);
       const probedEdited = JSON.stringify(await observe(base, ids));
       assert.notEqual(probedEdited, probed);
-      // There is no delete route for a meeting, so the probe is removed from
-      // the persisted data file while the application is closed, and a fresh
-      // application over the same directory is opened to read the records back.
-      // This keeps `observe`'s path list the same before and after the control.
-      await app.close();
-      removeMeeting(dir, ids.probe);
-      app = await open(dir);
-      base = app.url;
-      // The same observation paths as before the control hold with the probe's
-      // record gone: the control's accepted create, edit and removal left the
-      // committed state exactly as it was.
-      assert.equal(JSON.stringify(await observe(base, ids)), beforeRestart);
       // Every subsequent hostile request is compared against the current state.
       // Accepted writes follow (a completed task), so the restart comparison
       // below uses the state observed just before the restart instead.
@@ -837,6 +811,10 @@ describe("workspace integration: linked overview and restart", () => {
       assert.match(engagementPage.body, new RegExp(`href="/tasks/${ids.tasks[2]}"`));
       assert.match(engagementPage.body, new RegExp(`href="/items/${ids.items[2]}"`));
       assert.match(engagementPage.body, new RegExp(`href="/items/${ids.items[6]}"`));
+      assert.ok(sectionOf(engagementPage.body, "Meeting history").includes(escapeHtml(ids.probeTitle)));
+      const probeDetail = await send(app.url, { path: `/meetings/${ids.probe}` });
+      assert.equal(probeDetail.status, 200);
+      assert.ok(probeDetail.body.includes(escapeHtml(ids.probeTitle)));
       const meetingDetail = await send(app.url, { path: `/meetings/${ids.meetings[0]}` });
       assert.equal(meetingDetail.status, 200);
       assert.ok(meetingDetail.body.includes(escapeHtml("Alpha kickoff (edited)")));
@@ -872,8 +850,11 @@ describe("workspace integration: linked overview and restart", () => {
       );
       const clientHistory = sectionOf(overview.body, "Meeting history");
       assert.equal(clientHistory.split(`href="/meetings/${ids.meetings[1]}"`).length - 1, 1);
-      // The probe meeting was removed and is not in the client-wide history.
-      assert.equal(clientHistory.split(`href="/meetings/${ids.probe}"`).length - 1, 0);
+      // The probe meeting created and edited by the positive control survived
+      // the restart, with its edited title, in the client-wide history and on
+      // its own detail page.
+      assert.equal(clientHistory.split(`href="/meetings/${ids.probe}"`).length - 1, 1);
+      assert.ok(clientHistory.includes(escapeHtml(ids.probeTitle)));
       // Next steps groups survive too.
       const nextSteps = sectionOf(overview.body, "Next steps");
       assert.match(nextStepGroup(nextSteps, "Open follow-ups", "Open commitments"), new RegExp(`href="/items/${ids.items[5]}"`));
