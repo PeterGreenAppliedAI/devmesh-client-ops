@@ -693,13 +693,15 @@ describe("work pages: tasks", () => {
 
       // A project-scoped create URL derives the parent engagement, but a blank
       // submitted project means no project link: the URL project is not applied.
+      // Post directly to the project-scoped endpoint, not to the engagement
+      // action the rendered form uses.
       const taskFormPage = await send(server.origin, { path: `/projects/${h.project.id}/tasks/new` });
       const taskForm = parseForm(taskFormPage.body);
       taskForm.controls.set("title", "No project task");
       taskForm.controls.set("projectId", "");
       const created = await send(server.origin, {
         method: "POST",
-        path: taskForm.action,
+        path: `/projects/${h.project.id}/tasks/new`,
         form: Object.fromEntries(taskForm.controls),
       });
       assert.match(redirectTarget(created), /^\/tasks\/task-\d+$/);
@@ -716,7 +718,7 @@ describe("work pages: tasks", () => {
       itemForm.controls.set("projectId", "");
       const createdItem = await send(server.origin, {
         method: "POST",
-        path: itemForm.action,
+        path: `/projects/${h.project.id}/items/new`,
         form: Object.fromEntries(itemForm.controls),
       });
       assert.match(redirectTarget(createdItem), /^\/items\/item-\d+$/);
@@ -726,12 +728,13 @@ describe("work pages: tasks", () => {
       assert.equal(item.projectId, undefined);
       assert.equal("projectId" in item, false);
 
-      // A selected project on the same URL is still honoured.
+      // A selected project on the same URL is still honoured when posted
+      // directly to the project-scoped endpoint.
       const inProject = parseForm((await send(server.origin, { path: `/projects/${h.secondProject.id}/tasks/new` })).body);
       inProject.controls.set("title", "In second project");
       const placed = await send(server.origin, {
         method: "POST",
-        path: inProject.action,
+        path: `/projects/${h.secondProject.id}/tasks/new`,
         form: Object.fromEntries(inProject.controls),
       });
       assert.match(redirectTarget(placed), /^\/tasks\/task-\d+$/);
