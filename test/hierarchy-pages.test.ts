@@ -1236,9 +1236,14 @@ describe("hierarchy pages", () => {
       // The client's one primary action is creating an engagement; the empty
       // project list names what is missing rather than guessing a project.
       assert.match(overview.body, /<section><h2>Engagements<\/h2><p class="primary-action"><a href="[^"]+">New engagement<\/a>/);
-      // The project's status is a text badge in the project list, and its
-      // engagement is named in the same badge.
-      assert.match(overview.body, /<section><h2>Projects<\/h2><ul><li><a href="\/projects\/[^"]+">Prototype<\/a> <span class="badge">completed · Discovery<\/span><\/li><\/ul>/);
+      // The project's status is a text badge in the project list, beside its
+      // link, and its engagement is named as a link to the engagement page.
+      assert.match(
+        overview.body,
+        new RegExp(
+          `<section><h2>Projects<\\/h2><ul><li><a href="\\/projects\\/[^"]+">Prototype<\\/a> <span class="badge">completed<\\/span> · <a href="\\/engagements\\/${engagement.id}">Discovery<\\/a><\\/li><\\/ul>`,
+        ),
+      );
       // The engagement list shows its status as a text badge too.
       assert.match(overview.body, /<section><h2>Engagements<\/h2>[\s\S]*<li><a href="\/engagements\/[^"]+">Discovery<\/a> <span class="badge">active<\/span><\/li>/);
       assert.doesNotMatch(overview.body, /No projects yet\./);
@@ -1344,12 +1349,18 @@ describe("hierarchy pages", () => {
       const before = JSON.stringify(server.store.snapshot());
 
       // The client overview's engagement and project lists each show a status
-      // badge beside their link, and the project's badge names its engagement.
+      // badge beside their link, and the project's engagement is named as a
+      // link after the badge.
       const overview = await send(server.origin, { path: `/clients/${client.id}` });
       const engagements = sectionOf(overview.body, "Engagements");
       assert.match(engagements, /<li><a href="\/engagements\/[^"]+">Discovery<\/a> <span class="badge">on_hold<\/span><\/li>/);
       const projects = sectionOf(overview.body, "Projects");
-      assert.match(projects, /<li><a href="\/projects\/[^"]+">Prototype<\/a> <span class="badge">planned · Discovery<\/span><\/li>/);
+      assert.match(
+        projects,
+        new RegExp(
+          `<li><a href="\\/projects\\/[^"]+">Prototype<\\/a> <span class="badge">planned<\\/span> · <a href="\\/engagements\\/${engagement.id}">Discovery<\\/a><\\/li>`,
+        ),
+      );
       // The engagement page's project list shows the status badge too.
       const engagementPage = await send(server.origin, { path: `/engagements/${engagement.id}` });
       assert.match(

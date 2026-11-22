@@ -305,19 +305,24 @@ export interface ListEntry {
   readonly label: string;
   /** Stored text shown as escaped text badges beside the link. */
   readonly badges?: readonly string[];
+  /** Already-escaped markup shown after the badges, such as a parent link. */
+  readonly trailing?: string;
 }
 
 /**
  * Render a list of links, or a sentence when there are none. A list entry's
  * badges (a stored status, for example) are shown as escaped text badges beside
- * its link, so a state is readable at a glance without markup of its own.
+ * its link, so a state is readable at a glance without markup of its own. Any
+ * trailing markup the entry carries (a parent link, for example) follows the
+ * badges; the caller escaped it.
  */
 export function childList(items: readonly ListEntry[]): string {
   if (items.length === 0) return "<p>None yet.</p>";
   return `<ul>${items
     .map((item) => {
       const badges = (item.badges ?? []).map((text) => ` ${badge(text)}`).join("");
-      return `<li>${link(item.href, item.label)}${badges}</li>`;
+      const trailing = item.trailing === undefined ? "" : ` · ${item.trailing}`;
+      return `<li>${link(item.href, item.label)}${badges}${trailing}</li>`;
     })
     .join("")}</ul>`;
 }

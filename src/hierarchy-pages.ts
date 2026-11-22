@@ -410,15 +410,19 @@ function clientShowPage(client: Client, snapshot: Snapshot, store: Store): Page 
     label: engagement.name,
     badges: [engagement.status],
   }));
+  const engagementById = new Map(engagements.map((engagement) => [engagement.id, engagement]));
   const projectItems = projects.map((project) => {
-    const engagement = engagements.find((candidate) => candidate.id === project.engagementId);
+    const engagement = engagementById.get(project.engagementId);
     return {
       href: `/projects/${encodeURIComponent(project.id)}`,
       label: project.name,
-      badges:
+      // The project's own status is the badge; its engagement is a separate
+      // link, so a stored name can never be read as part of the status.
+      badges: [project.status],
+      trailing:
         engagement === undefined
-          ? [project.status]
-          : [`${project.status} · ${engagement.name}`],
+          ? undefined
+          : link(`/engagements/${encodeURIComponent(engagement.id)}`, engagement.name),
     };
   });
 

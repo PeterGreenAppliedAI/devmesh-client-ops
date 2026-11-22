@@ -595,8 +595,20 @@ describe("workspace integration: linked overview and restart", () => {
       const projectSection = sectionOf(overview.body, "Projects");
       assert.match(projectSection, new RegExp(`href="/projects/${alphaProject}"`));
       assert.match(projectSection, new RegExp(`href="/projects/${betaProject}"`));
-      assert.match(projectSection, /<a href="\/projects\/[^"]+">Alpha project<\/a> <span class="badge">active · Alpha<\/span>/);
-      assert.match(projectSection, /<a href="\/projects\/[^"]+">Beta project<\/a> <span class="badge">active · Beta<\/span>/);
+      // The status is the badge; the project's engagement is a link after it,
+      // so a stored name is never read as part of the status.
+      assert.match(
+        projectSection,
+        new RegExp(
+          `<a href="/projects/[^"]+">Alpha project</a> <span class="badge">active</span> · <a href="/engagements/${alpha}">Alpha</a>`,
+        ),
+      );
+      assert.match(
+        projectSection,
+        new RegExp(
+          `<a href="/projects/[^"]+">Beta project</a> <span class="badge">active</span> · <a href="/engagements/${beta}">Beta</a>`,
+        ),
+      );
 
       // Current tasks: exactly the open and in-progress tasks, with and without
       // dates, and never the completed ones.
