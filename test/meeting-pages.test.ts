@@ -633,10 +633,10 @@ describe("meeting pages: creation", () => {
       assert.equal((invalid.body.match(/aria-invalid="true"/g) ?? []).length, 1);
       assert.equal(JSON.stringify(server.store.snapshot()), before);
 
-      // Correcting the title on the rendered form and resubmitting saves only
-      // what was posted and keeps every omitted field, the project included.
+      // Correcting the title on the rendered form and resubmitting the whole
+      // correction form saves it and keeps every value it carries, including
+      // the stored values the original submission omitted.
       form.controls.set("title", "Corrected");
-      for (const name of ["date", "notes", "projectId"]) form.controls.delete(name);
       const corrected = await send(server.origin, {
         method: "POST",
         path: form.action,
@@ -692,6 +692,22 @@ describe("meeting pages: creation", () => {
       });
       assert.equal(unknownProject.status, 400);
       assert.doesNotMatch(unknownProject.body, /Not found/);
+      // The rejected project is the form's own visible choice: its select is
+      // marked invalid and points at the message the summary also carries.
+      assert.equal((unknownProject.body.match(/aria-invalid="true"/g) ?? []).length, 1);
+      assert.equal(invalidControls(unknownProject.body).length, 1);
+      assert.equal(invalidControls(unknownProject.body)[0].field, "projectId");
+      assert.match(
+        unknownProject.body,
+        /<select[^>]*\sid="field-projectId"[^>]*\saria-invalid="true"[^>]*\saria-describedby="field-projectId-error"/,
+      );
+      assert.match(
+        unknownProject.body,
+        /<option value="project-99" selected>project-99 \(not a valid choice\)<\/option>/,
+      );
+      const unknownCorrection = parseForm(unknownProject.body);
+      assert.equal(unknownCorrection.controls.get("title"), "Unknown");
+      assert.equal(unknownCorrection.controls.get("date"), "2026-05-05");
       assert.equal(JSON.stringify(server.store.snapshot()), before);
 
       // A tampered parent id in the form is refused: the engagement and client
@@ -963,6 +979,55 @@ describe("meeting pages: editing", () => {
       assert.equal(editCorrection.controls.get("title"), "Hijacked");
       assert.equal(JSON.stringify(server.store.snapshot()), beforeEdit);
 
+      // An unknown submitted project on an edit is a correctable 400, not a
+      // 404: the submitter can pick a real project and resubmit. The edit save
+      // goes through the store with the supplied project rather than the create
+      // path's project lookup, so the store's own message about the missing
+      // record names no visible control: it stays in the summary and marks
+      // nothing invalid.
+      const unknownEdit = await send(server.origin, {
+        method: "POST",
+        path: `/meetings/${meeting.id}/edit`,
+        form: {
+          id: meeting.id,
+          title: "Unknown project",
+          date: "2026-03-03",
+          notes: "keep",
+          projectId: "project-99",
+        },
+      });
+      assert.equal(unknownEdit.status, 400);
+      assert.doesNotMatch(unknownEdit.body, /Not found/);
+      assert.match(String(unknownEdit.headers["content-type"]), /^text\/html/);
+      assert.match(unknownEdit.body, /role="alert"><p>No project with id &quot;project-99&quot;<\/p>/);
+      assert.equal((unknownEdit.body.match(/aria-invalid="true"/g) ?? []).length, 0);
+      assert.equal(invalidControls(unknownEdit.body).length, 0);
+      assert.doesNotMatch(unknownEdit.body, /id="field-projectId"[^>]*aria-invalid/);
+      assert.match(unknownEdit.body, /<option value="project-99" selected>project-99 \(not a valid choice\)<\/option>/);
+      const unknownEditForm = parseForm(unknownEdit.body);
+      assert.equal(unknownEditForm.controls.get("title"), "Unknown project");
+      assert.equal(unknownEditForm.controls.get("date"), "2026-03-03");
+      assert.equal(unknownEditForm.controls.get("notes"), "keep");
+      assert.equal(JSON.stringify(server.store.snapshot()), beforeEdit);
+      // Correcting the project on the rendered form and resubmitting saves the
+      // change while the record's other fields are kept.
+      unknownEditForm.controls.set("projectId", h.secondProject.id);
+      const unknownFixed = await send(server.origin, {
+        method: "POST",
+        path: unknownEditForm.action,
+        form: Object.fromEntries(unknownEditForm.controls),
+      });
+      assert.equal(redirectTarget(unknownFixed), `/meetings/${meeting.id}`);
+      const unknownStored = server.store.snapshot().meetings.find(
+        (candidate) => candidate.id === meeting.id,
+      );
+      assert.ok(unknownStored !== undefined);
+      assert.equal(unknownStored.title, "Unknown project");
+      assert.equal(unknownStored.projectId, h.secondProject.id);
+      assert.equal(unknownStored.date, "2026-03-03");
+      const afterUnknownFix = JSON.stringify(server.store.snapshot());
+      assert.notEqual(afterUnknownFix, beforeEdit);
+
       // A conflicting submitted id is refused on a form for the URL record.
       const conflicting = await send(server.origin, {
         method: "POST",
@@ -971,7 +1036,7 @@ describe("meeting pages: editing", () => {
       });
       assert.equal(conflicting.status, 400);
       assert.match(conflicting.body, /does not match this URL/);
-      assert.equal(JSON.stringify(server.store.snapshot()), beforeEdit);
+      assert.equal(JSON.stringify(server.store.snapshot()), afterUnknownFix);
 
       // A tampered engagement on an edit is refused even though the other
       // fields are valid and changed: the record does not move and the rest of
@@ -991,7 +1056,7 @@ describe("meeting pages: editing", () => {
       assert.equal(editEngagementTamper.status, 400);
       assert.match(editEngagementTamper.body, /role="alert"/);
       assert.match(editEngagementTamper.body, /not the parent engagement of this form/);
-      assert.equal(JSON.stringify(server.store.snapshot()), beforeEdit);
+      assert.equal(JSON.stringify(server.store.snapshot()), afterUnknownFix);
 
       // A tampered client on an edit is refused the same way.
       const editClientTamper = await send(server.origin, {
@@ -1007,15 +1072,15 @@ describe("meeting pages: editing", () => {
       });
       assert.equal(editClientTamper.status, 400);
       assert.match(editClientTamper.body, /not the client of this engagement/);
-      assert.equal(JSON.stringify(server.store.snapshot()), beforeEdit);
+      assert.equal(JSON.stringify(server.store.snapshot()), afterUnknownFix);
 
       // The stored parents still come from the record, never the form, and the
       // rejected submissions did not change anything.
       const storedAfterTamper = server.store.snapshot().meetings[0];
       assert.equal(storedAfterTamper.clientId, h.client.id);
       assert.equal(storedAfterTamper.engagementId, h.engagement.id);
-      assert.equal(storedAfterTamper.title, "Fixed");
-      assert.equal(storedAfterTamper.date, "2026-02-28");
+      assert.equal(storedAfterTamper.title, "Unknown project");
+      assert.equal(storedAfterTamper.date, "2026-03-03");
       assert.notEqual(before, beforeEdit);
     } finally {
       await server.close();

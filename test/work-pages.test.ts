@@ -696,6 +696,25 @@ describe("work pages: tasks", () => {
       assert.match(editClientMismatch.body, /not the client of this engagement/);
       assert.equal(JSON.stringify(server.store.snapshot()), beforeEdit);
 
+      // A present blank parent on an edit is a mismatch too: a blank parent
+      // differs from the stored one, so it is refused and writes nothing.
+      for (const form of [
+        { id: task.id, title: "Renamed", engagementId: "" },
+        { id: task.id, title: "Renamed", clientId: "" },
+        { id: task.id, title: "Renamed", engagementId: h.engagement.id, clientId: "" },
+        { id: task.id, title: "Renamed", engagementId: "", clientId: h.client.id },
+      ] as readonly Record<string, string>[]) {
+        const blankEdit = await send(server.origin, { method: "POST", path: editUrl, form });
+        assert.equal(blankEdit.status, 400, JSON.stringify(form));
+        assert.match(
+          blankEdit.body,
+          /not the (parent engagement|client) of this/,
+          JSON.stringify(form),
+        );
+        assert.equal((blankEdit.body.match(/aria-invalid="true"/g) ?? []).length, 0);
+        assert.equal(JSON.stringify(server.store.snapshot()), beforeEdit, JSON.stringify(form));
+      }
+
       // An existing identity conflict takes precedence over a parent mismatch.
       const precedence = await send(server.origin, {
         method: "POST",
@@ -760,6 +779,33 @@ describe("work pages: tasks", () => {
       });
       assert.equal(itemEditMismatch.status, 400);
       assert.match(itemEditMismatch.body, /not the parent engagement of this form/);
+      const itemEditClientMismatch = await send(server.origin, {
+        method: "POST",
+        path: itemEditUrl,
+        form: { id: item.id, title: "Renamed item", clientId: h.otherClient.id },
+      });
+      assert.equal(itemEditClientMismatch.status, 400);
+      assert.match(itemEditClientMismatch.body, /not the client of this engagement/);
+      assert.equal(JSON.stringify(server.store.snapshot()), beforeItemEdit);
+
+      // A present blank or differing parent on an item edit is refused and
+      // writes nothing.
+      for (const form of [
+        { id: item.id, title: "Renamed item", engagementId: "" },
+        { id: item.id, title: "Renamed item", clientId: "" },
+        { id: item.id, title: "Renamed item", engagementId: h.engagement.id, clientId: "" },
+      ] as readonly Record<string, string>[]) {
+        const blankEdit = await send(server.origin, { method: "POST", path: itemEditUrl, form });
+        assert.equal(blankEdit.status, 400, JSON.stringify(form));
+        assert.match(
+          blankEdit.body,
+          /not the (parent engagement|client) of this/,
+          JSON.stringify(form),
+        );
+        assert.equal((blankEdit.body.match(/aria-invalid="true"/g) ?? []).length, 0);
+        assert.equal(JSON.stringify(server.store.snapshot()), beforeItemEdit, JSON.stringify(form));
+      }
+
       const itemPrecedence = await send(server.origin, {
         method: "POST",
         path: itemEditUrl,
@@ -1076,13 +1122,10 @@ describe("work pages: tasks", () => {
       // The refused submissions saved nothing.
       assert.equal(JSON.stringify(server.store.snapshot()), before);
 
-      // Correcting the title on the rendered form and resubmitting saves only
-      // the submitted fields and keeps every omitted one.
+      // Correcting the title on the rendered form and resubmitting the whole
+      // correction form saves it and keeps every value it carries, including
+      // the stored values the original submission omitted.
       taskForm.controls.set("title", "Corrected task");
-      for (const name of ["status", "priority", "owner", "dueDate", "context"]) {
-        taskForm.controls.delete(name);
-      }
-      taskForm.controls.delete("projectId");
       const corrected = await send(server.origin, {
         method: "POST",
         path: taskForm.action,
@@ -1099,8 +1142,6 @@ describe("work pages: tasks", () => {
       assert.equal(storedTask.context, "Keep context");
 
       itemForm.controls.set("title", "Corrected item");
-      itemForm.controls.delete("context");
-      itemForm.controls.delete("projectId");
       const correctedItem = await send(server.origin, {
         method: "POST",
         path: itemForm.action,
@@ -1248,6 +1289,16 @@ describe("work pages: tasks", () => {
       });
       assert.equal(invalidEdit.status, 400);
       assert.doesNotMatch(invalidEdit.body, /Not found/);
+      // The edit save goes through the store with the supplied project rather
+      // than the create path's project lookup, so the store's own message about
+      // the missing record names no visible control: it stays in the summary
+      // and marks nothing invalid. The rejected project stays selected for
+      // correction.
+      assert.match(invalidEdit.body, /role="alert"><p>No project with id &quot;project-99&quot;<\/p>/);
+      assert.equal((invalidEdit.body.match(/aria-invalid="true"/g) ?? []).length, 0);
+      assert.equal(invalidControls(invalidEdit.body).length, 0);
+      assert.doesNotMatch(invalidEdit.body, /id="field-projectId"[^>]*aria-invalid/);
+      assert.match(invalidEdit.body, /<option value="project-99" selected>project-99 \(not a valid choice\)<\/option>/);
       const editForm = parseForm(invalidEdit.body);
       assert.equal(editForm.action, `/tasks/${stored.id}/edit`);
       assert.equal(editForm.controls.get("title"), "Edited unknown");
@@ -1268,6 +1319,19 @@ describe("work pages: tasks", () => {
         },
       });
       assert.equal(invalidItem.status, 400);
+      // A select project that does not exist is the item form's own visible
+      // choice, so its control and message are associated.
+      assert.equal((invalidItem.body.match(/aria-invalid="true"/g) ?? []).length, 1);
+      assert.equal(invalidControls(invalidItem.body).length, 1);
+      assert.equal(invalidControls(invalidItem.body)[0].field, "projectId");
+      assert.match(
+        invalidItem.body,
+        /<select[^>]*\sid="field-projectId"[^>]*\saria-invalid="true"[^>]*\saria-describedby="field-projectId-error"/,
+      );
+      assert.match(invalidItem.body, /<option value="project-99" selected>project-99 \(not a valid choice\)<\/option>/);
+      const itemInline = /<p id="field-projectId-error">([^<]*)<\/p>/.exec(invalidItem.body);
+      assert.ok(itemInline !== null);
+      assert.ok(invalidItem.body.includes(`<li>${itemInline[1]}</li>`));
       const itemForm = parseForm(invalidItem.body);
       assert.equal(itemForm.controls.get("title"), "Item unknown project");
       assert.equal(itemForm.controls.get("context"), "keep");
