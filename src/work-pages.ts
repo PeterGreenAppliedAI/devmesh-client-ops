@@ -545,6 +545,11 @@ function itemEdit(values: Readonly<Record<string, string>>, create: boolean): Wo
  * the stored record, so a corrected form carries the current record rather than
  * blank controls and an edit never blanks what it did not touch. A hidden
  * control keeps its server-chosen value.
+ *
+ * A validation refusal and a missing record named by the submission (a
+ * nonexistent project selected on the form) are both problems the user can
+ * correct, so both become form errors. A missing URL parent or edit target is
+ * resolved before the write and never reaches here.
  */
 function formFailure(
   error: unknown,
@@ -553,7 +558,9 @@ function formFailure(
   action: string,
   record?: Readonly<Record<string, string>>,
 ): FormError | null {
-  if (!(error instanceof ValidationError)) return null;
+  if (!(error instanceof ValidationError) && !(error instanceof MissingRecordError)) {
+    return null;
+  }
   const base = record ?? {};
   const filled: Record<string, string> = {};
   for (const field of fields) {
@@ -676,13 +683,16 @@ export function workRoutes(store: Store): WorkRoutes {
       };
     }
     if (parts[0] === "projects") {
-      // The project form posts to the engagement's new endpoint with the
-      // engagement as its parent; the project is a selection inside it.
-      const engagementId = text(form, "engagementId");
-      const scope = engagementScope(snap, engagementId);
+      // The project is the parent the path names: it is resolved from the URL,
+      // never from the submitted form, so a tampered parent id is ignored. The
+      // project form posts to the engagement's new endpoint, with the
+      // engagement derived from the URL project as its parent. A project
+      // selected by the submission must be one of that engagement's projects.
+      const projectId = decodeId(parts[1] ?? "", "project");
+      const scope = projectScope(snap, projectId);
       return {
         scope: withSelectedProject(snap, scope, text(form, "projectId")),
-        parent: { name: "engagementId", id: engagementId },
+        parent: { name: "engagementId", id: scope.engagement.id },
       };
     }
     throw new MissingRecordError("No parent for that path");

@@ -339,11 +339,13 @@ function engagementShowPage(engagement: Engagement, snapshot: Snapshot, store: S
     {
       title: "Engagement-only work",
       body: [
-        workSection("Tasks without a project", "/tasks", newTaskHref, workEntries(only.tasks, describeTask)),
-        workSection("Work items without a project", "/items", newItemHref, workEntries(only.items, describeItem)),
-      ]
-        .map((section) => `<h3>${escapeHtml(section.title)}</h3>${section.body}`)
-        .join("\n"),
+        ...[
+          workSection("Tasks without a project", "/tasks", newTaskHref, workEntries(only.tasks, describeTask)),
+          workSection("Work items without a project", "/items", newItemHref, workEntries(only.items, describeItem)),
+        ].map((section) => `<h3>${escapeHtml(section.title)}</h3>${section.body}`),
+        `<h3>Counts</h3>${countList(taskStatusCounts(store, clientId, { engagementId }))}`,
+        `<p>Open work items: ${escapeHtml(String(openItemCount(store, clientId, { engagementId })))}</p>`,
+      ].join("\n"),
     },
   ];
 

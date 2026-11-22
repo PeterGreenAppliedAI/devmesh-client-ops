@@ -529,6 +529,92 @@ describe("work pages: tasks", () => {
     }
   });
 
+  it("refuses a nonexistent submitted project as a correctable error, not a 404", async () => {
+    const server = await running();
+    try {
+      const h = await hierarchy(server.store);
+      const before = JSON.stringify(server.store.snapshot());
+
+      // A create naming a project that does not exist keeps every submitted
+      // value so the user can pick a real project and resubmit.
+      const invalid = await send(server.origin, {
+        method: "POST",
+        path: `/engagements/${h.engagement.id}/tasks/new`,
+        form: {
+          engagementId: h.engagement.id,
+          title: "Unknown project",
+          status: "open",
+          priority: "high",
+          owner: "keep owner",
+          dueDate: "",
+          context: "keep context",
+          projectId: "project-99",
+        },
+      });
+      assert.equal(invalid.status, 400);
+      assert.match(String(invalid.headers["content-type"]), /^text\/html/);
+      assert.match(invalid.body, /role="alert"/);
+      assert.doesNotMatch(invalid.body, /Not found/);
+      const form = parseForm(invalid.body);
+      assert.equal(form.action, `/engagements/${h.engagement.id}/tasks/new`);
+      assert.equal(form.controls.get("title"), "Unknown project");
+      assert.equal(form.controls.get("owner"), "keep owner");
+      assert.equal(form.controls.get("context"), "keep context");
+      // The rejected project is shown selected for correction.
+      assert.match(invalid.body, /<option value="project-99" selected>project-99 \(not a valid choice\)<\/option>/);
+      assert.equal(JSON.stringify(server.store.snapshot()), before);
+
+      // Correcting the project and resubmitting the rendered form saves it.
+      form.controls.set("projectId", h.secondProject.id);
+      const corrected = await send(server.origin, {
+        method: "POST",
+        path: form.action,
+        form: Object.fromEntries(form.controls),
+      });
+      assert.match(redirectTarget(corrected), /^\/tasks\/task-\d+$/);
+      const stored = server.store.snapshot().tasks[0];
+      assert.equal(stored.title, "Unknown project");
+      assert.equal(stored.projectId, h.secondProject.id);
+
+      // An edit naming a nonexistent project keeps the submitted values and
+      // the record's untouched fields, and the record is unchanged.
+      const beforeEdit = JSON.stringify(server.store.snapshot());
+      const invalidEdit = await send(server.origin, {
+        method: "POST",
+        path: `/tasks/${stored.id}/edit`,
+        form: { id: stored.id, title: "Edited unknown", projectId: "project-99" },
+      });
+      assert.equal(invalidEdit.status, 400);
+      assert.doesNotMatch(invalidEdit.body, /Not found/);
+      const editForm = parseForm(invalidEdit.body);
+      assert.equal(editForm.action, `/tasks/${stored.id}/edit`);
+      assert.equal(editForm.controls.get("title"), "Edited unknown");
+      assert.equal(editForm.controls.get("owner"), "keep owner");
+      assert.equal(JSON.stringify(server.store.snapshot()), beforeEdit);
+
+      // The same holds for work items.
+      const invalidItem = await send(server.origin, {
+        method: "POST",
+        path: `/engagements/${h.engagement.id}/items/new`,
+        form: {
+          engagementId: h.engagement.id,
+          kind: "question",
+          title: "Item unknown project",
+          context: "keep",
+          state: "open",
+          projectId: "project-99",
+        },
+      });
+      assert.equal(invalidItem.status, 400);
+      const itemForm = parseForm(invalidItem.body);
+      assert.equal(itemForm.controls.get("title"), "Item unknown project");
+      assert.equal(itemForm.controls.get("context"), "keep");
+      assert.equal(JSON.stringify(server.store.snapshot()), beforeEdit);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("refuses a conflicting submitted task id on an edit URL", async () => {
     const server = await running();
     try {
@@ -783,6 +869,83 @@ describe("work pages: project-scoped creation", () => {
       await server.close();
     }
   });
+
+  it("derives the engagement from the URL project and refuses cross-engagement tampering", async () => {
+    const server = await running();
+    try {
+      const h = await hierarchy(server.store);
+
+      // A POST to project A's URL cannot create work under engagement B by
+      // submitting B's ids: the URL project is the parent and B is ignored.
+      const crossParent = await send(server.origin, {
+        method: "POST",
+        path: `/projects/${h.project.id}/tasks/new`,
+        form: {
+          engagementId: h.sibling.id,
+          title: "Wrong parent",
+          status: "open",
+          priority: "normal",
+          owner: "",
+          dueDate: "",
+          context: "",
+          projectId: h.project.id,
+        },
+      });
+      const createdId = idOf(crossParent);
+      const created = server.store.snapshot().tasks.find((task) => task.id === createdId);
+      assert.ok(created !== undefined);
+      assert.equal(created.engagementId, h.engagement.id);
+      assert.equal(created.clientId, h.client.id);
+      assert.equal(created.projectId, h.project.id);
+
+      // A selected project from a different engagement is refused.
+      const beforeCross = JSON.stringify(server.store.snapshot());
+      const crossProject = await send(server.origin, {
+        method: "POST",
+        path: `/projects/${h.project.id}/tasks/new`,
+        form: {
+          engagementId: h.sibling.id,
+          title: "Cross project",
+          status: "open",
+          priority: "normal",
+          owner: "keep",
+          dueDate: "",
+          context: "",
+          projectId: h.siblingProject.id,
+        },
+      });
+      assert.equal(crossProject.status, 400);
+      assert.match(crossProject.body, /does not belong to engagementId/);
+      assert.equal(JSON.stringify(server.store.snapshot()), beforeCross);
+      // The correction form posts to the URL project's engagement and keeps the
+      // submitted values, showing the rejected project selected.
+      const correction = parseForm(crossProject.body);
+      assert.equal(correction.action, `/engagements/${h.engagement.id}/tasks/new`);
+      assert.equal(correction.controls.get("engagementId"), h.engagement.id);
+      assert.equal(correction.controls.get("title"), "Cross project");
+      assert.equal(correction.controls.get("owner"), "keep");
+      assert.match(crossProject.body, new RegExp(`<option value="${h.siblingProject.id}" selected>`));
+
+      // A nonexistent URL project is not found, and nothing is written.
+      const beforeMissing = JSON.stringify(server.store.snapshot());
+      for (const family of ["tasks", "items"]) {
+        const missing = await send(server.origin, {
+          method: "POST",
+          path: `/projects/project-99/${family}/new`,
+          form: {
+            engagementId: h.engagement.id,
+            title: "Ghost",
+            projectId: h.project.id,
+          },
+        });
+        assert.equal(missing.status, 404, family);
+        assert.match(missing.body, /Not found/);
+      }
+      assert.equal(JSON.stringify(server.store.snapshot()), beforeMissing);
+    } finally {
+      await server.close();
+    }
+  });
 });
 
 describe("work pages: lists and rollups", () => {
@@ -953,7 +1116,10 @@ describe("work pages: lists and rollups", () => {
       // The meeting is not listed as a task or an item.
       assert.ok(!page.body.includes(`href="/meetings/`));
 
-      // An engagement rollup counts engagement-only work exactly once.
+      // An engagement rollup counts engagement-only work exactly once, and the
+      // page renders the engagement-wide counts using the explicit engagement
+      // scope: two tasks (one engagement-only in progress, one project open) and
+      // two open items (engagement-only open plus project open).
       const only = server.store.listTasks({ clientId: h.client.id, engagementId: h.engagement.id });
       assert.equal(only.length, 2);
       // Each task belongs to exactly one scope: the engagement-only group or a
@@ -965,6 +1131,20 @@ describe("work pages: lists and rollups", () => {
       });
       assert.equal(projectTasks.length, 1);
       assert.equal(only.filter((task) => task.projectId === undefined).length + projectTasks.length, only.length);
+
+      // The engagement page's own counts include both engagement-only work and
+      // project work, each counted once. The first "open: 1" etc. above belongs
+      // to the first project; the engagement section carries the totals.
+      const engagementRows = taskStatusCounts(server.store, h.client.id, { engagementId: h.engagement.id });
+      assert.deepEqual(engagementRows, [
+        { label: "open", count: 1 },
+        { label: "in_progress", count: 1 },
+        { label: "done", count: 0 },
+      ]);
+      assert.equal(openItemCount(server.store, h.client.id, { engagementId: h.engagement.id }), 2);
+      // The rendered engagement-wide tally is visible before the project sections.
+      assert.match(page.body, /<h3>Counts<\/h3><ul><li>open: 1<\/li><li>in_progress: 1<\/li><li>done: 0<\/li><\/ul>/);
+      assert.match(page.body, /Open work items: 2/);
     } finally {
       await server.close();
     }
@@ -988,16 +1168,45 @@ describe("work pages: lists and rollups", () => {
         title: "Eng A item",
         state: "open",
       });
+      // An engagement with no projects of its own, holding only project-less work.
+      const bare = await server.store.createEngagement({ clientId: h.client.id, name: "Bare" });
+      await server.store.createTask({
+        clientId: h.client.id,
+        engagementId: bare.id,
+        title: "Bare task",
+        status: "in_progress",
+      });
+      await server.store.createItem({
+        clientId: h.client.id,
+        engagementId: bare.id,
+        kind: "question",
+        title: "Bare item",
+        state: "open",
+      });
 
       const siblingPage = await send(server.origin, { path: `/engagements/${h.sibling.id}` });
       assert.equal(siblingPage.status, 200);
       // The sibling's own scope is empty: none of the other engagement's work
-      // is folded into it, and its counts are all zero.
+      // is folded into it, and its counts are all zero, including the
+      // engagement-wide tally before its (absent) project sections.
       assert.ok(!siblingPage.body.includes("Eng A task"));
       assert.ok(!siblingPage.body.includes("Eng A item"));
       assert.match(siblingPage.body, /<li>open: 0<\/li>/);
       assert.match(siblingPage.body, /<li>done: 0<\/li>/);
+      assert.match(siblingPage.body, /<h3>Counts<\/h3><ul><li>open: 0<\/li><li>in_progress: 0<\/li><li>done: 0<\/li><\/ul>/);
       assert.match(siblingPage.body, /Open work items: 0/);
+
+      // An engagement without projects shows its engagement-only rollup: the
+      // project-less task and open item count once, in the engagement scope.
+      const barePage = await send(server.origin, { path: `/engagements/${bare.id}` });
+      assert.equal(barePage.status, 200);
+      assert.ok(containsEscaped(barePage.body, "Bare task"));
+      assert.ok(containsEscaped(barePage.body, "Bare item"));
+      assert.match(barePage.body, /<h3>Counts<\/h3><ul><li>open: 0<\/li><li>in_progress: 1<\/li><li>done: 0<\/li><\/ul>/);
+      assert.match(barePage.body, /Open work items: 1/);
+      // The sibling's work stays off the bare engagement's page too.
+      assert.ok(!barePage.body.includes("Eng A task"));
+      assert.ok(!barePage.body.includes("Eng A item"));
 
       // The sibling project page is empty too.
       const siblingProjectPage = await send(server.origin, { path: `/projects/${h.siblingProject.id}` });
