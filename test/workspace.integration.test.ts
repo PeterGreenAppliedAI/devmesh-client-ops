@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -218,7 +218,6 @@ async function observe(
     readonly tasks: readonly string[];
     readonly items: readonly string[];
     readonly meetings: readonly string[];
-    readonly probe: string;
     readonly otherEngagement: string;
     readonly otherProject: string;
     readonly otherMeeting: string;
@@ -234,8 +233,6 @@ async function observe(
     ...ids.tasks.map((id) => `/tasks/${id}`),
     ...ids.items.map((id) => `/items/${id}`),
     ...ids.meetings.map((id) => `/meetings/${id}`),
-    // The probe meeting exists only after the positive control is accepted.
-    ...(ids.probe === "" ? [] : [`/meetings/${ids.probe}`]),
     `/tasks/${ids.otherTask}`,
     `/items/${ids.otherItem}`,
     `/meetings/${ids.otherMeeting}`,
@@ -256,6 +253,23 @@ async function observe(
   return { counts, pages };
 }
 
+/**
+ * Remove one meeting from the store's persisted data file. The application is
+ * closed first, so the file is the only copy of the data and no write races.
+ * The file is read, edited and written whole; a missing or unexpected shape is
+ * a test failure, not a silent reset.
+ */
+function removeMeeting(directory: string, meetingId: string): void {
+  const file = readdirSync(directory).find((name) => name.endsWith(".json"));
+  assert.ok(file !== undefined, "the store wrote a data file");
+  const path = join(directory, file);
+  const data = JSON.parse(readFileSync(path, "utf8")) as { meetings: Array<{ id: string }> };
+  assert.ok(Array.isArray(data.meetings), "the data file holds meetings");
+  data.meetings = data.meetings.filter((meeting) => meeting.id !== meetingId);
+  assert.ok(!data.meetings.some((meeting) => meeting.id === meetingId), "probe meeting removed");
+  writeFileSync(path, JSON.stringify(data));
+}
+
 // ---------------------------------------------------------------------------
 // The workflow
 // ---------------------------------------------------------------------------
@@ -266,7 +280,7 @@ describe("workspace integration: linked overview and restart", () => {
 
     // -- Fresh application and store over the same temporary directory. -----
     let app = await open(dir);
-    const base = app.url;
+    let base = app.url;
     const ids = {
       client: "",
       engagements: [] as string[],
@@ -489,11 +503,14 @@ describe("workspace integration: linked overview and restart", () => {
         // A tampered project on a task create.
         [`/engagements/${alpha}/tasks/new`, { title: "Alpha project task", status: "done", priority: "normal", owner: "Lee", dueDate: "", context: "project work", projectId: betaProject }, 400],
         // A cross-engagement project on a meeting edit: the record must not move.
-        [`/meetings/${alphaProjectMeeting}/edit`, { id: alphaProjectMeeting, title: "Alpha kickoff (edited)", date: "2026-01-20", notes: "Edited & kept", projectId: betaProject }, 400],
+        [`/meetings/${alphaProjectMeeting}/edit`, { id: alphaProjectMeeting, title: "Crossed project", date: "2026-05-05", notes: "should not save", projectId: betaProject }, 400],
+        // A tampered parent on a meeting edit, with valid changed fields: the
+        // record must not move and the other fields must not be saved.
+        [`/meetings/${alphaProjectMeeting}/edit`, { id: alphaProjectMeeting, engagementId: beta, title: "Crossed engagement", date: "2026-05-05", notes: "should not save", projectId: alphaProject }, 400],
         // A blank title on a meeting create.
         [`/engagements/${alpha}/meetings/new`, { title: " ", date: "2026-05-05", notes: "" }, 400],
         // A hostile request that names another record's id on an edit.
-        [`/meetings/${alphaEngagementMeeting}/edit`, { id: alphaProjectMeeting, title: "Alpha kickoff (edited)", date: "2026-01-20", notes: "Edited & kept" }, 400],
+        [`/meetings/${alphaEngagementMeeting}/edit`, { id: alphaProjectMeeting, title: "Crossed id", date: "2026-05-05", notes: "should not save" }, 400],
         // A tampered parent on a project-scoped meeting create.
         [`/projects/${alphaProject}/meetings/new`, { engagementId: beta, title: "Alpha kickoff (edited)", date: "2026-01-20", notes: "Edited & kept", projectId: alphaProject }, 400],
         // A hostile request that tries to move a closed decision back to open.
@@ -520,25 +537,46 @@ describe("workspace integration: linked overview and restart", () => {
       assert.equal(foreign.status, 403);
       assert.equal(JSON.stringify(await observe(base, ids)), beforeHostile);
       // A positive control: the same kind of request with only the tampered
-      // field corrected is accepted, and the snapshot changes, so a snapshot
-      // that never changed would fail this test rather than pass silently. The
-      // probe meeting is never edited or deleted, so its detail page is added
-      // to `observe` from here on, including after the restart.
+      // field corrected is accepted, and the observation changes in its existing
+      // paths (the new meeting's count, the history links and the scoped pages),
+      // so a snapshot that never changed would fail this test rather than pass
+      // silently. The probe meeting is then edited and removed, which the
+      // existing paths also observe, so the path list stays the same before and
+      // after the control and ids.probe is never a path in it.
       const legit = await send(base, {
         method: "POST",
         path: `/engagements/${alpha}/meetings/new`,
         form: { title: "Snapshot probe", date: "2026-07-01", notes: "" },
       });
       ids.probe = redirectTarget(legit).split("/").pop() as string;
-      const probed = JSON.stringify(await observe(base, ids));
-      assert.notEqual(probed, beforeRestart);
       const probePage = await send(base, { path: `/meetings/${ids.probe}` });
       assert.equal(probePage.status, 200);
       assert.ok(probePage.body.includes("Snapshot probe"));
-      // Every subsequent hostile request is compared against the probed state.
+      const probed = JSON.stringify(await observe(base, ids));
+      assert.notEqual(probed, beforeRestart);
+      // Edit the probe so an accepted write of a changed title is observed.
+      const probeEdit = parseForm((await send(base, { path: `/meetings/${ids.probe}/edit` })).body);
+      probeEdit.controls.set("title", "Snapshot probe (edited)");
+      const probeEdited = await send(base, { method: "POST", path: probeEdit.action, form: Object.fromEntries(probeEdit.controls) });
+      assert.equal(redirectTarget(probeEdited), `/meetings/${ids.probe}`);
+      const probedEdited = JSON.stringify(await observe(base, ids));
+      assert.notEqual(probedEdited, probed);
+      // There is no delete route for a meeting, so the probe is removed from
+      // the persisted data file while the application is closed, and a fresh
+      // application over the same directory is opened to read the records back.
+      // This keeps `observe`'s path list the same before and after the control.
+      await app.close();
+      removeMeeting(dir, ids.probe);
+      app = await open(dir);
+      base = app.url;
+      // The same observation paths as before the control hold with the probe's
+      // record gone: the control's accepted create, edit and removal left the
+      // committed state exactly as it was.
+      assert.equal(JSON.stringify(await observe(base, ids)), beforeRestart);
+      // Every subsequent hostile request is compared against the current state.
       // Accepted writes follow (a completed task), so the restart comparison
       // below uses the state observed just before the restart instead.
-      beforeHostile = probed;
+      beforeHostile = JSON.stringify(await observe(base, ids));
 
       // -- The client overview. ----------------------------------------------
       const overview = await send(base, { path: `/clients/${ids.client}` });
@@ -834,8 +872,8 @@ describe("workspace integration: linked overview and restart", () => {
       );
       const clientHistory = sectionOf(overview.body, "Meeting history");
       assert.equal(clientHistory.split(`href="/meetings/${ids.meetings[1]}"`).length - 1, 1);
-      // The probe meeting survived and is in the client-wide history once.
-      assert.equal(clientHistory.split(`href="/meetings/${ids.probe}"`).length - 1, 1);
+      // The probe meeting was removed and is not in the client-wide history.
+      assert.equal(clientHistory.split(`href="/meetings/${ids.probe}"`).length - 1, 0);
       // Next steps groups survive too.
       const nextSteps = sectionOf(overview.body, "Next steps");
       assert.match(nextStepGroup(nextSteps, "Open follow-ups", "Open commitments"), new RegExp(`href="/items/${ids.items[5]}"`));
