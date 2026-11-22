@@ -341,7 +341,7 @@ describe("meeting pages: creation", () => {
     }
   });
 
-  it("rejects a tampered cross-engagement project and a tampered parent without mutating", async () => {
+  it("rejects tampered parents from the path parent and leaves the data unchanged", async () => {
     const server = await running();
     try {
       const h = await hierarchy(server.store);
@@ -405,6 +405,20 @@ describe("meeting pages: creation", () => {
       assert.equal(parentCorrection.controls.get("title"), "Parent tamper");
       assert.equal(parentCorrection.controls.get("date"), "2026-05-05");
       assert.equal(JSON.stringify(server.store.snapshot()), before);
+      // Resubmitting the corrected form creates the meeting under the parent
+      // derived from the path, never under the tampered engagement.
+      const parentFixed = await send(server.origin, {
+        method: "POST",
+        path: parentCorrection.action,
+        form: Object.fromEntries(parentCorrection.controls),
+      });
+      assert.match(redirectTarget(parentFixed), /^\/meetings\/meeting-\d+$/);
+      const parentFixedStored = server.store.snapshot().meetings[0];
+      assert.equal(parentFixedStored.title, "Parent tamper");
+      assert.equal(parentFixedStored.engagementId, h.engagement.id);
+      assert.equal(parentFixedStored.clientId, h.client.id);
+      assert.equal(server.store.snapshot().meetings.length, 1);
+      const afterParentFix = JSON.stringify(server.store.snapshot());
 
       // A tampered client id is refused the same way.
       const clientTamper = await send(server.origin, {
@@ -420,7 +434,12 @@ describe("meeting pages: creation", () => {
       });
       assert.equal(clientTamper.status, 400);
       assert.match(clientTamper.body, /not the client of this engagement/);
-      assert.equal(JSON.stringify(server.store.snapshot()), before);
+      const clientCorrection = parseForm(clientTamper.body);
+      assert.equal(clientCorrection.action, `/engagements/${h.engagement.id}/meetings/new`);
+      assert.equal(clientCorrection.controls.get("engagementId"), h.engagement.id);
+      assert.equal(clientCorrection.controls.get("title"), "Client tamper");
+      assert.equal(clientCorrection.controls.get("date"), "2026-05-05");
+      assert.equal(JSON.stringify(server.store.snapshot()), afterParentFix);
 
       // A tampered parent through a project-scoped path is refused too.
       const projectParentTamper = await send(server.origin, {
@@ -436,9 +455,34 @@ describe("meeting pages: creation", () => {
       });
       assert.equal(projectParentTamper.status, 400);
       assert.match(projectParentTamper.body, /not the parent engagement of this form/);
-      assert.equal(JSON.stringify(server.store.snapshot()), before);
+      // The project-scoped correction form keeps the engagement of the URL
+      // project as its authoritative parent and the submitted values.
+      const projectCorrection = parseForm(projectParentTamper.body);
+      assert.equal(projectCorrection.action, `/engagements/${h.engagement.id}/meetings/new`);
+      assert.equal(projectCorrection.controls.get("engagementId"), h.engagement.id);
+      assert.equal(projectCorrection.controls.get("projectId"), h.project.id);
+      assert.equal(projectCorrection.controls.get("title"), "Project parent tamper");
+      assert.equal(JSON.stringify(server.store.snapshot()), afterParentFix);
+      // A submitted project id is never consulted when the parent is tampered:
+      // even a project outside the engagement leaves the refusal in place.
+      const projectAndParentTamper = await send(server.origin, {
+        method: "POST",
+        path: `/projects/${h.project.id}/meetings/new`,
+        form: {
+          engagementId: h.sibling.id,
+          title: "Both tampered",
+          date: "2026-05-05",
+          notes: "",
+          projectId: h.siblingProject.id,
+        },
+      });
+      assert.equal(projectAndParentTamper.status, 400);
+      assert.match(projectAndParentTamper.body, /not the parent engagement of this form/);
+      assert.doesNotMatch(projectAndParentTamper.body, /does not belong to engagementId/);
+      assert.equal(JSON.stringify(server.store.snapshot()), afterParentFix);
 
-      // The stored parent ids are still derived from the URL, never the form.
+      // The stored parent ids are still derived from the URL, never the form,
+      // including when the hidden parent controls are omitted entirely.
       const created = await send(server.origin, {
         method: "POST",
         path: `/engagements/${h.engagement.id}/meetings/new`,
@@ -449,6 +493,7 @@ describe("meeting pages: creation", () => {
       assert.ok(createdStored !== undefined);
       assert.equal(createdStored.engagementId, h.engagement.id);
       assert.equal(createdStored.clientId, h.client.id);
+      assert.equal(server.store.snapshot().meetings.length, 2);
     } finally {
       await server.close();
     }

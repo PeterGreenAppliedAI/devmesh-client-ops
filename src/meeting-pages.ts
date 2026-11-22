@@ -419,20 +419,25 @@ export function meetingRoutes(store: Store): MeetingRoutes {
 
   /**
    * The parent a creation POST names: the client and engagement are derived
-   * from the URL path alone and are authoritative. The submitted form may carry
-   * parent ids for the hidden controls it was rendered with, but it may not
-   * change them: a submitted engagement id (or client id) that differs from
-   * the parent in the path is a tampered parent and is refused, leaving the
-   * data unchanged. This resolves only the parent; the optional selected
-   * project is resolved separately, inside the correction boundary, so an
-   * unknown or cross-engagement project becomes a correctable form error. A
-   * nonexistent URL parent (or URL project) is a missing record and stays a 404.
+   * from the URL path alone and are authoritative. The submitted form carries
+   * hidden parent ids when it was rendered that way, but it may not change
+   * them: a submitted engagement id (or client id) that is not the parent in
+   * the path is a tampered parent and is refused, leaving the data unchanged.
+   * Omitting a parent control is not tampering; the URL parent still decides.
+   * This resolves only the parent; the optional selected project is resolved
+   * separately, inside the correction boundary, so an unknown or
+   * cross-engagement project becomes a correctable form error. A nonexistent
+   * URL parent (or URL project) is a missing record and stays a 404.
    */
   function postedParent(
     snap: Snapshot,
     path: string,
     form: Readonly<Record<string, string>>,
-  ): { readonly scope: CreateScope; readonly parent: { name: string; id: string }; readonly conflict: ValidationError | null } {
+  ): {
+    readonly scope: CreateScope;
+    readonly parent: { readonly name: "engagementId"; readonly id: string };
+    readonly conflict: ValidationError | null;
+  } {
     const pathname = path.split("?")[0];
     const parts = pathname.split("/").slice(1);
     if (parts[0] === "engagements") {
@@ -441,7 +446,7 @@ export function meetingRoutes(store: Store): MeetingRoutes {
       return {
         scope,
         parent: { name: "engagementId", id: engagementId },
-        conflict: submittedParentConflict(form, scope, engagementId),
+        conflict: submittedParentConflict(form, scope),
       };
     }
     if (parts[0] === "projects") {
@@ -453,26 +458,28 @@ export function meetingRoutes(store: Store): MeetingRoutes {
       return {
         scope: { client: scope.client, engagement: scope.engagement },
         parent: { name: "engagementId", id: scope.engagement.id },
-        conflict: submittedParentConflict(form, scope, scope.engagement.id),
+        conflict: submittedParentConflict(form, scope),
       };
     }
     throw new MissingRecordError("No parent for that path");
   }
 
   /**
-   * Check that a submitted parent id, when present, names the parent the URL
-   * chose. An omitted control is fine (a client that does not resubmit hidden
-   * fields cannot tamper); a present but different value is refused, and so is
-   * a submitted client id that names a different client. The URL parent stays
-   * authoritative either way. The problem is reported as invalid input on the
-   * correction form by `createMeeting`.
+   * Check that every submitted parent id, when present, names the parent the
+   * URL chose. An omitted control is fine (a client that does not resubmit
+   * hidden fields cannot tamper); a present but different value is refused,
+   * and so is a submitted client id that names a different client. The URL
+   * parent stays authoritative either way. The problem is reported as invalid
+   * input on the correction form by `createMeeting`.
    */
   function submittedParentConflict(
     form: Readonly<Record<string, string>>,
     scope: CreateScope,
-    engagementId: string,
   ): ValidationError | null {
-    if (Object.hasOwn(form, "engagementId") && form["engagementId"] !== engagementId) {
+    if (
+      Object.hasOwn(form, "engagementId") &&
+      form["engagementId"] !== scope.engagement.id
+    ) {
       return new ValidationError(
         `Submitted engagementId ${JSON.stringify(form["engagementId"])} is not the parent engagement of this form`,
       );
@@ -549,9 +556,15 @@ export function meetingRoutes(store: Store): MeetingRoutes {
       { name: parent.name, label: parent.name, hidden: true, value: parent.id },
       ...meetingFields(projectChoices(snap, scope.engagement.id)).filter((field) => field.name !== "id"),
     ];
+    // The parent conflict is settled before any selector resolves the
+    // submitted project, so a tampered request is refused without reading it.
+    if (conflict !== null) {
+      const failure = formFailure(conflict, suppliedValues(request.form, fields), fields, action);
+      if (failure !== null) throw failure;
+      throw conflict;
+    }
     const values = suppliedValues(request.form, fields);
     try {
-      if (conflict !== null) throw conflict;
       // The optional selected project is resolved inside the boundary: an
       // unknown project is a correctable error, a blank one records an
       // engagement-only meeting.
