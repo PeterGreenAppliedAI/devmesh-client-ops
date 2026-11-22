@@ -12,13 +12,13 @@
  */
 import {
   escapeHtml,
+  fieldErrorsFor,
   FormError,
   redirect,
   renderForm,
   renderPage,
   renderFormSummary,
   type DisplayValue,
-  type FieldError,
   type FieldSpec,
   type FieldPresentation,
   type Page,
@@ -690,50 +690,6 @@ function itemEdit(values: Readonly<Record<string, string>>, create: boolean): Wo
   return edit;
 }
 
-/**
- * The form controls a refusal names. A validation message such as "task.title
- * must be nonblank" or "task.dueDate must be a YYYY-MM-DD date" names a field
- * of the record; the visible control of that field, when the form has one, is
- * reported so it can be marked invalid and described by its own message. A
- * message that names no visible control (an identity or parent link, or a
- * record the form could not name) reports nothing here and stays in the
- * summary.
- */
-function reportedFieldErrors(
-  message: string,
-  values: Readonly<Record<string, string>>,
-  fields: readonly FieldSpec[],
-): readonly FieldError[] {
-  const visible = new Map<string, FieldSpec>();
-  for (const field of fields) {
-    if (field.hidden !== true) visible.set(field.name, field);
-  }
-  const errors: FieldError[] = [];
-  // A field is named only by its actual identity: a word such as `task.title`,
-  // `item.state` or `projectId` that is either qualified by the record or equal
-  // to a visible control's name. A quoted submitted value is not a field
-  // reference, so the message `Submitted engagementId "title" is not the
-  // parent engagement of this form` is about the hidden parent link and never
-  // marks the visible title control invalid. A hidden identity or parent name
-  // names no visible control and stays in the summary alone.
-  const parts = message.split(/[:\s]+/).filter((word) => word !== "");
-  const name = parts.find((word) => {
-    const dotted = word.replace(/[[][0-9]+[]]/g, "");
-    const field = dotted.includes(".") ? dotted.slice(dotted.indexOf(".") + 1) : dotted;
-    return visible.has(field);
-  });
-  if (name !== undefined) {
-    const dotted = name.replace(/[[][0-9]+[]]/g, "");
-    const fieldName = dotted.includes(".") ? dotted.slice(dotted.indexOf(".") + 1) : dotted;
-    const field = visible.get(fieldName);
-    if (field !== undefined) {
-      const error: FieldError = { field: fieldName, message };
-      const value = values[fieldName] ?? field.value;
-      errors.push(value === undefined ? error : { ...error, value });
-    }
-  }
-  return errors;
-}
 
 /**
  * The controls of a form the submission omitted: the record's current value
@@ -789,7 +745,7 @@ function formFailure(
       filled[field.name] = omittedControlValue(field, base) ?? "";
     }
   }
-  const errors = reportedFieldErrors(error.message, filled, fields);
+  const errors = fieldErrorsFor(error.message, filled, fields);
   return new FormError(error.message, filled, errors, fields, action);
 }
 

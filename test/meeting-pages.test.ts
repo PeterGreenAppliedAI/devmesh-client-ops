@@ -163,6 +163,28 @@ function parseForm(document: string): ParsedForm {
   return { action: unescapeHtml(action[1]), controls };
 }
 
+
+/**
+ * The visible controls a page associates with a field error: each control
+ * carrying `aria-invalid="true"` with an `aria-describedby` naming a message
+ * element of the same text as the control's own error paragraph.
+ */
+function invalidControls(
+  document: string,
+): readonly { readonly field: string; readonly describedBy: string }[] {
+  const found: { field: string; describedBy: string }[] = [];
+  for (const match of document.matchAll(
+    /<(?:input|textarea|select)[^>]*\sid="field-(?<field>[^"]+)"[^>]*\saria-invalid="true"[^>]*\saria-describedby="(?<described>[^"]+)"/g,
+  )) {
+    if (match.groups === undefined) continue;
+    const message = new RegExp(`<p id="${match.groups.described}">([^<]*)<\\/p>`).exec(document);
+    assert.ok(message !== null, `${match.groups.field} has a message`);
+    assert.ok(document.includes(`<li>${message[1]}</li>`), `${match.groups.field} stays in the summary`);
+    found.push({ field: match.groups.field, describedBy: match.groups.described });
+  }
+  return found;
+}
+
 /**
  * A client with two engagements (one sibling of the other) and one project
  * each, plus a second client with its own engagement and meeting.
@@ -325,31 +347,28 @@ describe("meeting pages: creation", () => {
         assert.equal(correction.controls.get("projectId"), h.project.id);
         // The failing visible field is marked invalid and describes itself with
         // a message of its own, which the summary also carries.
-        const failing = title.trim() === "" ? "title" : "date";
-        assert.equal((reply.body.match(/aria-invalid="true"/g) ?? []).length, 1, `${title} ${date}`);
-        assert.match(
-          reply.body,
-          new RegExp(
-            `<(?<tag>input)[^>]*\\sid="field-${failing}"[^>]*\\saria-invalid="true"[^>]*\\saria-describedby="field-${failing}-error"`,
-          ),
-          `${title} ${date}`,
-        );
-        const inline = new RegExp(`<p id="field-${failing}-error">([^<]*)<\\/p>`).exec(reply.body);
-        assert.ok(inline !== null, `${title} ${date}`);
-        assert.ok(reply.body.includes(`<li>${inline[1]}</li>`), `${title} ${date} summary`);
+        const fields = title.trim() === "" ? ["title"] : ["date"];
+        assert.equal(invalidControls(reply.body).length, fields.length, `${title} ${date}`);
+        for (const failing of fields) {
+          const associated = invalidControls(reply.body).find((control) => control.field === failing);
+          assert.ok(associated !== undefined, `${title} ${date} marks ${failing}`);
+          const inline = new RegExp(`<p id="${associated.describedBy}">([^<]*)<\\/p>`).exec(reply.body);
+          assert.ok(inline !== null, `${title} ${date}`);
+          assert.ok(reply.body.includes(`<li>${inline[1]}</li>`), `${title} ${date} summary`);
+        }
       }
       assert.equal(JSON.stringify(server.store.snapshot()), before);
 
       // Correcting the values and resubmitting the rendered form redirects.
-      const invalidControls = new Map(renderedCreate.controls);
-      invalidControls.set("title", "");
-      invalidControls.set("date", "2026-02-30");
-      invalidControls.set("notes", "<keep>");
-      invalidControls.set("projectId", h.project.id);
+      const invalidValues = new Map(renderedCreate.controls);
+      invalidValues.set("title", "");
+      invalidValues.set("date", "2026-02-30");
+      invalidValues.set("notes", "<keep>");
+      invalidValues.set("projectId", h.project.id);
       const invalid = await send(server.origin, {
         method: "POST",
         path: `/engagements/${h.engagement.id}/meetings/new`,
-        form: Object.fromEntries(invalidControls),
+        form: Object.fromEntries(invalidValues),
       });
       const form = parseForm(invalid.body);
       assert.match(invalid.body, /<textarea[^>]*>.*&lt;keep&gt;.*<\/textarea>/);
@@ -457,8 +476,9 @@ describe("meeting pages: creation", () => {
       assert.doesNotMatch(reply.body, /id="field-notes"[^>]*aria-invalid/);
       assert.equal(parseForm(reply.body).controls.get("notes"), "notes");
 
-      // A tampered parent quoting a visible field name (notes) is about the
-      // hidden parent link, so it stays in the summary and marks no control.
+      // A tampered parent quoting a visible field name (notes) names the
+      // hidden client link, not the notes control: the message stays in the
+      // summary, and the quoted word marks no control invalid.
       const parentTamper = await send(server.origin, {
         method: "POST",
         path: `/engagements/${h.engagement.id}/meetings/new`,
@@ -466,8 +486,21 @@ describe("meeting pages: creation", () => {
       });
       assert.equal(parentTamper.status, 400);
       assert.match(parentTamper.body, /not the client of this engagement/);
-      assert.equal((parentTamper.body.match(/aria-invalid="true"/g) ?? []).length, 0);
+      assert.equal(invalidControls(parentTamper.body).length, 0);
       assert.equal(parseForm(parentTamper.body).controls.get("notes"), "keep");
+
+      // An engagement parent tampered to a bare visible field name (title) is a
+      // problem with the hidden engagement link, so the summary carries it and
+      // no visible control is marked invalid.
+      const engagementTamper = await send(server.origin, {
+        method: "POST",
+        path: `/engagements/${h.engagement.id}/meetings/new`,
+        form: { engagementId: "title", title: "T", date: "2026-01-01", notes: "", projectId: "" },
+      });
+      assert.equal(engagementTamper.status, 400);
+      assert.match(engagementTamper.body, /not the parent engagement of this form/);
+      assert.equal(invalidControls(engagementTamper.body).length, 0);
+      assert.equal(JSON.stringify(server.store.snapshot()), before);
       assert.equal(JSON.stringify(server.store.snapshot()), before);
 
       // An existing identity conflict takes precedence over a parent mismatch

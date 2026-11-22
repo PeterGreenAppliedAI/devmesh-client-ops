@@ -9,12 +9,12 @@
  */
 import {
   escapeHtml,
+  fieldErrorsFor,
   FormError,
   redirect,
   renderForm,
   renderFormError,
   renderPage,
-  type FieldError,
   type FieldSpec,
   type Page,
   type Redirect,
@@ -691,45 +691,6 @@ function submissionFields(
   return [...hidden, ...base];
 }
 
-/**
- * The visible controls a validation message names, so the message can be
- * associated with each control it is about. A message such as
- * `engagement.status` names a visible control; one that names no visible
- * control (an identity or parent link, or a record the form cannot name) stays
- * in the summary alone.
- */
-function reportedFieldErrors(
-  message: string,
-  values: Readonly<Record<string, string>>,
-  fields: readonly FieldSpec[],
-): readonly FieldError[] {
-  const visible = new Map<string, FieldSpec>();
-  for (const field of fields) {
-    if (field.hidden !== true) visible.set(field.name, field);
-  }
-  const errors: FieldError[] = [];
-  // A field is named only by its actual identity: a word such as
-  // `meeting.date` or `projectId` that is either qualified by the record or
-  // equal to a visible control's name. A quoted submitted value is not a
-  // field reference, so a message about a hidden identity or parent link never
-  // marks a visible control invalid.
-  const words = message.split(/[:\s]+/).filter((word) => word !== "");
-  const name = words.find((word) => {
-    const dotted = word.replace(/[[][0-9]+[]]/g, "");
-    const field = dotted.includes(".") ? dotted.slice(dotted.indexOf(".") + 1) : dotted;
-    return visible.has(field);
-  });
-  if (name !== undefined) {
-    const dotted = name.replace(/[[][0-9]+[]]/g, "");
-    const fieldName = dotted.includes(".") ? dotted.slice(dotted.indexOf(".") + 1) : dotted;
-    const field = visible.get(fieldName);
-    if (field !== undefined) {
-      const value = values[fieldName] ?? field.value;
-      errors.push(value === undefined ? { field: fieldName, message } : { field: fieldName, message, value });
-    }
-  }
-  return errors;
-}
 
 /**
  * Build a correctable form error from a store refusal. The submitted values are
@@ -762,7 +723,7 @@ function formFailure(
       filled[field.name] = base[field.name];
     }
   }
-  const errors = reportedFieldErrors(error.message, filled, fields);
+  const errors = fieldErrorsFor(error.message, filled, fields);
   return new FormError(error.message, filled, errors, fields, action);
 }
 

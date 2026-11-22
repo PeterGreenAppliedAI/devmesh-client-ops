@@ -214,6 +214,69 @@ export function renderFormSummary(summary: string, errors: readonly FieldError[]
 }
 
 /**
+ * The visible control a refusal message names, when the message names one.
+ *
+ * A message names a field only by its actual identity: the qualified form the
+ * store uses (`task.title`, `meeting.date`, `engagement.status`) or a bare
+ * word that is exactly one of the visible controls' names (`projectId`). A
+ * word inside a quoted submitted value, and an incidental word that merely
+ * reads like a field name, is not a field reference. A parent link
+ * (`engagementId`) is only named when a message names its field itself, not
+ * when it quotes a value; a hidden control is never matched, so an identity or
+ * parent problem stays in the summary alone.
+ */
+export function namedVisibleField(
+  message: string,
+  fields: readonly FieldSpec[],
+): string | undefined {
+  const visible = new Set<string>();
+  for (const field of fields) {
+    if (field.hidden !== true) visible.add(field.name);
+  }
+  // A quoted submitted value is skipped whole: its first word opens the quote
+  // and no word is a field reference until the closing quote is seen.
+  let quoted: string | null = null;
+  for (const raw of message.split(/\s+/)) {
+    const word = raw.replace(/[[][0-9]+[]]/g, "");
+    if (quoted !== null) {
+      if (word.includes(quoted)) quoted = null;
+      continue;
+    }
+    if (word === "" || word.startsWith("\"") || word.startsWith("'") || word.startsWith("`")) {
+      const quote = word[0];
+      if (word.length > 1 && word.slice(1).includes(quote)) continue;
+      quoted = quote;
+      continue;
+    }
+    // A qualified name (`task.title`, `task.dueDate:`) names the part after
+    // its record prefix; a bare word must be a visible control's exact name.
+    const unquoted = word.replace(/^["']|["']$/g, "").replace(/[:;,]$/, "");
+    const name = unquoted.includes(".") ? unquoted.slice(unquoted.lastIndexOf(".") + 1) : unquoted;
+    if (visible.has(name)) return name;
+  }
+  return undefined;
+}
+
+/**
+ * The field problems a refusal message reports: the visible control it names,
+ * with the submitted value the form holds. A message that names no visible
+ * control (a hidden identity or parent link, or a record the form cannot
+ * name) reports nothing and stays in the summary alone.
+ */
+export function fieldErrorsFor(
+  message: string,
+  values: Readonly<Record<string, string>>,
+  fields: readonly FieldSpec[],
+): readonly FieldError[] {
+  const fieldName = namedVisibleField(message, fields);
+  if (fieldName === undefined) return [];
+  const field = fields.find((candidate) => candidate.name === fieldName && candidate.hidden !== true);
+  if (field === undefined) return [];
+  const value = values[fieldName] ?? field.value;
+  return [value === undefined ? { field: fieldName, message } : { field: fieldName, message, value }];
+}
+
+/**
  * Render a form that posts to a fixed internal destination. The action is an
  * escaped route, the method is POST, and every control shows the submitted
  * value (or the initial value) escaped. One alert summarises the form's
