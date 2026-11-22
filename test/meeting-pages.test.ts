@@ -1060,7 +1060,7 @@ describe("meeting pages: editing", () => {
       // An invalid project holding characters the message has to escape (a
       // quote, a backslash, a newline, a tab) still matches its own
       // JSON-encoded refusal and points at the select, kept for correction.
-      for (const value of ['meet-"99', "back\\slash", "line\nbreak", "tab\tvalue"]) {
+      for (const value of ['meet-"99', "back\\slash", "trailing\\", "line\nbreak", "tab\tvalue"]) {
         const escaped = await send(server.origin, {
           method: "POST",
           path: `/meetings/${meeting.id}/edit`,

@@ -423,6 +423,14 @@ function quotedReference(message: string, value: string): string | undefined {
     let end = message.length;
     for (let index = match.index + match[0].length; index < message.length; index += 1) {
       const char = message[index];
+      if (char === "\\" && quote === "\"" && message[index + 1] === "\\") {
+        // A JSON double-quoted value escapes a backslash as `\\`, so a value
+        // ending in a backslash carries an escaped pair just before the
+        // closing quote; the pair belongs to the value, not to its end.
+        raw += char + (message[index + 1] ?? "");
+        index += 1;
+        continue;
+      }
       if (char === "\\" && message[index + 1] === quote) {
         raw += char + quote;
         index += 1;
