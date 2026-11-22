@@ -4,7 +4,7 @@ import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
-import { escapeHtml, renderPage, renderFormError, FormError } from "../src/html.ts";
+import { escapeHtml, PAGE_HEADERS, renderPage, renderFormError, FormError } from "../src/html.ts";
 import {
   layoutContextFor,
   layoutContextForFormError,
@@ -345,6 +345,8 @@ describe("layout context", () => {
     assert.match(bare.html, /<h1>Plain<\/h1>/);
     assert.match(bare.html, /<p>body<\/p>/);
     assert.equal(bare.layout, undefined);
+    // Without explicit headers a page carries the standard page headers.
+    assert.deepEqual(bare.headers, PAGE_HEADERS);
 
     const context: LayoutContext = {
       clients: [{ id: "c1", name: "<evil> & \"x\"" }],
@@ -363,6 +365,22 @@ describe("layout context", () => {
     assert.match(failurePage.html, /<main id="main">/);
     assert.match(failurePage.html, /Skip to main content/);
     assert.equal(failurePage.layout, context);
+  });
+
+  it("keeps the headers of the page it wraps", () => {
+    const context: LayoutContext = {
+      clients: [],
+      ancestry: [],
+    };
+    const custom: Readonly<Record<string, string>> = Object.freeze({
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+      "Content-Security-Policy": "default-src 'none'",
+      "X-Marker": "kept",
+    });
+    const wrapped = renderPage("Title", "<p>body</p>", context, custom);
+    assert.deepEqual(wrapped.headers, custom);
+    assert.equal(wrapped.layout, context);
   });
 
   it("renders the shell directly with one main landmark and keyboard-operable controls", () => {
@@ -404,6 +422,44 @@ describe("layout: every application page is wrapped in the shared shell", () => 
       }
     } finally {
       await server.close();
+    }
+  });
+
+  it("preserves the page's own headers when wrapping it in the shell", async () => {
+    const store = await openStore(tempDir());
+    const pageHeaders: Readonly<Record<string, string>> = Object.freeze({
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+      "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'",
+      "X-Layout-Marker": "kept",
+    });
+    const server = await startServer({
+      store,
+      port: 0,
+      routes: {
+        home: {
+          get: {
+            method: "GET",
+            render: () => renderPage("Custom", "<p>body</p>", undefined, pageHeaders),
+          },
+        },
+        health: { get: { method: "GET", render: () => renderPage("Health", "<p>ok</p>") } },
+      },
+    });
+    try {
+      const reply = await send(server.origin, { path: "/" });
+      assert.equal(reply.status, 200);
+      // The page was wrapped in the shell, and its own headers survived.
+      mainContentOf(reply.body);
+      assert.equal(reply.headers["x-layout-marker"], "kept");
+      assert.match(String(reply.headers["content-type"]), /^text\/html; charset=utf-8/);
+      assert.match(
+        String(reply.headers["content-security-policy"]),
+        /default-src 'none'; style-src 'unsafe-inline'/,
+      );
+    } finally {
+      await server.close();
+      await store.close();
     }
   });
 
