@@ -15,6 +15,7 @@ import {
   type FieldSpec,
 } from "../src/html.ts";
 import {
+  allowedOrigins,
   appRoutes,
   canonicalOrigin,
   DEFAULT_MAX_BODY_BYTES,
@@ -632,6 +633,28 @@ describe("canonical origin and Host checks", () => {
     }
   });
 
+  it("derives both allowed aliases from the bound port, with default-port serialization", () => {
+    // The production derivation startServer uses, exercised without a listener
+    // and without binding a privileged port. Each alias is serialized through
+    // one URL, so a default port is dropped from both origin and authority.
+    assert.deepEqual(allowedOrigins(80), [
+      { origin: "http://127.0.0.1", authority: "127.0.0.1" },
+      { origin: "http://localhost", authority: "localhost" },
+    ]);
+    assert.deepEqual(allowedOrigins(8080), [
+      { origin: "http://127.0.0.1:8080", authority: "127.0.0.1:8080" },
+      { origin: "http://localhost:8080", authority: "localhost:8080" },
+    ]);
+    for (const port of [80, 443, 8080, 65535]) {
+      const entries = allowedOrigins(port);
+      assert.equal(entries.length, 2, `port ${port}`);
+      for (const { origin, authority } of entries) {
+        assert.equal(new URL(origin).origin, origin, `port ${port}`);
+        assert.equal(authority, new URL(origin).host.toLowerCase(), `port ${port}`);
+      }
+    }
+  });
+
   it("accepts a canonical GET with or without the canonical Origin", async () => {
     const fixture = await newFixture();
     try {
@@ -757,22 +780,101 @@ describe("canonical origin and Host checks", () => {
     }
   });
 
-  it("rejects a foreign or missing Host before any handler runs", async () => {
+  it("rejects a foreign, missing or lookalike Host before any handler runs", async () => {
     const fixture = await newFixture();
+    const port = fixture.server.port;
     try {
       // No Host header at all: Node's client would add one, so write it raw.
       const absent = await rawGetWithoutHost(fixture.server.origin);
       assert.equal(absent.status, 403);
       assertNoHandlerRan(fixture.calls);
-      for (const host of ["example.com", `evil.example:${fixture.server.port}`, `localhost:${fixture.server.port}`, "127.0.0.1"]) {
+      // Foreign hosts, an alias without the bound port, and lookalike hosts
+      // that merely end in or contain an accepted alias must all be refused.
+      const refused = [
+        "example.com",
+        `evil.example:${port}`,
+        "127.0.0.1",
+        "localhost",
+        `127.0.0.1:${port + 1}`,
+        `localhost:${port + 1}`,
+        `127.0.0.1.:${port}`,
+        `localhost.:${port}`,
+        `notlocalhost:${port}`,
+        `evil-localhost:${port}`,
+        `127.0.0.10:${port}`,
+        `127.0.0.1.evil.example:${port}`,
+        `localhost.evil.example:${port}`,
+        `x127.0.0.1:${port}`,
+        `127.0.0.1${port}`,
+        `[::1]:${port}`,
+        `127.0.0.1:${port}:0`,
+      ];
+      for (const host of refused) {
         const reply = await send(fixture.server.origin, { host });
         assert.equal(reply.status, 403, `host ${host}`);
         assertNoHandlerRan(fixture.calls);
       }
-      // An explicitly empty Host is also not the canonical authority.
+      // An explicitly empty Host is also not an accepted authority.
       const empty = await raw(fixture.server.origin, ["GET / HTTP/1.1", "Host: ", "Connection: close"]);
       assert.equal(empty.status, 403);
       assertNoHandlerRan(fixture.calls);
+    } finally {
+      await closeFixture(fixture);
+    }
+  });
+
+  it("accepts both loopback aliases with a matching Origin on GET and POST", async () => {
+    const fixture = await newFixture(true);
+    try {
+      const port = fixture.server.port;
+      for (const host of [`127.0.0.1:${port}`, `localhost:${port}`]) {
+        const origin = `http://${host}`;
+        const get = await send(fixture.server.origin, { host, origin });
+        assert.equal(get.status, 200, `GET ${host}`);
+        const getNoOrigin = await send(fixture.server.origin, { host, origin: null });
+        assert.equal(getNoOrigin.status, 200, `GET without Origin ${host}`);
+        const post = await send(fixture.server.origin, { host, origin, method: "POST", body: "name=Ada" });
+        assert.equal(post.status, 303, `POST ${host}`);
+      }
+      // Two GETs and one POST per alias reached their handlers.
+      assert.equal(fixture.calls.get, 4);
+      assert.equal(fixture.calls.post, 2);
+    } finally {
+      await closeFixture(fixture);
+    }
+  });
+
+  it("refuses a mixed localhost/127.0.0.1 Origin pair", async () => {
+    const fixture = await newFixture(true);
+    try {
+      const port = fixture.server.port;
+      const pairs = [
+        { host: `127.0.0.1:${port}`, origin: `http://localhost:${port}` },
+        { host: `localhost:${port}`, origin: `http://127.0.0.1:${port}` },
+      ];
+      for (const pair of pairs) {
+        const get = await send(fixture.server.origin, pair);
+        assert.equal(get.status, 403, `GET ${pair.host} / ${pair.origin}`);
+        const post = await send(fixture.server.origin, { ...pair, method: "POST", body: "name=Ada" });
+        assert.equal(post.status, 403, `POST ${pair.host} / ${pair.origin}`);
+        assertNoHandlerRan(fixture.calls);
+      }
+    } finally {
+      await closeFixture(fixture);
+    }
+  });
+
+  it("keeps authority case handling for both aliases", async () => {
+    const fixture = await newFixture();
+    try {
+      const port = fixture.server.port;
+      for (const host of [`LOCALHOST:${port}`, `LocalHost:${port}`, `127.0.0.1:${port}`]) {
+        const reply = await send(fixture.server.origin, { host, origin: `http://${host.toLowerCase()}` });
+        assert.equal(reply.status, 200, host);
+      }
+      // A mixed case-alias Origin is still refused: the aliases differ.
+      const mixed = await send(fixture.server.origin, { host: `LOCALHOST:${port}`, origin: `http://127.0.0.1:${port}` });
+      assert.equal(mixed.status, 403);
     } finally {
       await closeFixture(fixture);
     }
@@ -790,7 +892,17 @@ describe("canonical origin and Host checks", () => {
         headers: { "x-forwarded-host": new URL(fixture.server.origin).host },
       });
       assert.equal(rejected.status, 403);
-      assert.equal(fixture.calls.get, 1);
+      // A forwarded proto/host never widens the accepted set: an editor that
+      // forwards localhost must still send that alias as Host with its bound
+      // port and the matching Origin, and a forwarded header alone is ignored.
+      const forwardedAlias = await send(fixture.server.origin, {
+        headers: {
+          "x-forwarded-host": `localhost:${fixture.server.port}`,
+          "x-forwarded-proto": "https",
+        },
+      });
+      assert.equal(forwardedAlias.status, 200);
+      assert.equal(fixture.calls.get, 2);
       assert.equal(fixture.calls.mutations, 0);
     } finally {
       await closeFixture(fixture);
@@ -802,7 +914,18 @@ describe("Origin checks before routes", () => {
   it("rejects every supplied foreign or null Origin", async () => {
     const fixture = await newFixture();
     try {
-      for (const origin of ["http://evil.example", "null", "https://127.0.0.1:1"]) {
+      const port = fixture.server.port;
+      for (const origin of [
+        "http://evil.example",
+        "null",
+        "https://127.0.0.1:1",
+        "https://localhost",
+        `https://localhost:${port}`,
+        `https://127.0.0.1:${port}`,
+        `http://127.0.0.1:${port + 1}`,
+        `http://localhost:${port + 1}`,
+        "http://localhost.",
+      ]) {
         const reply = await send(fixture.server.origin, { origin });
         assert.equal(reply.status, 403, `origin ${origin}`);
         assertNoHandlerRan(fixture.calls);
