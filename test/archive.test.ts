@@ -283,9 +283,25 @@ describe("archival flags", () => {
           );
         }
         // Counters are untouched by archival: allocation continues past them
-        // and archival never consumes or reuses an id.
-        const next = await reopened.createClient({ name: "Next" });
-        assert.equal(next.id, "client-2");
+        // and archival never consumes or reuses an id. Every family gets its
+        // next record allocated past the seeded one.
+        const client2 = await reopened.createClient({ name: "Fresh client" });
+        assert.equal(client2.id, "client-2", "client counter advanced past archival");
+        const engagement2 = await reopened.createEngagement({
+          clientId: client2.id,
+          name: "Fresh engagement",
+        });
+        assert.equal(engagement2.id, "engagement-2", "engagement counter advanced past archival");
+        const project2 = await reopened.createProject({
+          engagementId: engagement2.id,
+          name: "Fresh project",
+        });
+        assert.equal(project2.id, "project-2", "project counter advanced past archival");
+        const links = { clientId: client2.id, engagementId: engagement2.id };
+        const task2 = await reopened.createTask({ ...links, title: "Fresh task" });
+        assert.equal(task2.id, "task-2", "task counter advanced past archival");
+        const item2 = await reopened.createItem({ ...links, kind: "follow_up", title: "Fresh item" });
+        assert.equal(item2.id, "item-2", "item counter advanced past archival");
       } finally {
         await reopened.close();
       }
@@ -299,8 +315,14 @@ describe("archival flags", () => {
     const store = await openStore(dir);
     try {
       const w = await workspace(store);
+      const initialCounters = JSON.parse(readFileSync(storePath(dir), "utf8")).nextIds;
       for (const kind of kinds) {
         await store.setArchived(kind, idsOf(w)[kind], true);
+        assert.deepEqual(
+          JSON.parse(readFileSync(storePath(dir), "utf8")).nextIds,
+          initialCounters,
+          `${kind} archive leaves counters unchanged`,
+        );
       }
       const counters = JSON.parse(readFileSync(storePath(dir), "utf8")).nextIds;
       const editedClient = await store.updateClient(w.client.id, { name: "Renamed" });
@@ -310,11 +332,15 @@ describe("archival flags", () => {
       assert.equal(editedTask.archived, true);
       assert.equal(editedTask.title, "New title");
       assert.deepEqual(JSON.parse(readFileSync(storePath(dir), "utf8")).nextIds, counters);
-      // A restore of every family leaves counters exactly unchanged.
+      // Restoring every family leaves counters unchanged.
       for (const kind of kinds) {
         await store.setArchived(kind, idsOf(w)[kind], false);
+        assert.deepEqual(
+          JSON.parse(readFileSync(storePath(dir), "utf8")).nextIds,
+          counters,
+          `${kind} restore leaves counters unchanged`,
+        );
       }
-      assert.deepEqual(JSON.parse(readFileSync(storePath(dir), "utf8")).nextIds, counters);
       // An ordinary edit input cannot set or clear the flag.
       const created = await store.createTask({
         clientId: w.client.id,
@@ -331,8 +357,22 @@ describe("archival flags", () => {
       assert.equal(cleared.archived, true, "edit input cannot clear the flag");
       const flagged = await store.updateTask(w.task.id, { archived: true } as never);
       assert.equal(flagged.archived, true, "edit input cannot set the flag either");
-    } finally {
+      // Re-archive the client through the ordinary path before restart; the
+      // task keeps the flag it retained through the edits above.
+      await store.setArchived("client", w.client.id, true);
+      // After a restart the edits and the archival flags are both still there.
       await store.close();
+      const reopened = await openStore(dir);
+      try {
+        assert.equal(reopened.snapshot().clients[0].archived, true);
+        const task = reopened.snapshot().tasks.find((t) => t.id === w.task.id)!;
+        assert.equal(task.archived, true);
+        assert.equal(task.title, "Again");
+      } finally {
+        await reopened.close();
+      }
+    } finally {
+      await store.close().catch(() => undefined);
     }
   });
 
@@ -484,59 +524,60 @@ describe("archival flags", () => {
     }
   });
 
-  it("accepts stored boolean flags on all five families and reads false as active", async () => {
-    const dir = tempDir();
-    const flags = [true, false, true, false, true] as const;
-    const document = {
-      schemaVersion: 4,
-      clients: [
-        { id: "client-1", name: "A", background: "", contacts: "", stakeholders: "", requirements: "", objectives: "", archived: flags[0] },
-        { id: "client-2", name: "B", background: "", contacts: "", stakeholders: "", requirements: "", objectives: "" },
-      ],
-      engagements: [
-        { id: "engagement-1", clientId: "client-1", name: "E", objectives: "", status: "planned", archived: flags[1] },
-      ],
-      projects: [
-        { id: "project-1", engagementId: "engagement-1", name: "P", objectives: "", status: "planned", archived: flags[2] },
-      ],
-      tasks: [
-        { id: "task-1", clientId: "client-1", engagementId: "engagement-1", projectId: "project-1", title: "T", status: "open", priority: "normal", owner: "", context: "", archived: flags[3] },
-      ],
-      items: [
-        { id: "item-1", clientId: "client-1", engagementId: "engagement-1", projectId: "project-1", kind: "blocker", title: "I", context: "", state: "open", archived: flags[4] },
-      ],
-      meetings: [],
-      nextIds: { clients: 3, engagements: 2, projects: 2, tasks: 2, items: 2 },
-    };
-    writeFileSync(storePath(dir), JSON.stringify(document), "utf8");
-    const store = await openStore(dir);
-    try {
-      const snapshot = store.snapshot();
-      // Only true means archived; a stored false reads as active.
-      assert.equal(snapshot.clients[0].archived, true);
-      assert.equal("archived" in snapshot.clients[1], false);
-      assert.equal(snapshot.engagements[0].archived, false);
-      assert.equal(snapshot.projects[0].archived, true);
-      assert.equal(snapshot.tasks[0].archived, false);
-      assert.equal(snapshot.items[0].archived, true);
-      // A stored false is not rewritten by reading, and setArchived(false)
-      // removes the flag while setArchived(true) adds it.
-      assert.equal(JSON.parse(readFileSync(storePath(dir), "utf8")).clients[0].archived, true);
-      await store.setArchived("engagement", "engagement-1", false);
-      assert.equal("archived" in storedRecord(dir, "engagement", "engagement-1"), false);
-      await store.setArchived("project", "project-1", false);
-      assert.equal("archived" in storedRecord(dir, "project", "project-1"), false);
-    } finally {
-      await store.close();
-    }
-    // After restoring, the stored flags the user removed stay removed.
-    writeFileSync(storePath(dir), JSON.stringify(document), "utf8");
-    const store2 = await openStore(dir);
-    try {
-      assert.equal(store2.snapshot().engagements[0].archived, false);
-      assert.equal(store2.snapshot().projects[0].archived, true);
-    } finally {
-      await store2.close();
+  it("accepts stored true and false flags on every family and reads false as active", async () => {
+    // Each family is exercised twice, once flagged true and once flagged false,
+    // so acceptance is proven for every one of the five families.
+    const families = [
+      ["client", "client-1"],
+      ["engagement", "engagement-1"],
+      ["project", "project-1"],
+      ["task", "task-1"],
+      ["item", "item-1"],
+    ] as const satisfies readonly (readonly [ArchiveKind, string])[];
+    for (const [kind, id] of families) {
+      for (const flag of [true, false] as const) {
+        const dir = tempDir();
+        const client = { id: "client-1", name: "A", background: "", contacts: "", stakeholders: "", requirements: "", objectives: "" };
+        const engagement = { id: "engagement-1", clientId: "client-1", name: "E", objectives: "", status: "planned" };
+        const project = { id: "project-1", engagementId: "engagement-1", name: "P", objectives: "", status: "planned" };
+        const task = { id: "task-1", clientId: "client-1", engagementId: "engagement-1", projectId: "project-1", title: "T", status: "open", priority: "normal", owner: "", context: "" };
+        const item = { id: "item-1", clientId: "client-1", engagementId: "engagement-1", projectId: "project-1", kind: "blocker", title: "I", context: "", state: "open" };
+        const withFlag = (record: Record<string, unknown>) =>
+          kind === (record.id as string).split("-")[0] ? { ...record, archived: flag } : record;
+        const document = {
+          schemaVersion: 4,
+          clients: [withFlag(client)],
+          engagements: [withFlag(engagement)],
+          projects: [withFlag(project)],
+          tasks: [withFlag(task)],
+          items: [withFlag(item)],
+          meetings: [],
+          nextIds: { clients: 2, engagements: 2, projects: 2, tasks: 2, items: 2 },
+        };
+        writeFileSync(storePath(dir), JSON.stringify(document), "utf8");
+        const store = await openStore(dir);
+        try {
+          const snapshot = store.snapshot();
+          const record = recordOf(snapshot, kind, id)!;
+          if (flag) {
+            assert.equal(record.archived, true, `${kind} true accepted as archived`);
+            assert.equal(isEffectivelyArchived(snapshot, record as never), true, `${kind} true is archived`);
+          } else {
+            // A stored false is accepted and reads as active.
+            assert.equal(record.archived, false, `${kind} false accepted as stored`);
+            assert.equal(isEffectivelyArchived(snapshot, record as never), false, `${kind} false is active`);
+          }
+          // Reading never rewrites the document.
+          assert.equal(storedRecord(dir, kind, id).archived, flag, `${kind} flag stored unchanged`);
+          assert.equal(readFileSync(storePath(dir), "utf8"), JSON.stringify(document));
+          // setArchived(false) removes the flag whether it was true or false.
+          await store.setArchived(kind, id, false);
+          assert.equal("archived" in recordOf(store.snapshot(), kind, id)!, false, `${kind} restored`);
+          assert.equal("archived" in storedRecord(dir, kind, id), false, `${kind} flag removed on disk`);
+        } finally {
+          await store.close();
+        }
+      }
     }
   });
 
@@ -838,6 +879,16 @@ describe("archival persistence failures", () => {
         assert.equal(readFileSync(storePath(dir), "utf8"), archivedBytes);
         state.failWrites = false;
         // Once writes work again the unarchive is committed and persisted.
+        await store.setArchived(kind, ids[kind], false);
+        assert.equal("archived" in recordOf(store.snapshot(), kind, ids[kind])!, false);
+        // Fail a repeat unarchive of the now-unarchived record: it stays
+        // active in memory and on disk, and the failure is rejected.
+        const restoredBytes = readFileSync(storePath(dir), "utf8");
+        state.failWrites = true;
+        await assert.rejects(store.setArchived(kind, ids[kind], false), PersistenceError);
+        assert.equal("archived" in recordOf(store.snapshot(), kind, ids[kind])!, false);
+        assert.equal(readFileSync(storePath(dir), "utf8"), restoredBytes);
+        state.failWrites = false;
         await store.setArchived(kind, ids[kind], false);
         assert.equal("archived" in recordOf(store.snapshot(), kind, ids[kind])!, false);
         // A failing flush of the repeated archive likewise publishes nothing.
