@@ -178,7 +178,7 @@ function nextStepGroup(body: string, title: string, next: string | null): string
 
 /** The current-task section of a client overview. */
 function currentTasks(body: string): string {
-  return sectionOf(body, "Current tasks (open or in progress)");
+  return sectionOf(body, "Current tasks (open, in progress or waiting)");
 }
 
 /** The count shown for a labelled tally row inside the given text. */
@@ -595,8 +595,8 @@ describe("workspace integration: linked overview and restart", () => {
         ),
       );
 
-      // Current tasks: exactly the open and in-progress tasks, with and without
-      // dates, and never the completed ones.
+      // Current tasks: exactly the open, in-progress and waiting tasks, with
+      // and without dates, and never the completed ones.
       const current = currentTasks(overview.body);
       // Each task card links to its detail page and, separately, to its edit
       // workflow; only the detail links are the current task list here.

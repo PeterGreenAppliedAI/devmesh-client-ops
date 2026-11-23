@@ -626,15 +626,29 @@ describe("work pages: tasks", () => {
     }
   });
 
-  it("offers no waiting choice on task forms and refuses a submitted waiting status", async () => {
+  it("offers the waiting status on task forms and saves it", async () => {
     const server = await running();
     try {
       const h = await hierarchy(server.store);
-      // The create and edit forms offer only the three original statuses.
+      // The temporary waiting-form gate is gone: the create and edit forms offer
+      // every status, waiting included.
       const createPage = await send(server.origin, { path: `/engagements/${h.engagement.id}/tasks/new` });
       const createForm = parseForm(createPage.body);
       assert.equal(createForm.controls.get("status"), "open");
-      assert.doesNotMatch(createPage.body, /<option value="waiting"/);
+      assert.match(createPage.body, /<option value="waiting">waiting<\/option>/);
+      // A create form saves a submitted waiting status.
+      createForm.controls.set("title", "Waits");
+      createForm.controls.set("status", "waiting");
+      const created = await send(server.origin, {
+        method: "POST",
+        path: createForm.action,
+        form: Object.fromEntries(createForm.controls),
+      });
+      assert.equal(created.status, 303);
+      const createdId = redirectTarget(created).split("/").pop() as string;
+      const stored = server.store.snapshot().tasks.find((task) => task.id === createdId)!;
+      assert.equal(stored.status, "waiting");
+
       const task = await server.store.createTask({
         clientId: h.client.id,
         engagementId: h.engagement.id,
@@ -642,55 +656,19 @@ describe("work pages: tasks", () => {
       });
       const editPage = await send(server.origin, { path: `/tasks/${task.id}/edit` });
       assert.equal(editPage.status, 200);
-      assert.doesNotMatch(editPage.body, /<option value="waiting"/);
-
-      // A submitted waiting status is refused through the usual FormError
-      // handling on both create and edit, writing nothing.
-      const before = JSON.stringify(server.store.snapshot());
-      const createWaiting = await send(server.origin, {
+      assert.match(editPage.body, /<option value="waiting">waiting<\/option>/);
+      const editForm = parseForm(editPage.body);
+      editForm.controls.set("status", "waiting");
+      const edited = await send(server.origin, {
         method: "POST",
-        path: `/engagements/${h.engagement.id}/tasks/new`,
-        form: { title: "Tries waiting", status: "waiting", priority: "normal", owner: "", dueDate: "", context: "", projectId: "" },
+        path: editForm.action,
+        form: Object.fromEntries(editForm.controls),
       });
-      assert.equal(createWaiting.status, 400);
-      assert.match(createWaiting.body, /role="alert"/);
-      // The correction message names exactly the statuses the form permits,
-      // so it never tells the user that the refused `waiting` is allowed.
-      assert.match(createWaiting.body, /task\.status must be one of open, in_progress, done(?!.*waiting)/);
-      assert.doesNotMatch(createWaiting.body, /open, in_progress, done, waiting/);
-      // The status select is the one marked control, not the title field the
-      // refusal message's own word `title` would otherwise name.
-      assert.equal((createWaiting.body.match(/aria-invalid="true"/g) ?? []).length, 1);
-      assert.match(
-        createWaiting.body,
-        /<select[^>]*\sid="field-status"[^>]*\saria-invalid="true"[^>]*\saria-describedby="field-status-error"/,
-      );
-      const editWaiting = await send(server.origin, {
-        method: "POST",
-        path: `/tasks/${task.id}/edit`,
-        form: { id: task.id, status: "waiting" },
-      });
-      assert.equal(editWaiting.status, 400);
-      assert.match(editWaiting.body, /role="alert"/);
-      assert.match(editWaiting.body, /task\.status must be one of open, in_progress, done(?!.*waiting)/);
-      assert.doesNotMatch(editWaiting.body, /open, in_progress, done, waiting/);
-      assert.equal((editWaiting.body.match(/aria-invalid="true"/g) ?? []).length, 1);
-      assert.match(
-        editWaiting.body,
-        /<select[^>]*\sid="field-status"[^>]*\saria-invalid="true"[^>]*\saria-describedby="field-status-error"/,
-      );
-      assert.equal(JSON.stringify(server.store.snapshot()), before);
-
-      // The store itself still accepts waiting: the form is the only barrier.
-      const waiting = await server.store.createTask({
-        clientId: h.client.id,
-        engagementId: h.engagement.id,
-        title: "Waiting stored",
-        status: "waiting",
-      });
-      assert.equal(waiting.status, "waiting");
+      assert.equal(edited.status, 303);
+      assert.equal(redirectTarget(edited), `/tasks/${task.id}`);
+      assert.equal(server.store.snapshot().tasks.find((candidate) => candidate.id === task.id)!.status, "waiting");
       // The detail page shows the stored waiting badge as plain escaped text.
-      const detail = await send(server.origin, { path: `/tasks/${waiting.id}` });
+      const detail = await send(server.origin, { path: `/tasks/${task.id}` });
       assert.equal(detail.status, 200);
       assert.match(detail.body, /<span class="badge">waiting<\/span>/);
     } finally {

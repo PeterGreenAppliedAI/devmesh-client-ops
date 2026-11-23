@@ -241,11 +241,11 @@ export const TASK_STATUSES: readonly TaskStatus[] = ["open", "in_progress", "wai
  */
 export const LEGACY_TASK_STATUSES: readonly TaskStatus[] = ["open", "in_progress", "done"];
 /**
- * The statuses the task form offers. `waiting` is deliberately omitted until
- * the boards expose it, so a submitted waiting value is refused like any other
- * invalid status.
+ * The statuses the task form offers. Every status is offered, `waiting`
+ * included: the boards expose waiting as its own group, so the task form no
+ * longer holds a temporary gate against it.
  */
-export const TASK_FORM_STATUSES: readonly TaskStatus[] = ["open", "in_progress", "done"];
+export const TASK_FORM_STATUSES: readonly TaskStatus[] = ["open", "in_progress", "waiting", "done"];
 
 /**
  * The assertions a board movement may make about the target record before it

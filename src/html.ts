@@ -653,7 +653,7 @@ const REDIRECT_HEADERS: Readonly<Record<string, string>> = Object.freeze({
  * record that exists in the store, escaped through `redirect`, and matched
  * against these exact segment shapes.
  */
-const INTERNAL_REDIRECT_PATHS: readonly string[] = Object.freeze(["/", "/health"]);
+const INTERNAL_REDIRECT_PATHS: readonly string[] = Object.freeze(["/", "/health", "/kanban"]);
 const INTERNAL_REDIRECT_PATTERNS: readonly RegExp[] = Object.freeze([
   /^\/clients\/[A-Za-z0-9_-]+$/,
   /^\/engagements\/[A-Za-z0-9_-]+$/,
@@ -661,6 +661,11 @@ const INTERNAL_REDIRECT_PATTERNS: readonly RegExp[] = Object.freeze([
   /^\/tasks\/[A-Za-z0-9_-]+$/,
   /^\/items\/[A-Za-z0-9_-]+$/,
   /^\/meetings\/[A-Za-z0-9_-]+$/,
+  // The board scopes: the whole board (fixed, above) and one record's board.
+  // A board movement redirects only to these server-built validated scopes.
+  /^\/clients\/[A-Za-z0-9_-]+\/kanban$/,
+  /^\/engagements\/[A-Za-z0-9_-]+\/kanban$/,
+  /^\/projects\/[A-Za-z0-9_-]+\/kanban$/,
 ]);
 
 function isInternalPath(pathname: string): boolean {
