@@ -811,14 +811,18 @@ describe("work persistence", () => {
     } finally {
       await store.close();
     }
-    // The migrated document is written at the current schema version.
+    // The migrated document is written at the current schema version, with an
+    // empty journal: no event is invented for the records that already exist.
     const saved = JSON.parse(readFileSync(storePath(dir), "utf8"));
-    assert.equal(saved.schemaVersion, 4);
+    assert.equal(saved.schemaVersion, 5);
     assert.equal(saved.tasks.length, 1);
+    assert.deepEqual(saved.activity, []);
+    assert.equal(saved.nextActivityId, 1);
 
     const reopened = await openStore(dir);
     try {
       assert.equal(reopened.snapshot().tasks[0].title, "First task");
+      assert.deepEqual(reopened.snapshot().activity, []);
     } finally {
       await reopened.close();
     }
