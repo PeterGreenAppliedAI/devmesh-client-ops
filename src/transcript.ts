@@ -42,14 +42,19 @@ export const SUPPORTED_EXPORTS: readonly string[] = Object.freeze([
   "UTF-8 .md files",
 ]);
 
-/** The formats the core accepts. */
-export type ImportFormat = "paste" | "txt" | "markdown";
+/**
+ * The formats the core accepts. `docx` is imported by the DOCX adapter
+ * (`transcript-docx.ts`): its original content is the DOCX bytes, preserved
+ * exactly, and its extracted text is read from the document.
+ */
+export type ImportFormat = "paste" | "txt" | "markdown" | "docx";
 
 /** The formats the core accepts, in guidance order. */
 export const IMPORT_FORMATS: readonly ImportFormat[] = Object.freeze([
   "paste",
   "txt",
   "markdown",
+  "docx",
 ]);
 
 /** Why an import was refused. */
@@ -58,7 +63,8 @@ export type ImportRefusalCode =
   | "invalid_utf8"
   | "invalid_text"
   | "whitespace_only"
-  | "too_large";
+  | "too_large"
+  | "unreadable_document";
 
 /** A refused import: no usable import is returned. */
 export interface ImportRefusal {
@@ -644,22 +650,27 @@ export function validateImportResult(value: unknown): ImportResult {
     throw new ValidationError("import result.canonicalIdentity must be sha256: plus lowercase hex");
   }
 
-  // The original bytes must encode the original text exactly, and the hash must
-  // describe those bytes.
-  let decoded: string;
-  try {
-    decoded = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(originalBytes);
-  } catch {
-    throw new ValidationError("import result.originalBytes must be valid UTF-8");
+  // These formats' original content is the text itself, so the original bytes
+  // must encode the original text exactly. A DOCX original is binary DOCX
+  // content, so its bytes are the authority and are not text.
+  const textualOriginal = format !== "docx";
+  if (textualOriginal) {
+    let decoded: string;
+    try {
+      decoded = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(originalBytes);
+    } catch {
+      throw new ValidationError("import result.originalBytes must be valid UTF-8");
+    }
+    if (decoded !== originalText) {
+      throw new ValidationError("import result.originalBytes must encode originalText exactly");
+    }
+    if (extractedText !== originalText) {
+      throw new ValidationError("import result.extractedText must equal the original text for this format");
+    }
   }
-  if (decoded !== originalText) {
-    throw new ValidationError("import result.originalBytes must encode originalText exactly");
-  }
+  // The hash always describes the stored bytes.
   if (sha256Hex(originalBytes) !== originalSha256) {
     throw new ValidationError("import result.originalSha256 does not match originalBytes");
-  }
-  if (extractedText !== originalText) {
-    throw new ValidationError("import result.extractedText must equal the original text for this format");
   }
 
   if (canonicalText !== canonicalize(extractedText)) {
