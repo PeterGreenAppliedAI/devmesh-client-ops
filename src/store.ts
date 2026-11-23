@@ -59,6 +59,20 @@ import {
   type ActivityEvent,
   type ActivityTargetKind,
 } from "./activity.ts";
+import { openOriginalStore, type OriginalFileSystem, type OriginalStore } from "./transcript-files.ts";
+import {
+  canonicalIdentityOf,
+  canonicalize,
+  IMPORT_FORMATS,
+  isWellFormedUnicode,
+  MAX_CONTENT_BYTES,
+  utf8Length,
+  validatePassage,
+  type ImportFormat,
+  type Passage,
+  type PassageLocation,
+  type PassageRange,
+} from "./transcript.ts";
 
 export type {
   ActivityAction,
@@ -97,16 +111,18 @@ export {
 } from "./model.ts";
 
 /**
- * Version 5 carries the hierarchy, the work collections, archival flags and the
- * activity journal.
+ * Version 6 carries the hierarchy, the work collections, archival flags, the
+ * activity journal and the transcript metadata.
  */
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 /** Version 1 stored only the client/engagement/project hierarchy. */
 const LEGACY_SCHEMA_VERSION = 1;
 /** Version 3 stored the hierarchy and work collections, without archival flags. */
 const WORK_SCHEMA_VERSION = 3;
 /** Version 4 added archival flags but predates the activity journal. */
 const FLAGS_SCHEMA_VERSION = 4;
+/** Version 5 added the activity journal but predates the transcripts. */
+const JOURNAL_SCHEMA_VERSION = 5;
 const STORE_FILE = "workspace.json";
 const LOCK_FILE = "workspace.lock";
 const WORK_KEYS = ["tasks", "items", "meetings"] as const;
@@ -123,7 +139,9 @@ const FLAGS_STATE_KEYS = [
   "nextIds",
 ] as const;
 const ACTIVITY_KEYS = ["activity", "nextActivityId"] as const;
-const STATE_KEYS = [...FLAGS_STATE_KEYS, ...ACTIVITY_KEYS] as const;
+const TRANSCRIPT_KEYS = ["transcripts"] as const;
+const JOURNAL_STATE_KEYS = [...FLAGS_STATE_KEYS, ...ACTIVITY_KEYS] as const;
+const STATE_KEYS = [...JOURNAL_STATE_KEYS, ...TRANSCRIPT_KEYS] as const;
 
 /** Input fields accepted when creating a client. */
 export interface ClientCreate {
@@ -235,6 +253,60 @@ export interface MeetingEdit extends Partial<
   engagementId?: string;
 }
 
+/**
+ * One stored transcript source: the original content a transcript was imported
+ * from and the text extracted from it. The source identity is stored, never
+ * regenerated on load.
+ *
+ * A source's original content is either a pasted original, kept as its own
+ * exact JSON string, or a file original, named by the SHA-256 of its exact
+ * bytes together with the byte length (the bytes stay on disk as a hash
+ * reference; they are never base64 in the JSON). Exactly one of the two is
+ * present, chosen by the source's stored format: a `paste` source is exact
+ * text, while every file format (`txt`, `markdown`, `docx`, `pdf`) is a hash
+ * reference. `extractedText` is the text extracted from the original, and the
+ * passages carry its ranges and locations.
+ *
+ * Each source is identified separately and keeps its stored identity: the
+ * format and filename are the source's own, and its passages name it. The
+ * canonical content identity is the transcript's: the canonical transcript is
+ * engagement-wide, while distinct originals (different formats or bytes) may
+ * back it as separate sources.
+ */
+export interface TranscriptSource {
+  /** The source's own identity, stored and never regenerated on load. */
+  readonly id: string;
+  readonly format: ImportFormat;
+  /** The display filename. */
+  readonly filename: string;
+  /** The SHA-256 hex digest of the file original's exact bytes. */
+  readonly originalSha256?: string;
+  /** The file original's exact byte length. */
+  readonly originalLength?: number;
+  /** The exact pasted original text, for a pasted source. */
+  readonly originalText?: string;
+  /** The text extracted from the original content. */
+  readonly extractedText: string;
+  /** The passages of the extracted text, with their stored identities. */
+  readonly passages: readonly Passage[];
+}
+
+/**
+ * One canonical transcript: its identity, canonical content, the meeting it
+ * belongs to and its sources. A transcript belongs to one meeting, and its
+ * canonical content is unique within that meeting's engagement.
+ */
+export interface Transcript {
+  /** The canonical transcript identity: `sha256:` plus the canonical content's hash. */
+  readonly id: string;
+  /** The canonical content: the source text with whitespace runs collapsed. */
+  readonly canonicalText: string;
+  /** The meeting the transcript belongs to. */
+  readonly meetingId: string;
+  /** The sources the transcript was imported from, each with stored identities. */
+  readonly sources: readonly TranscriptSource[];
+}
+
 /** Detached, read-only view of the committed state. */
 export interface Snapshot {
   readonly clients: readonly Client[];
@@ -248,13 +320,22 @@ export interface Snapshot {
    * an absent journal means no events have been recorded.
    */
   readonly activity?: readonly ActivityEvent[];
+  /**
+   * The stored transcript metadata. Snapshots built by hand may omit it; an
+   * absent list means no transcripts have been stored.
+   */
+  readonly transcripts?: readonly Transcript[];
 }
 
 /** Internal file-system adapter, injectable so tests can simulate failures. */
 export interface FileSystem {
   existsSync(path: string): boolean;
   mkdirSync(path: string, options: { recursive: true }): void;
-  readFileSync(path: string, encoding: "utf8"): string;
+  /**
+   * Read a file's text when the `"utf8"` encoding is given, or its exact bytes
+   * when no encoding is given (for verifying an original file's content).
+   */
+  readFileSync(path: string, encoding?: "utf8"): string | Uint8Array;
   /**
    * Open a file for exclusive creation; fails with EEXIST if it already exists.
    * It also opens a directory for reading when flushing it, with the "r" flag.
@@ -292,6 +373,12 @@ export type { BoardScope, TaskIdentityExpectation } from "./kanban.ts";
 export interface StoreOptions {
   fs?: Partial<FileSystem>;
   /**
+   * Overrides for the original-file store's file operations, so a test can
+   * fail an original's publication or verification through the interface the
+   * store accepts. Only tests pass them.
+   */
+  originalsFs?: Partial<OriginalFileSystem>;
+  /**
    * The platform whose directory-durability rules apply; defaults to
    * `process.platform`. Only tests pass it, so they can exercise either the
    * Windows skip or the POSIX directory flush on any operating system.
@@ -306,6 +393,15 @@ export interface StoreOptions {
    * the whole mutation is rejected as a persistence failure.
    */
   now?: () => Date;
+}
+
+/**
+ * Validate the stored transcript list against the loaded records and return it
+ * detached, exactly as opening a document validates it. A transcript store uses
+ * this to keep its stored metadata identical to what reopening would accept.
+ */
+export function validateTranscripts(value: unknown, snapshot: Snapshot): readonly Transcript[] {
+  return parseTranscripts(value, clone(snapshot) as State);
 }
 
 /** A collection of records that a store persists. */
@@ -375,6 +471,7 @@ interface State {
   nextIds: Record<string, number>;
   activity: ActivityEvent[];
   nextActivityId: number;
+  transcripts: Transcript[];
 }
 
 /**
@@ -423,7 +520,10 @@ function defaultFileSystem(platform: string): FileSystem {
   const fs: FileSystem = {
     existsSync,
     mkdirSync: (path, options) => mkdirSync(path, options),
-    readFileSync: (path, encoding) => readFileSync(path, encoding),
+    readFileSync: ((path: string, encoding?: "utf8"): string | Uint8Array =>
+    encoding === undefined
+      ? new Uint8Array(readFileSync(path))
+      : (readFileSync(path, "utf8") as string)) as FileSystem["readFileSync"],
     openSync: (path, flags) => openSync(path, flags),
     writeSync: (fd, data) => writeSync(fd, data),
     fsyncSync: (fd) => fsyncSync(fd),
@@ -444,6 +544,9 @@ function toJson(state: State): string {
     tasks: state.tasks,
     items: state.items,
     meetings: state.meetings,
+    // Transcript metadata is stored exactly as validated: the stored source
+    // and passage identities, original hash/length or pasted original text.
+    transcripts: state.transcripts,
     activity: state.activity,
     // The journal counter is the next event id to allocate. It is serialized as
     // it stands: the ceiling is a valid stored value, meaning the journal is
@@ -478,6 +581,7 @@ function emptyState(): State {
     nextIds: {},
     activity: [],
     nextActivityId: 1,
+    transcripts: [],
   };
 }
 
@@ -488,6 +592,387 @@ function idSuffix(kind: Kind, id: string): number | null {
   if (!/^[1-9][0-9]*$/.test(suffix)) return null;
   const value = Number(suffix);
   return Number.isSafeInteger(value) ? value : null;
+}
+
+const HASH = /^[0-9a-f]{64}$/;
+const IDENTITY = /^sha256:[0-9a-f]{64}$/;
+const TRANSCRIPT_RECORD_KEYS = [
+  "id",
+  "canonicalText",
+  "meetingId",
+  "sources",
+] as const;
+const SOURCE_FILE_KEYS = [
+  "id",
+  "format",
+  "filename",
+  "originalSha256",
+  "originalLength",
+  "extractedText",
+  "passages",
+] as const;
+const SOURCE_PASTE_KEYS = [
+  "id",
+  "format",
+  "filename",
+  "originalText",
+  "extractedText",
+  "passages",
+] as const;
+
+function transcriptRecord(
+  value: unknown,
+  what: string,
+  keys: readonly string[],
+): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new ValidationError(`${what} must be an object`);
+  }
+  const record = value as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    if (!keys.includes(key)) {
+      throw new ValidationError(`${what} has unsupported field ${JSON.stringify(key)}`);
+    }
+  }
+  for (const key of keys) {
+    if (!Object.prototype.hasOwnProperty.call(record, key)) {
+      throw new ValidationError(`${what} is missing field ${JSON.stringify(key)}`);
+    }
+  }
+  return record;
+}
+
+function transcriptString(value: unknown, what: string): string {
+  if (typeof value !== "string") throw new ValidationError(`${what} must be a string`);
+  return value;
+}
+
+function transcriptNonblank(value: unknown, what: string): string {
+  const text = transcriptString(value, what);
+  if (text.trim() === "") throw new ValidationError(`${what} must be a nonblank string`);
+  return text;
+}
+
+function transcriptFormat(value: unknown, what: string): ImportFormat {
+  if (typeof value !== "string" || !(IMPORT_FORMATS as readonly string[]).includes(value)) {
+    throw new ValidationError(`${what} must be one of ${IMPORT_FORMATS.join(", ")}`);
+  }
+  return value as ImportFormat;
+}
+
+/**
+ * Require `text` to be well-formed Unicode within the content limit, then
+ * require its canonical content and identity to be `canonicalText` and
+ * `identity`. Ill-formed text (a lone surrogate) is refused before it could be
+ * encoded lossily, exactly as an import refuses it.
+ */
+function requireCanonicalText(text: string, canonicalText: unknown, identity: unknown, what: string): void {
+  if (!isWellFormedUnicode(text)) {
+    throw new ValidationError(`${what} is not well-formed Unicode`);
+  }
+  if (utf8Length(text) > MAX_CONTENT_BYTES) {
+    throw new ValidationError(`${what} exceeds the content limit`);
+  }
+  if (canonicalText !== canonicalize(text)) {
+    throw new ValidationError(`${what}.canonicalText is not the canonical content`);
+  }
+  if (identity !== canonicalIdentityOf(text)) {
+    throw new ValidationError(`${what}.id does not match the canonical content`);
+  }
+}
+
+/**
+ * Validate one stored transcript source and return it detached. The source has
+ * its own stored identity and the source's format selects the original's
+ * shape: a `paste` source is the exact pasted text (its own JSON string), and
+ * every file format is a hash reference, the file original's SHA-256 and exact
+ * byte length (never base64 content). The extracted text is the authority for
+ * the passages: every passage must name the stored source identity, keep its
+ * stored id, sit at an in-bounds range that matches its text, and carry its
+ * real line and column. Source and passage ids are never regenerated.
+ */
+function parseSource(
+  value: unknown,
+  what: string,
+  transcriptId: string,
+  format: ImportFormat,
+): TranscriptSource {
+  // The original's representation is chosen by the stored format, never by
+  // which key happens to be present: a pasted source must carry its exact
+  // text, while a file-format source must carry a hash and length. A source
+  // carrying the other representation (or both) fails the exact key set.
+  const pasted = format === "paste";
+  const keys = pasted ? SOURCE_PASTE_KEYS : SOURCE_FILE_KEYS;
+  const record = transcriptRecord(value, what, keys);
+  const id = transcriptNonblank(record.id, `${what}.id`);
+  const filename = transcriptNonblank(record.filename, `${what}.filename`);
+  const extractedText = transcriptString(record.extractedText, `${what}.extractedText`);
+  // The extracted text's identity must be the transcript's canonical identity,
+  // so every source backs the one canonical transcript.
+  requireCanonicalText(extractedText, canonicalize(extractedText), transcriptId, what);
+
+  if (pasted) {
+    // A pasted original is its exact text; the extracted text is the same text.
+    const originalText = transcriptString(record.originalText, `${what}.originalText`);
+    if (!isWellFormedUnicode(originalText)) {
+      throw new ValidationError(`${what}.originalText is not well-formed Unicode`);
+    }
+    if (originalText !== extractedText) {
+      throw new ValidationError(`${what}.extractedText must equal the pasted original text`);
+    }
+    return {
+      id,
+      format,
+      filename,
+      originalText,
+      extractedText,
+      passages: parsePassages(record.passages, extractedText, id, what),
+    };
+  }
+
+  const originalSha256 = transcriptString(record.originalSha256, `${what}.originalSha256`);
+  if (!HASH.test(originalSha256)) {
+    throw new ValidationError(`${what}.originalSha256 must be a lowercase hex SHA-256`);
+  }
+  const originalLength = record.originalLength;
+  if (
+    typeof originalLength !== "number" ||
+    !Number.isSafeInteger(originalLength) ||
+    originalLength < 0 ||
+    originalLength > MAX_CONTENT_BYTES
+  ) {
+    throw new ValidationError(
+      `${what}.originalLength must be a non-negative safe integer within the content limit`,
+    );
+  }
+
+  return {
+    id,
+    format,
+    filename,
+    originalSha256,
+    originalLength,
+    extractedText,
+    passages: parsePassages(record.passages, extractedText, id, what),
+  };
+}
+
+/**
+ * Validate the stored passages of one source against its extracted text and
+ * return them detached, keeping the stored identities exactly. Every passage
+ * names the source, its id is unique, its range is in bounds and matches its
+ * text, it does not overlap the passage before it, its location is the real
+ * line and column, and a page-based source's pages never go backwards.
+ */
+function parsePassages(
+  value: unknown,
+  extractedText: string,
+  id: string,
+  what: string,
+): readonly Passage[] {
+  if (!Array.isArray(value)) {
+    throw new ValidationError(`${what}.passages must be an array`);
+  }
+  const passages = value as readonly unknown[];
+  if (passages.length === 0) {
+    throw new ValidationError(`${what}.passages must not be empty`);
+  }
+  const breaks = lineBreaks(extractedText);
+  const seen = new Set<string>();
+  const validated: Passage[] = [];
+  let previousEnd = 0;
+  let previousPage = 0;
+  for (let index = 0; index < passages.length; index += 1) {
+    let passage: Passage;
+    try {
+      passage = validatePassage(passages[index]);
+    } catch (cause) {
+      throw new ValidationError(
+        `${what}.passages[${index}] is invalid: ${cause instanceof Error ? cause.message : "unknown"}`,
+      );
+    }
+    if (passage.sourceId !== id) {
+      throw new ValidationError(`${what}.passages[${index}].sourceId must equal the source id`);
+    }
+    if (seen.has(passage.id)) {
+      throw new ValidationError(`${what}.passages[${index}].id is duplicated`);
+    }
+    seen.add(passage.id);
+    if (passage.range.end > extractedText.length || passage.range.start > extractedText.length) {
+      throw new ValidationError(`${what}.passages[${index}] range runs past the extracted text`);
+    }
+    if (extractedText.slice(passage.range.start, passage.range.end) !== passage.text) {
+      throw new ValidationError(`${what}.passages[${index}] text does not match its exact range`);
+    }
+    if (passage.range.start < previousEnd) {
+      throw new ValidationError(`${what}.passages[${index}] overlaps the previous passage`);
+    }
+    const { line, column } = locateLineColumn(extractedText, passage.range.start, breaks);
+    if (passage.location.line !== line || passage.location.column !== column) {
+      throw new ValidationError(`${what}.passages[${index}] location is not the real line and column`);
+    }
+    if (passage.page !== undefined) {
+      if (passage.page < previousPage) {
+        throw new ValidationError(`${what}.passages[${index}] page goes backwards`);
+      }
+      previousPage = passage.page;
+    }
+    previousEnd = passage.range.end;
+    validated.push(passage);
+  }
+  return validated;
+}
+
+/**
+ * Validate one stored transcript: exact keys and types, its identity and
+ * canonical content consistent, its meeting present, its sources non-empty,
+ * each source with its own stored identity and exactly one kind of original,
+ * chosen by its format, and its passages validated against each source.
+ *
+ * The stored canonical content is the transcript's, and each source's
+ * extracted text must canonicalise to it. Several sources may back one
+ * canonical transcript, with distinct originals (formats or bytes), but every
+ * source identity is its own: no source may reuse another source's id.
+ */
+function parseTranscript(value: unknown, what: string): Transcript {
+  const record = transcriptRecord(value, what, TRANSCRIPT_RECORD_KEYS);
+  const id = transcriptString(record.id, `${what}.id`);
+  if (!IDENTITY.test(id)) {
+    throw new ValidationError(`${what}.id must be sha256: plus lowercase hex`);
+  }
+  const canonicalText = transcriptString(record.canonicalText, `${what}.canonicalText`);
+  requireCanonicalText(canonicalText, canonicalText, id, what);
+  // The canonical content is the content of a source: every source's extracted
+  // text must canonicalise to it, so a transcript cannot mix unrelated content.
+  const meetingId = transcriptNonblank(record.meetingId, `${what}.meetingId`);
+  if (!Array.isArray(record.sources)) {
+    throw new ValidationError(`${what}.sources must be an array`);
+  }
+  const rawSources = record.sources as readonly unknown[];
+  if (rawSources.length === 0) {
+    throw new ValidationError(`${what}.sources must not be empty`);
+  }
+  const sources: TranscriptSource[] = [];
+  const seen = new Set<string>();
+  for (let index = 0; index < rawSources.length; index += 1) {
+    const raw = rawSources[index];
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+      throw new ValidationError(`${what}.sources[${index}] must be an object`);
+    }
+    const sourceFormat = transcriptFormat(
+      (raw as Record<string, unknown>).format,
+      `${what}.sources[${index}].format`,
+    );
+    const source = parseSource(raw, `${what}.sources[${index}]`, id, sourceFormat);
+    if (seen.has(source.id)) {
+      throw new ValidationError(`${what}.sources[${index}].id is duplicated`);
+    }
+    if (canonicalize(source.extractedText) !== canonicalText) {
+      throw new ValidationError(
+        `${what}.sources[${index}].extractedText is not the transcript's canonical content`,
+      );
+    }
+    seen.add(source.id);
+    sources.push(source);
+  }
+  return { id, canonicalText, meetingId, sources };
+}
+
+/**
+ * Validate the stored transcript list against the loaded records and return it
+ * detached. Each transcript belongs to exactly one meeting; the meeting must
+ * exist and its engagement is resolved through the meeting's authoritative
+ * parents, so the meeting's stored client and engagement links are the only
+ * ones trusted. A transcript is an engagement-wide record: its identity and
+ * its canonical content are unique within its engagement, even when two
+ * transcripts' originals differ, so no engagement may hold the same
+ * transcript twice. The same content in a different engagement is a different
+ * transcript, not a clash, so identical canonical content may exist once in
+ * each of several engagements. A stored source or passage identity is kept as
+ * stored and never regenerated.
+ */
+function parseTranscripts(value: unknown, state: State): readonly Transcript[] {
+  if (!Array.isArray(value)) {
+    throw new ValidationError("transcripts must be an array");
+  }
+  const seenIds = new Set<string>();
+  const seenContent = new Map<string, string>();
+  return value.map((raw, index) => {
+    const transcript = parseTranscript(raw, `transcripts[${index}]`);
+    const meeting = state.meetings.find((m) => m.id === transcript.meetingId);
+    if (meeting === undefined) {
+      throw new ValidationError(
+        `transcripts[${index}] references missing meeting ${JSON.stringify(transcript.meetingId)}`,
+      );
+    }
+    try {
+      requireWorkParents(state, meeting.clientId, meeting.engagementId, meeting.projectId);
+    } catch (cause) {
+      throw new ValidationError(
+        `transcripts[${index}] meeting ${JSON.stringify(meeting.id)} has invalid parent links`,
+      );
+    }
+    // The identity and the canonical content are unique within the engagement
+    // the meeting authoritatively belongs to. A distinct engagement is a
+    // distinct scope, so the same identity there is a different transcript.
+    const idKey = `${meeting.engagementId}\u0000${transcript.id}`;
+    if (seenIds.has(idKey)) {
+      throw new ValidationError(
+        `engagement ${JSON.stringify(meeting.engagementId)} holds duplicate transcript id ` +
+          JSON.stringify(transcript.id),
+      );
+    }
+    seenIds.add(idKey);
+    const key = `${meeting.engagementId}\u0000${transcript.canonicalText}`;
+    const previous = seenContent.get(key);
+    if (previous !== undefined) {
+      throw new ValidationError(
+        `engagement ${JSON.stringify(meeting.engagementId)} holds duplicate canonical transcript content ` +
+          `(${JSON.stringify(previous)} and ${JSON.stringify(transcript.id)})`,
+      );
+    }
+    seenContent.set(key, transcript.id);
+    return transcript;
+  });
+}
+
+/** The line breaks in `text`, as UTF-16 offsets; a `\r\n` counts once at its `\r`. */
+function lineBreaks(text: string): number[] {
+  const offsets: number[] = [];
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code === 13) {
+      offsets.push(index);
+      if (text.charCodeAt(index + 1) === 10) index += 1;
+    } else if (code === 10) {
+      offsets.push(index);
+    }
+  }
+  return offsets;
+}
+
+/** The 1-based line and column of an offset, found in the sorted `breaks` list. */
+function locateLineColumn(
+  text: string,
+  offset: number,
+  breaks: readonly number[],
+): { line: number; column: number } {
+  let low = 0;
+  let high = breaks.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (breaks[middle] < offset) low = middle + 1;
+    else high = middle;
+  }
+  let lineStart = 0;
+  if (low > 0) {
+    const previous = breaks[low - 1];
+    lineStart =
+      text.charCodeAt(previous) === 13 && text.charCodeAt(previous + 1) === 10
+        ? previous + 2
+        : previous + 1;
+  }
+  return { line: low + 1, column: offset - lineStart + 1 };
 }
 
 function parseState(text: string): State {
@@ -504,6 +989,7 @@ function parseState(text: string): State {
   const version = record.schemaVersion;
   if (
     version !== SCHEMA_VERSION &&
+    version !== JOURNAL_SCHEMA_VERSION &&
     version !== FLAGS_SCHEMA_VERSION &&
     version !== WORK_SCHEMA_VERSION &&
     version !== LEGACY_SCHEMA_VERSION
@@ -517,25 +1003,40 @@ function parseState(text: string): State {
   // predate archival flags: they are accepted as active records, and no flag is
   // invented for them. Versions 1, 3 and 4 predate the activity journal: they
   // are accepted with an empty journal in memory and the file is not rewritten
-  // at open time. Each version keeps the strict key rules of its own
-  // generation: version 1 must contain exactly the hierarchy keys, so a
-  // document that mentions a work collection or a work counter while claiming
-  // the old version is refused rather than guessed at. Versions 3 and 4 must
-  // contain exactly the hierarchy plus the work collections, and version 5 must
-  // contain exactly those plus the journal. Only versions 4 and 5 may carry an
-  // `archived` field, and only as a boolean; `true` means archived and `false`
-  // means active, read exactly as an absent flag.
+  // at open time. Versions 1 to 5 predate the transcripts: they are accepted
+  // with an empty transcript list, and no transcript is invented for them.
+  // Each version keeps the strict key rules of its own generation: version 1
+  // must contain exactly the hierarchy keys, so a document that mentions a work
+  // collection or a work counter while claiming the old version is refused
+  // rather than guessed at. Versions 3 and 4 must contain exactly the hierarchy
+  // plus the work collections, version 5 must contain exactly those plus the
+  // journal, and version 6 must contain exactly those plus the transcripts.
+  // Only versions 4, 5 and 6 may carry an `archived` field, and only as a
+  // boolean; `true` means archived and `false` means active, read exactly as an
+  // absent flag.
   const legacy = version === LEGACY_SCHEMA_VERSION;
-  const journal = version === SCHEMA_VERSION;
-  const flagsAllowed = version === SCHEMA_VERSION || version === FLAGS_SCHEMA_VERSION;
+  const journal =
+    version === SCHEMA_VERSION || version === JOURNAL_SCHEMA_VERSION;
+  const transcripts = version === SCHEMA_VERSION;
+  const flagsAllowed =
+    version === SCHEMA_VERSION || version === JOURNAL_SCHEMA_VERSION || version === FLAGS_SCHEMA_VERSION;
   const allowedKeys = legacy
     ? LEGACY_STATE_KEYS
-    : journal
+    : transcripts
       ? STATE_KEYS
-      : FLAGS_STATE_KEYS;
+      : journal
+        ? JOURNAL_STATE_KEYS
+        : FLAGS_STATE_KEYS;
   for (const key of Object.keys(record)) {
     if (!(allowedKeys as readonly string[]).includes(key)) {
       throw new PersistenceError(`Stored data has unsupported field ${JSON.stringify(key)}`);
+    }
+  }
+  if (!transcripts && version !== LEGACY_SCHEMA_VERSION) {
+    if ("transcripts" in record) {
+      throw new PersistenceError(
+        `Stored schema version ${version} cannot contain transcripts`,
+      );
     }
   }
   if (legacy) {
@@ -704,6 +1205,16 @@ function parseState(text: string): State {
       }
     }
   }
+  if (transcripts) {
+    // A malformed transcript refuses the whole document rather than being
+    // repaired. Opening never rewrites the file, and the file is left intact
+    // when opening is refused.
+    try {
+      state.transcripts = [...parseTranscripts(record.transcripts, state)];
+    } catch (cause) {
+      throw new PersistenceError(`Stored transcripts are invalid: ${(cause as Error)?.message}`, { cause });
+    }
+  }
   return state;
 }
 
@@ -716,6 +1227,7 @@ function snapshotOf(state: State): Snapshot {
     items: clone(state.items),
     meetings: clone(state.meetings),
     activity: clone(state.activity),
+    transcripts: clone(state.transcripts),
   });
 }
 
@@ -958,6 +1470,21 @@ interface MutationChange<T> {
 }
 
 /**
+ * What a transcript commit resolves with: the committed meeting, the canonical
+ * transcript and its sources, and whether the commit created a meeting, wrote
+ * a new original or only recorded the metadata.
+ */
+export interface TranscriptCommit {
+  readonly meetingId: string;
+  readonly transcriptId: string;
+  readonly sourceIds: readonly string[];
+  /** True when this commit created a meeting (one create event). */
+  readonly createdMeeting: boolean;
+  /** True when this commit attached a new original (one edit event). */
+  readonly attachedOriginal: boolean;
+}
+
+/**
  * Whether two record values are the same validated record, treating an absent
  * archival flag and `false` as equivalent: that is the only difference the two
  * spellings may show.
@@ -1157,6 +1684,11 @@ class StoreImpl implements Store {
   private readonly directory: string;
   private readonly storePath: string;
   private readonly lockPath: string;
+  /**
+   * The original-file store for this workspace, used to publish and verify
+   * transcript originals before the metadata that names them is committed.
+   */
+  private readonly originals: OriginalStore;
   private queue: Promise<unknown> = Promise.resolve();
   private closed = false;
   private lockReleased = false;
@@ -1168,17 +1700,115 @@ class StoreImpl implements Store {
    */
   private blocked: PersistenceError | null = null;
 
-  constructor(state: State, fs: FileSystem, directory: string, now: () => Date) {
+  constructor(
+    state: State,
+    fs: FileSystem,
+    directory: string,
+    now: () => Date,
+    originals: OriginalStore,
+  ) {
     this.state = state;
     this.fs = fs;
     this.now = now;
     this.directory = directory;
     this.storePath = join(directory, STORE_FILE);
     this.lockPath = join(directory, LOCK_FILE);
+    this.originals = originals;
   }
 
   snapshot(): Snapshot {
     return snapshotOf(this.state);
+  }
+
+  /** Refuse an adapter read that did not return text where text is required. */
+  private requireText(value: string | Uint8Array, message: string): string {
+    if (typeof value !== "string") {
+      throw new PersistenceError(message);
+    }
+    return value;
+  }
+
+  /** True once the store has been closed or blocked. */
+  unavailable(): PersistenceError | null {
+    if (this.closed) return new PersistenceError("Store is closed");
+    return this.blocked;
+  }
+
+  /**
+   * The failure that refuses a write while the store's state is not known to be
+   * committed, or null. An operation already admitted to the queue checks this
+   * inside its turn; it is not refused merely because close has started.
+   */
+  writeBlock(): PersistenceError | null {
+    return this.blocked;
+  }
+
+  /** The original-file store over the same workspace directory. */
+  originalFiles(): OriginalStore {
+    return this.originals;
+  }
+
+  /**
+   * Run an unexposed store operation inside this store's own mutation queue, so
+   * it is serialized with every ordinary create, edit and save of the store: no
+   * other mutation can interleave with the operation between reading the
+   * committed state and committing its result. The operation is the one queue
+   * admission for the whole import: inside its turn it commits directly through
+   * `commitTranscripts` and never enqueues again. An operation admitted before
+   * close keeps running and commits until its turn ends, exactly like an
+   * ordinary mutation, which close drains; a call admitted after close is
+   * refused. A failed operation publishes nothing and rejects with its own
+   * error.
+   */
+  async runExclusive<T>(operation: () => Promise<T>): Promise<T> {
+    return this.enqueue(operation);
+  }
+
+  /**
+   * Rebuild and persist the transcript list, then publish the new committed
+   * state. The caller's build is applied to a draft of the committed state and
+   * validated exactly as reopening validates it, before anything is written.
+   * The activity event, when earned, is stamped and allocated inside this
+   * serialized write, so a meeting create or an attachment and its event are
+   * saved by one write. Persistence failures publish nothing.
+   */
+  async commitTranscripts(
+    mutate: (draft: State) => MutationChange<TranscriptCommit>,
+  ): Promise<TranscriptCommit> {
+    // Called inside the caller's queue turn (see `runExclusive`), so it must not
+    // enqueue again; the admission was decided when the operation was accepted,
+    // and an operation accepted before close keeps committing until its turn
+    // ends, exactly like an ordinary mutation close drains. A store whose state
+    // became blocked is still refused before anything is written; a call made
+    // after close never reaches here, because it is refused on admission.
+    if (this.blocked) {
+      throw new PersistenceError(
+        "The store cannot accept further mutations until it is reopened",
+        { cause: this.blocked },
+      );
+    }
+    const draft: State = clone(this.state);
+    const change = mutate(draft);
+    const transcripts = validateTranscripts(clone(draft.transcripts), draft);
+    draft.transcripts = [...transcripts];
+    if (change.event !== undefined) {
+      const at = this.clock();
+      let id: number;
+      try {
+        id = allocateActivityId(draft);
+      } catch (cause) {
+        throw new PersistenceError("Failed to allocate the next activity event id", { cause });
+      }
+      draft.activity.push({
+        id,
+        at,
+        action: change.event.action,
+        targetKind: change.event.targetKind,
+        targetId: change.event.targetId,
+      });
+    }
+    await this.persist(draft);
+    return clone(change.value);
   }
 
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {
@@ -1204,7 +1834,8 @@ class StoreImpl implements Store {
     return run;
   }
 
-  private nextId(draft: State, key: CounterKey): string {
+  /** Allocate the next id of a collection in the persisted draft. */
+  nextId(draft: State, key: CounterKey): string {
     const next = draft.nextIds[key] ?? 1;
     const items = draft[key] as readonly { id: string }[];
     const kind = collections[key].kind;
@@ -1743,7 +2374,7 @@ class StoreImpl implements Store {
     if (this.lockReleased) return;
     try {
       try {
-        this.fs.readFileSync(this.lockPath, "utf8");
+        this.requireText(this.fs.readFileSync(this.lockPath, "utf8"), "Failed to release store ownership");
       } catch (cause) {
         if (isMissing(cause)) {
           this.lockReleased = true;
@@ -1855,13 +2486,23 @@ export async function openStore(
     if (fs.existsSync(storePath)) {
       let text: string;
       try {
-        text = fs.readFileSync(storePath, "utf8");
+        const read = fs.readFileSync(storePath, "utf8");
+        if (typeof read !== "string") {
+          throw new PersistenceError("Failed to read workspace data as text");
+        }
+        text = read;
       } catch (cause) {
         throw new PersistenceError("Failed to read workspace data", { cause });
       }
       state = parseState(text);
     }
-    return new StoreImpl(state, fs, directory, now);
+    // The original store shares the workspace directory and, on POSIX, its
+    // directory-durability rules; it never reads or writes workspace.json.
+    const originals = openOriginalStore(directory, {
+      platform,
+      ...(options.originalsFs === undefined ? {} : { fs: options.originalsFs }),
+    });
+    return new StoreImpl(state, fs, directory, now, originals);
   } catch (error) {
     if (lockCreated) {
       try {

@@ -47,7 +47,7 @@ function lockPath(dir: string): string {
 /** A stored document with one record of every target family. */
 function documentWithEveryFamily(overrides: Record<string, unknown> = {}) {
   return {
-    schemaVersion: 5,
+    schemaVersion: 6,
     clients: [
       {
         id: "client-1",
@@ -98,11 +98,23 @@ function documentWithEveryFamily(overrides: Record<string, unknown> = {}) {
         notes: "",
       },
     ],
+    transcripts: [],
     activity: [],
     nextActivityId: 1,
     nextIds: { clients: 2, engagements: 2, projects: 2, tasks: 2, items: 2, meetings: 2 },
     ...overrides,
   };
+}
+
+/**
+ * The same document at schema 5, which predates the transcripts: it keeps the
+ * journal fields but carries no transcript list. Tests use it to check that
+ * the schema-5 rules still hold alongside the schema-6 rules.
+ */
+function documentAtSchemaFive(): Record<string, unknown> {
+  const document = documentWithEveryFamily({ schemaVersion: 5 }) as Record<string, unknown>;
+  delete document.transcripts;
+  return document;
 }
 
 /** A valid base event; overrides are untyped so malformed values can be built. */
@@ -155,7 +167,7 @@ describe("activity journal storage", () => {
       assert.deepEqual(snapshot.activity, []);
 
       // Opening an empty directory writes nothing on its own: the journal is
-      // empty until the first successful create, which writes schema 5 and
+      // empty until the first successful create, which writes schema 6 and
       // records its own event with that create.
       assert.equal(existsSync(storePath(dir)), false);
       await hierarchy(store);
@@ -168,7 +180,7 @@ describe("activity journal storage", () => {
       await store.close();
     }
     const saved = JSON.parse(readFileSync(storePath(dir), "utf8"));
-    assert.equal(saved.schemaVersion, 5);
+    assert.equal(saved.schemaVersion, 6);
     assert.deepEqual(saved.activity, [
       event({ id: 1, action: "create", targetKind: "client", targetId: "client-1" }),
       event({ id: 2, action: "create", targetKind: "engagement", targetId: "engagement-1" }),
@@ -219,7 +231,7 @@ describe("activity journal storage", () => {
       await store.close();
     }
     const saved = JSON.parse(readFileSync(storePath(dir), "utf8"));
-    assert.equal(saved.schemaVersion, 5);
+    assert.equal(saved.schemaVersion, 6);
     assert.deepEqual(saved.activity.slice(0, journal.length), journal);
     assert.equal(saved.activity.length, journal.length + 1);
     assert.equal(saved.nextActivityId, 9);
@@ -288,7 +300,7 @@ describe("activity journal storage", () => {
         await store.close();
       }
       assert.equal(readFileSync(storePath(dir), "utf8"), content);
-      // An ordinary successful save upgrades to schema 5. No event is invented
+      // An ordinary successful save upgrades to schema 6. No event is invented
       // for records that already existed: the journal starts with the save's own
       // event, if that save changed a record effectively.
       if ((document as { schemaVersion: number }).schemaVersion === 4) {
@@ -302,7 +314,7 @@ describe("activity journal storage", () => {
           await saving.close();
         }
         const saved = JSON.parse(readFileSync(storePath(dir), "utf8"));
-        assert.equal(saved.schemaVersion, 5);
+        assert.equal(saved.schemaVersion, 6);
         assert.deepEqual(saved.activity, [
           event({ id: 1, action: "restore", targetKind: "client", targetId: "client-1" }),
         ]);
@@ -316,7 +328,7 @@ describe("activity journal storage", () => {
           await saving.close();
         }
         const saved = JSON.parse(readFileSync(storePath(dir), "utf8"));
-        assert.equal(saved.schemaVersion, 5);
+        assert.equal(saved.schemaVersion, 6);
         assert.deepEqual(saved.activity, [
           event({ id: 1, action: "edit", targetKind: "client", targetId: "client-1" }),
         ]);
@@ -366,6 +378,7 @@ describe("activity journal storage", () => {
     const base = documentWithEveryFamily({ schemaVersion: 4 });
     delete (base as Record<string, unknown>).activity;
     delete (base as Record<string, unknown>).nextActivityId;
+    delete (base as Record<string, unknown>).transcripts;
     for (const extra of [{ activity: [] }, { nextActivityId: 1 }, { activity: [], nextActivityId: 1 }]) {
       await assertRefused(dir, { ...base, ...extra }, /unsupported field/);
     }
@@ -373,7 +386,9 @@ describe("activity journal storage", () => {
 
   it("refuses a schema 5 document that lacks or misplaces the journal fields", async () => {
     const dir = tempDir();
-    const base = documentWithEveryFamily();
+    // A version 5 document: the journal fields are required and the transcripts
+    // do not exist yet, so the base carries the journal and no transcript list.
+    const base = documentAtSchemaFive();
     const withoutActivity = { ...base };
     delete (withoutActivity as Record<string, unknown>).activity;
     await assertRefused(dir, withoutActivity, /invalid/);

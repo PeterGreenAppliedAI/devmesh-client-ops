@@ -253,7 +253,7 @@ describe("kanban task movement", () => {
       await store.close();
     }
     const saved = JSON.parse(readFileSync(storePath(dir), "utf8"));
-    assert.equal(saved.schemaVersion, 5);
+    assert.equal(saved.schemaVersion, 6);
     const reopened = await openStore(dir);
     try {
       const tasks = reopened.snapshot().tasks;
