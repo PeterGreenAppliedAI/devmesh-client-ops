@@ -1739,12 +1739,6 @@ class StoreImpl implements Store {
     return this.originals;
   }
 
-  /** The next meeting id that a create would allocate, without advancing. */
-  nextMeetingId(): string {
-    const next = this.state.nextIds.meetings ?? 1;
-    return `meeting-${next}`;
-  }
-
   /**
    * Run an unexposed store operation inside this store's own mutation queue, so
    * it is serialized with every ordinary create, edit and save of the store: no
