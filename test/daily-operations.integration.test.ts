@@ -20,6 +20,10 @@
  * untouched, then closes both the store and the server and reopens them to
  * confirm the records, the history and the dashboard survive.
  *
+ * The authoritative stored snapshot is captured before the very first page read
+ * (no page is requested before it), and it is compared after the read batches,
+ * the board reads and the refused movement; the journal is compared separately.
+ *
  * The home clock (which selects the reference day) is injected through
  * `appRoutes`, and the registered feature routes are kept beside it, so a test
  * sees a fixed day while every other page is the real one. The journal clock of
@@ -249,6 +253,38 @@ function linksOf(body: string): readonly string[] {
   return links;
 }
 
+/**
+ * Every page of the workspace: the dashboard, the client list, the board
+ * scopes, the archive discovery page, the health page and every fixture record's
+ * own pages.
+ * `linkedPaths` are the internal record links extracted from rendered pages, so
+ * a page reachable from a rendered link (and not only from a constructed path)
+ * is requested too.
+ */
+function workspacePaths(ids: FixtureIds, linkedPaths: readonly string[] = []): readonly string[] {
+  const base = [
+    "/",
+    "/clients",
+    "/archived",
+    "/health",
+    "/kanban",
+    ...ids.engagements.map((id) => `/engagements/${id}/kanban`),
+    ...ids.projects.map((id) => `/projects/${id}/kanban`),
+    `/clients/${ids.alphaClient}/kanban`,
+    `/clients/${ids.betaClient}/kanban`,
+  ];
+  const records = [
+    `/clients/${ids.alphaClient}`,
+    `/clients/${ids.betaClient}`,
+    ...ids.engagements.flatMap((id) => [`/engagements/${id}`]),
+    ...ids.projects.flatMap((id) => [`/projects/${id}`]),
+    ...ids.tasks.map((id) => `/tasks/${id}`),
+    ...ids.items.map((id) => `/items/${id}`),
+    ...ids.meetings.map((id) => `/meetings/${id}`),
+  ];
+  return [...new Set([...base, ...records, ...linkedPaths])];
+}
+
 /** The record ids linked under a heading inside one fragment. */
 function idsLinked(body: string, prefix: string): readonly string[] {
   const pattern = new RegExp(`href="${prefix}/([^"/]+)"`, "g");
@@ -284,29 +320,28 @@ interface Observation {
   readonly pages: readonly { readonly path: string; readonly body: string }[];
 }
 
-async function observe(base: string, ids: FixtureIds): Promise<Observation> {
-  const paths = [
-    "/",
-    "/clients",
-    `/clients/${ids.alphaClient}`,
-    `/clients/${ids.betaClient}`,
-    ...ids.engagements.map((id) => `/engagements/${id}`),
-    ...ids.projects.map((id) => `/projects/${id}`),
-    ...ids.tasks.map((id) => `/tasks/${id}`),
-    ...ids.items.map((id) => `/items/${id}`),
-    ...ids.meetings.map((id) => `/meetings/${id}`),
-    "/kanban",
-    ...ids.engagements.map((id) => `/engagements/${id}/kanban`),
-    ...ids.projects.map((id) => `/projects/${id}/kanban`),
-    `/clients/${ids.alphaClient}/kanban`,
-    `/clients/${ids.betaClient}/kanban`,
-    "/archived",
-  ];
+async function observe(
+  base: string,
+  ids: FixtureIds,
+  linkedPaths: readonly string[] = [],
+): Promise<Observation> {
   const pages: { path: string; body: string }[] = [];
-  for (const path of paths) {
+  const known = new Set<string>();
+  const visit = async (path: string): Promise<void> => {
+    if (known.has(path)) return;
+    known.add(path);
     const reply = await send(base, { path });
     assert.equal(reply.status, 200, `${path} is readable`);
     pages.push({ path, body: reply.body });
+  };
+  for (const path of workspacePaths(ids, linkedPaths)) await visit(path);
+  // Every internal record link a read page renders is read as well, so a page
+  // the workspace offers cannot change unnoticed.
+  const recordLink = /^\/(clients|engagements|projects|tasks|items|meetings)\/[^/]+$/;
+  for (const page of [...pages]) {
+    for (const href of linksOf(mainContentOf(page.body))) {
+      if (recordLink.test(href)) await visit(href);
+    }
   }
   return { pages };
 }
@@ -639,9 +674,16 @@ describe("F2 daily operations integration", () => {
       assert.equal(journalOf(app.store.snapshot()).length, created.tasks.length + created.items.length + created.meetings.length + 6);
 
       // -- The dashboard at the fixed reference day. -------------------------
-      // The authoritative state before any page is read: the full stored
-      // snapshot, records and journal, taken straight from the store.
-      const beforeReads = await readStore(app.store);
+      // The authoritative stored state before the very first page is read: the
+      // full stored snapshot, records and journal, taken straight from the
+      // store. No page has been requested by the suite before this point, so a
+      // read that changed a record once cannot establish the baseline.
+      const beforeFirstRead = await readStore(app.store);
+      const journalBeforeReads = JSON.stringify(journalOf(app.store.snapshot()));
+      // The home clock selects the reference day; the store's journal clock
+      // stamps the events. Neither read changes a stored value.
+      const readStoreBefore = await readStore(app.store);
+      assert.equal(JSON.stringify(readStoreBefore), JSON.stringify(beforeFirstRead), "reading the store changes nothing");
       const home = await send(base, { path: "/" });
       assert.equal(home.status, 200);
       assert.match(String(home.headers["content-type"]), /^text\/html; charset=utf-8/);
@@ -722,7 +764,12 @@ describe("F2 daily operations integration", () => {
       const newestCreate = activity.slice(activity.indexOf('<li class="card">'), activity.indexOf("</li>"));
 
       // -- Reads change nothing: read every scope, then compare the store. --
-      beforeRefusal = snapshotOf(await observe(base, ids));
+      // Every page of the workspace, including those linked from the pages
+      // read, is requested; the observation is the baseline the later reads and
+      // the refused movement are compared with.
+      const readLinks = linksOf(mainContentOf(home.body)).filter((href) => /^\/(clients|engagements|projects|tasks|items|meetings)\/[^/]+$/.test(href));
+      const observedAfterReads = await observe(base, ids, readLinks);
+      beforeRefusal = snapshotOf(observedAfterReads);
       // Follow the dashboard's summary links to the existing records. Each
       // record row links its own detail page, its client, engagement and, when
       // it has one, its project; the engagement rows link the engagement and
@@ -769,8 +816,9 @@ describe("F2 daily operations integration", () => {
       // Reads recorded nothing: no event was added and no record changed. The
       // stored snapshot taken before the very first page read is the baseline,
       // so a read that changed a record once cannot establish it.
-      assert.equal(snapshotOf(await observe(base, ids)), beforeRefusal);
-      assert.deepEqual(await readStore(app.store), beforeReads, "reads leave the store untouched");
+      assert.equal(snapshotOf(await observe(base, ids, readLinks)), beforeRefusal);
+      assert.deepEqual(await readStore(app.store), beforeFirstRead, "reads leave the store untouched");
+      assert.equal(JSON.stringify(journalOf(app.store.snapshot())), journalBeforeReads, "reads add no journal event");
 
       // -- Every board scope, and back to all work. --------------------------
       const expectedTasks: Readonly<Record<string, readonly string[]>> = {
@@ -862,8 +910,8 @@ describe("F2 daily operations integration", () => {
       const backBoard = await readBoard(backHref);
       assert.ok(backBoard.includes('<a href="/kanban" aria-current="page">All work</a>'));
       // The board navigation is a read too: the state is unchanged.
-      assert.equal(snapshotOf(await observe(base, ids)), beforeRefusal);
-      assert.deepEqual(await readStore(app.store), beforeReads, "board reads leave the store untouched");
+      assert.equal(snapshotOf(await observe(base, ids, readLinks)), beforeRefusal);
+      assert.deepEqual(await readStore(app.store), beforeFirstRead, "board reads leave the store untouched");
 
       // -- Putting an engagement on hold keeps it unfinished. ----------------
       // The engagement's own record page links its edit form; the rendered
@@ -960,7 +1008,7 @@ describe("F2 daily operations integration", () => {
       // A movement that the scope check refuses leaves the records and the
       // journal untouched. The stale card's form asserts the task's identity,
       // so submitting it with a scope it is not in is refused with a 400.
-      const refusedState = snapshotOf(await observe(base, ids));
+      const refusedState = snapshotOf(await observe(base, ids, readLinks));
       const staleForm = parseForm(card, `/tasks/${ids.high}/move`);
       staleForm.controls.set("status", "open");
       // The task is inside the project scope, so submit it from a scope it is
@@ -970,7 +1018,7 @@ describe("F2 daily operations integration", () => {
       const refused = await submit(base, staleForm);
       assert.equal(refused.status, 400);
       assert.match(String(refused.headers["content-type"]), /^text\/plain/);
-      assert.equal(snapshotOf(await observe(base, ids)), refusedState, "a refused movement changes nothing");
+      assert.equal(snapshotOf(await observe(base, ids, readLinks)), refusedState, "a refused movement changes nothing");
       assert.deepEqual(await readStore(app.store), afterWaitingStore, "a refused movement leaves the store untouched");
       // A conflicting identity assertion is refused without a write.
       const forged = parseForm(card, `/tasks/${ids.high}/move`);
@@ -1022,7 +1070,7 @@ describe("F2 daily operations integration", () => {
       assert.match(donePage.body, /<dd><span class="badge">done<\/span><\/dd>/);
 
       // -- Restart: close both, reopen the same temporary directory. --------
-      beforeRestart = snapshotOf(await observe(base, ids));
+      beforeRestart = snapshotOf(await observe(base, ids, readLinks));
       const activityBeforeRestart = JSON.stringify(journalOf(app.store.snapshot()));
       await app.close();
       app = await running(dir, () => NOW, journal);
@@ -1030,7 +1078,7 @@ describe("F2 daily operations integration", () => {
       try {
         // The records and their history read back exactly as before, through
         // the same pages, links and boards.
-        assert.equal(snapshotOf(await observe(base, ids)), beforeRestart);
+        assert.equal(snapshotOf(await observe(base, ids, readLinks)), beforeRestart);
         const restarted = app.store.snapshot();
         assert.equal(JSON.stringify(journalOf(restarted)), activityBeforeRestart);
         // The moved task is done and its two movement events are in history.
@@ -1055,8 +1103,14 @@ describe("F2 daily operations integration", () => {
         // The journal clock was read once per recorded event, and never more.
         assert.equal(stamps, journalOf(restarted).length);
         // A read after the restart still records nothing.
-        const stable = snapshotOf(await observe(base, ids));
+        const storeAfterRestart = await readStore(app.store);
+        const stable = snapshotOf(await observe(base, ids, readLinks));
         assert.equal(stable, beforeRestart);
+        // The reads after the restart leave the reopened store untouched too:
+        // both the store snapshot and the journal are unchanged by them.
+        assert.deepEqual(await readStore(app.store), storeAfterRestart, "post-restart reads leave the store untouched");
+        assert.equal(JSON.stringify(journalOf(app.store.snapshot())), JSON.stringify(journalOf(restarted)));
+
       } finally {
         await app.close();
       }
