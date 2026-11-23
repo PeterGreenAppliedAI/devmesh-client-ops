@@ -83,11 +83,31 @@ function throwingDateClock(): () => Date {
   return () =>
     ({
       getUTCFullYear: () => 2026,
+      getTime: () => Date.UTC(2026, 0, 1),
       toISOString: () => {
         throw new RangeError("Invalid time value");
       },
     }) as unknown as Date;
 }
+
+/** A real `Date` whose `toISOString` returns impossible canonical text. */
+function impossibleIsoClock(): () => Date {
+  return () => {
+    const date = new Date(Date.UTC(2026, 0, 1));
+    date.toISOString = () => "2026-13-01T00:00:00.000Z";
+    return date;
+  };
+}
+
+/** A real `Date` whose `toISOString` text disagrees with its instant. */
+function mismatchedIsoClock(): () => Date {
+  return () => {
+    const date = new Date(Date.UTC(2026, 0, 1));
+    date.toISOString = () => "2026-07-01T00:00:00.000Z";
+    return date;
+  };
+}
+
 
 function fsError(code: string): NodeJS.ErrnoException {
   const error = new Error(code) as NodeJS.ErrnoException;
@@ -464,11 +484,18 @@ describe("each effective create, edit, archive and restore records one event", (
     const dir = tempDir();
     const seed = await openStore(dir, { now: clock() });
     let w: Awaited<ReturnType<typeof workspace>>;
+    let seedEvents: string[];
+    let seedIds: number[];
     let journalLength: number;
     let counter: number;
     try {
       w = await workspace(seed);
-      journalLength = seed.snapshot().activity!.length;
+      // Capture the expected journal independently of the store API, straight
+      // from the seed's own snapshot fields, before the file is edited.
+      const seeded = seed.snapshot().activity!;
+      seedEvents = seeded.map((e) => `${e.action}:${e.targetKind}:${e.targetId}`);
+      seedIds = seeded.map((e) => e.id);
+      journalLength = seeded.length;
       counter = JSON.parse(readFileSync(storePath(dir), "utf8")).nextActivityId;
     } finally {
       await seed.close();
@@ -491,7 +518,13 @@ describe("each effective create, edit, archive and restore records one event", (
         );
         assert.equal(record?.archived, false, `${family} loaded with an explicit false`);
       }
-      assert.deepEqual(recorded(store), targets(store.snapshot().activity!), "journal loads as stored");
+      const loaded = store.snapshot().activity!;
+      assert.deepEqual(
+        loaded.map((e) => `${e.action}:${e.targetKind}:${e.targetId}`),
+        seedEvents,
+        "journal loads as stored",
+      );
+      assert.deepEqual(loaded.map((e) => e.id), seedIds, "event ids load as stored");
       const before = recorded(store).length;
       for (const family of ARCHIVE_FAMILIES) {
         const id = recordOf(w, family).id;
@@ -649,6 +682,8 @@ describe("the journal's clock and counter", () => {
       invalidClock,
       invalidDateClock,
       throwingDateClock,
+      impossibleIsoClock,
+      mismatchedIsoClock,
     ]) {
       const dir = tempDir();
       const seed = await openStore(dir, { now: clock() });

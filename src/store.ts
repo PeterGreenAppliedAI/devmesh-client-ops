@@ -863,17 +863,25 @@ function requireParentId(value: unknown, field: string, kind: string): string {
  */
 function canonicalInstant(date: Date): string {
   let year: number;
+  let instant: number;
   let iso: string;
   try {
     // An invalid `Date` (for example `new Date(NaN)`) has no instant: reading
-    // its year yields NaN and `toISOString` throws a `RangeError`. Both are
-    // turned into a persistence failure here, never a raw conversion error.
+    // its year and time yields NaN and `toISOString` throws a `RangeError`.
+    // Both are turned into a persistence failure here, never a raw error.
     year = date.getUTCFullYear();
+    instant = date.getTime();
     iso = date.toISOString();
   } catch (cause) {
     throw new PersistenceError("The activity clock returned an invalid date", { cause });
   }
-  if (typeof iso !== "string" || Number.isNaN(year) || year < 0 || year > 9999) {
+  if (
+    typeof iso !== "string" ||
+    Number.isNaN(year) ||
+    year < 0 ||
+    year > 9999 ||
+    !Number.isFinite(instant)
+  ) {
     throw new PersistenceError(
       "The activity clock returned an instant outside the canonical year range",
     );
@@ -883,6 +891,17 @@ function canonicalInstant(date: Date): string {
   if (iso.length !== 24) {
     throw new PersistenceError(
       "The activity clock returned an instant outside the canonical year range",
+    );
+  }
+  // A `Date` whose `toISOString` is overridden (or otherwise returns
+  // malformed text) can pass the length check while carrying a non-canonical
+  // or impossible instant. Rebuild the canonical text from the intrinsic
+  // millisecond value and require the supplied text to be exactly that, so
+  // only a well-formed instant that round-trips is accepted.
+  const rebuilt = new Date(instant).toISOString();
+  if (rebuilt !== iso) {
+    throw new PersistenceError(
+      "The activity clock returned text that is not a canonical UTC instant",
     );
   }
   return iso;
