@@ -574,7 +574,7 @@ export function kanbanRoutes(store: Store): KanbanRoutes {
       // the validated scope and the (already checked) submitted assertions are
       // kept, and the status select is the marked control.
       const values = moveValues(submittedStatus, scope, expected);
-      const fields = moveFields(scope);
+      const fields = moveFields(scope, expected);
       const message = `task.status must be one of ${TASK_STATUS_VALUES.join(", ")}`;
       throw new FormError(
         message,
@@ -614,9 +614,19 @@ function taskMoveAction(id: string): string {
   return `/tasks/${encodeURIComponent(id)}/move`;
 }
 
-/** The controls of a move correction: a visible status select and the hidden links. */
-function moveFields(scope: BoardScope): readonly FieldSpec[] {
-  return [
+/**
+ * The controls of a move correction: a visible status select and the hidden
+ * links. The identity assertions are optional in a submission, so a hidden
+ * assertion control is rendered only for an assertion the submission actually
+ * carried; the corrected form then resubmits exactly the assertions that were
+ * submitted, and an omitted assertion stays omitted instead of becoming a
+ * blank value that a resubmission would fail.
+ */
+function moveFields(
+  scope: BoardScope,
+  expected: TaskIdentityExpectation,
+): readonly FieldSpec[] {
+  const fields: FieldSpec[] = [
     {
       name: "status",
       label: "Status",
@@ -626,11 +636,18 @@ function moveFields(scope: BoardScope): readonly FieldSpec[] {
     },
     { name: "scopeKind", label: "Scope kind", hidden: true, value: scope.kind },
     { name: "scopeId", label: "Scope id", hidden: true, value: scope.kind === "all" ? "" : scope.id },
-    { name: "id", label: "Id", hidden: true },
-    { name: "clientId", label: "Client", hidden: true },
-    { name: "engagementId", label: "Engagement", hidden: true },
-    { name: "projectId", label: "Project", hidden: true },
   ];
+  const assertionControls: Readonly<Record<keyof TaskIdentityExpectation, { readonly label: string }>> = {
+    id: { label: "Id" },
+    clientId: { label: "Client" },
+    engagementId: { label: "Engagement" },
+    projectId: { label: "Project" },
+  };
+  for (const key of ["id", "clientId", "engagementId", "projectId"] as const) {
+    if (expected[key] === undefined) continue;
+    fields.push({ name: key, label: assertionControls[key].label, hidden: true, value: expected[key] });
+  }
+  return fields;
 }
 
 /**

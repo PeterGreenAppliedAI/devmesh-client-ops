@@ -688,6 +688,78 @@ describe("board movement refusals", () => {
     }
   });
 
+  it("corrects an invalid status resubmitted with omitted identity assertions", async () => {
+    const server = await running();
+    try {
+      const h = await hierarchy(server.store);
+      const task = await server.store.createTask({
+        clientId: h.client.id,
+        engagementId: h.engagement.id,
+        title: "Optional assertions",
+        status: "open",
+      });
+      // The rendered card form carries assertions; dropping some or all keeps
+      // them optional in the submission, as the interface says they are.
+      const rendered = parseForm(columnOf((await send(server.origin, { path: "/kanban" })).body, "Actionable: open"));
+      const submissions: Record<string, string>[] = [
+        { status: "paused", scopeKind: "all", scopeId: "" },
+        { status: "paused", scopeKind: "all", scopeId: "", id: task.id },
+        {
+          status: "paused",
+          scopeKind: "engagement",
+          scopeId: h.engagement.id,
+          clientId: h.client.id,
+          engagementId: h.engagement.id,
+        },
+      ];
+      for (const form of submissions) {
+        const before = JSON.stringify(server.store.snapshot());
+        const reply = await send(server.origin, { method: "POST", path: rendered.action, form });
+        assert.equal(reply.status, 400, JSON.stringify(form));
+        assert.match(reply.body, /role="alert"/, JSON.stringify(form));
+        // The corrected form keeps the invalid status and the validated scope.
+        const correction = parseForm(reply.body);
+        assert.equal(correction.controls.get("status"), "paused", JSON.stringify(form));
+        assert.equal(correction.controls.get("scopeKind"), form["scopeKind"], JSON.stringify(form));
+        assert.equal(correction.controls.get("scopeId"), form["scopeId"], JSON.stringify(form));
+        // It renders only the assertions that were submitted, never a blank one.
+        for (const key of ["id", "clientId", "engagementId", "projectId"] as const) {
+          assert.equal(correction.controls.get(key), form[key], `${key} ${JSON.stringify(form)}`);
+        }
+        assert.deepEqual([...correction.controls.keys()].sort(), Object.keys(form).sort(), JSON.stringify(form));
+        assert.equal(JSON.stringify(server.store.snapshot()), before, JSON.stringify(form));
+
+        // Correcting the status and resubmitting that very form now succeeds
+        // and redirects to the retained scope: assertions are never invented.
+        correction.controls.set("status", "in_progress");
+        const corrected = await send(server.origin, {
+          method: "POST",
+          path: correction.action,
+          form: Object.fromEntries(correction.controls),
+        });
+        assert.equal(corrected.status, 303, JSON.stringify(form));
+        assert.equal(
+          redirectTarget(corrected),
+          form["scopeKind"] === "all" ? "/kanban" : `/engagements/${h.engagement.id}/kanban`,
+          JSON.stringify(form),
+        );
+        assert.equal(
+          server.store.snapshot().tasks.find((candidate) => candidate.id === task.id)!.status,
+          "in_progress",
+        );
+        // Put it back so the next submission starts from the same state.
+        const back = await send(server.origin, {
+          method: "POST",
+          path: rendered.action,
+          form: { status: "open", scopeKind: "all", scopeId: "", id: task.id },
+        });
+        assert.equal(back.status, 303);
+      }
+    } finally {
+      await server.close();
+    }
+  });
+
   it("refuses an invalid scope with 400 and no write", async () => {
     const server = await running();
     try {
