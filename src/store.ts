@@ -41,6 +41,10 @@ import {
   type WorkItem,
 } from "./model.ts";
 import { requireArchiveArguments, type ArchiveKind } from "./archive.ts";
+import { parseActivity, type ActivityEvent } from "./activity.ts";
+
+export type { ActivityAction, ActivityEvent, ActivityTargetKind } from "./activity.ts";
+export { ACTIVITY_ACTIONS, ACTIVITY_TARGET_KINDS, parseActivityEvent } from "./activity.ts";
 
 export type {
   Client,
@@ -64,12 +68,17 @@ export {
   ValidationError,
 } from "./model.ts";
 
-/** Version 4 carries the hierarchy, the work collections and archival flags. */
-const SCHEMA_VERSION = 4;
+/**
+ * Version 5 carries the hierarchy, the work collections, archival flags and the
+ * activity journal.
+ */
+const SCHEMA_VERSION = 5;
 /** Version 1 stored only the client/engagement/project hierarchy. */
 const LEGACY_SCHEMA_VERSION = 1;
 /** Version 3 stored the hierarchy and work collections, without archival flags. */
 const WORK_SCHEMA_VERSION = 3;
+/** Version 4 added archival flags but predates the activity journal. */
+const FLAGS_SCHEMA_VERSION = 4;
 const STORE_FILE = "workspace.json";
 const LOCK_FILE = "workspace.lock";
 const WORK_KEYS = ["tasks", "items", "meetings"] as const;
@@ -80,11 +89,13 @@ const LEGACY_STATE_KEYS = [
   "projects",
   "nextIds",
 ] as const;
-const STATE_KEYS = [
+const FLAGS_STATE_KEYS = [
   ...LEGACY_STATE_KEYS.slice(0, 4),
   ...WORK_KEYS,
   "nextIds",
 ] as const;
+const ACTIVITY_KEYS = ["activity", "nextActivityId"] as const;
+const STATE_KEYS = [...FLAGS_STATE_KEYS, ...ACTIVITY_KEYS] as const;
 
 /** Input fields accepted when creating a client. */
 export interface ClientCreate {
@@ -204,6 +215,11 @@ export interface Snapshot {
   readonly tasks: readonly Task[];
   readonly items: readonly WorkItem[];
   readonly meetings: readonly Meeting[];
+  /**
+   * The activity journal, oldest first. Snapshots built by hand may omit it;
+   * an absent journal means no events have been recorded.
+   */
+  readonly activity?: readonly ActivityEvent[];
 }
 
 /** Internal file-system adapter, injectable so tests can simulate failures. */
@@ -317,6 +333,8 @@ interface State {
   items: WorkItem[];
   meetings: Meeting[];
   nextIds: Record<string, number>;
+  activity: ActivityEvent[];
+  nextActivityId: number;
 }
 
 /**
@@ -386,6 +404,10 @@ function toJson(state: State): string {
     tasks: state.tasks,
     items: state.items,
     meetings: state.meetings,
+    activity: state.activity,
+    // The journal counter is the next event id to allocate; it is kept below
+    // the safe-integer ceiling exactly like the record counters.
+    nextActivityId: Math.min(state.nextActivityId, Number.MAX_SAFE_INTEGER - 1),
     // A stored counter is the next id to allocate. It must therefore stay below
     // the safe-integer ceiling so the loader accepts it and allocation can
     // still advance: when the highest allocated id is one less than the
@@ -413,6 +435,8 @@ function emptyState(): State {
     items: [],
     meetings: [],
     nextIds: {},
+    activity: [],
+    nextActivityId: 1,
   };
 }
 
@@ -439,6 +463,7 @@ function parseState(text: string): State {
   const version = record.schemaVersion;
   if (
     version !== SCHEMA_VERSION &&
+    version !== FLAGS_SCHEMA_VERSION &&
     version !== WORK_SCHEMA_VERSION &&
     version !== LEGACY_SCHEMA_VERSION
   ) {
@@ -449,16 +474,24 @@ function parseState(text: string): State {
   // Version 1 snapshots predate the work collections; they are accepted as
   // documents with empty task, item and meeting collections. Versions 1 and 3
   // predate archival flags: they are accepted as active records, and no flag is
-  // invented for them. Each version keeps the strict key rules of its own
+  // invented for them. Versions 1, 3 and 4 predate the activity journal: they
+  // are accepted with an empty journal in memory and the file is not rewritten
+  // at open time. Each version keeps the strict key rules of its own
   // generation: version 1 must contain exactly the hierarchy keys, so a
   // document that mentions a work collection or a work counter while claiming
   // the old version is refused rather than guessed at. Versions 3 and 4 must
-  // contain exactly the hierarchy plus the work collections. Only version 4
-  // may carry an `archived` field, and only as a boolean; `true` means archived
-  // and `false` means active, read exactly as an absent flag.
+  // contain exactly the hierarchy plus the work collections, and version 5 must
+  // contain exactly those plus the journal. Only versions 4 and 5 may carry an
+  // `archived` field, and only as a boolean; `true` means archived and `false`
+  // means active, read exactly as an absent flag.
   const legacy = version === LEGACY_SCHEMA_VERSION;
-  const flagsAllowed = version === SCHEMA_VERSION;
-  const allowedKeys = legacy ? LEGACY_STATE_KEYS : STATE_KEYS;
+  const journal = version === SCHEMA_VERSION;
+  const flagsAllowed = version === SCHEMA_VERSION || version === FLAGS_SCHEMA_VERSION;
+  const allowedKeys = legacy
+    ? LEGACY_STATE_KEYS
+    : journal
+      ? STATE_KEYS
+      : FLAGS_STATE_KEYS;
   for (const key of Object.keys(record)) {
     if (!(allowedKeys as readonly string[]).includes(key)) {
       throw new PersistenceError(`Stored data has unsupported field ${JSON.stringify(key)}`);
@@ -469,6 +502,15 @@ function parseState(text: string): State {
       if (key in record) {
         throw new PersistenceError(
           `Stored schema version ${LEGACY_SCHEMA_VERSION} cannot contain ${key}`,
+        );
+      }
+    }
+  }
+  if (!journal) {
+    for (const key of ACTIVITY_KEYS) {
+      if (key in record) {
+        throw new PersistenceError(
+          `Stored schema version ${version} cannot contain ${key}`,
         );
       }
     }
@@ -579,6 +621,20 @@ function parseState(text: string): State {
       );
     }
   }
+  if (journal) {
+    // A schema 5 document must carry both journal fields. The journal is
+    // validated against the records just parsed: every target must exist, ids
+    // must be unique and increasing, and the counter must be able to advance
+    // past them. No event is invented for older documents, and a malformed
+    // journal refuses the whole document rather than being repaired.
+    try {
+      const parsed = parseActivity(record.activity, record.nextActivityId, state);
+      state.activity = [...parsed.activity];
+      state.nextActivityId = parsed.nextActivityId;
+    } catch (cause) {
+      throw new PersistenceError("Stored activity journal is invalid", { cause });
+    }
+  }
   // Work records are linked to a client, that client's engagement and, when
   // present, a project inside the same engagement, exactly as for new creates.
   for (const key of WORK_KEYS) {
@@ -604,6 +660,7 @@ function snapshotOf(state: State): Snapshot {
     tasks: clone(state.tasks),
     items: clone(state.items),
     meetings: clone(state.meetings),
+    activity: clone(state.activity),
   });
 }
 
