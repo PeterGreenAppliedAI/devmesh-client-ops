@@ -898,7 +898,15 @@ function canonicalInstant(date: Date): string {
   // or impossible instant. Rebuild the canonical text from the intrinsic
   // millisecond value and require the supplied text to be exactly that, so
   // only a well-formed instant that round-trips is accepted.
-  const rebuilt = new Date(instant).toISOString();
+  let rebuilt: string;
+  try {
+    // A finite millisecond value can still lie outside the range `Date`
+    // supports, in which case reconstruction throws a `RangeError`. That is
+    // an invalid clock, never a raw error escaping the mutation.
+    rebuilt = new Date(instant).toISOString();
+  } catch (cause) {
+    throw new PersistenceError("The activity clock returned an invalid date", { cause });
+  }
   if (rebuilt !== iso) {
     throw new PersistenceError(
       "The activity clock returned text that is not a canonical UTC instant",

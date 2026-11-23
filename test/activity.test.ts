@@ -99,6 +99,15 @@ function impossibleIsoClock(): () => Date {
   };
 }
 
+/** A real `Date` whose finite millisecond value lies outside `Date`'s range. */
+function outOfRangeInstantClock(): () => Date {
+  return () => {
+    const date = new Date(Date.UTC(2026, 0, 1));
+    date.getTime = () => Number.MAX_VALUE;
+    return date;
+  };
+}
+
 /** A real `Date` whose `toISOString` text disagrees with its instant. */
 function mismatchedIsoClock(): () => Date {
   return () => {
@@ -684,6 +693,7 @@ describe("the journal's clock and counter", () => {
       throwingDateClock,
       impossibleIsoClock,
       mismatchedIsoClock,
+      outOfRangeInstantClock,
     ]) {
       const dir = tempDir();
       const seed = await openStore(dir, { now: clock() });
