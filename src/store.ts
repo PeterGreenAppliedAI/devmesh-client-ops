@@ -44,7 +44,11 @@ import { requireArchiveArguments, type ArchiveKind } from "./archive.ts";
 import { parseActivity, type ActivityEvent } from "./activity.ts";
 
 export type { ActivityAction, ActivityEvent, ActivityTargetKind } from "./activity.ts";
-export { ACTIVITY_ACTIONS, ACTIVITY_TARGET_KINDS, parseActivityEvent } from "./activity.ts";
+export {
+  ACTIVITY_ACTIONS,
+  ACTIVITY_TARGET_KINDS,
+  parseActivityEvent,
+} from "./activity.ts";
 
 export type {
   Client,
@@ -405,9 +409,10 @@ function toJson(state: State): string {
     items: state.items,
     meetings: state.meetings,
     activity: state.activity,
-    // The journal counter is the next event id to allocate; it is kept below
-    // the safe-integer ceiling exactly like the record counters.
-    nextActivityId: Math.min(state.nextActivityId, Number.MAX_SAFE_INTEGER - 1),
+    // The journal counter is the next event id to allocate. It is serialized as
+    // it stands: the ceiling is a valid stored value, meaning the journal is
+    // exhausted, and allocating there is refused rather than clamped.
+    nextActivityId: state.nextActivityId,
     // A stored counter is the next id to allocate. It must therefore stay below
     // the safe-integer ceiling so the loader accepts it and allocation can
     // still advance: when the highest allocated id is one less than the

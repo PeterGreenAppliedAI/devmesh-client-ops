@@ -106,20 +106,17 @@ function requireTimestamp(value: unknown, what: string): string {
   const daysInMonth = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
   const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
   const limit = month === 2 && leap ? 29 : daysInMonth;
-  if (
-    day < 1 ||
-    day > limit ||
-    hour > 23 ||
-    minute > 59 ||
-    second > 59 ||
-    year < 1
-  ) {
+  if (day < 1 || day > limit || hour > 23 || minute > 59 || second > 59) {
     throw new ValidationError(`${what} must be a real calendar date and time`);
   }
   return text;
 }
 
-/** Accept a positive safe integer strictly below the safe-integer ceiling. */
+/**
+ * Accept a positive safe integer id strictly below the safe-integer ceiling.
+ * The ceiling itself is reserved: an id there cannot be safely represented and
+ * the journal counter cannot advance past it, so it is refused as an event id.
+ */
 function requireEventId(value: unknown, what: string): number {
   if (
     typeof value !== "number" ||
@@ -203,10 +200,13 @@ function targetExists(
 
 /**
  * Parse a stored journal and its counter against the document's records. Every
- * event is validated strictly; ids are unique and increasing, because events
- * are appended in the order they were recorded. The counter is a positive safe
- * integer below the ceiling that is greater than every event id, so the next
- * allocation cannot reproduce one. The returned events are detached and frozen.
+ * event is validated strictly; ids are unique, and every target must exist.
+ * Events are not required to be stored in id order: identity is the id, and
+ * uniqueness is what the counter has to cover. The counter is a positive safe
+ * integer, the ceiling included, that is greater than every event id, so the
+ * next allocation cannot reproduce one; a counter at the ceiling therefore
+ * means the journal is exhausted, and allocation there is refused. The
+ * returned events are detached and frozen.
  */
 export function parseActivity(
   value: unknown,
@@ -232,20 +232,13 @@ export function parseActivity(
     seen.add(event.id);
     return event;
   });
-  // Events are appended in the order they were recorded, so a stored journal
-  // whose ids are not increasing is not a journal this store could have
-  // written; accepting it would make "the next event" ambiguous. The counter
-  // then only has to exceed the highest id, which it does below.
   const highest = events.reduce((max, event) => Math.max(max, event.id), 0);
   if (
     typeof nextActivityId !== "number" ||
     !Number.isSafeInteger(nextActivityId) ||
-    nextActivityId < 1 ||
-    nextActivityId >= Number.MAX_SAFE_INTEGER
+    nextActivityId < 1
   ) {
-    throw new ValidationError(
-      "nextActivityId must be a positive safe integer below the safe-integer ceiling",
-    );
+    throw new ValidationError("nextActivityId must be a positive safe integer");
   }
   if (nextActivityId <= highest) {
     throw new ValidationError(
@@ -253,4 +246,29 @@ export function parseActivity(
     );
   }
   return { activity: deepFreeze(clone(events)), nextActivityId };
+}
+
+/**
+ * Allocate the next journal event id and advance the counter. Allocation needs
+ * room to advance: a counter at the safe-integer ceiling cannot produce a
+ * further id, so it is refused and the state is left unchanged. The caller
+ * owns the state passed in; this function never captures an event or writes
+ * one to disk, it only hands out the next identity.
+ */
+export function allocateActivityId(
+  state: { activity: readonly ActivityEvent[]; nextActivityId: number },
+): number {
+  const next = state.nextActivityId;
+  if (!Number.isSafeInteger(next) || next < 1 || next >= Number.MAX_SAFE_INTEGER) {
+    throw new ValidationError(
+      "Cannot allocate an activity event id: the journal counter cannot advance safely",
+    );
+  }
+  if (state.activity.some((event) => event.id === next)) {
+    throw new ValidationError(
+      `Cannot allocate an activity event id: ${next} is already used`,
+    );
+  }
+  state.nextActivityId = next + 1;
+  return next;
 }

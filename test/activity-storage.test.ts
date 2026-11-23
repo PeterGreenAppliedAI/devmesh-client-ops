@@ -10,8 +10,20 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
-import { ACTIVITY_ACTIONS, ACTIVITY_TARGET_KINDS, parseActivityEvent } from "../src/activity.ts";
-import { openStore, PersistenceError, ValidationError, type Store } from "../src/store.ts";
+import {
+  ACTIVITY_ACTIONS,
+  ACTIVITY_TARGET_KINDS,
+  allocateActivityId,
+  parseActivityEvent,
+  type ActivityEvent,
+} from "../src/activity.ts";
+import {
+  openStore,
+  PersistenceError,
+  ValidationError,
+  type Snapshot,
+  type Store,
+} from "../src/store.ts";
 
 const roots: string[] = [];
 after(() => {
@@ -93,7 +105,8 @@ function documentWithEveryFamily(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function event(overrides: Record<string, unknown> = {}) {
+/** A valid base event; overrides are untyped so malformed values can be built. */
+function event(overrides: Record<string, unknown> = {}): ActivityEvent {
   return {
     id: 1,
     at: "2026-02-03T04:05:06.007Z",
@@ -101,7 +114,7 @@ function event(overrides: Record<string, unknown> = {}) {
     targetKind: "client",
     targetId: "client-1",
     ...overrides,
-  };
+  } as ActivityEvent;
 }
 
 /** Write a document, expect opening to fail, and check file and lock are kept. */
@@ -340,17 +353,19 @@ describe("activity journal storage", () => {
   });
 
   it("refuses malformed events under the strict event rules", async () => {
+    // Each case names the rule it isolates, so a case that is refused for some
+    // other reason cannot hide a missing check. Every journal here carries a
+    // counter of 2, which is valid for the single event id 1 these cases use,
+    // so the only possible refusal is that event's own rule.
     const dir = tempDir();
-    const cases: unknown[][] = [
-      // Exact keys: an unknown field and every missing field are refused.
-      // A target id must be a string; it need not name an existing record here.
-      [event({ targetId: 42 })],
-      [event({ targetId: null })],
+    const single: unknown[][] = [
+      // Exact keys: an unknown field is refused.
       [{ ...event(), extra: true }],
-      [{ id: 1, at: "2026-02-03T04:05:06.007Z", action: "create", targetKind: "client" }],
+      // Every missing field is refused, one case per field.
       [{ at: "2026-02-03T04:05:06.007Z", action: "create", targetKind: "client", targetId: "client-1" }],
       [{ id: 1, action: "create", targetKind: "client", targetId: "client-1" }],
       [{ id: 1, at: "2026-02-03T04:05:06.007Z", targetKind: "client", targetId: "client-1" }],
+      [{ id: 1, at: "2026-02-03T04:05:06.007Z", action: "create", targetId: "client-1" }],
       [{ id: 1, at: "2026-02-03T04:05:06.007Z", action: "create", targetKind: "client" }],
       // An event must be an object.
       ["not an event"],
@@ -381,11 +396,10 @@ describe("activity journal storage", () => {
       [event({ action: null })],
       [event({ targetKind: "workspace" })],
       [event({ targetKind: "Client" })],
-      // Meetings are never archived or restored.
-      [event({ action: "archive", targetKind: "meeting", targetId: "meeting-1" })],
-      [event({ action: "restore", targetKind: "meeting", targetId: "meeting-1" })],
+      // A target id must be a string.
+      [event({ targetId: 42 })],
+      [event({ targetId: null })],
       // Targets must exist.
-      // (A non-string target id is refused by the event parser on its own.)
       [event({ targetKind: "task", targetId: "task-9" })],
       [event({ targetKind: "task", targetId: "client-1" })],
       [event({ targetKind: "engagement", targetId: "engagement-9" })],
@@ -393,60 +407,179 @@ describe("activity journal storage", () => {
       [event({ targetKind: "item", targetId: "item-9" })],
       [event({ targetKind: "meeting", targetId: "meeting-9" })],
       [event({ targetKind: "meeting", targetId: "client-1" })],
-      // Duplicate IDs.
-      [event({ id: 2 }), event({ id: 2 })],
-      // IDs out of order: the journal is append-only, so this is not a journal
-      // this store could have written.
-      [event({ id: 2 }), event({ id: 1 })],
-      // A counter that does not exceed every id, or is not a usable integer.
-      // (Counter cases are exercised separately below, since the journal alone
-      // is still refused with the counter left at 1.)
+      // Meetings are never archived or restored.
+      [event({ action: "archive", targetKind: "meeting", targetId: "meeting-1" })],
+      [event({ action: "restore", targetKind: "meeting", targetId: "meeting-1" })],
     ];
-    for (const activity of cases) {
-      await assertRefused(dir, documentWithEveryFamily({ activity }));
+    for (const activity of single) {
+      await assertRefused(
+        dir,
+        documentWithEveryFamily({ activity, nextActivityId: 2 }),
+      );
     }
-    // The same strict rules apply when parsing an event directly; a journal
-    // with duplicates or out-of-order ids is valid per event and is refused
-    // only by the whole-journal check above.
-    const perEventCases = cases.filter(
-      (activity) =>
-        activity.length === 1 &&
-        typeof activity[0] === "object" &&
-        activity[0] !== null &&
-        !Array.isArray(activity[0]) &&
-        // Target existence needs the whole document, so it is checked above.
-        !("targetId" in (activity[0] as Record<string, unknown>)),
-    );
-    for (const [value] of perEventCases) {
+    // Duplicate IDs: the counter is valid either way, so the duplicate alone is
+    // what refuses the journal.
+    for (const activity of [
+      [event({ id: 1 }), event({ id: 1, action: "edit" })],
+      [event({ id: 2 }), event({ id: 2, action: "edit" })],
+      [event({ id: 1 }), event({ id: 2, action: "edit" }), event({ id: 1 })],
+    ]) {
+      await assertRefused(
+        dir,
+        documentWithEveryFamily({ activity, nextActivityId: 3 }),
+      );
+    }
+    // The same strict rules apply when parsing an event directly. These cases
+    // need no document, so their target-existence cases are checked above.
+    const perEventCases = [
+      { ...event(), extra: true },
+      { at: "2026-02-03T04:05:06.007Z", action: "create", targetKind: "client", targetId: "client-1" },
+      { id: 1, action: "create", targetKind: "client", targetId: "client-1" },
+      { id: 1, at: "2026-02-03T04:05:06.007Z", targetKind: "client", targetId: "client-1" },
+      { id: 1, at: "2026-02-03T04:05:06.007Z", action: "create", targetId: "client-1" },
+      { id: 1, at: "2026-02-03T04:05:06.007Z", action: "create", targetKind: "client" },
+      "not an event",
+      null,
+      [event()],
+      event({ id: 0 }),
+      event({ id: -1 }),
+      event({ id: 1.5 }),
+      event({ id: Number.MAX_SAFE_INTEGER }),
+      event({ id: Number.MAX_SAFE_INTEGER + 2 }),
+      event({ id: "1" }),
+      event({ id: null }),
+      event({ at: "2026-02-03T04:05:06Z" }),
+      event({ at: "2026-02-03T04:05:06.07Z" }),
+      event({ at: "2026-02-03T04:05:06.007+00:00" }),
+      event({ at: "2026-02-03T04:05:06.007" }),
+      event({ at: "2026-02-03 04:05:06.007Z" }),
+      event({ at: "2023-02-29T00:00:00.000Z" }),
+      event({ at: "2026-13-01T00:00:00.000Z" }),
+      event({ at: "2026-02-03T24:00:00.000Z" }),
+      event({ at: "" }),
+      event({ at: 1700000000000 }),
+      event({ action: "delete" }),
+      event({ action: "CREATE" }),
+      event({ action: null }),
+      event({ targetKind: "workspace" }),
+      event({ targetKind: "Client" }),
+      event({ targetId: 42 }),
+      event({ targetId: null }),
+      event({ action: "archive", targetKind: "meeting", targetId: "meeting-1" }),
+      event({ action: "restore", targetKind: "meeting", targetId: "meeting-1" }),
+    ];
+    for (const value of perEventCases) {
       assert.throws(() => parseActivityEvent(value), ValidationError);
+    }
+    // A canonical UTC timestamp is accepted at the calendar extremes that are
+    // real instants, including year zero.
+    for (const at of [
+      "0000-01-01T00:00:00.000Z",
+      "0000-02-29T00:00:00.000Z",
+      "2024-02-29T23:59:59.999Z",
+      "9999-12-31T23:59:59.999Z",
+    ]) {
+      assert.equal(parseActivityEvent(event({ at })).at, at);
+    }
+  });
+
+  it("accepts a stored journal whose events are not in id order", async () => {
+    // Validation is about unique identity, not storage order: a journal with
+    // ids 2 then 1 and a counter of 3 is a valid journal.
+    const dir = tempDir();
+    const activity = [
+      event({ id: 2, action: "edit" }),
+      event({ id: 1, action: "create" }),
+    ];
+    writeFileSync(
+      storePath(dir),
+      JSON.stringify(documentWithEveryFamily({ activity, nextActivityId: 3 })),
+      "utf8",
+    );
+    const store = await openStore(dir);
+    try {
+      assert.deepEqual(store.snapshot().activity, activity);
+    } finally {
+      await store.close();
     }
   });
 
   it("refuses counter values that cannot advance past every event id", async () => {
     const dir = tempDir();
     const twoEvents = [event({ id: 1 }), event({ id: 2, action: "edit", targetId: "client-1" })];
-    for (const nextActivityId of [
-      0,
-      -1,
-      1.5,
-      Number.MAX_SAFE_INTEGER,
-      Number.MAX_SAFE_INTEGER + 2,
-      "2",
-      null,
-    ]) {
+    for (const nextActivityId of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 2, "2", null]) {
       await assertRefused(dir, documentWithEveryFamily({ activity: twoEvents, nextActivityId }));
     }
     // A counter equal to or below an existing id would reproduce it.
-    await assertRefused(dir, documentWithEveryFamily({ activity: twoEvents, nextActivityId: 1 }));
-    // A counter above the highest id is accepted.
-    const content = JSON.stringify(documentWithEveryFamily({ activity: twoEvents, nextActivityId: 3 }));
-    writeFileSync(storePath(dir), content, "utf8");
+    for (const nextActivityId of [1, 2]) {
+      await assertRefused(dir, documentWithEveryFamily({ activity: twoEvents, nextActivityId }));
+    }
+    // A counter above the highest id is accepted and survives a save unchanged.
+    writeFileSync(
+      storePath(dir),
+      JSON.stringify(documentWithEveryFamily({ activity: twoEvents, nextActivityId: 3 })),
+      "utf8",
+    );
     const store = await openStore(dir);
     try {
       assert.equal(store.snapshot().activity!.length, 2);
+      await store.updateClient("client-1", { name: "Renamed" });
     } finally {
       await store.close();
     }
+    assert.equal(JSON.parse(readFileSync(storePath(dir), "utf8")).nextActivityId, 3);
+  });
+
+  it("accepts an exhausted journal and keeps its ceiling counter on save", async () => {
+    // The highest usable event id is the ceiling minus one; the counter that
+    // follows it is the ceiling itself, which the task allows as a stored
+    // value. It is not clamped, and the exhausted journal can still be saved.
+    const dir = tempDir();
+    const highest = Number.MAX_SAFE_INTEGER - 1;
+    const activity = [event({ id: highest })];
+    writeFileSync(
+      storePath(dir),
+      JSON.stringify(documentWithEveryFamily({ activity, nextActivityId: Number.MAX_SAFE_INTEGER })),
+      "utf8",
+    );
+    const store = await openStore(dir);
+    try {
+      assert.deepEqual(store.snapshot().activity, activity);
+      await store.updateClient("client-1", { name: "Renamed" });
+    } finally {
+      await store.close();
+    }
+    const saved = JSON.parse(readFileSync(storePath(dir), "utf8"));
+    assert.equal(saved.nextActivityId, Number.MAX_SAFE_INTEGER);
+    assert.deepEqual(saved.activity, activity);
+
+    const reopened = await openStore(dir);
+    try {
+      assert.equal(reopened.snapshot().activity![0].id, highest);
+    } finally {
+      await reopened.close();
+    }
+  });
+
+  it("refuses journal allocation once the counter reaches the ceiling", () => {
+    // Allocation at the ceiling fails and leaves the state unchanged: no event
+    // is captured and the counter does not move past what can be represented.
+    const state: { activity: ActivityEvent[]; nextActivityId: number } = {
+      activity: [],
+      nextActivityId: Number.MAX_SAFE_INTEGER,
+    };
+    assert.throws(() => allocateActivityId(state), ValidationError);
+    assert.equal(state.nextActivityId, Number.MAX_SAFE_INTEGER);
+    assert.deepEqual(state.activity, []);
+
+    // Allocation still advances below the ceiling, skipping a used id.
+    const usable = { activity: [event({ id: 4 })], nextActivityId: 4 };
+    assert.throws(() => allocateActivityId(usable), ValidationError);
+    assert.equal(usable.nextActivityId, 4);
+    assert.equal(allocateActivityId({ activity: [event({ id: 4 })], nextActivityId: 5 }), 5);
+    const next = { activity: [], nextActivityId: 1 };
+    assert.equal(allocateActivityId(next), 1);
+    assert.equal(next.nextActivityId, 2);
   });
 
   it("exposes the fixed action and target lists", () => {
@@ -507,16 +640,21 @@ describe("activity journal storage", () => {
   });
 
   it("keeps a hand-built snapshot's missing journal as empty", async () => {
-    // Existing hand-built snapshots omit `activity`; the type makes it optional
-    // and an absent journal means no events. This is a type-level expectation.
+    // Existing hand-built snapshots omit `activity`. Typed as the production
+    // Snapshot, the fixture only compiles because the interface makes the
+    // journal optional; its absent journal is then read as empty.
+    const withoutJournal: Snapshot = {
+      clients: [],
+      engagements: [],
+      projects: [],
+      tasks: [],
+      items: [],
+      meetings: [],
+    };
+    assert.equal(withoutJournal.activity, undefined);
     const store = await openStore(tempDir());
     try {
-      const snapshot = store.snapshot();
-      const withoutJournal: { readonly clients: readonly unknown[]; readonly activity?: readonly unknown[] } = {
-        clients: snapshot.clients,
-      };
-      assert.equal(withoutJournal.activity, undefined);
-      assert.deepEqual(snapshot.activity, []);
+      assert.deepEqual(store.snapshot().activity, []);
     } finally {
       await store.close();
     }
