@@ -456,6 +456,73 @@ describe("PDF parser resources", () => {
     assert.deepEqual(cleaned, [1, 2]);
     assert.deepEqual(destroyed, [true]);
   });
+
+  it("refuses the import when the loading task rejects with null, not just Error objects", async () => {
+    const parser: PdfParser = {
+      load: () => ({
+        promise: Promise.resolve({
+          numPages: 1,
+          getPage: () =>
+            Promise.resolve({
+              getTextContent: () => Promise.resolve({ items: [{ str: "Usable text." }] }),
+            }),
+        }),
+        // A release failure is a failure whatever the rejected value is.
+        destroy: () => Promise.reject(null),
+      }),
+    };
+    refused(
+      await importPdf(pdfBytes([["x"]]), "null-destroy.pdf", parser),
+      "unreadable_document",
+      /parser resources were not released.*destroying the document loading task/i,
+    );
+  });
+
+  it("refuses the import when a page cleanup throws null, still releasing every page and the task", async () => {
+    const cleaned: number[] = [];
+    const destroyed: boolean[] = [];
+    const parser: PdfParser = {
+      load: () => ({
+        promise: Promise.resolve({
+          numPages: 2,
+          getPage: (pageNumber: number) =>
+            Promise.resolve({
+              getTextContent: () => Promise.resolve({ items: [{ str: `Page ${pageNumber}` }] }),
+              cleanup: () => {
+                cleaned.push(pageNumber);
+                // Throwing and rejecting with null and undefined are failures;
+                // they must not be mistaken for a successful release.
+                if (pageNumber === 1) throw null;
+                if (pageNumber === 2) return Promise.reject(undefined);
+                return true;
+              },
+            }),
+        }),
+        destroy: () => {
+          destroyed.push(true);
+          return Promise.resolve();
+        },
+      }),
+    };
+    refused(
+      await importPdf(pdfBytes([["First"], ["Second"]]), "null-page-release.pdf", parser),
+      "unreadable_document",
+      /parser resources were not released.*cleaning up a document page/i,
+    );
+    assert.deepEqual(cleaned, [1, 2]);
+    assert.deepEqual(destroyed, [true]);
+  });
+});
+
+describe("PDF fixtures", () => {
+  it("pdfOfLength produces exactly the requested length or reports failure", () => {
+    const base = pdfBytes([["Fixture text."]]).length;
+    for (const length of [base, base + 1, base + 2, base + 3, base + 17]) {
+      const bytes = pdfOfLength([["Fixture text."]], length);
+      assert.equal(bytes.length, length, `requested ${length} bytes`);
+    }
+    assert.throws(() => pdfOfLength([["Fixture text."]], base - 1), /cannot be shorter/);
+  });
 });
 
 describe("PDF size limits", () => {

@@ -387,6 +387,29 @@ async function releasePage(page: PdfPage, pageNumber: number, fail: (error: unkn
   }
 }
 
+/** A release failure: which release failed and the value it threw or rejected. */
+interface ReleaseFailure {
+  readonly stage: "page" | "destroy";
+  readonly error: unknown;
+}
+
+/**
+ * Run one release operation, recording a failure however the operation fails.
+ * Whether it failed is tracked separately from the thrown value, so throwing
+ * or rejecting `null` or `undefined` is still a failure, not a success.
+ */
+async function attemptRelease(
+  stage: ReleaseFailure["stage"],
+  release: () => unknown,
+  failures: ReleaseFailure[],
+): Promise<void> {
+  try {
+    await release();
+  } catch (error) {
+    failures.push(Object.freeze({ stage, error }));
+  }
+}
+
 /**
  * Import a text-based PDF file's bytes and return the core import result. The
  * bytes are copied and preserved exactly; the extracted text is the text of
@@ -438,11 +461,12 @@ export async function importPdf(
   // The outcome decided by extraction. A release failure, or a failure while
   // deciding the outcome, replaces it with a classified refusal, so no outcome
   // is ever returned with resources left unreleased or an unexpected failure
-  // swallowed.
+  // swallowed. The failures list records that a release failed separately from
+  // the thrown value, so a `null` or `undefined` rejection is still a failure.
   let outcome: PdfImportOutcome;
-  let destroyError: unknown = null;
+  const failures: ReleaseFailure[] = [];
   try {
-    outcome = await extract(filename, originalBytes, task);
+    outcome = await extract(filename, originalBytes, task, failures);
   } catch (error) {
     outcome = refuse(
       "unreadable_document",
@@ -451,14 +475,11 @@ export async function importPdf(
       }; ${RE_EXPORT_GUIDANCE}`,
     );
   } finally {
-    try {
-      await task.destroy();
-    } catch (error) {
-      destroyError = error;
-    }
+    await attemptRelease("destroy", () => task.destroy(), failures);
   }
-  if (destroyError !== null) {
-    return releaseFailed(filename, "destroying the document loading task", destroyError);
+  const destroyFailure = failures.find((failure) => failure.stage === "destroy");
+  if (destroyFailure !== undefined) {
+    return releaseFailed(filename, "destroying the document loading task", destroyFailure.error);
   }
   return outcome;
 }
@@ -472,6 +493,7 @@ async function extract(
   filename: string,
   originalBytes: Uint8Array,
   task: PdfLoadingTask,
+  failures: ReleaseFailure[],
 ): Promise<PdfImportOutcome> {
   let document: PdfDocument;
   try {
@@ -484,10 +506,9 @@ async function extract(
   }
 
   const pages: ExtractedPage[] = [];
-  // The first page release failure; the import is refused for it.
-  let releaseError: unknown = null;
+  // Every page release failure is recorded; the first one refuses the import.
   const fail = (error: unknown): void => {
-    if (releaseError === null) releaseError = error;
+    failures.push(Object.freeze({ stage: "page", error }));
   };
   try {
     const count = document.numPages;
@@ -505,7 +526,8 @@ async function extract(
     // A page that will not yield text fails the whole import; never publish
     // partial extraction as complete. Every page released so far was released,
     // and the failed page was released in its `finally`.
-    if (releaseError !== null) return releaseFailed(filename, "cleaning up a document page", releaseError);
+    const pageFailure = failures.find((failure) => failure.stage === "page");
+    if (pageFailure !== undefined) return releaseFailed(filename, "cleaning up a document page", pageFailure.error);
     // The core's `unreadable_document` code names a document that cannot be
     // read; a page that failed to extract is one.
     return refuse(
@@ -513,8 +535,9 @@ async function extract(
       `Page extraction failed for the file ${JSON.stringify(filename)}, so the whole import was refused rather than returning a partial result; ${RE_EXPORT_GUIDANCE}`,
     );
   }
-  if (releaseError !== null) {
-    return releaseFailed(filename, "cleaning up a document page", releaseError);
+  const releaseFailure = failures.find((failure) => failure.stage === "page");
+  if (releaseFailure !== undefined) {
+    return releaseFailed(filename, "cleaning up a document page", releaseFailure.error);
   }
 
   const extractedText = pages

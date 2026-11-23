@@ -182,34 +182,26 @@ export function pdfBytes(pages: readonly TestPage[]): Uint8Array {
 
 /**
  * A PDF with the given pages whose total length is exactly `totalBytes`. The
- * extra bytes are a PDF comment line (`%` begins a comment) placed right after
- * the header, where comments are allowed; the cross-reference offsets and
- * `startxref` are computed after it is written, so the document is valid and
- * its page text is unchanged.
+ * extra bytes are a PDF comment placed after the final `%%EOF` (a comment is
+ * allowed as trailing data), so they shift nothing: the cross-reference
+ * offsets, `/Length` values and the page text are exactly those of the base
+ * document, and the document stays valid. Only an exact-size document is
+ * returned; a length this helper cannot reach reports failure rather than
+ * substituting another size.
  */
 export function pdfOfLength(pages: readonly TestPage[], totalBytes: number): Uint8Array {
   const base = buildPdf(pages);
   if (totalBytes < base.length) {
     throw new Error(`a PDF with these pages cannot be shorter than ${base.length} bytes`);
   }
-  // Padding shifts every offset, which can widen (or, when the offsets cross
-  // a power-of-ten boundary, not widen) the `startxref` number. Measure the
-  // padded document and adjust the comment by the difference until the result
-  // is exactly the requested length.
-  let paddingLength = totalBytes - base.length;
+  const paddingLength = totalBytes - base.length;
   if (paddingLength === 0) return base;
-  for (let attempt = 0; attempt < 8; attempt += 1) {
-    // A comment line is "%" plus its text plus "\n", exactly `paddingLength`
-    // bytes long; it must be at least one byte of text.
-    const comment = `%${"p".repeat(Math.max(0, paddingLength - 2))}\n`;
-    const padded = writeDocument(documentObjects(pages), "", comment);
-    const difference = totalBytes - padded.length;
-    if (difference === 0) return padded;
-    paddingLength += difference;
-    // Shrinking below the unpadded size is impossible.
-    if (paddingLength < 3) return padded;
-  }
-  throw new Error("the padded PDF is not the requested length");
+  // A trailing comment is "%" plus its text, so any positive length is reachable.
+  const padding = `%${"p".repeat(paddingLength - 1)}`;
+  const out = new Uint8Array(totalBytes);
+  out.set(base);
+  out.set(bytesOf(padding), base.length);
+  return out;
 }
 
 /**
