@@ -303,8 +303,12 @@ describe("kanban task movement", () => {
         for (const to of TASK_STATUSES) {
           if (from === to) continue;
           // Reset the task to `from` first; the movement's own event then
-          // carries the transition under test.
-          if (task.status !== from) await store.moveTask(task.id, from as TaskStatus, scope);
+          // carries the transition under test. The current record, not the
+          // stale creation result, tells us where the task actually stands.
+          const current = store.snapshot().tasks.find((entry) => entry.id === task.id)!;
+          if (current.status !== from) await store.moveTask(task.id, from as TaskStatus, scope);
+          const established = store.snapshot().tasks.find((entry) => entry.id === task.id)!;
+          assert.equal(established.status, from, `${from} -> ${to} begins at ${from}`);
           const journalAt = store.snapshot().activity!.length;
           const moved = await store.moveTask(task.id, to, scope);
           assert.equal(moved.status, to, `${from} -> ${to}`);
@@ -349,10 +353,15 @@ describe("kanban task movement", () => {
     try {
       const h = await hierarchy(store);
       const task = await store.createTask({ clientId: h.client.id, engagementId: h.engagement.id, title: "Same" });
-      const journalBefore = store.snapshot().activity!.length;
-      const moved = await store.moveTask(task.id, "open", { kind: "all" });
-      assert.equal(moved.status, "open");
-      assert.equal(store.snapshot().activity!.length, journalBefore);
+      for (const status of TASK_STATUSES) {
+        if (status !== "open") await store.moveTask(task.id, status, { kind: "all" });
+        const current = store.snapshot().tasks.find((entry) => entry.id === task.id)!;
+        assert.equal(current.status, status, `task stands at ${status}`);
+        const journalBefore = store.snapshot().activity!.length;
+        const moved = await store.moveTask(task.id, status, { kind: "all" });
+        assert.equal(moved.status, status, `${status} -> ${status}`);
+        assert.equal(store.snapshot().activity!.length, journalBefore, `${status} -> ${status} records no event`);
+      }
     } finally {
       await store.close();
     }
