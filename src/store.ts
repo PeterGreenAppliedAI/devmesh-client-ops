@@ -1734,6 +1734,15 @@ class StoreImpl implements Store {
     return this.blocked;
   }
 
+  /**
+   * The failure that refuses a write while the store's state is not known to be
+   * committed, or null. An operation already admitted to the queue checks this
+   * inside its turn; it is not refused merely because close has started.
+   */
+  writeBlock(): PersistenceError | null {
+    return this.blocked;
+  }
+
   /** The original-file store over the same workspace directory. */
   originalFiles(): OriginalStore {
     return this.originals;
@@ -1743,22 +1752,16 @@ class StoreImpl implements Store {
    * Run an unexposed store operation inside this store's own mutation queue, so
    * it is serialized with every ordinary create, edit and save of the store: no
    * other mutation can interleave with the operation between reading the
-   * committed state and committing its result. The operation is refused like a
-   * mutation when the store is closed or blocked. A failed operation publishes
-   * nothing and rejects with its own error.
+   * committed state and committing its result. The operation is the one queue
+   * admission for the whole import: inside its turn it commits directly through
+   * `commitTranscripts` and never enqueues again. An operation admitted before
+   * close keeps running and commits until its turn ends, exactly like an
+   * ordinary mutation, which close drains; a call admitted after close is
+   * refused. A failed operation publishes nothing and rejects with its own
+   * error.
    */
   async runExclusive<T>(operation: () => Promise<T>): Promise<T> {
     return this.enqueue(operation);
-  }
-
-  /**
-   * Persist the committed state as an unchanged no-op, through the ordinary
-   * no-op save path. The draft is built without a change and saved exactly as
-   * any other write is; no event is recorded. A save failure rejects and adds
-   * nothing, exactly as for a mutation.
-   */
-  async commitNoop(mutate: (draft: State) => MutationChange<unknown>): Promise<unknown> {
-    return this.enqueue(() => this.commit(mutate));
   }
 
   /**
@@ -1772,7 +1775,12 @@ class StoreImpl implements Store {
   async commitTranscripts(
     mutate: (draft: State) => MutationChange<TranscriptCommit>,
   ): Promise<TranscriptCommit> {
-    if (this.closed) throw new PersistenceError("Store is closed");
+    // Called inside the caller's queue turn (see `runExclusive`), so it must not
+    // enqueue again; the admission was decided when the operation was accepted,
+    // and an operation accepted before close keeps committing until its turn
+    // ends, exactly like an ordinary mutation close drains. A store whose state
+    // became blocked is still refused before anything is written; a call made
+    // after close never reaches here, because it is refused on admission.
     if (this.blocked) {
       throw new PersistenceError(
         "The store cannot accept further mutations until it is reopened",

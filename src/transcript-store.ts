@@ -33,10 +33,13 @@
  *
  * Durability and failure rules:
  *
- * - Every import runs inside the workspace store's own mutation queue, so its
- *   argument, parent and lifecycle validation, its blob publication and its
- *   JSON commit are serialized with every ordinary store operation; a meeting
- *   id is allocated from the draft that is actually persisted.
+ * - Every import is one admission to the workspace store's own mutation queue,
+ *   so its argument, parent and lifecycle validation, its blob publication and
+ *   its JSON commit are serialized with every ordinary store operation; inside
+ *   its turn it commits directly and never enqueues again, and a meeting id is
+ *   allocated from the draft that is actually persisted. An import accepted
+ *   before `close` finishes and commits while close waits for the queue, exactly
+ *   like an ordinary mutation close drains; a call after close is refused.
  * - The complete proposed metadata is validated before any blob is published,
  *   so a validation failure writes nothing at all, blobs included.
  * - Original files are published and verified before the JSON that names them
@@ -314,7 +317,8 @@ interface CommitStore {
     },
   ): Promise<unknown>;
   originalFiles(): OriginalStore;
-  unavailable(): PersistenceError | null;
+  /** The failure that refuses a write on a store whose state is not committed. */
+  writeBlock(): PersistenceError | null;
 }
 
 /** The supplied meeting create, normalized after validation. */
@@ -380,24 +384,28 @@ class TranscriptStoreImpl implements TranscriptStore {
     return this.store as unknown as CommitStore;
   }
 
-  /** The failure that refuses writes when the store is closed or blocked. */
-  private unavailable(): PersistenceError | null {
-    return this.internals().unavailable();
+  /** The failure that refuses an accepted import's write when it is blocked. */
+  private writeBlock(): PersistenceError | null {
+    return this.internals().writeBlock();
   }
 
   /**
    * Import exactly one raw paste or file. The whole import (its argument and
    * parent validation, the complete metadata validation, the blob publication
-   * and the JSON commit) runs through the workspace store's own mutation queue
-   * and commit, so it is serialized with every ordinary store operation: the
-   * association is allocated from the id actually committed, and an intervening
-   * store write cannot move it. A malformed call, a parser refusal or an invalid
-   * parent writes nothing.
+   * and the JSON commit) is the one admission to the workspace store's own
+   * mutation queue and commits inside that turn, so it is serialized with every
+   * ordinary store operation: the association is allocated from the id actually
+   * committed, and an intervening store write cannot move it. Close drains an
+   * accepted import before releasing ownership, and refuses later calls. A
+   * malformed call, a parser refusal or an invalid parent writes nothing.
    */
   importTranscript(input: TranscriptInput, target: TranscriptTarget): Promise<TranscriptImportResult> {
     return this.exclusive(async () => {
-      const unavailable = this.unavailable();
-      if (unavailable !== null) throw unavailable;
+      // Admission was decided when this import entered the store's queue: an
+      // import accepted before close keeps running while close drains the queue.
+      // A store that became blocked may not build on uncommitted state.
+      const blocked = this.writeBlock();
+      if (blocked !== null) throw blocked;
       // The arguments are checked before any read or write, so a malformed
       // call writes nothing at all.
       const parsed = this.parseTarget(target);
@@ -1048,8 +1056,10 @@ class TranscriptStoreImpl implements TranscriptStore {
     engagementId?: unknown,
   ): Promise<TranscriptSourceRead> {
     return this.exclusive(async () => {
-      const unavailable = this.unavailable();
-      if (unavailable !== null) throw unavailable;
+      // Admission was decided when this read entered the store's queue; a store
+      // that became blocked refuses the read like any other write-side check.
+      const blocked = this.writeBlock();
+      if (blocked !== null) throw blocked;
       const wantedTranscript = requireNonblank(transcriptId, "transcriptId");
       const wantedSource = requireNonblank(sourceId, "sourceId");
       const wantedEngagement =

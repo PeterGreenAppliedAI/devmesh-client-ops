@@ -26,6 +26,7 @@ import {
   type Store,
 } from "../src/store.ts";
 import { openTranscriptStore, type TranscriptStore } from "../src/transcript-store.ts";
+import type { DocxParser } from "../src/transcript-docx.ts";
 import { ORIGINALS_DIRECTORY, type OriginalFileSystem } from "../src/transcript-files.ts";
 import { canonicalize, importPastedText, MAX_CONTENT_BYTES } from "../src/transcript.ts";
 import { docxBytes, docxOfLength } from "./fixtures/transcript-docx.ts";
@@ -964,6 +965,131 @@ describe("transcript store: concurrent repeats", () => {
       assert.equal(ts.store.snapshot().meetings.length, 1);
     } finally {
       await ts.close();
+    }
+  });
+});
+
+describe("transcript store: imports share the store queue with close", () => {
+  it("commits an import immediately followed by close, then refuses calls after close", async () => {
+    const dir = tempDir();
+    const { ts, parents } = await freshStore(dir);
+    const result = await (async () => {
+      // The import is admitted, then close starts before the import's turn has
+      // necessarily finished: close drains it and keeps ownership until it does.
+      const pending = ts.importTranscript({ kind: "paste", text: PASTED_TEXT }, createFor(parents));
+      await ts.close();
+      return pending;
+    })();
+    // The accepted import committed: its result, association, counters and one
+    // create event all name the id allocated from the committed draft.
+    assert.equal(result.outcome, "created");
+    assert.equal(result.createdMeeting, true);
+    assert.equal(result.transcript.meetingId, result.meeting.id);
+    assert.deepEqual(
+      activity(ts.store).map((event) => [event.action, event.targetKind, event.targetId]),
+      [
+        ["create", "client", "client-1"],
+        ["create", "engagement", "engagement-1"],
+        ["create", "meeting", result.meeting.id],
+      ],
+      "the import recorded exactly one meeting create event",
+    );
+    // A call admitted after close is refused.
+    await assert.rejects(
+      ts.importTranscript({ kind: "paste", text: "Later." }, createFor(parents)),
+      PersistenceError,
+    );
+    await assert.rejects(ts.readSource(result.transcript.id, result.sourceIds[0]), PersistenceError);
+    // Reopening finds exactly the committed import and releases the lock.
+    const reopened = await openTranscriptStore(dir);
+    try {
+      const saved = JSON.parse(readFileSync(storePath(dir), "utf8"));
+      assert.equal(saved.meetings.length, 1);
+      assert.equal(saved.transcripts.length, 1);
+      assert.equal(saved.transcripts[0].meetingId, result.meeting.id);
+      assert.equal(saved.nextIds.meetings, 2, "the meeting id counter advanced once");
+      assert.equal(saved.activity.length, 3);
+      assert.equal(reopened.transcripts().length, 1);
+      const read = await reopened.readSource(result.transcript.id, result.sourceIds[0]);
+      assert.equal(read.extractedText, PASTED_TEXT);
+    } finally {
+      await reopened.close();
+    }
+  });
+
+  it("waits for a paused parser and then commits the accepted import before close returns", async () => {
+    const dir = tempDir();
+    let release: () => void = () => {};
+    const paused: DocxParser = {
+      convertToHtml: () =>
+        new Promise((resolve) => {
+          release = () => resolve({ value: "<p>Alice: Hello there.</p><p>Bob: Hi, how are you?</p>" });
+        }),
+    };
+    const { ts, parents } = await freshStore(dir, { docxParser: paused });
+    let closed = false;
+    let committed: { meetingId: string; outcome: string } | undefined;
+    try {
+      const pending = ts.importTranscript(
+        { kind: "file", bytes: docxBytes(["ignored"]), filename: "paused.docx" },
+        createFor(parents),
+      );
+      pending.then(
+        (result) => {
+          committed = { meetingId: result.meeting.id, outcome: result.outcome };
+        },
+        () => {
+          committed = undefined;
+        },
+      );
+      // Close starts while the parser is paused: it must not release ownership
+      // or let a later write in until the accepted import has committed.
+      const closing = ts.close().then(() => {
+        closed = true;
+      });
+      let sawClosed = false;
+      for (let attempt = 0; attempt < 200 && !sawClosed; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        sawClosed = closed;
+      }
+      assert.equal(sawClosed, false, "close waits for the accepted import");
+      assert.equal(committed, undefined, "the import has not committed yet");
+      assert.equal(existsSync(join(dir, "workspace.lock")), true, "close retains ownership");
+      await assert.rejects(
+        ts.importTranscript({ kind: "paste", text: PASTED_TEXT }, createFor(parents)),
+        PersistenceError,
+        "a call admitted after close is refused while close waits",
+      );
+      assert.equal(ts.store.snapshot().meetings.length, 0, "nothing published before the commit");
+      assert.equal(committed, undefined);
+      // Release the paused parser: the import commits, then close finishes.
+      release();
+      await Promise.all([pending, closing]);
+      assert.equal(closed, true);
+      const resolved = committed as { meetingId: string; outcome: string } | undefined;
+      assert.equal(resolved?.outcome, "created");
+      assert.equal(resolved?.meetingId, "meeting-1");
+      assert.equal(
+        activity(ts.store).filter((event) => event.targetKind === "meeting").length,
+        1,
+        "exactly one meeting create event",
+      );
+      assert.equal(existsSync(join(dir, "workspace.lock")), false, "close released ownership");
+    } finally {
+      // Release the paused parser in every path, so a failed assertion never
+      // strands the import or close.
+      release();
+    }
+    const reopened = await openTranscriptStore(dir);
+    try {
+      const saved = JSON.parse(readFileSync(storePath(dir), "utf8"));
+      assert.equal(saved.meetings.length, 1, "the paused import's meeting was committed");
+      assert.equal(saved.transcripts.length, 1);
+      assert.equal(saved.meetings[0].id, "meeting-1");
+      assert.equal(saved.transcripts[0].meetingId, "meeting-1");
+      assert.equal(saved.activity.length, 3);
+    } finally {
+      await reopened.close();
     }
   });
 });
