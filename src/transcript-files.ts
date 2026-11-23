@@ -18,6 +18,9 @@
  *
  * - The workspace writer owns put operations: they are serialized through one
  *   queue, so two puts never interleave their temporary files or publications.
+ * - A put creates the owned `originals` directory when it is absent (and makes
+ *   that new directory entry durable where the platform requires it), so a
+ *   normal workspace is usable on first put without manual preparation.
  * - A put writes a unique, same-directory temporary file in full (every short
  *   write is retried by the byte offset), flushes it, closes it and only then
  *   atomically publishes it under its hash name. On platforms with directory
@@ -27,7 +30,9 @@
  * - A reference is returned only after publication and, where the platform
  *   requires it, the directory flush, so the caller gets a usable reference.
  * - Retrying after an earlier publication failure satisfies the same rules: a
- *   put checks for an existing hash-named file first and never overwrites one.
+ *   put checks for an existing hash-named file first and never overwrites one,
+ *   and a verified reuse still runs the directory-durability step before a
+ *   reference is returned.
  *
  * Reuse and verification: before reusing an existing original its bytes are
  * read and verified against the hash. Verified bytes are reused. Missing or
@@ -47,6 +52,7 @@ import {
   closeSync,
   fsyncSync,
   lstatSync,
+  mkdirSync,
   openSync,
   readFileSync,
   renameSync,
@@ -61,7 +67,11 @@ export const MAX_ORIGINAL_BYTES = 10 * 1024 * 1024;
 /** The owned directory, inside the workspace directory, that holds originals. */
 export const ORIGINALS_DIRECTORY = "originals";
 
+// JavaScript's `$` also matches before a final line terminator, so a regex alone
+// would accept a digest followed by a newline. The exact length is checked
+// first, which no trailing character can satisfy.
 const HASH_PATTERN = /^[0-9a-f]{64}$/;
+const HASH_LENGTH = 64;
 const TEMPORARY_SUFFIX = ".tmp";
 
 /** Raised for integrity failures: bytes absent, unreadable or not the hash. */
@@ -105,6 +115,8 @@ export interface OriginalReference {
 export interface OriginalFileSystem {
   /** True when a path exists (any file type). */
   existsSync(path: string): boolean;
+  /** Create a directory and any missing parents; succeeds when it exists. */
+  mkdirSync(path: string, options: { recursive: true }): void;
   /** Open a file for exclusive creation ("wx"), or a directory for reading ("r"). */
   openSync(path: string, flags: "wx" | "r"): number;
   /** Write bytes at the descriptor's current position; returns bytes written. */
@@ -139,7 +151,8 @@ export interface OriginalStoreOptions {
 export interface OriginalStore {
   /**
    * The original files directory this store publishes into, an owned directory
-   * inside the workspace directory. A store does not create or clean it.
+   * inside the workspace directory. It is created on first `put` when absent
+   * and never cleaned up.
    */
   readonly directory: string;
   /**
@@ -163,6 +176,7 @@ function defaultFileSystem(platform: string): OriginalFileSystem {
       // A dangling link is refused as an integrity failure rather than read.
       return existsAt(path);
     },
+    mkdirSync: (path, options) => mkdirSync(path, options),
     openSync: (path, flags) => openSync(path, flags),
     writeSync: (fd, data) => writeSync(fd, data),
     fsyncSync: (fd) => fsyncSync(fd),
@@ -268,7 +282,11 @@ function sha256Hex(bytes: Uint8Array): string {
 
 /** True when `value` is exactly a lowercase 64-character SHA-256 hex digest. */
 function isHash(value: unknown): value is string {
-  return typeof value === "string" && HASH_PATTERN.test(value);
+  return (
+    typeof value === "string" &&
+    value.length === HASH_LENGTH &&
+    HASH_PATTERN.test(value)
+  );
 }
 
 /** Require a validated hash or refuse the call before any file access. */
@@ -342,8 +360,13 @@ class OriginalStoreImpl implements OriginalStore {
     return this.enqueue(async () => this.putVerified(sha256, content));
   }
 
-  /** Reuse a verified existing original, else publish a new one durably. */
+  /**
+   * Reuse a verified existing original, else publish a new one durably. Before
+   * the first file access the owned directory is created if it is absent, so a
+   * normal workspace that the workspace writer created works on first use.
+   */
   private async putVerified(sha256: string, content: Uint8Array): Promise<OriginalReference> {
+    this.prepareDirectory();
     const existing = this.readIfPresent(sha256);
     if (existing !== null) {
       // Existing bytes are reused only when they verify; a hash that names
@@ -437,6 +460,30 @@ class OriginalStoreImpl implements OriginalStore {
       }
     }
     return cleanupFailure;
+  }
+
+  /**
+   * Create the owned originals directory when it is absent, then make the new
+   * directory entry durable where the platform requires it. Creating an already
+   * existing directory is not a failure and never replaces anything. A failure
+   * to create it is reported as a persistence failure.
+   */
+  private prepareDirectory(): void {
+    let present: boolean;
+    try {
+      present = this.fs.existsSync(this.directory);
+    } catch (cause) {
+      throw new OriginalPersistenceError("Failed to check for the originals directory", { cause });
+    }
+    if (present) return;
+    try {
+      this.fs.mkdirSync(this.directory, { recursive: true });
+    } catch (cause) {
+      throw new OriginalPersistenceError("Failed to create the originals directory", { cause });
+    }
+    // The new directory entry is flushed before anything is written into it, on
+    // the platforms that require it.
+    this.fsyncDirectory();
   }
 
   /** Flush the originals directory where the platform requires it. */

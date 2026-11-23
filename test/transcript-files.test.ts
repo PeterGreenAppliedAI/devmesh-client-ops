@@ -30,20 +30,26 @@ after(() => {
   for (const root of roots) rmSync(root, { recursive: true, force: true });
 });
 
-/** A workspace directory holding a workspace.json and an originals directory. */
+/**
+ * A workspace directory holding a workspace.json, as the workspace writer
+ * creates it: it has no originals directory, so the store must create it on
+ * first put.
+ */
 function workspace(): string {
   const root = mkdtempSync(join(tmpdir(), "transcript-files-"));
   roots.push(root);
   writeFileSync(join(root, "workspace.json"), "{\"untouched\":true}\n", "utf8");
   rmSync(join(root, ORIGINALS_DIRECTORY), { recursive: true, force: true });
-  // The originals directory is the workspace writer's; a real adapter does not
-  // create it, so the test creates the owned directory before using the store.
   return root;
 }
 
-/** Create the store's owned directory inside a workspace. */
-function withDirectory(root: string): void {
-  mkdirSync(join(root, ORIGINALS_DIRECTORY), { recursive: true });
+/**
+ * Place bytes at an original path before the store runs, as a pre-existing
+ * file would be, creating the owned directory to hold them.
+ */
+function seed(path: string, bytes: Uint8Array): void {
+  mkdirSync(join(path, ".."), { recursive: true });
+  writeFileSync(path, bytes);
 }
 
 function sha256(bytes: Uint8Array): string {
@@ -59,13 +65,16 @@ function temporaryFiles(root: string): string[] {
 }
 
 function publishedFiles(root: string): string[] {
-  return readdirSync(join(root, ORIGINALS_DIRECTORY)).filter((name) => !name.endsWith(".tmp"));
+  const directory = join(root, ORIGINALS_DIRECTORY);
+  if (!existsSync(directory)) return [];
+  return readdirSync(directory).filter((name) => !name.endsWith(".tmp"));
 }
 
 /** A plain adapter over node:fs, matching the store's default. */
 function realFs(): OriginalFileSystem {
   return {
     existsSync: (path) => existsSync(path),
+    mkdirSync: (path, options) => mkdirSync(path, options),
     openSync: (path, flags) => fsModule.openSync(path, flags),
     writeSync: (fd, data) => fsModule.writeSync(fd, data),
     fsyncSync: (fd) => fsModule.fsyncSync(fd),
@@ -77,6 +86,28 @@ function realFs(): OriginalFileSystem {
     // and reaches this adapter's openSync, fsyncSync and closeSync.
     fsyncDirectorySync: undefined as unknown as () => void,
   };
+}
+
+/**
+ * The descriptors handed out for directory handles; they are never passed to a
+ * real fs operation, so a directory flush works even on a Windows host.
+ */
+const DIRECTORY_HANDLES = new Set<number>();
+let nextDirectoryHandle = 1_000_000;
+
+/** A simulated directory handle for the injected openSync, recording the path. */
+function directoryAwareOpen(opened: string[], path: string, flags: "wx" | "r"): number {
+  if (flags === "wx") return realFs().openSync(path, flags);
+  opened.push(path);
+  const fd = nextDirectoryHandle;
+  nextDirectoryHandle += 1;
+  DIRECTORY_HANDLES.add(fd);
+  return fd;
+}
+
+/** True when `fd` is a simulated directory handle, not a real file descriptor. */
+function isDirectoryHandle(fd: number): boolean {
+  return DIRECTORY_HANDLES.has(fd);
 }
 
 /** A failing operation thrown as a Node-style error with a code. */
@@ -106,7 +137,6 @@ function assertReference(ref: OriginalReference, bytes: Uint8Array): void {
 describe("original store: put and read", () => {
   it("stores exact bytes under their lowercase SHA-256 name, never the submitted filename", async () => {
     const root = workspace();
-    withDirectory(root);
     const store = openOriginalStore(root);
     const bytes = new TextEncoder().encode("Grüße 👩‍👩‍👧 binary-ish \u0000\u0001\r\n");
     const ref = await store.put(bytes);
@@ -119,9 +149,25 @@ describe("original store: put and read", () => {
     assert.equal(readFileSync(join(root, "workspace.json"), "utf8"), "{\"untouched\":true}\n");
   });
 
+  it("works on first use in a normal workspace that has no originals directory", async () => {
+    const root = workspace();
+    assert.equal(existsSync(join(root, ORIGINALS_DIRECTORY)), false);
+    const bytes = new TextEncoder().encode("first use");
+    const store = openOriginalStore(root);
+    const ref = await store.put(bytes);
+    assertReference(ref, bytes);
+    assert.equal(existsSync(join(root, ORIGINALS_DIRECTORY)), true);
+    assert.deepEqual(publishedFiles(root), [ref.sha256]);
+    assert.deepEqual(temporaryFiles(root), []);
+    assert.equal(readFileSync(join(root, "workspace.json"), "utf8"), "{\"untouched\":true}\n");
+    // Reopening reuses the created directory without creating anything new.
+    const reopened = openOriginalStore(root);
+    assert.equal((await reopened.read(ref.sha256)).sha256, ref.sha256);
+    assert.deepEqual(publishedFiles(root), [ref.sha256]);
+  });
+
   it("returns detached bytes that callers cannot use to change stored content", async () => {
     const root = workspace();
-    withDirectory(root);
     const store = openOriginalStore(root);
     const bytes = Uint8Array.from([1, 2, 3, 4]);
     const ref = await store.put(bytes);
@@ -135,7 +181,6 @@ describe("original store: put and read", () => {
 
   it("handles an empty original and the inclusive 10 MiB limit, refusing one byte over", async () => {
     const root = workspace();
-    withDirectory(root);
     const store = openOriginalStore(root);
     const empty = await store.put(new Uint8Array(0));
     assert.equal(empty.byteLength, 0);
@@ -162,7 +207,6 @@ describe("original store: put and read", () => {
 
   it("verifies and reuses an existing original instead of writing a second file", async () => {
     const root = workspace();
-    withDirectory(root);
     const store = openOriginalStore(root);
     const bytes = new TextEncoder().encode("same content twice");
     const first = await store.put(bytes);
@@ -175,7 +219,6 @@ describe("original store: put and read", () => {
 
   it("reuses an original across reopening the store", async () => {
     const root = workspace();
-    withDirectory(root);
     const bytes = new TextEncoder().encode("durable across reopen");
     const first = await openOriginalStore(root).put(bytes);
 
@@ -189,7 +232,6 @@ describe("original store: put and read", () => {
 
   it("reads a verified original by hash, deriving the path only from the hash", async () => {
     const root = workspace();
-    withDirectory(root);
     const store = openOriginalStore(root);
     const bytes = new TextEncoder().encode("read me");
     const { sha256: hash } = await store.put(bytes);
@@ -217,12 +259,18 @@ describe("original store: malformed hashes", () => {
     undefined,
     {},
     ["0".repeat(64)],
+    // A valid digest followed by a line terminator is 65 characters, so `$`
+    // matching before the terminator must not let it through.
+    "0".repeat(64) + "\n",
+    "0".repeat(64) + "\r",
+    "0".repeat(64) + "\r\n",
+    "0".repeat(64) + "\u2028",
+    "\n" + "0".repeat(64),
   ];
 
   for (const value of malformed) {
     it(`refuses ${JSON.stringify(value)} before any file access`, async () => {
       const root = workspace();
-      withDirectory(root);
       let touched = false;
       const store = openOriginalStore(root, {
         fs: adapter({
@@ -247,7 +295,6 @@ describe("original store: malformed hashes", () => {
 
   it("refuses non-Uint8Array bytes for put", async () => {
     const root = workspace();
-    withDirectory(root);
     const store = openOriginalStore(root);
     for (const value of [undefined, null, "text", [1, 2, 3], new ArrayBuffer(4), { bytes: [1] }]) {
       await assert.rejects(store.put(value), OriginalValidationError);
@@ -259,11 +306,10 @@ describe("original store: malformed hashes", () => {
 describe("original store: mismatching, missing and corrupt existing bytes", () => {
   it("refuses mismatching existing bytes without replacing them", async () => {
     const root = workspace();
-    withDirectory(root);
     const bytes = new TextEncoder().encode("honest content");
     const hash = sha256(bytes);
     const impostor = Buffer.from("different content");
-    writeFileSync(originalPath(root, hash), impostor);
+    seed(originalPath(root, hash), impostor);
 
     const store = openOriginalStore(root);
     await assert.rejects(store.put(bytes), (error: unknown) => {
@@ -279,7 +325,6 @@ describe("original store: mismatching, missing and corrupt existing bytes", () =
 
   it("refuses a missing read as an integrity error", async () => {
     const root = workspace();
-    withDirectory(root);
     const hash = sha256(new TextEncoder().encode("never stored"));
     const store = openOriginalStore(root);
     await assert.rejects(store.read(hash), (error: unknown) => {
@@ -291,11 +336,10 @@ describe("original store: mismatching, missing and corrupt existing bytes", () =
 
   it("refuses a corrupt read, including an oversized file, without touching it", async () => {
     const root = workspace();
-    withDirectory(root);
     const bytes = new TextEncoder().encode("corrupt me");
     const hash = sha256(bytes);
     const corrupt = Buffer.from("tampered bytes");
-    writeFileSync(originalPath(root, hash), corrupt);
+    seed(originalPath(root, hash), corrupt);
     const store = openOriginalStore(root);
     await assert.rejects(store.read(hash), OriginalIntegrityError);
     assert.equal(readFileSync(originalPath(root, hash)).equals(corrupt), true);
@@ -304,10 +348,9 @@ describe("original store: mismatching, missing and corrupt existing bytes", () =
 
   it("reports an unreadable existing original as an integrity failure and keeps it", async () => {
     const root = workspace();
-    withDirectory(root);
     const bytes = new TextEncoder().encode("present but unreadable");
     const hash = sha256(bytes);
-    writeFileSync(originalPath(root, hash), Buffer.from(bytes));
+    seed(originalPath(root, hash), Buffer.from(bytes));
     const store = openOriginalStore(root, {
       fs: adapter({
         readFileSync: () => {
@@ -326,13 +369,12 @@ describe("original store: mismatching, missing and corrupt existing bytes", () =
 
   it("does not overwrite an existing original that a concurrent put published", async () => {
     const root = workspace();
-    withDirectory(root);
     const bytes = new TextEncoder().encode("published elsewhere");
     const hash = sha256(bytes);
     // The file is present from the start, but the first existence check reports
     // it absent (as if another writer published it between the two checks); the
     // store verifies it on the second check rather than renaming over it.
-    writeFileSync(originalPath(root, hash), Buffer.from(bytes));
+    seed(originalPath(root, hash), Buffer.from(bytes));
     let calls = 0;
     const store = openOriginalStore(root, {
       fs: adapter({
@@ -353,7 +395,6 @@ describe("original store: mismatching, missing and corrupt existing bytes", () =
 describe("original store: injected persistence failures", () => {
   it("writes short writes fully, honoring the byte offset", async () => {
     const root = workspace();
-    withDirectory(root);
     const bytes = new TextEncoder().encode("a moderately long original to write in pieces");
     const plain = realFs();
     let writeCalls = 0;
@@ -375,7 +416,6 @@ describe("original store: injected persistence failures", () => {
 
   it("reports a write that makes no progress and removes only its temporary file", async () => {
     const root = workspace();
-    withDirectory(root);
     const bytes = new TextEncoder().encode("refused write");
     const store = openOriginalStore(root, {
       fs: adapter({ writeSync: () => 0 }),
@@ -391,7 +431,6 @@ describe("original store: injected persistence failures", () => {
 
   it("reports a write that claims to write past the buffer end", async () => {
     const root = workspace();
-    withDirectory(root);
     const store = openOriginalStore(root, { fs: adapter({ writeSync: () => 9999 }) });
     await assert.rejects(store.put(new TextEncoder().encode("x")), OriginalPersistenceError);
     assert.deepEqual(readdirSync(join(root, ORIGINALS_DIRECTORY)), []);
@@ -399,7 +438,6 @@ describe("original store: injected persistence failures", () => {
 
   it("reports a flush failure, removes its temporary file and publishes nothing", async () => {
     const root = workspace();
-    withDirectory(root);
     const store = openOriginalStore(root, {
       fs: adapter({
         fsyncSync: () => {
@@ -414,12 +452,13 @@ describe("original store: injected persistence failures", () => {
 
   it("reports a close failure, closes again and removes its temporary file", async () => {
     const root = workspace();
-    withDirectory(root);
     const plain = realFs();
     let closes = 0;
     const store = openOriginalStore(root, {
+      platform: "win32",
       fs: adapter({
-        // The first close reports failure but still closes; cleanup closes again.
+        // The first file close reports failure but still closes; cleanup closes
+        // again, which this adapter observes and lets succeed.
         closeSync: (fd) => {
           closes += 1;
           plain.closeSync(fd);
@@ -435,7 +474,6 @@ describe("original store: injected persistence failures", () => {
 
   it("reports a rename (publication) failure and removes only its temporary file", async () => {
     const root = workspace();
-    withDirectory(root);
     const store = openOriginalStore(root, {
       fs: adapter({
         renameSync: () => {
@@ -451,15 +489,16 @@ describe("original store: injected persistence failures", () => {
 
   it("reports a directory flush failure, keeps the published original and retries to success", async () => {
     const root = workspace();
-    withDirectory(root);
     const bytes = new TextEncoder().encode("directory flush fails once");
     let flushes = 0;
     const store = openOriginalStore(root, {
       platform: "linux",
       fs: adapter({
+        // The simulated flush reports a failure only for the publication, not
+        // for the directory created on first use.
         fsyncDirectorySync: () => {
           flushes += 1;
-          if (flushes === 1) throw fsError("EIO");
+          if (flushes === 2) throw fsError("EIO");
         },
       }),
     });
@@ -468,16 +507,18 @@ describe("original store: injected persistence failures", () => {
       assert.match(error.message, /directory/);
       return true;
     });
+    assert.equal(flushes, 2, "the injected publication flush was reached");
     // The publication happened; the published original is retained as evidence.
     const hash = sha256(bytes);
     assert.deepEqual(publishedFiles(root), [hash]);
     assert.equal(readFileSync(originalPath(root, hash)).equals(Buffer.from(bytes)), true);
     assert.deepEqual(temporaryFiles(root), []);
 
-    // A verified retry reuses the published bytes and satisfies durability.
+    // A verified retry of an unreopen store reuses the published bytes and
+    // satisfies durability again on the same adapter.
     const retried = await store.put(bytes);
     assertReference(retried, bytes);
-    assert.ok(flushes >= 2, "the retry ran the directory flush");
+    assert.equal(flushes, 3, "the retry ran the directory flush");
     // A fresh store reusing the original runs the durability step too.
     let reopenedFlushes = 0;
     const reopened = openOriginalStore(root, {
@@ -495,8 +536,8 @@ describe("original store: injected persistence failures", () => {
 
   it("reports a directory open failure during the directory flush, keeping the published original", async () => {
     const root = workspace();
-    withDirectory(root);
     const bytes = new TextEncoder().encode("directory open fails");
+    mkdirSync(join(root, ORIGINALS_DIRECTORY), { recursive: true });
     const plain = realFs();
     const store = openOriginalStore(root, {
       platform: "linux",
@@ -515,18 +556,21 @@ describe("original store: injected persistence failures", () => {
 
   it("reports a directory flush failure during the directory flush, keeping the published original", async () => {
     const root = workspace();
-    withDirectory(root);
     const bytes = new TextEncoder().encode("directory fsync fails");
-    const plain = realFs();
+    mkdirSync(join(root, ORIGINALS_DIRECTORY), { recursive: true });
     const store = openOriginalStore(root, {
       platform: "linux",
       fs: adapter({
-        // The file's own flush (with the temp descriptor) succeeds; only the
-        // directory handle's flush fails.
+        // The simulated directory handle's flush fails; the file's own flush
+        // succeeds.
+        openSync: (path, flags) => directoryAwareOpen([], path, flags),
+        closeSync: (fd) => {
+          if (isDirectoryHandle(fd)) throw fsError("EIO");
+          realFs().closeSync(fd);
+        },
         fsyncSync: (fd) => {
-          const stat = fsModule.fstatSync(fd);
-          if (stat.isDirectory()) throw fsError("EIO");
-          plain.fsyncSync(fd);
+          if (isDirectoryHandle(fd)) throw fsError("EIO");
+          realFs().fsyncSync(fd);
         },
       }),
     });
@@ -537,7 +581,6 @@ describe("original store: injected persistence failures", () => {
 
   it("reports a cleanup unlink failure as the operation failure with the cleanup attached", async () => {
     const root = workspace();
-    withDirectory(root);
     const renameFailure = fsError("EXDEV");
     const store = openOriginalStore(root, {
       fs: adapter({
@@ -562,7 +605,6 @@ describe("original store: injected persistence failures", () => {
 
   it("retries successfully after an earlier publication failure without replacing anything", async () => {
     const root = workspace();
-    withDirectory(root);
     const bytes = new TextEncoder().encode("retry after failure");
     const failing = openOriginalStore(root, {
       fs: adapter({
@@ -583,7 +625,6 @@ describe("original store: injected persistence failures", () => {
 
   it("publishes nothing and leaves the existing original when a failure hits an existing hash", async () => {
     const root = workspace();
-    withDirectory(root);
     const bytes = new TextEncoder().encode("existing survives failures");
     const first = await openOriginalStore(root).put(bytes);
     const before = readFileSync(originalPath(root, first.sha256));
@@ -606,7 +647,6 @@ describe("original store: injected persistence failures", () => {
 describe("original store: platform directory durability", () => {
   it("skips the directory step on Windows by checking the platform before any operation", async () => {
     const root = workspace();
-    withDirectory(root);
     let directoryOpened = false;
     const store = openOriginalStore(root, {
       platform: "win32",
@@ -628,29 +668,108 @@ describe("original store: platform directory durability", () => {
 
   it("flushes the directory on POSIX, including a reused original", async () => {
     const root = workspace();
-    withDirectory(root);
     const bytes = new TextEncoder().encode("posix directory flush");
     const opened: string[] = [];
     const store = openOriginalStore(root, {
       platform: "darwin",
       fs: adapter({
-        openSync: (path, flags) => {
-          if (flags === "r") opened.push(path);
-          return realFs().openSync(path, flags);
+        // A simulated directory handle, so this runs on a Windows host too.
+        openSync: (path, flags) => directoryAwareOpen(opened, path, flags),
+        // Simulated handles are never passed to a real fs operation.
+        fsyncSync: (fd) => {
+          if (!isDirectoryHandle(fd)) realFs().fsyncSync(fd);
+        },
+        closeSync: (fd) => {
+          if (!isDirectoryHandle(fd)) realFs().closeSync(fd);
         },
       }),
     });
     await store.put(bytes);
-    assert.deepEqual(opened, [join(root, ORIGINALS_DIRECTORY)]);
+    // The directory entry created on first use, then the published rename.
+    assert.deepEqual(opened, [join(root, ORIGINALS_DIRECTORY), join(root, ORIGINALS_DIRECTORY)]);
     // A reuse also satisfies the durability step.
     await store.put(bytes);
-    assert.deepEqual(opened, [join(root, ORIGINALS_DIRECTORY), join(root, ORIGINALS_DIRECTORY)]);
+    assert.deepEqual(opened, [
+      join(root, ORIGINALS_DIRECTORY),
+      join(root, ORIGINALS_DIRECTORY),
+      join(root, ORIGINALS_DIRECTORY),
+    ]);
   });
 
   it("reports a directory flush failure on POSIX instead of treating it as a skip", async () => {
     const root = workspace();
-    withDirectory(root);
     const bytes = new TextEncoder().encode("posix flush failure");
+    mkdirSync(join(root, ORIGINALS_DIRECTORY), { recursive: true });
+    const flushes: string[] = [];
+    const store = openOriginalStore(root, {
+      platform: "linux",
+      fs: adapter({
+        openSync: (path, flags) => directoryAwareOpen([], path, flags),
+        closeSync: (fd) => {
+          if (!isDirectoryHandle(fd)) realFs().closeSync(fd);
+        },
+        fsyncSync: (fd) => {
+          // Only the directory handle's flush fails.
+          if (isDirectoryHandle(fd)) {
+            flushes.push("directory");
+            throw fsError("EIO");
+          }
+          realFs().fsyncSync(fd);
+        },
+      }),
+    });
+    await assert.rejects(store.put(bytes), OriginalPersistenceError);
+    assert.deepEqual(flushes, ["directory"], "the injected directory flush was reached");
+    assert.deepEqual(publishedFiles(root), [sha256(bytes)]);
+    assert.deepEqual(temporaryFiles(root), []);
+  });
+
+  it("reports a directory close failure on POSIX, keeping the published original", async () => {
+    const root = workspace();
+    const bytes = new TextEncoder().encode("directory close fails");
+    mkdirSync(join(root, ORIGINALS_DIRECTORY), { recursive: true });
+    const closed: number[] = [];
+    const store = openOriginalStore(root, {
+      platform: "linux",
+      fs: adapter({
+        openSync: (path, flags) => directoryAwareOpen([], path, flags),
+        fsyncSync: (fd) => {
+          if (!isDirectoryHandle(fd)) realFs().fsyncSync(fd);
+        },
+        closeSync: (fd) => {
+          if (isDirectoryHandle(fd)) {
+            closed.push(fd);
+            throw fsError("EIO");
+          }
+          realFs().closeSync(fd);
+        },
+      }),
+    });
+    await assert.rejects(store.put(bytes), OriginalPersistenceError);
+    assert.equal(closed.length > 0, true, "the injected directory close was reached");
+    assert.deepEqual(publishedFiles(root), [sha256(bytes)]);
+    assert.deepEqual(temporaryFiles(root), []);
+  });
+
+  it("reports a failure to create the originals directory and publishes nothing", async () => {
+    const root = workspace();
+    const store = openOriginalStore(root, {
+      fs: adapter({
+        mkdirSync: () => {
+          throw fsError("EACCES");
+        },
+      }),
+    });
+    await assert.rejects(store.put(new TextEncoder().encode("no directory")), (error: unknown) => {
+      assert.ok(error instanceof OriginalPersistenceError);
+      assert.match(error.message, /create the originals directory/);
+      return true;
+    });
+    assert.equal(existsSync(join(root, ORIGINALS_DIRECTORY)), false);
+  });
+
+  it("reports an injected directory flush failure while creating the directory", async () => {
+    const root = workspace();
     const store = openOriginalStore(root, {
       platform: "linux",
       fs: adapter({
@@ -659,8 +778,16 @@ describe("original store: platform directory durability", () => {
         },
       }),
     });
-    await assert.rejects(store.put(bytes), OriginalPersistenceError);
-    assert.deepEqual(publishedFiles(root), [sha256(bytes)]);
+    await assert.rejects(store.put(new TextEncoder().encode("flush new directory")), (error: unknown) => {
+      assert.ok(error instanceof OriginalPersistenceError);
+      assert.match(error.message, /directory/);
+      return true;
+    });
+    // The directory may have been created, but no original was written into it.
+    if (existsSync(join(root, ORIGINALS_DIRECTORY))) {
+      assert.deepEqual(publishedFiles(root), []);
+      assert.deepEqual(temporaryFiles(root), []);
+    }
   });
 });
 
@@ -679,9 +806,8 @@ describe("original store: arguments and boundaries", () => {
 
   it("writes no JSON reference and leaves workspace.json and existing originals untouched", async () => {
     const root = workspace();
-    withDirectory(root);
     const existing = new TextEncoder().encode("pre-existing original");
-    writeFileSync(originalPath(root, sha256(existing)), Buffer.from(existing));
+    seed(originalPath(root, sha256(existing)), Buffer.from(existing));
     const jsonBefore = readFileSync(join(root, "workspace.json"), "utf8");
     const store = openOriginalStore(root);
     const ref = await store.put(new TextEncoder().encode("new original"));
@@ -695,7 +821,6 @@ describe("original store: arguments and boundaries", () => {
 
   it("never deletes a published hash file when a later put fails", async () => {
     const root = workspace();
-    withDirectory(root);
     const bytes = new TextEncoder().encode("published first");
     const first = await openOriginalStore(root).put(bytes);
     const failing = openOriginalStore(root, {
