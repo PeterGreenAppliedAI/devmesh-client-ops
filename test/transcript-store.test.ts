@@ -27,7 +27,7 @@ import {
 } from "../src/store.ts";
 import { openTranscriptStore, type TranscriptStore } from "../src/transcript-store.ts";
 import { ORIGINALS_DIRECTORY, type OriginalFileSystem } from "../src/transcript-files.ts";
-import { importPastedText, MAX_CONTENT_BYTES } from "../src/transcript.ts";
+import { canonicalize, importPastedText, MAX_CONTENT_BYTES } from "../src/transcript.ts";
 import { docxBytes, docxOfLength } from "./fixtures/transcript-docx.ts";
 import { pdfBytes, pdfOfLength } from "./fixtures/transcript-pdf.ts";
 
@@ -288,13 +288,22 @@ describe("transcript store: equivalence across formats", () => {
         { kind: "paste", text: "Alice: Hello." },
         createFor(parents),
       );
-      const second = await ts.importTranscript(
-        { kind: "paste", text: "alice: hello." },
-        { meetingId: first.meeting.id },
+      // Different case is different canonical content: the target already holds
+      // an attachment, so it is refused and nothing is written.
+      await assert.rejects(
+        ts.importTranscript(
+          { kind: "paste", text: "alice: hello." },
+          { meetingId: first.meeting.id },
+        ),
+        ValidationError,
       );
-      assert.notEqual(second.transcript.id, first.transcript.id);
-      assert.equal(second.outcome, "new_transcript");
       assert.equal(ts.transcripts().length, 1);
+      assert.equal(ts.transcripts()[0].sources.length, 1);
+      assert.notEqual(
+        ts.transcripts()[0].canonicalText,
+        canonicalize("alice: hello."),
+        "case is significant in the canonical content",
+      );
     } finally {
       await ts.close();
     }
@@ -348,6 +357,69 @@ describe("transcript store: equivalence across formats", () => {
       for (const source of second.transcript.sources) {
         assert.ok(source.passages.every((passage) => passage.sourceId === source.id));
       }
+    } finally {
+      await ts.close();
+    }
+  });
+});
+
+describe("transcript store: exact repeats across formats", () => {
+  it("retains a paste and a file with identical bytes as distinct originals", async () => {
+    const dir = tempDir();
+    const { ts, parents } = await freshStore(dir);
+    try {
+      const first = await ts.importTranscript({ kind: "paste", text: "Hello" }, createFor(parents));
+      // The same bytes as a .txt file: the same canonical content, a distinct
+      // original, committed with one edit instead of a duplicate-id refusal.
+      const asFile = await ts.importTranscript(
+        { kind: "file", bytes: encoder("Hello"), filename: "hello.txt" },
+        { meetingId: first.meeting.id },
+      );
+      assert.equal(asFile.outcome, "new_source");
+      assert.equal(asFile.transcript.id, first.transcript.id);
+      assert.equal(asFile.transcript.sources.length, 2);
+      const [pasteSource, fileSource] = asFile.transcript.sources;
+      assert.equal(pasteSource.format, "paste");
+      assert.equal(fileSource.format, "txt");
+      assert.notEqual(pasteSource.id, fileSource.id, "a paste and a file never share a stored source id");
+      // The file is a new original: exactly one edit was recorded.
+      assert.equal(activity(ts.store).at(-1)!.action, "edit");
+      // Exact repeats of each original across formats reuse its stored id: the
+      // file's bytes as a paste is still the file's own source.
+      const repeatFile = await ts.importTranscript(
+        { kind: "file", bytes: encoder("Hello"), filename: "renamed.txt" },
+        { meetingId: first.meeting.id },
+      );
+      assert.equal(repeatFile.outcome, "reused");
+      assert.equal(repeatFile.explanation?.code, "exact_repeat");
+      assert.deepEqual(repeatFile.sourceIds, asFile.sourceIds);
+      const repeatPaste = await ts.importTranscript({ kind: "paste", text: "Hello" }, { meetingId: first.meeting.id });
+      assert.equal(repeatPaste.outcome, "reused");
+      assert.deepEqual(repeatPaste.sourceIds, asFile.sourceIds);
+      assert.equal(repeatPaste.transcript.sources[0].filename, "Pasted text", "the first filename is kept");
+    } finally {
+      await ts.close();
+    }
+  });
+
+  it("writes no blob when the proposed metadata fails validation", async () => {
+    const dir = tempDir();
+    const { ts, parents } = await freshStore(dir);
+    try {
+      const first = await ts.importTranscript({ kind: "paste", text: "Validated words." }, createFor(parents));
+      const original = join(dir, ORIGINALS_DIRECTORY);
+      const before = existsSync(original) ? readdirSync(original) : [];
+      // A file original whose metadata cannot be committed: the target already
+      // holds a transcript of different content.
+      await assert.rejects(
+        ts.importTranscript(
+          { kind: "file", bytes: encoder("Different file words."), filename: "different.txt" },
+          { meetingId: first.meeting.id },
+        ),
+        ValidationError,
+      );
+      const after = existsSync(original) ? readdirSync(original) : [];
+      assert.deepEqual(after, before, "nothing was published before the validation failed");
     } finally {
       await ts.close();
     }
@@ -441,28 +513,109 @@ describe("transcript store: exact repeats, distinct originals and reuse", () => 
       );
       const meetingBefore = ts.store.snapshot().meetings[0];
       const eventsBefore = activity(ts.store).length;
+      // The same content pasted again with its own whitespace is a distinct
+      // original, attached with one edit while the create's differences are
+      // reported and never written.
       const again = await ts.importTranscript(
         { kind: "paste", text: "Agenda.\r\n\r\nDecisions.\n" },
         createFor(parents, { title: "Different title", notes: "different notes" }),
       );
-      assert.equal(again.outcome, "reused");
+      assert.equal(again.outcome, "new_source");
       assert.equal(again.createdMeeting, false);
       assert.equal(again.meeting.id, first.meeting.id);
-      assert.equal(again.canonicalMeetingId, first.meeting.id);
       assert.deepEqual(again.conflicts, [
         { field: "title", supplied: "Different title", preserved: "Original" },
         { field: "notes", supplied: "different notes", preserved: "kept notes" },
       ]);
-      assert.equal(again.explanation?.code, "reused_canonical");
+      assert.equal(again.explanation?.code, "new_original");
       // The preserved metadata and project are untouched; no meeting was made.
       assert.deepEqual(ts.store.snapshot().meetings[0], meetingBefore);
       assert.equal(ts.store.snapshot().meetings.length, 1);
-      // Only the one new distinct original was attached (one edit).
+      // Only the one new distinct original was attached (one edit), and no
+      // meeting was created for it.
       assert.equal(again.transcript.sources.length, 2);
+      assert.equal(again.createdMeeting, false);
       assert.equal(activity(ts.store).length, eventsBefore + 1);
       assert.equal(activity(ts.store).at(-1)!.action, "edit");
+      assert.equal(activity(ts.store).at(-1)!.targetId, first.meeting.id);
     } finally {
       await ts.close();
+    }
+  });
+
+  it("reports differing supplied dates, projects and explicitly blank notes", async () => {
+    const dir = tempDir();
+    const { ts, parents } = await freshStore(dir);
+    try {
+      const project = await ts.store.createProject({ engagementId: parents.engagementId, name: "P" });
+      const first = await ts.importTranscript(
+        { kind: "paste", text: "Dated words." },
+        createFor(parents, { title: "Same", date: "2026-01-02", projectId: project.id, notes: "kept notes" }),
+      );
+      const meetingBefore = ts.store.snapshot().meetings[0];
+      const again = await ts.importTranscript(
+        { kind: "paste", text: "Dated words." },
+        createFor(parents, { title: "Same", date: "2026-02-03", notes: "" }),
+      );
+      assert.equal(again.outcome, "reused");
+      assert.equal(again.explanation?.code, "exact_repeat");
+      assert.deepEqual(again.conflicts, [
+        { field: "date", supplied: "2026-02-03", preserved: "2026-01-02" },
+        { field: "projectId", supplied: "", preserved: project.id },
+        { field: "notes", supplied: "", preserved: "kept notes" },
+      ]);
+      // The preserved metadata and project are untouched; nothing was written.
+      assert.deepEqual(ts.store.snapshot().meetings[0], meetingBefore);
+      assert.equal(ts.store.snapshot().meetings.length, 1);
+      // Notes that were not supplied at all are not a difference.
+      const omitted = await ts.importTranscript(
+        { kind: "paste", text: "Dated words." },
+        createFor(parents, { title: "Same", date: "2026-01-02", projectId: project.id }),
+      );
+      assert.deepEqual(omitted.conflicts, []);
+      assert.equal(omitted.meeting.id, first.meeting.id);
+    } finally {
+      await ts.close();
+    }
+  });
+
+  it("records no activity for a no-op repeat and rejects a failed no-op save", async () => {
+    const dir = tempDir();
+    const setup = await openTranscriptStore(dir);
+    const parents = await hierarchy(setup.store);
+    const first = await setup.importTranscript({ kind: "paste", text: "No-op words." }, createFor(parents));
+    await setup.close();
+    // Reopen with a failing rename, so even the no-op save cannot be written.
+    const failing = await openTranscriptStore(dir, { fs: workspaceAdapter({ renameSync: true }) });
+    try {
+      const before = failing.transcripts();
+      const eventsBefore = activity(failing.store).length;
+      await assert.rejects(
+        failing.importTranscript({ kind: "paste", text: "No-op words." }, { meetingId: first.meeting.id }),
+        PersistenceError,
+      );
+      // Nothing added: no source, no counter, no event, no memory change.
+      assert.deepEqual(failing.transcripts(), before);
+      assert.equal(failing.transcripts()[0].sources.length, 1);
+      assert.equal(activity(failing.store).length, eventsBefore);
+      assert.equal(failing.store.snapshot().meetings.length, 1);
+    } finally {
+      await failing.close();
+    }
+    // Reopened, the repeat succeeds as a no-op and records no event.
+    const reopened = await openTranscriptStore(dir);
+    try {
+      const eventsBefore = activity(reopened.store).length;
+      const repeat = await reopened.importTranscript(
+        { kind: "paste", text: "No-op words." },
+        { meetingId: first.meeting.id },
+      );
+      assert.equal(repeat.outcome, "reused");
+      assert.equal(repeat.explanation?.code, "exact_repeat");
+      assert.deepEqual(repeat.sourceIds, first.sourceIds);
+      assert.equal(activity(reopened.store).length, eventsBefore, "a no-op repeat records no event");
+    } finally {
+      await reopened.close();
     }
   });
 
@@ -478,6 +631,8 @@ describe("transcript store: exact repeats, distinct originals and reuse", () => 
         { kind: "paste", text: "Same words." },
         createFor(parents, { title: "Same", notes: "same notes" }),
       );
+      // An exact repeat is a no-op: the stored source is reused, no conflict is
+      // reported and no event is recorded.
       assert.equal(same.outcome, "reused");
       assert.deepEqual(same.conflicts, []);
       assert.equal(same.transcript.id, first.transcript.id);
@@ -562,35 +717,42 @@ describe("transcript store: replacement refusal and separate engagements", () =>
         createFor(parents),
       );
       const firstSourceIds = first.sourceIds;
-      // A meeting that already holds a transcript and carries notes.
+      // A notes-only meeting (a manual record with notes) receives its first
+      // attachment once, keeping its metadata, including its notes.
       const meeting = await ts.store.createMeeting({
         ...parents,
         title: "With notes",
         date: "2026-07-08",
         notes: "Some notes",
       });
+      const meetingBefore = ts.store.snapshot().meetings.find((m) => m.id === meeting.id)!;
       const attached = await ts.importTranscript(
         { kind: "paste", text: "Its own transcript." },
         { meetingId: meeting.id },
       );
-      assert.equal(attached.outcome, "new_transcript");
+      assert.equal(attached.outcome, "attached");
+      assert.equal(attached.meeting.id, meeting.id);
+      assert.deepEqual(attached.meeting, meetingBefore, "the meeting's metadata, notes included, is kept");
       const attachedSourceIds = attached.sourceIds;
-      // Different content aimed at that meeting becomes its own new transcript,
-      // never a replacement of the attachment it holds.
-      const second = await ts.importTranscript(
-        { kind: "paste", text: "A completely different conversation." },
-        { meetingId: meeting.id },
+      const eventsBefore = activity(ts.store).length;
+      // Different content aimed at that meeting is refused before writing: the
+      // attachment it holds is never replaced and no second transcript is made.
+      await assert.rejects(
+        ts.importTranscript(
+          { kind: "paste", text: "A completely different conversation." },
+          { meetingId: meeting.id },
+        ),
+        ValidationError,
       );
-      assert.equal(second.outcome, "new_transcript");
-      assert.equal(second.meeting.id, meeting.id);
-      assert.equal(second.explanation?.code, "new_transcript");
-      // The existing attachments and their sources are unchanged.
+      assert.equal(ts.transcripts().length, 2);
+      // The existing attachment and its sources are unchanged.
       const stored = ts.transcripts().find((t) => t.id === attached.transcript.id)!;
       assert.deepEqual(stored.sources.map((s) => s.id), attachedSourceIds);
-      assert.equal(ts.transcripts().length, 2);
+      assert.deepEqual(ts.store.snapshot().meetings.find((m) => m.id === meeting.id), meetingBefore);
       // The first meeting's transcript is untouched too.
       const untouched = ts.transcripts().find((t) => t.id === first.transcript.id)!;
       assert.deepEqual(untouched.sources.map((s) => s.id), firstSourceIds);
+      assert.equal(activity(ts.store).length, eventsBefore, "the refused attempt records nothing");
     } finally {
       await ts.close();
     }
@@ -677,6 +839,46 @@ describe("transcript store: replacement refusal and separate engagements", () =>
       assert.equal(repeat.meeting.id, target.id);
       assert.deepEqual(repeat.sourceIds, elsewhere.sourceIds);
       assert.equal(ts.transcripts().length, 2);
+    } finally {
+      await ts.close();
+    }
+  });
+
+  it("adds a repeat to the target engagement's transcript, not the first engagement's", async () => {
+    const dir = tempDir();
+    const { ts, parents } = await freshStore(dir);
+    try {
+      const first = await ts.importTranscript({ kind: "paste", text: "Shared words." }, createFor(parents));
+      const other = await ts.store.createClient({ name: "Other client" });
+      const otherEngagement = await ts.store.createEngagement({ clientId: other.id, name: "Other eng" });
+      const target = await ts.store.createMeeting({
+        clientId: other.id,
+        engagementId: otherEngagement.id,
+        title: "Elsewhere",
+        date: "2026-09-10",
+        notes: "",
+      });
+      const elsewhere = await ts.importTranscript({ kind: "paste", text: "Shared words." }, { meetingId: target.id });
+      // A distinct original (whitespace) aimed at the target is attached to the
+      // target engagement's own transcript; the first engagement's transcript
+      // is never appended to.
+      const distinct = await ts.importTranscript(
+        { kind: "paste", text: " Shared words.\r\n" },
+        { meetingId: target.id },
+      );
+      assert.equal(distinct.outcome, "new_source");
+      assert.equal(distinct.meeting.id, target.id);
+      assert.equal(distinct.transcript.sources.length, 2);
+      const firstStored = ts.transcripts().find((t) => t.meetingId === first.meeting.id)!;
+      assert.deepEqual(firstStored.sources.map((s) => s.id), first.sourceIds, "the first engagement is untouched");
+      const elsewhereStored = ts.transcripts().find((t) => t.meetingId === target.id)!;
+      assert.deepEqual(elsewhereStored.sources.map((s) => s.id), distinct.sourceIds);
+      assert.deepEqual(distinct.sourceIds.slice(0, 1), elsewhere.sourceIds);
+      // A source read returns the value scoped to the target engagement.
+      const read = await ts.readSource(distinct.transcript.id, distinct.sourceIds[1], otherEngagement.id);
+      assert.equal(read.engagementId, otherEngagement.id);
+      assert.equal(read.meetingId, target.id);
+      assert.equal(read.extractedText, " Shared words.\r\n");
     } finally {
       await ts.close();
     }
@@ -805,6 +1007,34 @@ describe("transcript store: validation, ancestry and lifecycle", () => {
       assert.equal(ts.transcripts().length, 0);
       assert.equal(ts.store.snapshot().meetings.length, 0);
       assert.equal(activity(ts.store).length, 2, "only the setup's creates");
+    } finally {
+      await ts.close();
+    }
+  });
+
+  it("validates a supplied create even when its content is reused", async () => {
+    const dir = tempDir();
+    const { ts, parents } = await freshStore(dir);
+    try {
+      await ts.importTranscript({ kind: "paste", text: "Existing words." }, createFor(parents));
+      const before = readFileSync(storePath(dir), "utf8");
+      // The content is known, but the supplied date is impossible and the parent
+      // is missing: both are refused before anything is written.
+      await assert.rejects(
+        ts.importTranscript(
+          { kind: "paste", text: "Existing words." },
+          createFor(parents, { date: "2023-02-29" }),
+        ),
+        ValidationError,
+      );
+      await assert.rejects(
+        ts.importTranscript(
+          { kind: "paste", text: "Existing words." },
+          createFor({ ...parents, engagementId: "engagement-9" }),
+        ),
+        MissingRecordError,
+      );
+      assert.equal(readFileSync(storePath(dir), "utf8"), before, "nothing written");
     } finally {
       await ts.close();
     }
@@ -963,6 +1193,40 @@ describe("transcript store: classified parser refusals", () => {
         },
       );
       assert.equal(readFileSync(storePath(dir), "utf8"), before, "nothing written");
+    } finally {
+      await ts.close();
+    }
+  });
+
+  it("keeps oversized originals and unsupported formats classified and writes nothing", async () => {
+    const dir = tempDir();
+    const { ts, parents } = await freshStore(dir);
+    try {
+      const before = readFileSync(storePath(dir), "utf8");
+      // An unsupported extension is the adapter's `unsupported_format` refusal.
+      await assert.rejects(
+        ts.importTranscript(
+          { kind: "file", bytes: encoder(PASTED_TEXT), filename: "notes.rtf" },
+          createFor(parents),
+        ),
+        (error: unknown) => refusal(error, "unsupported_format"),
+      );
+      // An oversized original is a `too_large` refusal at the inclusive limit.
+      const oversized = new Uint8Array(MAX_CONTENT_BYTES + 1);
+      oversized.fill(65);
+      await assert.rejects(
+        ts.importTranscript({ kind: "file", bytes: oversized, filename: "big.txt" }, createFor(parents)),
+        (error: unknown) => refusal(error, "too_large"),
+      );
+      // An oversized DOCX original is classified the same way, before its
+      // parser is asked to read it.
+      await assert.rejects(
+        ts.importTranscript({ kind: "file", bytes: oversized, filename: "big.docx" }, createFor(parents)),
+        (error: unknown) => refusal(error, "too_large"),
+      );
+      assert.equal(readFileSync(storePath(dir), "utf8"), before, "nothing written");
+      assert.equal(ts.transcripts().length, 0);
+      assert.equal(ts.store.snapshot().meetings.length, 0);
     } finally {
       await ts.close();
     }
@@ -1197,6 +1461,13 @@ describe("transcript store: blob and JSON failures", () => {
     const setup = await openTranscriptStore(dir);
     const parents = await hierarchy(setup.store);
     const first = await setup.importTranscript({ kind: "paste", text: "First." }, createFor(parents));
+    // A second meeting, ready to receive its own first attachment.
+    const second = await setup.store.createMeeting({
+      ...parents,
+      title: "Second meeting",
+      date: "2026-03-04",
+      notes: "",
+    });
     await setup.close();
     // Reopen with a failing rename, so the new commit cannot be written.
     const failing = await openTranscriptStore(dir, { fs: workspaceAdapter({ renameSync: true }) });
@@ -1204,7 +1475,7 @@ describe("transcript store: blob and JSON failures", () => {
       const committedBefore = failing.transcripts();
       const meetingEventsBefore = activity(failing.store).filter((e) => e.targetKind === "meeting").length;
       await assert.rejects(
-        failing.importTranscript({ kind: "paste", text: "Second, different." }, { meetingId: first.meeting.id }),
+        failing.importTranscript({ kind: "paste", text: "Second, different." }, { meetingId: second.id }),
         PersistenceError,
       );
       // The failed commit's new transcript and source ids are not exposed.

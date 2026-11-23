@@ -25,9 +25,11 @@
  * - A new content for any other supplied meeting becomes that meeting's own
  *   transcript, in its own engagement, once.
  * - Each distinct original (bytes) is retained with its own extracted text and
- *   mappings. An exact repeat of a stored original reuses its stored source id
- *   and first filename: it attaches nothing, records no activity, and is
- *   persisted through the ordinary no-op save path.
+ *   mappings, and each stored source id is derived from the canonical content,
+ *   the original's bytes and the original's kind, so a paste and a file with the
+ *   same bytes are distinct originals. An exact repeat of a stored original
+ *   reuses its stored source id and first filename: it attaches nothing, records
+ *   no activity, and is persisted through the ordinary no-op save path.
  *
  * Durability and failure rules:
  *
@@ -63,6 +65,7 @@ import {
   importPastedText,
   isWellFormedUnicode,
   MAX_CONTENT_BYTES,
+  SUPPORTED_EXPORTS,
   utf8Length,
   validatePassage,
   type ImportFormat,
@@ -310,8 +313,6 @@ interface CommitStore {
       event?: { action: "create" | "edit"; targetKind: "meeting"; targetId: string };
     },
   ): Promise<unknown>;
-  /** Commit a no-op import through the ordinary persistence path. */
-  commitNoop(mutate: (draft: DraftState) => { value: unknown }): Promise<unknown>;
   originalFiles(): OriginalStore;
   unavailable(): PersistenceError | null;
 }
@@ -442,10 +443,12 @@ class TranscriptStoreImpl implements TranscriptStore {
     }
     const filename = requireNonblank(record.filename, "transcript input.filename");
     const bytes = new Uint8Array(record.bytes);
-    // The original's limit, the format and the document contents are all the
-    // adapters' refusals: an oversized file or an unsupported extension keeps
-    // its `too_large` or `unsupported_format` code and guidance.
+    // The adapters classify an unsupported extension (`unsupported_format`) and
+    // an oversized original (`too_large`) as content refusals, not argument
+    // errors; the import keeps that classification and writes nothing.
     const format = fileFormat(filename);
+    if (format === "unsupported") throw unsupportedFormat(filename);
+    if (bytes.length > MAX_TRANSCRIPT_BYTES) throw tooLarge("original", bytes.length);
     let outcome: ImportOutcome;
     if (format === "docx") {
       outcome = (await importDocx(bytes, filename, this.docxParser)) as ImportOutcome;
@@ -636,7 +639,7 @@ class TranscriptStoreImpl implements TranscriptStore {
    */
   private newSource(prepared: PreparedImport): TranscriptSource {
     const result = prepared.result;
-    const id = sourceIdFor(result.canonicalText, result.originalSha256);
+    const id = sourceIdFor(result.canonicalText, `${prepared.file ? "file" : "paste"}.${result.originalSha256}`);
     const passages: readonly Passage[] = result.passages.map((passage) => ({
       ...passage,
       sourceId: id,
@@ -685,22 +688,25 @@ class TranscriptStoreImpl implements TranscriptStore {
    * The supplied differences from the preserved meeting, reported as conflicts
    * and never written. A supplied title, date, project or notes that differs
    * from the preserved value is reported, including an explicitly supplied
-   * blank notes that differs from preserved notes.
+   * blank notes (`""`) that differs from preserved notes; notes that were not
+   * supplied at all are not a difference.
    */
-  private conflicts(create: NormalizedCreate, meeting: Meeting): TranscriptConflict[] {
+  private conflicts(create: TranscriptMeetingCreate, meeting: Meeting): TranscriptConflict[] {
     const conflicts: TranscriptConflict[] = [];
-    if (create.title !== meeting.title) {
-      conflicts.push({ field: "title", supplied: create.title, preserved: meeting.title });
+    const title = create.title as string;
+    if (title !== meeting.title) {
+      conflicts.push({ field: "title", supplied: title, preserved: meeting.title });
     }
-    if (create.date !== meeting.date) {
-      conflicts.push({ field: "date", supplied: create.date, preserved: meeting.date });
+    const date = create.date as string;
+    if (date !== meeting.date) {
+      conflicts.push({ field: "date", supplied: date, preserved: meeting.date });
     }
-    if (create.projectId !== meeting.projectId) {
-      conflicts.push({ field: "projectId", supplied: create.projectId ?? "", preserved: meeting.projectId ?? "" });
+    const projectId = create.projectId as string | undefined;
+    if (projectId !== meeting.projectId) {
+      conflicts.push({ field: "projectId", supplied: projectId ?? "", preserved: meeting.projectId ?? "" });
     }
-    const notes = create.notes.trim();
-    if (notes !== meeting.notes.trim()) {
-      conflicts.push({ field: "notes", supplied: notes, preserved: meeting.notes });
+    if (create.notes !== undefined && create.notes !== meeting.notes) {
+      conflicts.push({ field: "notes", supplied: create.notes as string, preserved: meeting.notes });
     }
     return conflicts;
   }
@@ -709,8 +715,8 @@ class TranscriptStoreImpl implements TranscriptStore {
    * Plan an import whose target is a meeting create. The create is validated as
    * a meeting with valid parents; content the engagement already holds reuses
    * its canonical meeting (archived included) instead of creating a second one,
-   * and any other content creates one meeting and its transcript with the
-   * supplied metadata.
+   * and its supplied differences are reported. Any other content creates one
+   * meeting and its transcript with the supplied metadata.
    */
   private planCreate(
     prepared: PreparedImport,
@@ -720,7 +726,7 @@ class TranscriptStoreImpl implements TranscriptStore {
     const normalized = this.requireCreateParents(snapshot, create);
     const canonical = this.canonicalFor(snapshot, normalized.engagementId, prepared.result.canonicalText);
     if (canonical !== undefined) {
-      return this.planReuse(prepared, canonical, this.conflicts(normalized, canonical.meeting));
+      return this.planReuse(prepared, canonical, this.conflicts(create, canonical.meeting));
     }
     // The proposed metadata, transcript and source are all validated before the
     // blob is published.
@@ -756,9 +762,11 @@ class TranscriptStoreImpl implements TranscriptStore {
   /**
    * Plan an import whose target is a supplied meeting. The meeting and its
    * ancestry are validated first. Content the engagement already holds reuses
-   * its canonical meeting and leaves the target unchanged; new content attaches
-   * once to a notes-only meeting (keeping its metadata), and different content
-   * for a meeting that already holds an attachment is refused before writing.
+   * its canonical meeting and leaves the target unchanged. Otherwise the target
+   * accepts its first attachment once, keeping its metadata (its notes
+   * included), when it holds no transcript; a meeting that holds a transcript
+   * already is refused before anything is written, because an attachment is
+   * never replaced and different content never becomes a second transcript.
    */
   private planTarget(prepared: PreparedImport, meetingId: string, snapshot: Snapshot): CommitPlan {
     const target = this.findMeeting(snapshot, meetingId);
@@ -766,8 +774,7 @@ class TranscriptStoreImpl implements TranscriptStore {
     if (canonical !== undefined) {
       return this.planReuse(prepared, canonical, [], target.id);
     }
-    const held = this.transcriptOf(snapshot, target.id);
-    if (held !== undefined && held.sources.length > 0) {
+    if (this.transcriptOf(snapshot, target.id) !== undefined) {
       // The target already holds an attachment and this content is different:
       // an attachment is never replaced, and nothing of the target changes.
       throw new ValidationError(
@@ -799,9 +806,10 @@ class TranscriptStoreImpl implements TranscriptStore {
 
   /**
    * Plan reusing the engagement's canonical meeting for this content. An exact
-   * repeat of a stored original writes nothing (a no-op through the store's own
-   * persistence path); a distinct original is published and attached with one
-   * edit. The canonical meeting and project are preserved either way.
+   * repeat of a stored original is a no-op through the store's own persistence
+   * path: it saves the committed state exactly as before, records no event and
+   * adds nothing. A distinct original is published and attached with one edit.
+   * The canonical meeting, its metadata and project are preserved either way.
    */
   private planReuse(
     prepared: PreparedImport,
@@ -827,17 +835,19 @@ class TranscriptStoreImpl implements TranscriptStore {
         attachedOriginal: false,
       };
     }
+    const proposed = {
+      id: transcript.id,
+      canonicalText: transcript.canonicalText,
+      meetingId: meeting.id,
+      sources: this.proposedSources(transcript, this.newSource(prepared)),
+    };
+    this.validateProposal(this.store.snapshot(), meeting, proposed);
     return {
       ...base,
       outcome: "new_source",
       write: "edit",
       meeting: null,
-      transcript: {
-        id: transcript.id,
-        canonicalText: transcript.canonicalText,
-        meetingId: meeting.id,
-        sources: this.proposedSources(transcript, this.newSource(prepared)),
-      },
+      transcript: proposed,
       attachedOriginal: true,
     };
   }
@@ -862,6 +872,7 @@ class TranscriptStoreImpl implements TranscriptStore {
 
   /** Publish the prepared file original before the JSON that names it. */
   private async publish(prepared: PreparedImport): Promise<void> {
+    if (!prepared.file) return;
     let reference: { sha256: string; byteLength: number };
     try {
       reference = await this.originals.put(prepared.originalBytes);
@@ -878,7 +889,11 @@ class TranscriptStoreImpl implements TranscriptStore {
     }
   }
 
-  /** Create one meeting, its transcript and one create event in a single write. */
+  /**
+   * Create one meeting, its transcript and one create event in a single write.
+   * The meeting id is allocated from the draft that is actually persisted, so
+   * the meeting, its transcript's association and its event all name that id.
+   */
   private async writeCreate(prepared: PreparedImport, plan: CommitPlan): Promise<void> {
     const meeting = plan.meeting!;
     const transcript = plan.transcript!;
@@ -887,15 +902,17 @@ class TranscriptStoreImpl implements TranscriptStore {
       const created = parseMeeting({ ...meeting, id });
       draft.meetings.push(created);
       draft.transcripts.push({ ...transcript, id: prepared.result.id, meetingId: id });
+      plan.meetingId = id;
       return { value: undefined, event: { action: "create", targetKind: "meeting", targetId: id } };
     });
-    plan.meetingId = this.store.snapshot().meetings.at(-1)!.id;
   }
 
   /**
    * Commit one edit: a fresh transcript that attaches once to the supplied
    * meeting, or a new original added to the canonical transcript. The draft is
-   * re-checked inside the serialized write.
+   * re-checked inside the serialized write: the target must still hold no
+   * transcript of its own, and the engagement must still not hold this content
+   * elsewhere.
    */
   private async writeEdit(prepared: PreparedImport, plan: CommitPlan): Promise<void> {
     const proposed = plan.transcript!;
@@ -929,16 +946,13 @@ class TranscriptStoreImpl implements TranscriptStore {
   }
 
   /**
-   * Persist an exact repeat through the ordinary no-op path: the draft it builds
-   * is unchanged, so the store saves the committed state as a no-op and records
-   * no event. A save failure rejects exactly as for any other write and adds
-   * nothing.
+   * Persist an exact repeat through the ordinary no-op path: the commit's draft
+   * is unchanged, so the store validates the committed state, saves it exactly
+   * as before and records no event. A save failure rejects exactly as for any
+   * other write and adds nothing.
    */
   private async noop(): Promise<void> {
-    await this.internals().commitNoop((draft) => {
-      validateTranscripts(draft.transcripts, draft as unknown as Snapshot);
-      return { value: undefined };
-    });
+    await this.internals().commitTranscripts(() => ({ value: undefined }));
   }
 
   /**
@@ -1158,6 +1172,35 @@ function fileFormat(filename: string): ImportFormat | "unsupported" {
   return "unsupported";
 }
 
+/**
+ * A classified parser refusal as a `ValidationError`: `parser_refused` with the
+ * adapter's own refusal code and guidance, exactly like a refusal the adapters
+ * return.
+ */
+function refusedImport(code: string, message: string): ValidationError {
+  const error = new ValidationError(`transcript_refused: ${message}`);
+  const refusal = Object.freeze({ code, message, supportedExports: SUPPORTED_EXPORTS });
+  (error as ValidationError & { code?: string; refusal?: unknown }).code = "parser_refused";
+  (error as ValidationError & { code?: string; refusal?: unknown }).refusal = refusal;
+  return error;
+}
+
+/** The refusal for a filename whose extension names no supported format. */
+function unsupportedFormat(filename: string): ValidationError {
+  return refusedImport(
+    "unsupported_format",
+    `The file ${JSON.stringify(filename)} is not a supported format; import pasted text, or a UTF-8 .txt or .md file.`,
+  );
+}
+
+/** The refusal for content that exceeds the inclusive byte limit. */
+function tooLarge(what: string, length: number): ValidationError {
+  return refusedImport(
+    "too_large",
+    `The ${what} content is ${length} bytes; it must be at most ${MAX_TRANSCRIPT_BYTES} bytes. Nothing was truncated.`,
+  );
+}
+
 /** Require the import's text to be well-formed Unicode within the limit. */
 function requireWellFormed(result: ImportResult): void {
   if (canonicalize(result.extractedText) !== result.canonicalText) {
@@ -1171,7 +1214,7 @@ function requireWellFormed(result: ImportResult): void {
       throw new ValidationError(`the import's ${what} is not well-formed Unicode`);
     }
     if (utf8Length(text) > MAX_TRANSCRIPT_BYTES) {
-      throw new ValidationError(`the import's ${what} exceeds the content limit`);
+      throw tooLarge(what, utf8Length(text));
     }
   }
 }
