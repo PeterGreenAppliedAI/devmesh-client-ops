@@ -44,10 +44,11 @@ export const SUPPORTED_EXPORTS: readonly string[] = Object.freeze([
 
 /**
  * The formats the core accepts. `docx` is imported by the DOCX adapter
- * (`transcript-docx.ts`): its original content is the DOCX bytes, preserved
- * exactly, and its extracted text is read from the document.
+ * (`transcript-docx.ts`) and `pdf` by the PDF adapter (`transcript-pdf.ts`):
+ * for both, the original content is the file's bytes, preserved exactly, and
+ * the extracted text is read from the document.
  */
-export type ImportFormat = "paste" | "txt" | "markdown" | "docx";
+export type ImportFormat = "paste" | "txt" | "markdown" | "docx" | "pdf";
 
 /** The formats the core accepts, in guidance order. */
 export const IMPORT_FORMATS: readonly ImportFormat[] = Object.freeze([
@@ -55,6 +56,7 @@ export const IMPORT_FORMATS: readonly ImportFormat[] = Object.freeze([
   "txt",
   "markdown",
   "docx",
+  "pdf",
 ]);
 
 /** Why an import was refused. */
@@ -106,6 +108,12 @@ export interface Passage {
   readonly location: PassageLocation;
   /** Exactly `extractedText.slice(range.start, range.end)`. */
   readonly text: string;
+  /**
+   * For a page-based source (a PDF), the 1-based page the passage's text was
+   * extracted from. Absent for sources that are not paginated, whose
+   * passages do not claim a page.
+   */
+  readonly page?: number;
 }
 
 /** A successfully imported source. */
@@ -549,6 +557,9 @@ function requireRange(value: unknown, what: string): PassageRange {
 
 /** Validate the structure of one passage, without checking it against a source. */
 export function validatePassage(value: unknown): Passage {
+  if (typeof value === "object" && value !== null && "page" in value) {
+    return validatePagePassage(value);
+  }
   const record = requireRecord(value, "passage", ["id", "sourceId", "range", "location", "text"]);
   const id = requireNonblank(record.id, "passage.id");
   const sourceId = requireNonblank(record.sourceId, "passage.sourceId");
@@ -574,6 +585,20 @@ export function validatePassage(value: unknown): Passage {
     throw new ValidationError("passage.text must not carry leading or trailing whitespace");
   }
   if (text === "") throw new ValidationError("passage.text must not be empty");
+  return value as Passage;
+}
+
+/**
+ * Validate the structure of one page-based passage: the core passage fields
+ * plus its 1-based page. The page must be a positive safe integer.
+ */
+function validatePagePassage(value: unknown): Passage {
+  const record = requireRecord(value, "passage", ["id", "sourceId", "range", "location", "text", "page"]);
+  const { page: _page, ...core } = record;
+  validatePassage(Object.freeze(core));
+  if (!Number.isSafeInteger(record.page) || (record.page as number) < 1) {
+    throw new ValidationError("passage.page must be a 1-based safe integer");
+  }
   return value as Passage;
 }
 
@@ -651,9 +676,9 @@ export function validateImportResult(value: unknown): ImportResult {
   }
 
   // These formats' original content is the text itself, so the original bytes
-  // must encode the original text exactly. A DOCX original is binary DOCX
+  // must encode the original text exactly. A DOCX or PDF original is binary
   // content, so its bytes are the authority and are not text.
-  const textualOriginal = format !== "docx";
+  const textualOriginal = format !== "docx" && format !== "pdf";
   if (textualOriginal) {
     let decoded: string;
     try {

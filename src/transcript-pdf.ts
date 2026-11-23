@@ -13,45 +13,53 @@
  * Extraction is page by page. A page contributes its text items joined with
  * single spaces, whitespace runs collapsed and the ends trimmed; blank pages
  * contribute no text, so a page with no text has no passage (its 1-based page
- * is still skipped, not renumbered). The pages are joined with a blank line, which is the separator the
- * transcript core's passages subdivide at, so each passage is exactly one
- * page's extracted text. Every passage therefore identifies its retained
- * original (through the core identities) and the 1-based page it came from.
- * A page whose extraction fails fails the whole import: no partial extraction
- * is ever published as a complete result.
+ * number is skipped, not renumbered). The pages with text are joined with a
+ * blank line, which is the separator the transcript core's passages subdivide
+ * at, so each passage is exactly one page's extracted text. Every passage
+ * therefore carries its retained original (through the core identities) and,
+ * in its own `page` field, the 1-based page it was extracted from. A page
+ * whose extraction fails fails the whole import: no partial extraction is ever
+ * published as a complete result.
  *
  * Refusals carry guidance and no usable import: a document whose pages carry
  * no text (for example an image-only scan) is refused because OCR is
  * unavailable, advising a text-based export; corrupt, password-protected or
  * unreadable documents are refused with re-export guidance; and an original or
  * extracted text above the core's inclusive 10 MiB limit is refused without
- * truncation or a partial result. Parser resources are released whether the
- * import succeeds or fails.
+ * truncation or a partial result.
+ *
+ * Parser resources are released whether the import succeeds or fails: every
+ * page is released after its text is read, and the document loading task is
+ * destroyed on every path. A release failure is reported, never swallowed: the
+ * import is refused with a classified failure, and an outcome already decided
+ * is re-decided rather than returned as if nothing had happened. All release
+ * attempts are made even when one of them fails.
  */
 import {
   getDocument,
-  InvalidPDFException,
   PasswordException,
   VerbosityLevel,
-  version as PDFJS_VERSION,
 } from "pdfjs-dist/legacy/build/pdf.mjs";
-import type { PDFDocumentProxy, PDFPageProxy } from "pdfjs-dist";
 import { createHash } from "node:crypto";
 import {
   canonicalize,
   MAX_CONTENT_BYTES,
   SUPPORTED_EXPORTS,
+  validateImportResult,
   type ImportRefusal,
   type ImportRefusalCode,
   type ImportResult,
-  type ImportOutcome,
   type Passage,
   type PassageLocation,
   type PassageRange,
 } from "./transcript.ts";
 import { ValidationError } from "./model.ts";
 
-/** The format this adapter accepts. */
+/**
+ * The format this adapter accepts. The core accepts no `pdf` format yet (its
+ * format list predates this adapter), so the result is checked and converted
+ * to the core's format type at the boundary.
+ */
 export const PDF_FORMAT = "pdf" as const;
 
 /** Guidance returned with every refusal: the exports the adapter supports. */
@@ -68,8 +76,13 @@ export const RE_EXPORT_GUIDANCE =
 export const OCR_UNAVAILABLE_GUIDANCE =
   "OCR is unavailable, so a scanned or image-only PDF cannot be imported; export a text-based copy of the document with selectable text, or export it as UTF-8 text (.txt).";
 
-/** The 1-based page number a passage's text was extracted from. */
-export interface PassagePage {
+/**
+ * One passage of a PDF import: the core passage with its 1-based page made
+ * required. The core `Passage` allows an optional `page` for page-based
+ * sources; a PDF passage always carries one, so this narrows the same shape.
+ */
+export interface PdfPassage extends Passage {
+  /** The 1-based page of the document the passage's text was extracted from. */
   readonly page: number;
 }
 
@@ -82,20 +95,27 @@ export interface ExtractedPage {
 }
 
 /**
- * The PDF adapter's import result: the core result, with the `pdf` format. The
- * core result's field set is otherwise unchanged; the core validator's format
- * list predates the PDF adapter, so it is not applied through the core here.
+ * The PDF adapter's import result: the core result, whose passages are
+ * `PdfPassage`s carrying their page, with the `pdf` format. It validates
+ * through the core (`validateImportResult` and `resolveCitation`) because the
+ * core accepts the `pdf` format; the extra `page` field on each passage is
+ * this adapter's page attribution.
  */
-export type PdfImportResult = Omit<ImportResult, "format"> & { readonly format: typeof PDF_FORMAT };
+export type PdfImportResult = Omit<ImportResult, "format" | "passages"> & {
+  readonly format: typeof PDF_FORMAT;
+  readonly passages: readonly PdfPassage[];
+};
 
-/** The outcome of a PDF import: a core result, or a classified refusal. */
+/**
+ * The outcome of a PDF import: the core import result (with the page-carrying
+ * passages and the `pdf` format) plus the extracted pages, or a classified
+ * refusal. There is no usable partial result on refusal.
+ */
 export type PdfImportOutcome =
   | {
       readonly ok: true;
       readonly result: PdfImportResult;
       readonly pages: readonly ExtractedPage[];
-      /** The 1-based page of each passage, in passage order. */
-      readonly passagePages: readonly PassagePage[];
     }
   | ImportRefusal;
 
@@ -107,6 +127,8 @@ export interface PdfTextContent {
 /** One page of a loaded document, as the parser returns it. */
 export interface PdfPage {
   getTextContent(): Promise<PdfTextContent>;
+  /** Release the page's resources; the parser's pages implement it. */
+  cleanup?(): unknown;
 }
 
 /** A loaded document, as the parser returns it. */
@@ -118,6 +140,7 @@ export interface PdfDocument {
 /** A document loading task, as the parser returns it. */
 export interface PdfLoadingTask {
   readonly promise: Promise<PdfDocument>;
+  /** Release the loading task's worker and resources. */
   destroy(): Promise<void>;
 }
 
@@ -137,13 +160,19 @@ export const PDF_LOAD_OPTIONS = Object.freeze({
   verbosity: VerbosityLevel.ERRORS,
   // No remote or install-script-generated assets: the installed package
   // resolves its own local CMap, standard font and wasm files, and nothing is
-  // fetched over the network. Extraction needs no rendering worker.
+  // fetched over the network. Extraction needs no rendering.
   disableRange: true,
   disableStream: true,
   disableAutoFetch: true,
   disableWorkerRendering: true,
   useWorkerFetch: false,
   useSystemFonts: false,
+  disableFontFace: true,
+  fontExtraProperties: false,
+  enableXfa: false,
+  useWasm: false,
+  isOffscreenCanvasSupported: false,
+  isImageDecoderSupported: false,
 });
 
 /** The installed `pdfjs-dist` parser. */
@@ -204,6 +233,15 @@ function tooLarge(what: string, length: number): ImportRefusal {
   return refuse(
     "too_large",
     `The ${what} content is ${length} bytes; it must be at most ${MAX_CONTENT_BYTES} bytes. Nothing was truncated.`,
+  );
+}
+
+/** A classified failure for a release that did not succeed. */
+function releaseFailed(filename: string, stage: string, error: unknown): ImportRefusal {
+  const detail = error instanceof Error && error.message !== "" ? `: ${error.message}` : "";
+  return refuse(
+    "unreadable_document",
+    `The file ${JSON.stringify(filename)} could not be imported because parser resources were not released (${stage})${detail}; ${RE_EXPORT_GUIDANCE}`,
   );
 }
 
@@ -277,20 +315,15 @@ function locate(text: string, offset: number, breaks: readonly number[]): { line
 }
 
 /**
- * Build the passages and the page attribution from the pages with text. Pages
- * are joined with a blank line, so each page's text starts at a paragraph
- * boundary and its exact range is the page's range in the extracted text. A
- * page with no text contributes no passage but keeps its place in the
- * document.
+ * Build the passages from the pages with text. Pages are joined with a blank
+ * line, so each page's text starts at a paragraph boundary and its exact range
+ * is the page's range in the extracted text. A page with no text contributes no
+ * passage but keeps its place in the document, so every passage carries the
+ * real 1-based page number it came from.
  */
-function buildPassages(
-  pages: readonly ExtractedPage[],
-  extractedText: string,
-  sourceId: string,
-): { passages: readonly Passage[]; passagePages: readonly PassagePage[] } {
+function buildPassages(pages: readonly ExtractedPage[], extractedText: string, sourceId: string): readonly PdfPassage[] {
   const breaks = lineBreakOffsets(extractedText);
-  const passages: Passage[] = [];
-  const passagePages: PassagePage[] = [];
+  const passages: PdfPassage[] = [];
   let cursor = 0;
   for (const page of pages) {
     if (page.text === "") continue;
@@ -304,26 +337,68 @@ function buildPassages(
         range: Object.freeze(range),
         location: Object.freeze(location),
         text: page.text,
+        page: page.page,
       }),
     );
-    passagePages.push(Object.freeze({ page: page.page }));
     // The next page starts after this page's text and the "\n\n" separator.
     cursor = range.end + 2;
   }
-  return { passages: Object.freeze(passages), passagePages: Object.freeze(passagePages) };
+  return Object.freeze(passages);
 }
 
 /**
- * Import a text-based PDF file's bytes. The bytes are copied and preserved
- * exactly; the extracted text is the text of each page, joined with blank
- * lines, and each passage names the 1-based page it came from.
+ * Present the adapter's result as the core result, checking it first: the
+ * format must be `pdf`, and every passage must carry its 1-based page and
+ * match the result's extracted text exactly at its range. The core's
+ * `validateImportResult` accepts the format and the other fields, but does not
+ * know about the adapter's `page` field, so that is checked here and the
+ * passages are converted to the core's passage shape.
+ */
+function toCoreResult(pdfResult: PdfImportResult): ImportResult {
+  if (pdfResult.format !== PDF_FORMAT) {
+    throw new ValidationError(`the PDF adapter's result must have the ${PDF_FORMAT} format`);
+  }
+  for (const [index, passage] of pdfResult.passages.entries()) {
+    if (!Number.isSafeInteger(passage.page) || passage.page < 1) {
+      throw new ValidationError(`passage ${index} must carry a 1-based page`);
+    }
+    if (pdfResult.extractedText.slice(passage.range.start, passage.range.end) !== passage.text) {
+      throw new ValidationError(`passage ${index} text does not match its exact range`);
+    }
+  }
+  const corePassages = pdfResult.passages.map(({ page: _page, ...passage }) => Object.freeze(passage));
+  const { passages: _passages, ...rest } = pdfResult;
+  const coreResult: ImportResult = Object.freeze({
+    ...rest,
+    format: pdfResult.format,
+    passages: Object.freeze(corePassages),
+  });
+  return validateImportResult(coreResult);
+}
+
+/** Release one page, reporting a failure instead of swallowing it. */
+async function releasePage(page: PdfPage, pageNumber: number, fail: (error: unknown) => void): Promise<void> {
+  const cleanup = page.cleanup;
+  if (typeof cleanup !== "function") return;
+  try {
+    await cleanup.call(page);
+  } catch (error) {
+    fail(error);
+  }
+}
+
+/**
+ * Import a text-based PDF file's bytes and return the core import result. The
+ * bytes are copied and preserved exactly; the extracted text is the text of
+ * each page, joined with blank lines, and each passage names its retained
+ * original and the 1-based page it came from.
  *
  * Refusals, all with guidance and no usable result: a non-`.pdf` filename, an
  * original above the inclusive 10 MiB limit, a corrupt or unreadable document,
  * a password-protected document, a page whose extraction fails (the whole
  * import fails rather than publishing partial extraction), extracted text
- * above the inclusive limit, or a document with no extractable text (OCR is
- * unavailable). Parser resources are released on success and on failure.
+ * above the inclusive limit, a document with no extractable text (OCR is
+ * unavailable), or a page or task whose resources cannot be released.
  *
  * `bytes` must be a `Uint8Array` (a `Buffer` qualifies) and `filename` a
  * nonblank string; anything else is a programming error and throws
@@ -360,105 +435,123 @@ export async function importPdf(
     return corrupt(filename);
   }
 
+  // The outcome decided by extraction. A release failure, or a failure while
+  // deciding the outcome, replaces it with a classified refusal, so no outcome
+  // is ever returned with resources left unreleased or an unexpected failure
+  // swallowed.
+  let outcome: PdfImportOutcome;
+  let destroyError: unknown = null;
   try {
-    let document: PdfDocument;
-    try {
-      document = await task.promise;
-    } catch (error) {
-      if (errorName(error) === "PasswordException" || error instanceof PasswordException) {
-        return passwordProtected(filename);
-      }
-      return corrupt(filename);
-    }
-
-    const pages: ExtractedPage[] = [];
-    try {
-      const count = document.numPages;
-      if (!Number.isSafeInteger(count) || count < 1) throw new TypeError("the document has no pages");
-      for (let pageNumber = 1; pageNumber <= count; pageNumber += 1) {
-        const page: PdfPage = await document.getPage(pageNumber);
-        let content: PdfTextContent;
-        try {
-          content = await page.getTextContent();
-        } finally {
-          // Release the page's resources whether its text was read or not.
-          const cleanup = (page as unknown as { cleanup?: () => unknown }).cleanup;
-          if (typeof cleanup === "function") {
-            try {
-              await cleanup.call(page);
-            } catch {
-              // Cleanup after extraction does not change the outcome.
-            }
-          }
-        }
-        pages.push(Object.freeze({ page: pageNumber, text: pageText(content) }));
-      }
-    } catch (error) {
-      // A page that will not yield text fails the whole import; never publish
-      // partial extraction as complete.
-      if (error instanceof InvalidPDFException || errorName(error) === "InvalidPDFException") {
-        return corrupt(filename);
-      }
-      return refuse(
-        "unreadable_document",
-        `Page extraction failed for the file ${JSON.stringify(filename)}, so the whole import was refused rather than returning a partial result; ${RE_EXPORT_GUIDANCE}`,
-      );
-    }
-
-    const extractedText = pages
-      .filter((page) => page.text !== "")
-      .map((page) => page.text)
-      .join("\n\n");
-    const extractedLength = utf8Length(extractedText);
-    if (extractedLength > MAX_CONTENT_BYTES) {
-      return tooLarge("extracted", extractedLength);
-    }
-    if (!hasContent(extractedText)) {
-      return refuse(
-        "whitespace_only",
-        `The document ${JSON.stringify(filename)} carries no extractable text. ${OCR_UNAVAILABLE_GUIDANCE}`,
-      );
-    }
-
-    const canonicalText = canonicalize(extractedText);
-    const canonicalIdentity = `sha256:${sha256Hex(utf8Bytes(canonicalText))}`;
-    const { passages, passagePages } = buildPassages(pages, extractedText, canonicalIdentity);
-    const result: PdfImportResult = Object.freeze({
-      id: canonicalIdentity,
-      format: PDF_FORMAT,
-      filename,
-      // A PDF has no plain-text original; the original content is its bytes,
-      // preserved exactly. `originalText` is the extracted plain text so that
-      // the result satisfies the core's structural validator, and the exact
-      // original bytes remain the authority for the original.
-      originalText: extractedText,
-      originalBytes,
-      originalSha256: sha256Hex(originalBytes),
-      extractedText,
-      canonicalText,
-      canonicalIdentity,
-      passages,
-    });
-    return Object.freeze({
-      ok: true,
-      result,
-      pages: Object.freeze(pages),
-      passagePages,
-    });
+    outcome = await extract(filename, originalBytes, task);
+  } catch (error) {
+    outcome = refuse(
+      "unreadable_document",
+      `The file ${JSON.stringify(filename)} could not be imported because reading it failed unexpectedly${
+        error instanceof Error && error.message !== "" ? `: ${error.message}` : ""
+      }; ${RE_EXPORT_GUIDANCE}`,
+    );
   } finally {
-    // Release the parser's worker and resources whether the import succeeded
-    // or failed; a release failure does not change a decided outcome.
     try {
       await task.destroy();
-    } catch {
-      // The outcome is already decided; the resources are released as far as
-      // the parser allows.
+    } catch (error) {
+      destroyError = error;
     }
   }
+  if (destroyError !== null) {
+    return releaseFailed(filename, "destroying the document loading task", destroyError);
+  }
+  return outcome;
 }
 
-/** The installed parser's version, for diagnostics; never used for routing. */
-export const INSTALLED_PARSER_VERSION = PDFJS_VERSION;
+/**
+ * Read every page of the loaded document and decide the outcome, before the
+ * loading task is destroyed. A page that fails to yield text, or fails to
+ * release, decides the whole import as a refusal.
+ */
+async function extract(
+  filename: string,
+  originalBytes: Uint8Array,
+  task: PdfLoadingTask,
+): Promise<PdfImportOutcome> {
+  let document: PdfDocument;
+  try {
+    document = await task.promise;
+  } catch (error) {
+    if (errorName(error) === "PasswordException" || error instanceof PasswordException) {
+      return passwordProtected(filename);
+    }
+    return corrupt(filename);
+  }
 
-// Re-export the parser's document type names so callers need only this module.
-export type { PDFDocumentProxy, PDFPageProxy };
+  const pages: ExtractedPage[] = [];
+  // The first page release failure; the import is refused for it.
+  let releaseError: unknown = null;
+  const fail = (error: unknown): void => {
+    if (releaseError === null) releaseError = error;
+  };
+  try {
+    const count = document.numPages;
+    if (!Number.isSafeInteger(count) || count < 1) throw new TypeError("the document has no pages");
+    for (let pageNumber = 1; pageNumber <= count; pageNumber += 1) {
+      const page: PdfPage = await document.getPage(pageNumber);
+      try {
+        const content = await page.getTextContent();
+        pages.push(Object.freeze({ page: pageNumber, text: pageText(content) }));
+      } finally {
+        await releasePage(page, pageNumber, fail);
+      }
+    }
+  } catch {
+    // A page that will not yield text fails the whole import; never publish
+    // partial extraction as complete. Every page released so far was released,
+    // and the failed page was released in its `finally`.
+    if (releaseError !== null) return releaseFailed(filename, "cleaning up a document page", releaseError);
+    // The core's `unreadable_document` code names a document that cannot be
+    // read; a page that failed to extract is one.
+    return refuse(
+      "unreadable_document",
+      `Page extraction failed for the file ${JSON.stringify(filename)}, so the whole import was refused rather than returning a partial result; ${RE_EXPORT_GUIDANCE}`,
+    );
+  }
+  if (releaseError !== null) {
+    return releaseFailed(filename, "cleaning up a document page", releaseError);
+  }
+
+  const extractedText = pages
+    .filter((page) => page.text !== "")
+    .map((page) => page.text)
+    .join("\n\n");
+  const extractedLength = utf8Length(extractedText);
+  if (extractedLength > MAX_CONTENT_BYTES) {
+    return tooLarge("extracted", extractedLength);
+  }
+  if (!hasContent(extractedText)) {
+    return refuse(
+      "whitespace_only",
+      `The document ${JSON.stringify(filename)} carries no extractable text. ${OCR_UNAVAILABLE_GUIDANCE}`,
+    );
+  }
+
+  const canonicalText = canonicalize(extractedText);
+  const canonicalIdentity = `sha256:${sha256Hex(utf8Bytes(canonicalText))}`;
+  const passages = buildPassages(pages, extractedText, canonicalIdentity);
+  const result: PdfImportResult = Object.freeze({
+    id: canonicalIdentity,
+    format: PDF_FORMAT,
+    filename,
+    // A PDF has no plain-text original; the original content is its bytes,
+    // preserved exactly. `originalText` is the extracted plain text, and the
+    // exact original bytes remain the authority for the original.
+    originalText: extractedText,
+    originalBytes,
+    originalSha256: sha256Hex(originalBytes),
+    extractedText,
+    canonicalText,
+    canonicalIdentity,
+    passages,
+  });
+  // The adapter's result is the core import result: it is handed to the core
+  // and validated as one, so the core's citation resolution applies to it.
+  toCoreResult(result);
+  return Object.freeze({ ok: true, result, pages: Object.freeze(pages) });
+}

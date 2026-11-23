@@ -1,13 +1,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { describe, it } from "node:test";
-import { canonicalize, MAX_CONTENT_BYTES } from "../src/transcript.ts";
+import { canonicalize, MAX_CONTENT_BYTES, resolveCitation, validateImportResult, validatePassage } from "../src/transcript.ts";
 import {
   importPdf,
   pageText,
   PDF_SUPPORTED_EXPORTS,
   type ExtractedPage,
-  type PassagePage,
   type PdfImportOutcome,
   type PdfImportResult,
   type PdfLoadingTask,
@@ -29,11 +28,10 @@ function sha256(bytes: Uint8Array): string {
 function imported(outcome: PdfImportOutcome): {
   result: PdfImportResult;
   pages: readonly ExtractedPage[];
-  passagePages: readonly PassagePage[];
 } {
   assert.equal(outcome.ok, true, `expected success, got ${JSON.stringify(outcome)}`);
   if (!outcome.ok) throw new Error("unreachable");
-  return { result: outcome.result, pages: outcome.pages, passagePages: outcome.passagePages };
+  return { result: outcome.result, pages: outcome.pages };
 }
 
 /** Assert an outcome is a refusal with `code`, guidance and no usable import. */
@@ -47,7 +45,6 @@ function refused(outcome: PdfImportOutcome, code: string, messagePattern: RegExp
   const record = outcome as unknown as Record<string, unknown>;
   assert.equal(record.result, undefined);
   assert.equal(record.pages, undefined);
-  assert.equal(record.passagePages, undefined);
 }
 
 /** A loading task that never resolves, for a document that will not open. */
@@ -61,6 +58,29 @@ function unresolvedTask(destroyed: { value: boolean }): PdfLoadingTask {
   };
 }
 
+/** A parser that yields the given page texts and records destroy calls. */
+function textParser(pageTexts: readonly string[], state?: { destroyed: boolean[]; cleaned: number[] }): PdfParser {
+  return {
+    load: () => ({
+      promise: Promise.resolve({
+        numPages: pageTexts.length,
+        getPage: (pageNumber: number) =>
+          Promise.resolve({
+            getTextContent: () => Promise.resolve({ items: [{ str: pageTexts[pageNumber - 1] }] }),
+            cleanup: () => {
+              state?.cleaned.push(pageNumber);
+              return true;
+            },
+          }),
+      }),
+      destroy: () => {
+        state?.destroyed.push(true);
+        return Promise.resolve();
+      },
+    }),
+  };
+}
+
 describe("PDF import", () => {
   it("extracts readable text page by page, with one-based pages and exact originals", async () => {
     const bytes = pdfBytes([
@@ -69,7 +89,7 @@ describe("PDF import", () => {
       ["Page three closes the minutes."],
     ]);
     const snapshot = Uint8Array.from(bytes);
-    const { result, pages, passagePages } = imported(await importPdf(bytes, "minutes.pdf"));
+    const { result, pages } = imported(await importPdf(bytes, "minutes.pdf"));
 
     assert.equal(result.format, "pdf");
     assert.equal(result.filename, "minutes.pdf");
@@ -81,9 +101,9 @@ describe("PDF import", () => {
         [3, "Page three closes the minutes."],
       ],
     );
-    // One passage per page, each identifying its 1-based page.
+    // One passage per page, each identifying its 1-based page itself.
     assert.deepEqual(result.passages.map((p) => p.text), pages.map((p) => p.text));
-    assert.deepEqual(passagePages, [{ page: 1 }, { page: 2 }, { page: 3 }]);
+    assert.deepEqual(result.passages.map((p) => p.page), [1, 2, 3]);
 
     // Every passage names its retained original and an exact valid range.
     for (const [index, passage] of result.passages.entries()) {
@@ -96,7 +116,8 @@ describe("PDF import", () => {
       assert.equal(passage.location.start, passage.range.start);
       assert.equal(passage.location.end, passage.range.end);
       assert.ok(passage.location.line >= 1 && passage.location.column >= 1);
-      assert.equal(passagePages[index].page, index + 1);
+      assert.equal(passage.page, index + 1);
+      assert.ok(Object.isFrozen(passage));
     }
     assert.deepEqual(
       result.passages.map((p) => [p.location.line, p.location.column]),
@@ -117,6 +138,40 @@ describe("PDF import", () => {
     assert.equal(result.id, result.canonicalIdentity);
     assert.ok(Object.isFrozen(result));
     assert.ok(Object.isFrozen(result.passages));
+  });
+
+  it("returns the core result, which the core validates and resolves citations against", async () => {
+    const bytes = pdfBytes([["Alpha."], ["Beta on page two."]]);
+    const { result } = imported(await importPdf(bytes, "cite.pdf"));
+    // The result is a core import result: the core's validator accepts it
+    // unchanged, and the core's citation resolution resolves against it.
+    assert.equal(validateImportResult(result), result);
+    const passage = result.passages[1];
+    assert.equal(passage.page, 2);
+    const resolved = resolveCitation(
+      { sourceId: result.id, passageId: passage.id, range: passage.range },
+      result,
+      passage,
+    );
+    assert.equal(resolved.quote, "Beta on page two.");
+    assert.equal(resolved.sourceId, result.id);
+    assert.deepEqual(resolved.range, passage.range);
+    assert.deepEqual(resolved.location, passage.location);
+  });
+
+  it("carries each passage's page in the core result, and the core validates it", async () => {
+    const { result } = imported(await importPdf(pdfBytes([["First."], ["Second."]]), "pages.pdf"));
+    assert.equal(validateImportResult(result), result);
+    assert.deepEqual(result.passages.map((p) => p.page), [1, 2]);
+    // A passage whose page is not a 1-based integer is refused by the core.
+    const bad = { ...result.passages[0], page: 0 };
+    assert.throws(() => validateImportResult({ ...result, passages: [bad] }), /page must be a 1-based/);
+    const missing = { ...result.passages[0] } as Record<string, unknown>;
+    delete missing.page;
+    // Every PDF passage carries a page; a page-carrying result refuses a
+    // passage without one only for paginated sources, so the adapter always
+    // sets it. The core's own passages (paste, txt) still carry none.
+    assert.equal(validatePassage(missing).page, undefined);
   });
 
   it("copies the input buffer so later mutation cannot change the result", async () => {
@@ -163,7 +218,7 @@ describe("PDF import", () => {
 
   it("skips blank pages but keeps the real page numbers of the others", async () => {
     const bytes = pdfBytes([["First page."], [], ["Third page."], "image-only", ["Fifth page."]]);
-    const { result, pages, passagePages } = imported(await importPdf(bytes, "sparse.pdf"));
+    const { result, pages } = imported(await importPdf(bytes, "sparse.pdf"));
     assert.deepEqual(pages.map((page) => page.text), [
       "First page.",
       "",
@@ -172,24 +227,10 @@ describe("PDF import", () => {
       "Fifth page.",
     ]);
     assert.deepEqual(result.passages.map((p) => p.text), ["First page.", "Third page.", "Fifth page."]);
-    assert.deepEqual(passagePages, [{ page: 1 }, { page: 3 }, { page: 5 }]);
+    assert.deepEqual(result.passages.map((p) => p.page), [1, 3, 5]);
     for (const passage of result.passages) {
       assert.equal(result.extractedText.slice(passage.range.start, passage.range.end), passage.text);
     }
-  });
-
-  it("gives each passage its source and page, and citations resolve to it", async () => {
-    const bytes = pdfBytes([["Alpha."], ["Beta on page two."]]);
-    const { result, passagePages } = imported(await importPdf(bytes, "cite.pdf"));
-    const passage = result.passages[1];
-    assert.equal(passagePages[1].page, 2);
-    // The citation core's source validator predates the PDF format, so this
-    // adapter's own passages are checked here directly against the result.
-    const quote = result.extractedText.slice(passage.range.start, passage.range.end);
-    assert.equal(quote, "Beta on page two.");
-    assert.equal(passage.text, quote);
-    assert.equal(passage.sourceId, result.id);
-    assert.equal(passage.id, `${result.id}/p2`);
   });
 });
 
@@ -241,7 +282,11 @@ describe("PDF page text", () => {
         },
       }),
     };
-    refused(await importPdf(pdfBytes([["First"], ["Second"]]), "partial.pdf", parser), "unreadable_document", /whole import was refused/);
+    refused(
+      await importPdf(pdfBytes([["First"], ["Second"]]), "partial.pdf", parser),
+      "unreadable_document",
+      /whole import was refused/,
+    );
     assert.equal(destroyed, true);
   });
 });
@@ -309,29 +354,26 @@ describe("PDF refusals", () => {
 describe("PDF parser resources", () => {
   it("releases the parser on success and on refusal", async () => {
     const destroyed: boolean[] = [];
-    const textParser: PdfParser = {
-      load: () => ({
-        promise: Promise.resolve({
-          numPages: 1,
-          getPage: () =>
-            Promise.resolve({
-              getTextContent: () => Promise.resolve({ items: [{ str: "Released text." }] }),
-            }),
-        }),
-        destroy: () => {
-          destroyed.push(true);
-          return Promise.resolve();
-        },
-      }),
-    };
-    imported(await importPdf(pdfBytes([["x"]]), "ok.pdf", textParser));
+    imported(await importPdf(pdfBytes([["x"]]), "ok.pdf", textParser(["Released text."], { destroyed, cleaned: [] })));
     assert.deepEqual(destroyed, [true]);
 
-    const emptyParser: PdfParser = {
+    refused(
+      await importPdf(pdfBytes([["x"]]), "empty.pdf", textParser([""], { destroyed, cleaned: [] })),
+      "whitespace_only",
+      /OCR is unavailable/,
+    );
+    assert.deepEqual(destroyed, [true, true]);
+  });
+
+  it("refuses an unexpected extraction failure without a partial result, still releasing the task", async () => {
+    const destroyed: boolean[] = [];
+    const parser: PdfParser = {
       load: () => ({
         promise: Promise.resolve({
           numPages: 1,
-          getPage: () => Promise.resolve({ getTextContent: () => Promise.resolve({ items: [] }) }),
+          getPage: () => {
+            throw new Error("page lookup exploded");
+          },
         }),
         destroy: () => {
           destroyed.push(true);
@@ -339,8 +381,8 @@ describe("PDF parser resources", () => {
         },
       }),
     };
-    refused(await importPdf(pdfBytes([["x"]]), "empty.pdf", emptyParser), "whitespace_only", /OCR is unavailable/);
-    assert.deepEqual(destroyed, [true, true]);
+    refused(await importPdf(pdfBytes([["First"]]), "unexpected.pdf", parser), "unreadable_document", /whole import was refused/);
+    assert.deepEqual(destroyed, [true]);
   });
 
   it("cleans up each page whether its text was read or not", async () => {
@@ -370,7 +412,7 @@ describe("PDF parser resources", () => {
     assert.deepEqual(cleaned, [1, 2]);
   });
 
-  it("a release failure does not change a decided outcome", async () => {
+  it("refuses the import when the document loading task cannot be released", async () => {
     const parser: PdfParser = {
       load: () => ({
         promise: Promise.resolve({
@@ -383,8 +425,36 @@ describe("PDF parser resources", () => {
         destroy: () => Promise.reject(new Error("worker already gone")),
       }),
     };
-    const { result } = imported(await importPdf(pdfBytes([["x"]]), "release.pdf", parser));
-    assert.equal(result.extractedText, "Still usable.");
+    refused(await importPdf(pdfBytes([["x"]]), "release.pdf", parser), "unreadable_document", /parser resources were not released.*worker already gone/i);
+  });
+
+  it("refuses the import when a page cannot be released, still releasing every page and the task", async () => {
+    const cleaned: number[] = [];
+    const destroyed: boolean[] = [];
+    const parser: PdfParser = {
+      load: () => ({
+        promise: Promise.resolve({
+          numPages: 2,
+          getPage: (pageNumber: number) =>
+            Promise.resolve({
+              getTextContent: () => Promise.resolve({ items: [{ str: `Page ${pageNumber}` }] }),
+              cleanup: () => {
+                cleaned.push(pageNumber);
+                if (pageNumber === 1) throw new Error("page one cleanup failed");
+                return true;
+              },
+            }),
+        }),
+        destroy: () => {
+          destroyed.push(true);
+          return Promise.resolve();
+        },
+      }),
+    };
+    refused(await importPdf(pdfBytes([["First"], ["Second"]]), "page-release.pdf", parser), "unreadable_document", /page one cleanup failed/);
+    // Both pages were attempted and the task was destroyed.
+    assert.deepEqual(cleaned, [1, 2]);
+    assert.deepEqual(destroyed, [true]);
   });
 });
 
@@ -424,36 +494,17 @@ describe("PDF size limits", () => {
     // Two pages joined with "\n\n" reach exactly the limit when each page's
     // text is half of it minus one byte for the separator.
     const half = MAX_CONTENT_BYTES / 2;
-    const pageText = "a".repeat(half - 1);
-    const atLimitParser: PdfParser = {
-      load: () => ({
-        promise: Promise.resolve({
-          numPages: 2,
-          getPage: () =>
-            Promise.resolve({
-              getTextContent: () => Promise.resolve({ items: [{ str: pageText }] }),
-            }),
-        }),
-        destroy: () => Promise.resolve(),
-      }),
-    };
-    const { result } = imported(await importPdf(pdfBytes([["marker"]]), "limit.pdf", atLimitParser));
+    const page = "a".repeat(half - 1);
+    const { result } = imported(await importPdf(pdfBytes([["marker"]]), "limit.pdf", textParser([page, page])));
     assert.equal(Buffer.byteLength(result.extractedText, "utf8"), MAX_CONTENT_BYTES);
     assert.equal(result.passages.length, 2);
+    assert.deepEqual(result.passages.map((p) => p.page), [1, 2]);
 
-    const overParser: PdfParser = {
-      load: () => ({
-        promise: Promise.resolve({
-          numPages: 2,
-          getPage: () =>
-            Promise.resolve({
-              getTextContent: () => Promise.resolve({ items: [{ str: "a".repeat(half) }] }),
-            }),
-        }),
-        destroy: () => Promise.resolve(),
-      }),
-    };
-    refused(await importPdf(pdfBytes([["marker"]]), "over.pdf", overParser), "too_large", tooLarge);
+    refused(
+      await importPdf(pdfBytes([["marker"]]), "over.pdf", textParser(["a".repeat(half), "a".repeat(half)])),
+      "too_large",
+      tooLarge,
+    );
   });
 
   it("measures the extracted limit in UTF-8 bytes, not UTF-16 code units", async () => {
@@ -461,19 +512,7 @@ describe("PDF size limits", () => {
     // Half the limit in code units is exactly the limit in UTF-8 bytes; one
     // more code unit would exceed it.
     const text = "\u00E4".repeat(MAX_CONTENT_BYTES / 2 + 1);
-    const parser: PdfParser = {
-      load: () => ({
-        promise: Promise.resolve({
-          numPages: 1,
-          getPage: () =>
-            Promise.resolve({
-              getTextContent: () => Promise.resolve({ items: [{ str: text }] }),
-            }),
-        }),
-        destroy: () => Promise.resolve(),
-      }),
-    };
-    refused(await importPdf(pdfBytes([["marker"]]), "bytes.pdf", parser), "too_large", tooLarge);
+    refused(await importPdf(pdfBytes([["marker"]]), "bytes.pdf", textParser([text])), "too_large", tooLarge);
   });
 });
 
@@ -486,14 +525,27 @@ describe("PDF parser is exercised offline", () => {
     const outcome = await importPdf(bytes, "offline.pdf");
     assert.equal(outcome.ok, true);
     assert.deepEqual(bytes, snapshot);
-    const { result, passagePages } = imported(outcome);
+    const { result } = imported(outcome);
     assert.deepEqual(result.passages.map((p) => p.text), ["Offline parsing works.", "A second page."]);
-    assert.deepEqual(passagePages, [{ page: 1 }, { page: 2 }]);
+    assert.deepEqual(result.passages.map((p) => p.page), [1, 2]);
   });
 
   it("parses the fixture's image-only, password-protected and corrupt bytes itself", async () => {
     refused(await importPdf(pdfBytes(["image-only"]), "self-image.pdf"), "whitespace_only", /OCR is unavailable/);
     refused(await importPdf(passwordProtected(), "self-locked.pdf"), "unreadable_document", /password-protected/);
     refused(await importPdf(corruptBytes(), "self-corrupt.pdf"), "unreadable_document", /could not be read as a PDF/);
+  });
+
+  it("parses the padded original at the exact size limit with the installed parser", async () => {
+    // The inclusive original-size boundary is a valid PDF, not one the parser
+    // merely tolerates: its offsets are recomputed after padding.
+    const bytes = pdfOfLength([["Boundary text."]], MAX_CONTENT_BYTES);
+    assert.equal(bytes.length, MAX_CONTENT_BYTES);
+    const outcome = await importPdf(bytes, "boundary.pdf");
+    assert.equal(outcome.ok, true);
+    if (outcome.ok) {
+      assert.equal(outcome.result.extractedText, "Boundary text.");
+      assert.deepEqual(outcome.result.passages.map((p) => p.page), [1]);
+    }
   });
 });
