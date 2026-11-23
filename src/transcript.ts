@@ -16,13 +16,15 @@
  *   Case and punctuation remain significant, so content equivalence follows
  *   the canonical content, not the original bytes.
  *
- * Passages subdivide the extracted text at blank-line separators (a whitespace
- * run carrying at least two line breaks), each range trimmed to exact
- * non-whitespace bounds. Ranges are UTF-16 code-unit offsets into the
- * extracted text: `start` inclusive, `end` exclusive, so
- * `extractedText.slice(start, end)` is exactly the passage text, whatever the
- * Unicode content. A passage identity is stable for an import: it is the
- * canonical-content identity plus the passage's ordinal.
+ * Passages subdivide the extracted text at blank-line separators (two line
+ * breaks, `\r\n`, `\r` or `\n`, with nothing but spaces and tabs between
+ * them), each range trimmed to exact non-whitespace bounds. Ranges are UTF-16
+ * code-unit offsets into the extracted text: `start` inclusive, `end`
+ * exclusive, so `extractedText.slice(start, end)` is exactly the passage text,
+ * whatever the Unicode content. A passage identity is stable for an import: it
+ * is the canonical-content identity plus the passage's ordinal. Subdivision
+ * and location are single linear passes, so a text at the inclusive limit with
+ * very many passages is handled in proportion to its size.
  *
  * A refusal carries guidance naming the supported exports and no usable
  * import: the outcome has no result field at all.
@@ -208,43 +210,101 @@ function trimRange(text: string, start: number, end: number): PassageRange {
   return { start, end };
 }
 
-/** The line and column of `offset`, counting line breaks in `text`. */
-function locate(text: string, offset: number): { line: number; column: number } {
-  let line = 1;
-  let lineStart = 0;
-  for (let index = 0; index < offset; index += 1) {
+/**
+ * The line breaks in `text`, in order, as UTF-16 offsets: each `\r\n` counts
+ * once (at its `\r`), and a `\r` or `\n` not part of `\r\n` counts once. The
+ * scan is linear and independent of the text's newline style, so it stays
+ * practical at the inclusive limit even for text made only of `\r` breaks.
+ */
+function lineBreakOffsets(text: string): number[] {
+  const offsets: number[] = [];
+  for (let index = 0; index < text.length; index += 1) {
     const code = text.charCodeAt(index);
-    if (code === 10) {
-      line += 1;
-      lineStart = index + 1;
-    } else if (code === 13 && (index + 1 >= offset || text.charCodeAt(index + 1) !== 10)) {
-      line += 1;
-      lineStart = index + 1;
+    if (code === 13) {
+      offsets.push(index);
+      if (text.charCodeAt(index + 1) === 10) index += 1;
+    } else if (code === 10) {
+      offsets.push(index);
     }
+  }
+  return offsets;
+}
+
+/**
+ * The line and column of the first line break at or after `offset`, found in
+ * the sorted `breaks` list by binary search, so checking many passages never
+ * rescans the text. A line break ends a line: the line starts after its last
+ * code unit.
+ */
+function locate(
+  text: string,
+  offset: number,
+  breaks: readonly number[],
+): { line: number; column: number } {
+  let low = 0;
+  let high = breaks.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (breaks[middle] < offset) low = middle + 1;
+    else high = middle;
+  }
+  const index = low;
+  const line = index + 1;
+  let lineStart = 0;
+  if (index > 0) {
+    const previous = breaks[index - 1];
+    lineStart = text.charCodeAt(previous) === 13 && text.charCodeAt(previous + 1) === 10 ? previous + 2 : previous + 1;
   }
   return { line, column: offset - lineStart + 1 };
 }
 
+/** True when `text` at `index` starts a line break (`\r\n`, `\r` or `\n`). */
+function isLineBreak(text: string, index: number): boolean {
+  const code = text.charCodeAt(index);
+  return code === 13 || code === 10;
+}
+
+/** The offset just past the line break starting at `index`. */
+function afterLineBreak(text: string, index: number): number {
+  return text.charCodeAt(index) === 13 && text.charCodeAt(index + 1) === 10 ? index + 2 : index + 1;
+}
+
 /**
- * Subdivide the extracted text into passages at blank-line separators: a run
- * of whitespace carrying at least two line breaks. Each passage is trimmed to
- * exact bounds and carries its range, location and identity.
+ * Subdivide the extracted text into passages at blank-line separators: two line
+ * breaks with nothing but spaces and tabs between them. Each passage is
+ * trimmed to exact bounds and carries its range, location and identity. A
+ * single linear scan finds every separator, so the whole text is visited once
+ * however many passages it holds.
  */
 function subdivide(text: string, sourceId: string): readonly Passage[] {
+  const breaks = lineBreakOffsets(text);
   const spans: PassageRange[] = [];
-  const separator = /(?:\r\n|\r|\n)[ \t]*(?:\r\n|\r|\n)/g;
   let cursor = 0;
-  for (const match of text.matchAll(separator)) {
-    const index = match.index ?? 0;
-    spans.push(trimRange(text, cursor, index));
-    cursor = index + match[0].length;
+  let index = 0;
+  while (index < text.length) {
+    if (!isLineBreak(text, index)) {
+      index += 1;
+      continue;
+    }
+    const afterFirst = afterLineBreak(text, index);
+    let scan = afterFirst;
+    while (scan < text.length && (text.charCodeAt(scan) === 32 || text.charCodeAt(scan) === 9)) scan += 1;
+    if (scan < text.length && isLineBreak(text, scan)) {
+      // The separator runs from the first line break through the second.
+      const end = afterLineBreak(text, scan);
+      spans.push(trimRange(text, cursor, index));
+      cursor = end;
+      index = end;
+    } else {
+      index = afterFirst;
+    }
   }
   spans.push(trimRange(text, cursor, text.length));
 
   const passages: Passage[] = [];
   for (const span of spans) {
     if (span.start >= span.end) continue;
-    const { line, column } = locate(text, span.start);
+    const { line, column } = locate(text, span.start, breaks);
     passages.push(
       Object.freeze({
         id: `${sourceId}/p${passages.length + 1}`,
@@ -622,6 +682,9 @@ export function validateImportResult(value: unknown): ImportResult {
   let previousEnd = 0;
   const seen = new Set<string>();
   const validated: Passage[] = [];
+  // The line breaks are found once and every location is looked up in that
+  // list, so validating a result with many passages stays linear.
+  const breaks = lineBreakOffsets(extractedText);
   for (let index = 0; index < passages.length; index += 1) {
     const passage = validatePassage(passages[index]);
     requirePassageInSource(passage, extractedText, index);
@@ -638,7 +701,7 @@ export function validateImportResult(value: unknown): ImportResult {
     if (passage.range.start < previousEnd) {
       throw new ValidationError(`passage ${index} overlaps the previous passage`);
     }
-    const { line, column } = locate(extractedText, passage.range.start);
+    const { line, column } = locate(extractedText, passage.range.start, breaks);
     if (passage.location.line !== line || passage.location.column !== column) {
       throw new ValidationError(`passage ${index} location is not the real line and column`);
     }

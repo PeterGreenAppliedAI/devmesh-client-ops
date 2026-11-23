@@ -279,6 +279,61 @@ describe("passages", () => {
     assert.equal(result.passages.length, 1);
     assert.equal(result.passages[0].text, "single line\nstill one paragraph");
   });
+
+  it("subdivides identically for every newline style and gives honest locations", () => {
+    for (const newline of ["\n", "\r\n", "\r"]) {
+      const text = `One${newline}${newline}Two${newline}line${newline}${newline}Three.`;
+      const result = imported(importPastedText(text));
+      assert.deepEqual(result.passages.map((p) => p.text), ["One", `Two${newline}line`, "Three."]);
+      for (const passage of result.passages) {
+        assert.equal(text.slice(passage.range.start, passage.range.end), passage.text);
+        assert.equal(passage.location.start, passage.range.start);
+        assert.equal(passage.location.end, passage.range.end);
+      }
+      assert.equal(result.passages[0].location.line, 1);
+      assert.equal(result.passages[0].location.column, 1);
+      assert.equal(result.passages[1].location.line, 3);
+      assert.equal(result.passages[1].location.column, 1);
+      assert.equal(result.passages[2].location.line, 6);
+      assert.equal(result.passages[2].location.column, 1);
+      assert.equal(validateImportResult(result), result);
+    }
+  });
+
+  it("treats only spaces and tabs between two line breaks as a separator", () => {
+    const text = "First \n \t \nSecond";
+    const result = imported(importPastedText(text));
+    assert.deepEqual(result.passages.map((p) => p.text), ["First", "Second"]);
+    // A paragraph indented by a tab after the first break stays one passage.
+    const tabbed = imported(importPastedText("First\n\n\tSecond"));
+    assert.deepEqual(tabbed.passages.map((p) => p.text), ["First", "Second"]);
+  });
+
+  it("handles very many passages at the inclusive limit without rescanning the text", () => {
+    // 4 MiB of two-character paragraphs, each separated by a blank line: about
+    // a million passages, each needing its own exact range and location.
+    const unit = "a\n\n";
+    const count = 1024 * 1024;
+    const text = unit.repeat(count);
+    assert.equal(text.length, count * unit.length);
+    assert.ok(text.length <= MAX_CONTENT_BYTES);
+    const outcome = importPastedText(text);
+    assert.equal(outcome.ok, true);
+    if (!outcome.ok) throw new Error("unreachable");
+    const result = outcome.result;
+    assert.equal(result.passages.length, count);
+    const last = result.passages[result.passages.length - 1];
+    assert.equal(last.text, "a");
+    assert.equal(last.range.start, text.length - 3);
+    // The last unit's trailing line breaks are trimmed from the exact range.
+    assert.equal(last.range.end, text.length - 2);
+    // Each passage's "a" follows one line break, so passage ordinal n starts
+    // on line 2 * n - 1, at column 1.
+    assert.equal(last.location.line, 2 * result.passages.length - 1);
+    assert.equal(last.location.column, 1);
+    assert.equal(text.slice(last.range.start, last.range.end), last.text);
+    assert.equal(validateImportResult(result), result);
+  });
 });
 
 describe("strict validators", () => {
