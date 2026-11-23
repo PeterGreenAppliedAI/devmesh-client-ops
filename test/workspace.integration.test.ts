@@ -803,9 +803,11 @@ describe("workspace integration: linked overview and restart", () => {
       // The dashboard's task sections depend on the server's real calendar
       // day, so their membership is asserted with a fixed clock in
       // test/dashboard.test.ts. Here the read-only page is checked: it has
-      // the six named sections and never offers a form, and its item sections
+      // every named section and never offers a form, and its item sections
       // (which do not depend on the day) show the still-open records across
-      // clients. Done, closed, undated and follow-up records never appear.
+      // clients. Done, closed and undated tasks never appear in the date
+      // sections; open follow-ups have their own section; decisions never
+      // appear anywhere.
       const home = await send(base, { path: "/" });
       assert.equal(home.status, 200);
       assert.match(String(home.headers["content-type"]), /^text\/html; charset=utf-8/);
@@ -813,18 +815,28 @@ describe("workspace integration: linked overview and restart", () => {
       assert.ok(!home.body.includes("<form"));
       assert.ok(!home.body.includes('<input'));
       assert.ok(!home.body.includes('<textarea'));
-      for (const title of [
+      const homeHeadings = [
         "Overdue tasks",
         "Tasks due soon",
         "Open blockers",
         "Open questions",
         "Open commitments",
         "Open waiting items",
-      ]) {
-        assert.ok(home.body.includes(`<h2>${title}</h2>`), title);
+        "High-priority tasks",
+        "Waiting tasks",
+        "Open follow-ups",
+        "Recent activity",
+        "Engagements in progress",
+      ];
+      let headingAt = -1;
+      for (const title of homeHeadings) {
+        const at = home.body.indexOf(`<h2>${title}</h2>`);
+        assert.ok(at >= 0, title);
+        assert.ok(at > headingAt, `${title} keeps its place`);
+        headingAt = at;
       }
       // The undated in-progress task and the completed task never enter the
-      // task sections; the dated open task does appear in one of them.
+      // date sections; the dated open task does appear in one of them.
       const taskSections = sectionOf(home.body, "Overdue tasks") + sectionOf(home.body, "Tasks due soon");
       assert.ok(!taskSections.includes(`href="/tasks/${ids.tasks[1]}"`), "an undated task is never due");
       assert.ok(!taskSections.includes(`href="/tasks/${ids.tasks[2]}"`), "a completed task is never due");
@@ -846,9 +858,35 @@ describe("workspace integration: linked overview and restart", () => {
       assert.match(homeCommitments, new RegExp(`href="/items/${ids.items[3]}"`));
       const homeWaiting = sectionOf(home.body, "Open waiting items");
       assert.match(homeWaiting, new RegExp(`href="/items/${ids.items[4]}"`));
-      // The sibling client's follow-up (a kind with no section) never appears.
+      // Open follow-ups, from both clients, now have their own section.
+      const homeFollowUps = sectionOf(home.body, "Open follow-ups");
+      assert.match(homeFollowUps, new RegExp(`href="/items/${ids.items[5]}"`));
+      // The sibling client's own follow-up is the other-client item.
+      assert.match(homeFollowUps, new RegExp(`href="/items/${ids.otherItem}"`));
+      // The sibling client's follow-up now appears in that section and nowhere
+      // else; no decision is ever shown, whatever section lists it.
       const homeMain = mainContentOf(home.body);
-      assert.ok(!homeMain.includes(`href="/items/${ids.otherItem}"`));
+      assert.ok(homeMain.includes(`href="/items/${ids.otherItem}"`));
+      for (const decision of [ids.items[0], ids.items[6], ids.items[7]]) {
+        assert.ok(!homeMain.includes(`href="/items/${decision}"`), `decision ${decision} is never shown`);
+      }
+      // A high-priority open task (the sibling client's, which the store
+      // created with priority high) is listed in the high-priority section.
+      assert.match(
+        sectionOf(home.body, "High-priority tasks"),
+        new RegExp(`href="/tasks/${ids.otherTask}"`),
+      );
+      // The unfinished engagements are listed with links to themselves and
+      // their clients.
+      const homeEngagements = sectionOf(home.body, "Engagements in progress");
+      assert.match(homeEngagements, new RegExp(`<a href="/engagements/${alpha}">`));
+      assert.match(homeEngagements, new RegExp(`client <a href="/clients/${ids.client}">`));
+      assert.match(homeEngagements, new RegExp(`<a href="/engagements/${ids.otherEngagement}">`));
+      // Serving the pages recorded events, so the recent-activity section links
+      // the current records it names.
+      const homeActivity = sectionOf(home.body, "Recent activity");
+      assert.match(homeActivity, new RegExp(`href="/engagements/${alpha}"`));
+      assert.match(homeActivity, /<span class="action">(create|edit|archive|restore)<\/span>/);
       // Empty sections explain and link to /clients; none is empty here, so
       // the dashboard offers the client list from its own navigation instead.
       assert.ok(home.body.includes('href="/clients"'));
