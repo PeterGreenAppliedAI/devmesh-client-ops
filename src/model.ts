@@ -232,8 +232,33 @@ export function clone<T>(value: T): T {
   return structuredClone(value);
 }
 
-export type TaskStatus = "open" | "in_progress" | "done";
-export const TASK_STATUSES: readonly TaskStatus[] = ["open", "in_progress", "done"];
+export type TaskStatus = "open" | "in_progress" | "waiting" | "done";
+export const TASK_STATUSES: readonly TaskStatus[] = ["open", "in_progress", "waiting", "done"];
+/**
+ * The statuses a stored document may carry. Schema 5 added `waiting`; the
+ * legacy schemas 1, 3 and 4 keep their old status rules, so a task in a legacy
+ * document must still hold one of the three original statuses.
+ */
+export const LEGACY_TASK_STATUSES: readonly TaskStatus[] = ["open", "in_progress", "done"];
+/**
+ * The statuses the task form offers. `waiting` is deliberately omitted until
+ * the boards expose it, so a submitted waiting value is refused like any other
+ * invalid status.
+ */
+export const TASK_FORM_STATUSES: readonly TaskStatus[] = ["open", "in_progress", "done"];
+
+/**
+ * The assertions a board movement may make about the target record before it
+ * is moved. Each supplied id must equal the current stored record's link; an
+ * absent project link compares as the empty string, so a caller can assert
+ * that a task belongs to no project.
+ */
+export interface TaskIdentityExpectation {
+  id?: string;
+  clientId?: string;
+  engagementId?: string;
+  projectId?: string;
+}
 
 export type TaskPriority = "low" | "normal" | "high";
 export const TASK_PRIORITIES: readonly TaskPriority[] = ["low", "normal", "high"];

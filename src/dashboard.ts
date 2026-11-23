@@ -131,8 +131,8 @@ function byId<T extends { readonly id: string }>(records: readonly T[]): Map<str
 /**
  * Compute the six attention sections from one snapshot at one reference day.
  *
- * Tasks are eligible when they are open or in progress and carry a due date;
- * done and undated tasks never appear. Overdue is a date before today, due
+ * Tasks are eligible when they are open, in progress or waiting and carry a due
+ * date; done and undated tasks never appear. Overdue is a date before today, due
  * soon is today through today+7 inclusive (eight calendar dates). Items are
  * eligible when their kind has a section and their state is open; decisions
  * and follow-ups have no section. Effectively archived records (the record's
@@ -203,7 +203,9 @@ export function selectDashboard(
     .filter((task) => !isEffectivelyArchived(state, task))
     .filter(
       (task) =>
-        (task.status === "open" || task.status === "in_progress") &&
+        (task.status === "open" ||
+          task.status === "in_progress" ||
+          task.status === "waiting") &&
         task.dueDate !== undefined &&
         isCalendarDate(task.dueDate),
     );

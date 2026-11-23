@@ -626,6 +626,74 @@ describe("work pages: tasks", () => {
     }
   });
 
+  it("offers no waiting choice on task forms and refuses a submitted waiting status", async () => {
+    const server = await running();
+    try {
+      const h = await hierarchy(server.store);
+      // The create and edit forms offer only the three original statuses.
+      const createPage = await send(server.origin, { path: `/engagements/${h.engagement.id}/tasks/new` });
+      const createForm = parseForm(createPage.body);
+      assert.equal(createForm.controls.get("status"), "open");
+      assert.doesNotMatch(createPage.body, /<option value="waiting"/);
+      const task = await server.store.createTask({
+        clientId: h.client.id,
+        engagementId: h.engagement.id,
+        title: "Existing",
+      });
+      const editPage = await send(server.origin, { path: `/tasks/${task.id}/edit` });
+      assert.equal(editPage.status, 200);
+      assert.doesNotMatch(editPage.body, /<option value="waiting"/);
+
+      // A submitted waiting status is refused through the usual FormError
+      // handling on both create and edit, writing nothing.
+      const before = JSON.stringify(server.store.snapshot());
+      const createWaiting = await send(server.origin, {
+        method: "POST",
+        path: `/engagements/${h.engagement.id}/tasks/new`,
+        form: { title: "Tries waiting", status: "waiting", priority: "normal", owner: "", dueDate: "", context: "", projectId: "" },
+      });
+      assert.equal(createWaiting.status, 400);
+      assert.match(createWaiting.body, /role="alert"/);
+      assert.match(createWaiting.body, /task\.status must be one of/);
+      // The status select is the one marked control, not the title field the
+      // refusal message's own word `title` would otherwise name.
+      assert.equal((createWaiting.body.match(/aria-invalid="true"/g) ?? []).length, 1);
+      assert.match(
+        createWaiting.body,
+        /<select[^>]*\sid="field-status"[^>]*\saria-invalid="true"[^>]*\saria-describedby="field-status-error"/,
+      );
+      const editWaiting = await send(server.origin, {
+        method: "POST",
+        path: `/tasks/${task.id}/edit`,
+        form: { id: task.id, status: "waiting" },
+      });
+      assert.equal(editWaiting.status, 400);
+      assert.match(editWaiting.body, /role="alert"/);
+      assert.match(editWaiting.body, /task\.status must be one of/);
+      assert.equal((editWaiting.body.match(/aria-invalid="true"/g) ?? []).length, 1);
+      assert.match(
+        editWaiting.body,
+        /<select[^>]*\sid="field-status"[^>]*\saria-invalid="true"[^>]*\saria-describedby="field-status-error"/,
+      );
+      assert.equal(JSON.stringify(server.store.snapshot()), before);
+
+      // The store itself still accepts waiting: the form is the only barrier.
+      const waiting = await server.store.createTask({
+        clientId: h.client.id,
+        engagementId: h.engagement.id,
+        title: "Waiting stored",
+        status: "waiting",
+      });
+      assert.equal(waiting.status, "waiting");
+      // The detail page shows the stored waiting badge as plain escaped text.
+      const detail = await send(server.origin, { path: `/tasks/${waiting.id}` });
+      assert.equal(detail.status, 200);
+      assert.match(detail.body, /<span class="badge">waiting<\/span>/);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("refuses create/edit parent mismatches, accepting blank, matching and omitted parents", async () => {
     const server = await running();
     try {
@@ -2394,11 +2462,12 @@ describe("work pages: lists and rollups", () => {
       assert.deepEqual(engagementRows, [
         { label: "open", count: 1 },
         { label: "in_progress", count: 1 },
+        { label: "waiting", count: 0 },
         { label: "done", count: 0 },
       ]);
       assert.equal(openItemCount(server.store, h.client.id, { engagementId: h.engagement.id }), 2);
       // The rendered engagement-wide tally is visible before the project sections.
-      assert.match(page.body, /<h3>Counts<\/h3><ul><li>open: 1<\/li><li>in_progress: 1<\/li><li>done: 0<\/li><\/ul>/);
+      assert.match(page.body, /<h3>Counts<\/h3><ul><li>open: 1<\/li><li>in_progress: 1<\/li><li>waiting: 0<\/li><li>done: 0<\/li><\/ul>/);
       assert.match(page.body, /Open work items: 2/);
     } finally {
       await server.close();
@@ -2448,7 +2517,7 @@ describe("work pages: lists and rollups", () => {
       assert.ok(!siblingPage.body.includes("Eng A item"));
       assert.match(siblingPage.body, /<li>open: 0<\/li>/);
       assert.match(siblingPage.body, /<li>done: 0<\/li>/);
-      assert.match(siblingPage.body, /<h3>Counts<\/h3><ul><li>open: 0<\/li><li>in_progress: 0<\/li><li>done: 0<\/li><\/ul>/);
+      assert.match(siblingPage.body, /<h3>Counts<\/h3><ul><li>open: 0<\/li><li>in_progress: 0<\/li><li>waiting: 0<\/li><li>done: 0<\/li><\/ul>/);
       assert.match(siblingPage.body, /Open work items: 0/);
 
       // An engagement without projects shows its engagement-only rollup: the
@@ -2457,7 +2526,7 @@ describe("work pages: lists and rollups", () => {
       assert.equal(barePage.status, 200);
       assert.ok(containsEscaped(barePage.body, "Bare task"));
       assert.ok(containsEscaped(barePage.body, "Bare item"));
-      assert.match(barePage.body, /<h3>Counts<\/h3><ul><li>open: 0<\/li><li>in_progress: 1<\/li><li>done: 0<\/li><\/ul>/);
+      assert.match(barePage.body, /<h3>Counts<\/h3><ul><li>open: 0<\/li><li>in_progress: 1<\/li><li>waiting: 0<\/li><li>done: 0<\/li><\/ul>/);
       assert.match(barePage.body, /Open work items: 1/);
       // The sibling's work stays off the bare engagement's page too.
       assert.ok(!barePage.body.includes("Eng A task"));
@@ -2627,17 +2696,20 @@ describe("work pages: route matching and rollup helpers", () => {
       assert.deepEqual(engagement, [
         { label: "open", count: 2 },
         { label: "in_progress", count: 1 },
+        { label: "waiting", count: 0 },
         { label: "done", count: 1 },
       ]);
       // Each project's tally is its own explicit selection, isolated from siblings.
       assert.deepEqual(taskStatusCounts(store, h.client.id, { engagementId: h.engagement.id, projectId: h.project.id }), [
         { label: "open", count: 1 },
         { label: "in_progress", count: 0 },
+        { label: "waiting", count: 0 },
         { label: "done", count: 1 },
       ]);
       assert.deepEqual(taskStatusCounts(store, h.client.id, { engagementId: h.engagement.id, projectId: h.secondProject.id }), [
         { label: "open", count: 0 },
         { label: "in_progress", count: 1 },
+        { label: "waiting", count: 0 },
         { label: "done", count: 0 },
       ]);
       // The sibling engagement's task never leaks into this engagement's tally.
@@ -2645,6 +2717,7 @@ describe("work pages: route matching and rollup helpers", () => {
       assert.deepEqual(sibling, [
         { label: "open", count: 0 },
         { label: "in_progress", count: 0 },
+        { label: "waiting", count: 0 },
         { label: "done", count: 1 },
       ]);
 
