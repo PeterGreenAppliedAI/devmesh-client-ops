@@ -811,18 +811,26 @@ describe("work persistence", () => {
     } finally {
       await store.close();
     }
-    // The migrated document is written at the current schema version, with an
-    // empty journal: no event is invented for the records that already exist.
+    // The migrated document is written at the current schema version. No event
+    // is invented for the records that already exist: the journal holds only
+    // the events of this session's own effective mutations, the new task and
+    // the client's rename.
     const saved = JSON.parse(readFileSync(storePath(dir), "utf8"));
     assert.equal(saved.schemaVersion, 5);
     assert.equal(saved.tasks.length, 1);
-    assert.deepEqual(saved.activity, []);
-    assert.equal(saved.nextActivityId, 1);
+    assert.deepEqual(
+      saved.activity.map((e: { action: string; targetKind: string; targetId: string }) =>
+        `${e.action}:${e.targetKind}:${e.targetId}`,
+      ),
+      ["create:task:task-1", "edit:client:client-1"],
+      "only this session's changes are recorded",
+    );
+    assert.equal(saved.nextActivityId, 3);
 
     const reopened = await openStore(dir);
     try {
       assert.equal(reopened.snapshot().tasks[0].title, "First task");
-      assert.deepEqual(reopened.snapshot().activity, []);
+      assert.deepEqual(reopened.snapshot().activity, saved.activity);
     } finally {
       await reopened.close();
     }

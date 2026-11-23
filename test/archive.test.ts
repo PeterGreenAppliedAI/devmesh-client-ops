@@ -287,10 +287,10 @@ describe("archival flags", () => {
           }
         }
       }
-      // Every effective flip records exactly one event. A repeat of the flag
-      // already held is a no-op that saves as before. The task's flag is
-      // cleared by a respelled repeat (see below), so the task family has one
-      // restore per round rather than two.
+      // Every effective flip records exactly one event, and a repeat of the
+      // flag already held is a no-op that saves as before. Each family starts
+      // active and the loop requests true, true, false, false per round, so
+      // every round records one archive and one restore.
       const recorded = store.snapshot().activity!.map((e) => `${e.action}:${e.targetKind}:${e.targetId}`);
       const expectedJournal = [
         `create:client:${ids.client}`,
@@ -301,13 +301,7 @@ describe("archival flags", () => {
         `create:meeting:${w.meeting.id}`,
       ];
       for (const kind of kinds) {
-        // The task was archived before this loop, so it starts archived and its
-        // first flip of round 0 restores, the second is a respelled no-op.
         for (let round = 0; round < 3; round += 1) {
-          if (kind === "task" && round === 0) {
-            expectedJournal.push(`restore:task:${ids.task}`);
-            continue;
-          }
           expectedJournal.push(`archive:${kind}:${ids[kind]}`);
           expectedJournal.push(`restore:${kind}:${ids[kind]}`);
         }

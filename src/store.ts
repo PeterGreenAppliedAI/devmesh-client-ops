@@ -286,8 +286,11 @@ export interface StoreOptions {
   platform?: string;
   /**
    * The clock that stamps journal events; defaults to the server clock
-   * (`() => new Date()`). It is called inside the serialized commit, after
-   * validation, so events are stamped in commit order.
+   * (`() => new Date()`). It is read inside the serialized commit, after the
+   * mutation has been built and validated, so events are stamped in commit
+   * order. A no-op mutation still takes its timestamp, exactly as the task's
+   * rule for an invalid clock applies to every mutation, including a no-op one;
+   * the stamp is simply not kept because no event is recorded.
    */
   now?: () => Date;
 }
@@ -925,8 +928,8 @@ function editedChange<T extends object & { id: string }>(
 
 /**
  * The change of an archive or restore, or undefined when the record already
- * holds the requested flag (absent or `false` means active), so respelling the
- * flag is a no-op that records no event.
+ * holds the requested flag. An absent flag and `false` both mean active, so
+ * respelling an active record's flag is a no-op that records no event.
  */
 function archivedChange<T extends object & { id: string }>(
   updated: T,
@@ -934,7 +937,7 @@ function archivedChange<T extends object & { id: string }>(
   targetKind: ActivityTargetKind,
   archived: boolean,
 ): MutationChange<T> {
-  const already = (current as { archived?: boolean }).archived === archived;
+  const already = ((current as { archived?: boolean }).archived === true) === archived;
   return already
     ? { value: updated }
     : {
@@ -972,10 +975,9 @@ function applyArchivedChange(
   const index = items.findIndex((item) => item.id === args.id);
   (items as unknown[])[index] = updated;
   // `true` archives and `false` removes the flag. When the record already
-  // holds the requested flag value, this is a no-op: the record is rebuilt
-  // (respelled) and persisted as before, but no event is recorded.
-  const change = archivedChange(updated, current, args.kind, args.archived);
-  return { value: undefined, event: change.event };
+  // effectively holds the requested flag, this is a no-op: the record is
+  // rebuilt (respelled) and persisted as before, but no event is recorded.
+  return { value: undefined, event: archivedChange(updated, current, args.kind, args.archived).event };
 }
 
 function errorCode(cause: unknown): string | undefined {
@@ -1308,9 +1310,11 @@ class StoreImpl implements Store {
     }
     const draft: State = clone(this.state);
     const change = mutate(draft);
-    if (process.env.DEBUG_T8) console.error("DBG", JSON.stringify(change.event), JSON.stringify(change.value));
+    // The clock is read for every mutation that reaches this point, a no-op
+    // included, so a failing or invalid clock rejects it as a persistence
+    // failure before anything is persisted; a no-op then discards the stamp.
+    const at = this.clock();
     if (change.event !== undefined) {
-      const at = this.clock();
       // The event is appended to the same draft the record change was made in,
       // so the record and its event are saved by the one write below.
       let id: number;
@@ -1602,8 +1606,6 @@ class StoreImpl implements Store {
       }),
     );
   }
-
-
 
   listTasks(filter: WorkFilter): readonly Task[] {
     return selectWork(this.state.tasks, filter);

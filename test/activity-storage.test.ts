@@ -573,9 +573,10 @@ describe("activity journal storage", () => {
     // The highest usable event id is the ceiling minus one; the counter that
     // follows it is the ceiling itself, which the task allows as a stored
     // value. It is not clamped, and the exhausted journal can still be saved.
-    // Every mutation that would record an event is rejected with a
-    // PersistenceError before anything is persisted or published, including a
-    // no-op one, because the allocation is refused for it as well.
+    // Every effective mutation is rejected with a PersistenceError before
+    // anything is persisted or published, because the allocation is refused for
+    // it. A no-op records no event and so needs no allocation: it saves as
+    // before at the unchanged, exhausted counter.
     const dir = tempDir();
     const highest = Number.MAX_SAFE_INTEGER - 1;
     const activity = [event({ id: highest })];
@@ -587,10 +588,17 @@ describe("activity journal storage", () => {
     try {
       assert.deepEqual(store.snapshot().activity, activity);
       await assert.rejects(store.updateClient("client-1", { name: "Renamed" }), PersistenceError);
-      await assert.rejects(store.setArchived("client", "client-1", false), PersistenceError);
+      await assert.rejects(store.createClient({ name: "New" }), PersistenceError);
       assert.deepEqual(store.snapshot().activity, activity);
       assert.equal(store.snapshot().clients[0].name, "Acme");
       assert.equal(readFileSync(storePath(dir), "utf8"), content);
+      // A no-op keeps normal save behaviour: it persists and records nothing.
+      await store.setArchived("client", "client-1", false);
+      assert.deepEqual(store.snapshot().activity, activity);
+      assert.equal(
+        JSON.parse(readFileSync(storePath(dir), "utf8")).nextActivityId,
+        Number.MAX_SAFE_INTEGER,
+      );
     } finally {
       await store.close();
     }
