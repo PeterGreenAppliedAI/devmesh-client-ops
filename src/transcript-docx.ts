@@ -8,9 +8,13 @@
  * copied and preserved exactly; they are never mutated, persisted or sent
  * anywhere.
  *
- * Text extraction follows the document's block structure. A block is one
- * paragraph, a heading or a table cell, and the text of a block is its runs
- * joined in document order, a line break inside a run becoming `\n`. Consecutive
+ * Text extraction follows the document's block structure as mammoth writes it:
+ * a block is a paragraph, a heading, a list item or a table cell, and the text
+ * of a block is its runs joined in document order, a line break inside a run
+ * becoming `\n`. A list item is not called a paragraph, because mammoth writes
+ * a list item as `<ul><li>` and its correspondence to an original paragraph is
+ * not established; consecutive list items are separate blocks, never joined.
+ * Consecutive
  * nonempty blocks are separated by a blank line, which is the separator the
  * transcript core's passages subdivide at, so each passage is exactly one
  * extracted block. A passage therefore names its original (through the core
@@ -53,14 +57,14 @@ export const DOCX_SUPPORTED_EXPORTS: readonly string[] = Object.freeze([
 export const RE_EXPORT_GUIDANCE = "Re-export the document as DOCX (Word, .docx) or as UTF-8 text (.txt).";
 
 /**
- * One extracted block: a paragraph, heading or table cell of the DOCX, with
- * the plain text extracted from it and the kind of block it is. `kind` is
- * honest about the extraction: a table cell's text is not an original
- * paragraph, and the transcript result's passages carry the extracted text,
- * not this descriptor.
+ * One extracted block: a paragraph, heading, list item or table cell of the
+ * DOCX markup, with the plain text extracted from it and the kind of block it
+ * is. `kind` is honest about the extraction: a table cell's or a list item's
+ * text is not an original paragraph, and the transcript result's passages
+ * carry the extracted text, not this descriptor.
  */
 export interface ExtractedBlock {
-  readonly kind: "paragraph" | "heading" | "table_cell";
+  readonly kind: "paragraph" | "heading" | "list_item" | "table_cell";
   readonly text: string;
 }
 
@@ -156,11 +160,11 @@ function trimBlock(text: string): string {
 /**
  * Read the plain text of mammoth's word-processing markup, one entry per
  * block. This is a small linear scan over the HTML: text is accumulated into
- * the current block, a `<p>`, `<h1>`-`<h6>` or `<td>`/`<th>` starts a new
- * block (closing any block still open), `</p>`, `</h>`, `</td>`, `</th>` and
- * `</tr>` close the current block, `<br>` is a line break inside the current
- * block, and every other tag is structure only. A cell that contains
- * paragraphs contributes each of its paragraphs, not the cell again.
+ * the current block, a `<p>`, `<h1>`-`<h6>`, `<li>` or `<td>`/`<th>` starts a
+ * new block (closing any block still open), `</p>`, `</h>`, `</li>`, `</td>`,
+ * `</th>` and `</tr>` close the current block, `<br>` is a line break inside
+ * the current block, and every other tag is structure only. A cell that
+ * contains paragraphs contributes each of its paragraphs, not the cell again.
  */
 export function extractBlocks(html: string): readonly ExtractedBlock[] {
   const blocks: ExtractedBlock[] = [];
@@ -210,7 +214,7 @@ export function extractBlocks(html: string): readonly ExtractedBlock[] {
         close();
         cellDepth -= 1;
         if (cellDepth === 0) cellSuperseded = false;
-      } else if (name === "p" || name === "tr" || /^h[1-6]$/.test(name)) {
+      } else if (name === "p" || name === "li" || name === "tr" || /^h[1-6]$/.test(name)) {
         close();
       }
       continue;
@@ -224,6 +228,11 @@ export function extractBlocks(html: string): readonly ExtractedBlock[] {
       close();
       if (cellDepth > 0) cellSuperseded = true;
       kind = "heading";
+      hasCurrent = true;
+    } else if (name === "li") {
+      close();
+      if (cellDepth > 0) cellSuperseded = true;
+      kind = "list_item";
       hasCurrent = true;
     } else if (name === "td" || name === "th") {
       close();

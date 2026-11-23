@@ -177,6 +177,51 @@ describe("DOCX blocks with line breaks", () => {
   });
 });
 
+describe("DOCX list items", () => {
+  it("keeps consecutive list items as separate blocks, not joined as a paragraph", () => {
+    // Mammoth writes a list as `<ul><li>First</li><li>Second</li></ul>`.
+    assert.deepEqual(
+      extractBlocks("<ul><li>First</li><li>Second</li></ul>").map((b) => [b.kind, b.text]),
+      [
+        ["list_item", "First"],
+        ["list_item", "Second"],
+      ],
+    );
+  });
+
+  it("does not describe an extracted block as a paragraph unless the markup is one", async () => {
+    const html =
+      "<p>Intro.</p><ul><li>One</li><li>Two</li></ul><h2>Head</h2><table><tr><td>Cell</td></tr></table>";
+    const parser: DocxParser = { convertToHtml: () => Promise.resolve({ value: html }) };
+    const { result, blocks } = imported(await importDocx(docxBytes(["marker"]), "kinds.docx", parser));
+    assert.deepEqual(
+      blocks.map((b) => [b.kind, b.text]),
+      [
+        ["paragraph", "Intro."],
+        ["list_item", "One"],
+        ["list_item", "Two"],
+        ["heading", "Head"],
+        ["table_cell", "Cell"],
+      ],
+    );
+    assert.deepEqual(result.passages.map((p) => p.text), ["Intro.", "One", "Two", "Head", "Cell"]);
+    assert.deepEqual(
+      result.passages.map((p) => [p.location.line, p.location.column]),
+      [
+        [1, 1],
+        [3, 1],
+        [5, 1],
+        [7, 1],
+        [9, 1],
+      ],
+    );
+    for (const passage of result.passages) {
+      assert.equal(result.extractedText.slice(passage.range.start, passage.range.end), passage.text);
+    }
+    assert.equal(validateImportResult(result), result);
+  });
+});
+
 describe("DOCX refusals", () => {
   const reExport = /re-export .* as DOCX .* or .* UTF-8 text/i;
 
