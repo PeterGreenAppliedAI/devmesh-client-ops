@@ -20,9 +20,12 @@
  * untouched, then closes both the store and the server and reopens them to
  * confirm the records, the history and the dashboard survive.
  *
- * The authoritative stored snapshot is captured before the very first page read
- * (no page is requested before it), and it is compared after the read batches,
- * the board reads and the refused movement; the journal is compared separately.
+ * Every GET is bracketed by an authoritative stored snapshot (records and
+ * journal) taken straight from the store: during fixture setup each new-form
+ * GET and each redirect-destination GET is compared with the store before and
+ * after it, separately from the intentional POST between them. The whole-workspace
+ * read batches, the board reads, the refused movement and the post-restart
+ * reads are bracketed the same way, and the journal is compared separately.
  *
  * The home clock (which selects the reference day) is injected through
  * `appRoutes`, and the registered feature routes are kept beside it, so a test
@@ -320,7 +323,25 @@ interface Observation {
   readonly pages: readonly { readonly path: string; readonly body: string }[];
 }
 
+/**
+ * Read the whole workspace over HTTP, bracketed by the authoritative stored
+ * snapshot: the records and the journal are unchanged by this read batch.
+ */
 async function observe(
+  base: string,
+  store: Store,
+  ids: FixtureIds,
+  linkedPaths: readonly string[] = [],
+): Promise<Observation> {
+  const storeBefore = await readStore(store);
+  const journalBefore = JSON.stringify(journalOf(store.snapshot()));
+  const observation = await readWorkspace(base, ids, linkedPaths);
+  assert.deepEqual(await readStore(store), storeBefore, "this read batch leaves the records untouched");
+  assert.equal(JSON.stringify(journalOf(store.snapshot())), journalBefore, "this read batch records no event");
+  return observation;
+}
+
+async function readWorkspace(
   base: string,
   ids: FixtureIds,
   linkedPaths: readonly string[] = [],
@@ -344,6 +365,20 @@ async function observe(
     }
   }
   return { pages };
+}
+
+/**
+ * GET one page and bracket it with the authoritative stored snapshot: a single
+ * read leaves the records and the journal exactly as they were.
+ */
+async function readPage(base: string, store: Store, path: string): Promise<Reply> {
+  const storeBefore = await readStore(store);
+  const journalBefore = JSON.stringify(journalOf(store.snapshot()));
+  const reply = await send(base, { path });
+  assert.equal(reply.status, 200, `${path} is readable`);
+  assert.deepEqual(await readStore(store), storeBefore, `reading ${path} changes no record`);
+  assert.equal(JSON.stringify(journalOf(store.snapshot())), journalBefore, `reading ${path} records no event`);
+  return reply;
 }
 
 function snapshotOf(observation: Observation): string {
@@ -436,21 +471,48 @@ async function submit(base: string, form: ParsedForm): Promise<Reply> {
   return send(base, { method: "POST", path: form.action, form: Object.fromEntries(form.controls) });
 }
 
-/** Create one record through its rendered form and follow the redirect. */
+/**
+ * Create one record through its rendered form and follow the redirect.
+ *
+ * The form page GET and the redirect destination GET are reads, so each is
+ * bracketed by an authoritative stored snapshot (records and journal) taken
+ * straight from the store: a read that changed a record once during setup
+ * cannot become part of the baseline later reads are compared with.
+ */
 async function create(
   base: string,
+  store: Store,
   path: string,
   values: Record<string, string>,
 ): Promise<string> {
-  const form = parseForm((await send(base, { path })).body);
+  // The new-form page is a read: it must leave the store untouched.
+  const storeBeforeForm = await readStore(store);
+  const journalBeforeForm = JSON.stringify(journalOf(store.snapshot()));
+  const formPage = await send(base, { path });
+  assert.equal(formPage.status, 200, `the new form ${path} is rendered`);
+  assert.deepEqual(await readStore(store), storeBeforeForm, `reading the new form ${path} changes no record`);
+  assert.equal(JSON.stringify(journalOf(store.snapshot())), journalBeforeForm, `reading the new form ${path} records no event`);
+  const form = parseForm(formPage.body);
   for (const [key, value] of Object.entries(values)) {
     assert.ok(form.controls.has(key), `${path} form has control ${key}`);
     if (form.options.has(key)) chooseOption(form, key, value);
     else form.controls.set(key, value);
   }
   const reply = await submit(base, form);
-  // The create redirects (303) to the new record's page; request it.
-  return follow(base, reply);
+  // The intentional POST is the fixture's one mutation here.
+  const storeAfterPost = await readStore(store);
+  const journalAfterPost = JSON.stringify(journalOf(store.snapshot()));
+  assert.equal(
+    journalOf(store.snapshot()).length,
+    JSON.parse(journalBeforeForm).length + 1,
+    `creating through ${path} records exactly one event`,
+  );
+  // The create redirects (303) to the new record's page; request it, and the
+  // destination GET must leave the store exactly as the POST saved it.
+  const location = await follow(base, reply);
+  assert.deepEqual(await readStore(store), storeAfterPost, `reading the new record ${location} changes no record`);
+  assert.equal(JSON.stringify(journalOf(store.snapshot())), journalAfterPost, `reading the new record ${location} records no event`);
+  return location;
 }
 
 function idOf(location: string): string {
@@ -501,7 +563,7 @@ describe("F2 daily operations integration", () => {
 
     try {
       // -- Clients. ----------------------------------------------------------
-      created.alphaClient = idOf(await create(base, "/clients/new", {
+      created.alphaClient = idOf(await create(base, app.store, "/clients/new", {
         name: "Northwind <synthetic>",
         background: "Synthetic fixture client",
         contacts: "",
@@ -509,7 +571,7 @@ describe("F2 daily operations integration", () => {
         requirements: "",
         objectives: "",
       }));
-      created.betaClient = idOf(await create(base, "/clients/new", {
+      created.betaClient = idOf(await create(base, app.store, "/clients/new", {
         name: "Contoso & partners",
         background: "Second synthetic client",
         contacts: "",
@@ -519,17 +581,17 @@ describe("F2 daily operations integration", () => {
       }));
 
       // -- Engagements: active (with a project) and planned (no project). ----
-      created.alphaEngagement = idOf(await create(base, `/clients/${created.alphaClient}/engagements/new`, {
+      created.alphaEngagement = idOf(await create(base, app.store, `/clients/${created.alphaClient}/engagements/new`, {
         name: "Quarterly audit",
         objectives: "Deliver the audit",
         status: "active",
       }));
-      created.betaEngagement = idOf(await create(base, `/clients/${created.betaClient}/engagements/new`, {
+      created.betaEngagement = idOf(await create(base, app.store, `/clients/${created.betaClient}/engagements/new`, {
         name: "Discovery",
         objectives: "Discover the need",
         status: "planned",
       }));
-      created.alphaProject = idOf(await create(base, `/engagements/${created.alphaEngagement}/projects/new`, {
+      created.alphaProject = idOf(await create(base, app.store, `/engagements/${created.alphaEngagement}/projects/new`, {
         name: "Field work",
         objectives: "Field work package",
         status: "active",
@@ -539,7 +601,7 @@ describe("F2 daily operations integration", () => {
       // Two finished engagements of the first client that never count as
       // unfinished: an on-hold one (unfinished by status) is kept below, while
       // a completed one must stay out of the engagement overview.
-      created.completedEngagement = idOf(await create(base, `/clients/${created.alphaClient}/engagements/new`, {
+      created.completedEngagement = idOf(await create(base, app.store, `/clients/${created.alphaClient}/engagements/new`, {
         name: "Archived audit",
         objectives: "Already delivered",
         status: "completed",
@@ -548,7 +610,7 @@ describe("F2 daily operations integration", () => {
 
       // -- Tasks: assigned/unassigned, actionable/waiting/done, dated/undated.
       // The high-priority actionable task the milestone moves.
-      created.high = idOf(await create(base, `/projects/${created.alphaProject}/tasks/new`, {
+      created.high = idOf(await create(base, app.store, `/projects/${created.alphaProject}/tasks/new`, {
         title: "Prepare audit <plan>",
         status: "open",
         priority: "high",
@@ -558,7 +620,7 @@ describe("F2 daily operations integration", () => {
         projectId: created.alphaProject,
       }));
       // A high-priority in-progress task with no project and no owner.
-      created.highUnassigned = idOf(await create(base, `/engagements/${created.alphaEngagement}/tasks/new`, {
+      created.highUnassigned = idOf(await create(base, app.store, `/engagements/${created.alphaEngagement}/tasks/new`, {
         title: "Gather evidence",
         status: "in_progress",
         priority: "high",
@@ -568,7 +630,7 @@ describe("F2 daily operations integration", () => {
         projectId: "",
       }));
       // A waiting task, dated inside the due-soon range.
-      const waiting = idOf(await create(base, `/engagements/${created.alphaEngagement}/tasks/new`, {
+      const waiting = idOf(await create(base, app.store, `/engagements/${created.alphaEngagement}/tasks/new`, {
         title: "Await client reply",
         status: "waiting",
         priority: "high",
@@ -578,7 +640,7 @@ describe("F2 daily operations integration", () => {
         projectId: "",
       }));
       // A done task with a date, which never appears in the date sections.
-      created.done = idOf(await create(base, `/projects/${created.alphaProject}/tasks/new`, {
+      created.done = idOf(await create(base, app.store, `/projects/${created.alphaProject}/tasks/new`, {
         title: "Kickoff done",
         status: "done",
         priority: "low",
@@ -588,7 +650,7 @@ describe("F2 daily operations integration", () => {
         projectId: created.alphaProject,
       }));
       // A high-priority task of the other client, dated soon.
-      const betaHigh = idOf(await create(base, `/engagements/${created.betaEngagement}/tasks/new`, {
+      const betaHigh = idOf(await create(base, app.store, `/engagements/${created.betaEngagement}/tasks/new`, {
         title: "Draft scope",
         status: "open",
         priority: "high",
@@ -599,7 +661,7 @@ describe("F2 daily operations integration", () => {
       }));
       // An actionable non-high task with a date inside the due-soon range: it
       // is dated like the high tasks but must never reach the priority section.
-      const normalSoon = idOf(await create(base, `/projects/${created.alphaProject}/tasks/new`, {
+      const normalSoon = idOf(await create(base, app.store, `/projects/${created.alphaProject}/tasks/new`, {
         title: "Book the room",
         status: "open",
         priority: "normal",
@@ -624,28 +686,28 @@ describe("F2 daily operations integration", () => {
           ? `/projects/${created.alphaProject}/items/new`
           : `/engagements/${created.alphaEngagement}/items/new`;
         const projectId = where === "project" ? created.alphaProject : "";
-        created.items.push(idOf(await create(base, path, { kind, title, context: `${kind} context`, state: "open", projectId })));
+        created.items.push(idOf(await create(base, app.store, path, { kind, title, context: `${kind} context`, state: "open", projectId })));
       }
       // A closed blocker of the other client, which no section shows.
-      const closed = idOf(await create(base, `/engagements/${created.betaEngagement}/items/new`, {
+      const closed = idOf(await create(base, app.store, `/engagements/${created.betaEngagement}/items/new`, {
         kind: "blocker", title: "Closed blocker", context: "", state: "closed", projectId: "",
       }));
       created.items.push(closed);
 
       // -- Meetings on engagement and project scopes. ------------------------
-      created.meetings.push(idOf(await create(base, `/engagements/${created.alphaEngagement}/meetings/new`, {
+      created.meetings.push(idOf(await create(base, app.store, `/engagements/${created.alphaEngagement}/meetings/new`, {
         title: "Audit kickoff",
         date: day(-10),
         notes: "Kickoff notes",
         projectId: "",
       })));
-      created.meetings.push(idOf(await create(base, `/projects/${created.alphaProject}/meetings/new`, {
+      created.meetings.push(idOf(await create(base, app.store, `/projects/${created.alphaProject}/meetings/new`, {
         title: "Field review",
         date: day(-4),
         notes: "Field notes",
         projectId: created.alphaProject,
       })));
-      created.meetings.push(idOf(await create(base, `/engagements/${created.betaEngagement}/meetings/new`, {
+      created.meetings.push(idOf(await create(base, app.store, `/engagements/${created.betaEngagement}/meetings/new`, {
         title: "Discovery interview",
         date: day(-3),
         notes: "",
@@ -768,7 +830,7 @@ describe("F2 daily operations integration", () => {
       // read, is requested; the observation is the baseline the later reads and
       // the refused movement are compared with.
       const readLinks = linksOf(mainContentOf(home.body)).filter((href) => /^\/(clients|engagements|projects|tasks|items|meetings)\/[^/]+$/.test(href));
-      const observedAfterReads = await observe(base, ids, readLinks);
+      const observedAfterReads = await observe(base, app.store, ids, readLinks);
       beforeRefusal = snapshotOf(observedAfterReads);
       // Follow the dashboard's summary links to the existing records. Each
       // record row links its own detail page, its client, engagement and, when
@@ -816,7 +878,7 @@ describe("F2 daily operations integration", () => {
       // Reads recorded nothing: no event was added and no record changed. The
       // stored snapshot taken before the very first page read is the baseline,
       // so a read that changed a record once cannot establish it.
-      assert.equal(snapshotOf(await observe(base, ids, readLinks)), beforeRefusal);
+      assert.equal(snapshotOf(await observe(base, app.store, ids, readLinks)), beforeRefusal);
       assert.deepEqual(await readStore(app.store), beforeFirstRead, "reads leave the store untouched");
       assert.equal(JSON.stringify(journalOf(app.store.snapshot())), journalBeforeReads, "reads add no journal event");
 
@@ -910,13 +972,17 @@ describe("F2 daily operations integration", () => {
       const backBoard = await readBoard(backHref);
       assert.ok(backBoard.includes('<a href="/kanban" aria-current="page">All work</a>'));
       // The board navigation is a read too: the state is unchanged.
-      assert.equal(snapshotOf(await observe(base, ids, readLinks)), beforeRefusal);
+      assert.equal(snapshotOf(await observe(base, app.store, ids, readLinks)), beforeRefusal);
       assert.deepEqual(await readStore(app.store), beforeFirstRead, "board reads leave the store untouched");
 
       // -- Putting an engagement on hold keeps it unfinished. ----------------
       // The engagement's own record page links its edit form; the rendered
       // status select offers on hold, and saving it keeps the engagement in the
       // unfinished overview.
+      // The stored snapshot is taken before the engagement page and its edit
+      // form are read, so both GETs are bracketed by it.
+      const editHrefStore = await readStore(app.store);
+      const editJournal = JSON.stringify(journalOf(app.store.snapshot()));
       const engagementPage = await send(base, { path: `/engagements/${ids.alphaEngagement}` });
       assert.equal(engagementPage.status, 200);
       const editHref = linksOf(mainContentOf(engagementPage.body)).find((href) =>
@@ -925,6 +991,8 @@ describe("F2 daily operations integration", () => {
       assert.ok(editHref !== undefined, "the engagement page links its edit form");
       const editPage = await send(base, { path: editHref });
       assert.equal(editPage.status, 200);
+      assert.deepEqual(await readStore(app.store), editHrefStore, "reading the record and edit form changes no record");
+      assert.equal(JSON.stringify(journalOf(app.store.snapshot())), editJournal, "reading the record and edit form records no event");
       const holdForm = parseForm(editPage.body);
       assert.equal(holdForm.action, editHref);
       assert.equal(holdForm.controls.get("status"), "active");
@@ -938,7 +1006,7 @@ describe("F2 daily operations integration", () => {
       );
       // The dashboard overview still lists it, and its current status badge says
       // on hold; the completed engagement stays out.
-      const onHoldHome = await send(base, { path: "/" });
+      const onHoldHome = await readPage(base, app.store, "/");
       const onHoldSection = sectionOf(onHoldHome.body, "Engagements in progress");
       assert.deepEqual(idsLinked(onHoldSection, "/engagements"), [ids.betaEngagement, ids.alphaEngagement]);
       assert.ok(onHoldSection.includes('<span class="badge">on_hold</span>'));
@@ -951,7 +1019,7 @@ describe("F2 daily operations integration", () => {
 
       // -- A high-priority actionable task to waiting, then to done. --------
       const beforeMove = app.store.snapshot();
-      const allBoard = await send(base, { path: "/kanban" });
+      const allBoard = await readPage(base, app.store, "/kanban");
       const card = boardCards(columnOf(allBoard.body, "Actionable: open")).get(ids.high);
       assert.ok(card !== undefined, "the high task is actionable on all work");
       const moveForm = parseForm(card, `/tasks/${ids.high}/move`);
@@ -987,7 +1055,7 @@ describe("F2 daily operations integration", () => {
       // The dashboard reflects the movement: the task left the high-priority
       // (actionable) section and joined the waiting task section, while a
       // waiting task with a past date still qualifies for the date sections.
-      const afterWaitingHome = await send(base, { path: "/" });
+      const afterWaitingHome = await readPage(base, app.store, "/");
       assert.ok(!sectionOf(afterWaitingHome.body, "High-priority tasks").includes(`href="/tasks/${ids.high}"`));
       assert.ok(sectionOf(afterWaitingHome.body, "Overdue tasks").includes(`href="/tasks/${ids.high}"`));
       assert.ok(sectionOf(afterWaitingHome.body, "Overdue tasks").includes(escapeHtml(`${day(-1)} to ${day(-1)}`)));
@@ -1001,14 +1069,14 @@ describe("F2 daily operations integration", () => {
       assert.ok(newest.includes(`href="/tasks/${ids.high}"`));
       assert.ok(newest.includes(escapeHtml(instant(journalOf(afterWaiting).length).toISOString())));
       // The board shows it in the waiting column.
-      const waitingBoard = await send(base, { path: "/kanban" });
+      const waitingBoard = await readPage(base, app.store, "/kanban");
       assert.ok(boardCards(columnOf(waitingBoard.body, "Waiting: waiting")).has(ids.high));
       assert.ok(!boardCards(columnOf(waitingBoard.body, "Actionable: open")).has(ids.high));
 
       // A movement that the scope check refuses leaves the records and the
       // journal untouched. The stale card's form asserts the task's identity,
       // so submitting it with a scope it is not in is refused with a 400.
-      const refusedState = snapshotOf(await observe(base, ids, readLinks));
+      const refusedState = snapshotOf(await observe(base, app.store, ids, readLinks));
       const staleForm = parseForm(card, `/tasks/${ids.high}/move`);
       staleForm.controls.set("status", "open");
       // The task is inside the project scope, so submit it from a scope it is
@@ -1018,7 +1086,7 @@ describe("F2 daily operations integration", () => {
       const refused = await submit(base, staleForm);
       assert.equal(refused.status, 400);
       assert.match(String(refused.headers["content-type"]), /^text\/plain/);
-      assert.equal(snapshotOf(await observe(base, ids, readLinks)), refusedState, "a refused movement changes nothing");
+      assert.equal(snapshotOf(await observe(base, app.store, ids, readLinks)), refusedState, "a refused movement changes nothing");
       assert.deepEqual(await readStore(app.store), afterWaitingStore, "a refused movement leaves the store untouched");
       // A conflicting identity assertion is refused without a write.
       const forged = parseForm(card, `/tasks/${ids.high}/move`);
@@ -1054,7 +1122,7 @@ describe("F2 daily operations integration", () => {
       assert.equal(afterDone.tasks.find((task) => task.id === ids.high)!.status, "done");
       // The dashboard no longer lists a dated done task anywhere, and the
       // completed high task has left the high-priority section too.
-      const afterDoneHome = await send(base, { path: "/" });
+      const afterDoneHome = await readPage(base, app.store, "/");
       assert.ok(!sectionOf(afterDoneHome.body, "Waiting tasks").includes(`href="/tasks/${ids.high}"`));
       assert.ok(!sectionOf(afterDoneHome.body, "Overdue tasks").includes(`href="/tasks/${ids.high}"`));
       assert.ok(!sectionOf(afterDoneHome.body, "Tasks due soon").includes(`href="/tasks/${ids.high}"`));
@@ -1065,12 +1133,12 @@ describe("F2 daily operations integration", () => {
         "the high-priority section keeps only the open high tasks",
       );
       // Its current record page shows the done status and stays reachable.
-      const donePage = await send(base, { path: `/tasks/${ids.high}` });
+      const donePage = await readPage(base, app.store, `/tasks/${ids.high}`);
       assert.equal(donePage.status, 200);
       assert.match(donePage.body, /<dd><span class="badge">done<\/span><\/dd>/);
 
       // -- Restart: close both, reopen the same temporary directory. --------
-      beforeRestart = snapshotOf(await observe(base, ids, readLinks));
+      beforeRestart = snapshotOf(await observe(base, app.store, ids, readLinks));
       const activityBeforeRestart = JSON.stringify(journalOf(app.store.snapshot()));
       await app.close();
       app = await running(dir, () => NOW, journal);
@@ -1078,7 +1146,7 @@ describe("F2 daily operations integration", () => {
       try {
         // The records and their history read back exactly as before, through
         // the same pages, links and boards.
-        assert.equal(snapshotOf(await observe(base, ids, readLinks)), beforeRestart);
+        assert.equal(snapshotOf(await observe(base, app.store, ids, readLinks)), beforeRestart);
         const restarted = app.store.snapshot();
         assert.equal(JSON.stringify(journalOf(restarted)), activityBeforeRestart);
         // The moved task is done and its two movement events are in history.
@@ -1093,7 +1161,7 @@ describe("F2 daily operations integration", () => {
           assert.equal(movement.at, instant(position + 1).toISOString());
         }
         // The restarted dashboard is the same read-only page at the same day.
-        const restartedHome = await send(base, { path: "/" });
+        const restartedHome = await readPage(base, app.store, "/");
         assert.equal(restartedHome.status, 200);
         assert.ok(restartedHome.body.includes(escapeHtml(TODAY)));
         assert.ok(!sectionOf(restartedHome.body, "Waiting tasks").includes(`href="/tasks/${ids.high}"`));
@@ -1104,7 +1172,7 @@ describe("F2 daily operations integration", () => {
         assert.equal(stamps, journalOf(restarted).length);
         // A read after the restart still records nothing.
         const storeAfterRestart = await readStore(app.store);
-        const stable = snapshotOf(await observe(base, ids, readLinks));
+        const stable = snapshotOf(await observe(base, app.store, ids, readLinks));
         assert.equal(stable, beforeRestart);
         // The reads after the restart leave the reopened store untouched too:
         // both the store snapshot and the journal are unchanged by them.
