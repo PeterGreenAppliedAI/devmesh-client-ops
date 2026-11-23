@@ -259,7 +259,8 @@ describe("transcript storage: schema 6 round trips", () => {
     } finally {
       await writer.close();
     }
-    const saved = JSON.parse(readFileSync(storePath(dir), "utf8"));
+    const savedContent = readFileSync(storePath(dir), "utf8");
+    const saved = JSON.parse(savedContent);
     assert.equal(saved.schemaVersion, 6);
     assert.deepEqual(saved.transcripts, [transcript], "the save wrote every source");
     assert.equal(saved.meetings[0].title, "Saved");
@@ -271,11 +272,7 @@ describe("transcript storage: schema 6 round trips", () => {
     } finally {
       await reopened.close();
     }
-    assert.deepEqual(
-      JSON.parse(readFileSync(storePath(dir), "utf8")).transcripts,
-      [transcript],
-      "reopening never rewrites the file",
-    );
+    assert.equal(readFileSync(storePath(dir), "utf8"), savedContent, "reopening never rewrites the file");
   });
 
   it("round trips a PDF transcript whose passages carry pages", async () => {
