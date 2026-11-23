@@ -560,11 +560,21 @@ describe("transcript store: exact repeats, distinct originals and reuse", () => 
       );
       assert.equal(again.outcome, "reused");
       assert.equal(again.explanation?.code, "exact_repeat");
+      // An omitted project is not a difference; the supplied date and the
+      // explicitly supplied blank notes are.
       assert.deepEqual(again.conflicts, [
         { field: "date", supplied: "2026-02-03", preserved: "2026-01-02" },
-        { field: "projectId", supplied: "", preserved: project.id },
         { field: "notes", supplied: "", preserved: "kept notes" },
       ]);
+      // A genuinely supplied different project is a difference.
+      const otherProject = await ts.store.createProject({ engagementId: parents.engagementId, name: "Q" });
+      const other = await ts.importTranscript(
+        { kind: "paste", text: "Dated words." },
+        createFor(parents, { title: "Same", date: "2026-01-02", projectId: otherProject.id }),
+      );
+      assert.equal(other.outcome, "reused");
+      assert.deepEqual(other.conflicts, [{ field: "projectId", supplied: otherProject.id, preserved: project.id }]);
+      assert.equal(other.meeting.projectId, project.id);
       // The preserved metadata and project are untouched; nothing was written.
       assert.deepEqual(ts.store.snapshot().meetings[0], meetingBefore);
       assert.equal(ts.store.snapshot().meetings.length, 1);
@@ -840,6 +850,47 @@ describe("transcript store: replacement refusal and separate engagements", () =>
       assert.equal(repeat.meeting.id, target.id);
       assert.deepEqual(repeat.sourceIds, elsewhere.sourceIds);
       assert.equal(ts.transcripts().length, 2);
+    } finally {
+      await ts.close();
+    }
+  });
+
+  it("creates one transcript per engagement for identical content", async () => {
+    const dir = tempDir();
+    const { ts, parents } = await freshStore(dir);
+    try {
+      const here = await ts.importTranscript({ kind: "paste", text: "Shared words." }, createFor(parents));
+      assert.equal(here.outcome, "created");
+      const other = await ts.store.createClient({ name: "Other client" });
+      const otherEngagement = await ts.store.createEngagement({ clientId: other.id, name: "Other eng" });
+      // The same content in a different engagement is new content there: it
+      // creates that engagement's own meeting and transcript, not a reuse.
+      const elsewhere = await ts.importTranscript(
+        { kind: "paste", text: "Shared words." },
+        createFor({ clientId: other.id, engagementId: otherEngagement.id }),
+      );
+      assert.equal(elsewhere.outcome, "created", "a different engagement is a separate scope");
+      assert.notEqual(elsewhere.meeting.id, here.meeting.id);
+      assert.equal(elsewhere.transcript.meetingId, elsewhere.meeting.id);
+      assert.equal(here.transcript.meetingId, here.meeting.id);
+      const transcripts = ts.transcripts();
+      assert.equal(transcripts.length, 2, "one canonical transcript per engagement");
+      assert.equal(
+        transcripts.filter((t) => t.meetingId === here.meeting.id).length,
+        1,
+        "the first engagement holds its own transcript",
+      );
+      assert.equal(
+        transcripts.filter((t) => t.meetingId === elsewhere.meeting.id).length,
+        1,
+        "the second engagement holds its own transcript",
+      );
+      assert.equal(ts.store.snapshot().meetings.length, 2);
+      assert.equal(
+        activity(ts.store).filter((event) => event.targetKind === "meeting" && event.action === "create").length,
+        2,
+        "two meeting create events, one per created meeting",
+      );
     } finally {
       await ts.close();
     }

@@ -709,9 +709,12 @@ class TranscriptStoreImpl implements TranscriptStore {
     if (date !== meeting.date) {
       conflicts.push({ field: "date", supplied: date, preserved: meeting.date });
     }
+    // An omitted project is not a supplied one: only a project the caller
+    // actually supplied and that differs from the preserved project is a
+    // difference.
     const projectId = create.projectId as string | undefined;
-    if (projectId !== meeting.projectId) {
-      conflicts.push({ field: "projectId", supplied: projectId ?? "", preserved: meeting.projectId ?? "" });
+    if (projectId !== undefined && projectId !== meeting.projectId) {
+      conflicts.push({ field: "projectId", supplied: projectId, preserved: meeting.projectId ?? "" });
     }
     if (create.notes !== undefined && create.notes !== meeting.notes) {
       conflicts.push({ field: "notes", supplied: create.notes as string, preserved: meeting.notes });
