@@ -654,7 +654,10 @@ describe("work pages: tasks", () => {
       });
       assert.equal(createWaiting.status, 400);
       assert.match(createWaiting.body, /role="alert"/);
-      assert.match(createWaiting.body, /task\.status must be one of/);
+      // The correction message names exactly the statuses the form permits,
+      // so it never tells the user that the refused `waiting` is allowed.
+      assert.match(createWaiting.body, /task\.status must be one of open, in_progress, done(?!.*waiting)/);
+      assert.doesNotMatch(createWaiting.body, /open, in_progress, done, waiting/);
       // The status select is the one marked control, not the title field the
       // refusal message's own word `title` would otherwise name.
       assert.equal((createWaiting.body.match(/aria-invalid="true"/g) ?? []).length, 1);
@@ -669,7 +672,8 @@ describe("work pages: tasks", () => {
       });
       assert.equal(editWaiting.status, 400);
       assert.match(editWaiting.body, /role="alert"/);
-      assert.match(editWaiting.body, /task\.status must be one of/);
+      assert.match(editWaiting.body, /task\.status must be one of open, in_progress, done(?!.*waiting)/);
+      assert.doesNotMatch(editWaiting.body, /open, in_progress, done, waiting/);
       assert.equal((editWaiting.body.match(/aria-invalid="true"/g) ?? []).length, 1);
       assert.match(
         editWaiting.body,

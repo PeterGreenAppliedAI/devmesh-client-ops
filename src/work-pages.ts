@@ -693,8 +693,8 @@ function suppliedValues(
  * The problem with a submitted task status the form does not offer, or null
  * when the status is omitted or offered. The form's choices omit `waiting`
  * until the boards expose it, so a submitted waiting value is refused here,
- * through the usual FormError handling, with the store's ordinary message for
- * an invalid status. The refusal carries the rejected value so the presentation
+ * through the usual FormError handling, with a correctable message naming the
+ * statuses the form permits. The refusal carries the rejected value so the presentation
  * boundary associates it with the status select, never with an incidental word
  * of the message such as `title`. A value the store would also refuse (an
  * unknown status) is left to the form's ordinary validation and the store, so
@@ -707,10 +707,10 @@ function refusedTaskStatus(
   const status = values["status"];
   if ((TASK_FORM_STATUSES as readonly string[]).includes(status)) return null;
   if (!(TASK_STATUSES as readonly string[]).includes(status)) return null;
-  // The ordinary store wording for an invalid status, so the refusal reads
-  // exactly like any other status refusal.
+  // The wording the form uses for its permitted choices, so the correction
+  // message never names a status the form refuses.
   const error = new ValidationError(
-    `task.status must be one of ${TASK_STATUSES.join(", ")}`,
+    `task.status must be one of ${TASK_FORM_STATUSES.join(", ")}`,
   ) as ValidationError & { value: string };
   error.value = status;
   return error;
