@@ -181,12 +181,33 @@ function isBytes(value: unknown): value is Uint8Array {
   return value instanceof Uint8Array;
 }
 
-export function sha256Hex(bytes: Uint8Array): string {
+function sha256Hex(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
 function utf8Bytes(text: string): Uint8Array {
   return new TextEncoder().encode(text);
+}
+
+/**
+ * True when `text` is well formed Unicode: every UTF-16 code unit is a code
+ * point on its own except a high surrogate, which must be followed by a low
+ * surrogate. Text with a lone surrogate cannot be encoded as UTF-8 without
+ * replacing it, which would make an original text and its bytes disagree, so
+ * it is refused rather than silently changed.
+ */
+export function isWellFormedUnicode(text: string): boolean {
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = text.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
 }
 
 export function utf8Length(text: string): number {
@@ -409,27 +430,6 @@ function assemble(
 const PASTE_FILENAME = "Pasted text";
 
 /**
- * True when `text` is well formed Unicode: every UTF-16 code unit is a code
- * point on its own except a high surrogate, which must be followed by a low
- * surrogate. Text with a lone surrogate cannot be encoded as UTF-8 without
- * replacing it, which would make the original text and the original bytes
- * disagree, so it is refused rather than silently changed.
- */
-function isWellFormed(text: string): boolean {
-  for (let index = 0; index < text.length; index += 1) {
-    const code = text.charCodeAt(index);
-    if (code >= 0xd800 && code <= 0xdbff) {
-      const next = text.charCodeAt(index + 1);
-      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
-      index += 1;
-    } else if (code >= 0xdc00 && code <= 0xdfff) {
-      return false;
-    }
-  }
-  return true;
-}
-
-/**
  * Import pasted text. The text is preserved exactly as given (including its
  * whitespace, line endings and BOM) as the original content; the extracted text
  * is the same text. Ill-formed text carrying a lone surrogate is refused with
@@ -441,7 +441,7 @@ export function importPastedText(text: unknown): ImportOutcome {
   if (typeof text !== "string") {
     throw new ValidationError("pasted text must be a string");
   }
-  if (!isWellFormed(text)) {
+  if (!isWellFormedUnicode(text)) {
     return refuse(
       "invalid_text",
       `The pasted text is not well-formed Unicode (it contains a lone surrogate); import pasted text, or a UTF-8 .txt or .md file.`,

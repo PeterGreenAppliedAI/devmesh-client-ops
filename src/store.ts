@@ -63,8 +63,8 @@ import {
   canonicalIdentityOf,
   canonicalize,
   IMPORT_FORMATS,
+  isWellFormedUnicode,
   MAX_CONTENT_BYTES,
-  sha256Hex,
   utf8Length,
   validatePassage,
   type ImportFormat,
@@ -257,15 +257,23 @@ export interface MeetingEdit extends Partial<
  * from and the text extracted from it. The source identity is stored, never
  * regenerated on load.
  *
- * A source's original content is either a file original, named by the SHA-256
- * of its exact bytes together with the byte length (the bytes stay on disk as
- * a hash reference; they are never base64 in the JSON) or an exact pasted
- * original, kept as its own JSON string. Exactly one of the two is present.
- * `extractedText` is the text extracted from the original, and the passages
- * carry its ranges and locations.
+ * A source's original content is either a pasted original, kept as its own
+ * exact JSON string, or a file original, named by the SHA-256 of its exact
+ * bytes together with the byte length (the bytes stay on disk as a hash
+ * reference; they are never base64 in the JSON). Exactly one of the two is
+ * present, chosen by the source's stored format: a `paste` source is exact
+ * text, while every file format (`txt`, `markdown`, `docx`, `pdf`) is a hash
+ * reference. `extractedText` is the text extracted from the original, and the
+ * passages carry its ranges and locations.
+ *
+ * Each source is identified separately and keeps its stored identity: the
+ * format and filename are the source's own, and its passages name it. The
+ * canonical content identity is the transcript's: the canonical transcript is
+ * engagement-wide, while distinct originals (different formats or bytes) may
+ * back it as separate sources.
  */
 export interface TranscriptSource {
-  /** The source identity, equal to the transcript's canonical identity. */
+  /** The source's own identity, stored and never regenerated on load. */
   readonly id: string;
   readonly format: ImportFormat;
   /** The display filename. */
@@ -629,8 +637,16 @@ function transcriptFormat(value: unknown, what: string): ImportFormat {
   return value as ImportFormat;
 }
 
-/** Require a value to be the canonical content of `text`, within the limit. */
+/**
+ * Require `text` to be well-formed Unicode within the content limit, then
+ * require its canonical content and identity to be `canonicalText` and
+ * `identity`. Ill-formed text (a lone surrogate) is refused before it could be
+ * encoded lossily, exactly as an import refuses it.
+ */
 function requireCanonicalText(text: string, canonicalText: unknown, identity: unknown, what: string): void {
+  if (!isWellFormedUnicode(text)) {
+    throw new ValidationError(`${what} is not well-formed Unicode`);
+  }
   if (utf8Length(text) > MAX_CONTENT_BYTES) {
     throw new ValidationError(`${what} exceeds the content limit`);
   }
@@ -643,37 +659,41 @@ function requireCanonicalText(text: string, canonicalText: unknown, identity: un
 }
 
 /**
- * Validate one stored transcript source and return it detached. The source
- * identity is the transcript's canonical identity. Exactly one kind of original
- * is present: a file original is its SHA-256 hash and exact byte length (never
- * base64 content), and a pasted original is its exact text. The extracted text
- * is the authority for the passages: every passage must name the stored source
- * identity, keep its stored id, sit at an in-bounds range that matches its
- * text, and carry its real line and column. Ids are never regenerated.
+ * Validate one stored transcript source and return it detached. The source has
+ * its own stored identity and the source's format selects the original's
+ * shape: a `paste` source is the exact pasted text (its own JSON string), and
+ * every file format is a hash reference, the file original's SHA-256 and exact
+ * byte length (never base64 content). The extracted text is the authority for
+ * the passages: every passage must name the stored source identity, keep its
+ * stored id, sit at an in-bounds range that matches its text, and carry its
+ * real line and column. Source and passage ids are never regenerated.
  */
 function parseSource(
   value: unknown,
   what: string,
   transcriptId: string,
   format: ImportFormat,
-  keys: readonly string[],
-  allowPasted = false,
 ): TranscriptSource {
+  // The original's representation is chosen by the stored format, never by
+  // which key happens to be present: a pasted source must carry its exact
+  // text, while a file-format source must carry a hash and length. A source
+  // carrying the other representation (or both) fails the exact key set.
+  const pasted = format === "paste";
+  const keys = pasted ? SOURCE_PASTE_KEYS : SOURCE_FILE_KEYS;
   const record = transcriptRecord(value, what, keys);
   const id = transcriptNonblank(record.id, `${what}.id`);
-  if (id !== transcriptId) {
-    throw new ValidationError(`${what}.id must equal the transcript id`);
-  }
-  if (transcriptFormat(record.format, `${what}.format`) !== format) {
-    throw new ValidationError(`${what}.format must equal the transcript format`);
-  }
   const filename = transcriptNonblank(record.filename, `${what}.filename`);
   const extractedText = transcriptString(record.extractedText, `${what}.extractedText`);
-  requireCanonicalText(extractedText, canonicalize(extractedText), id, what);
+  // The extracted text's identity must be the transcript's canonical identity,
+  // so every source backs the one canonical transcript.
+  requireCanonicalText(extractedText, canonicalize(extractedText), transcriptId, what);
 
-  if (allowPasted) {
+  if (pasted) {
     // A pasted original is its exact text; the extracted text is the same text.
     const originalText = transcriptString(record.originalText, `${what}.originalText`);
+    if (!isWellFormedUnicode(originalText)) {
+      throw new ValidationError(`${what}.originalText is not well-formed Unicode`);
+    }
     if (originalText !== extractedText) {
       throw new ValidationError(`${what}.extractedText must equal the pasted original text`);
     }
@@ -782,9 +802,14 @@ function parsePassages(
 
 /**
  * Validate one stored transcript: exact keys and types, its identity and
- * canonical content consistent, its meeting present, its sources non-empty
- * with unique identities equal to the transcript identity and exactly one kind
- * of original each, and its passages validated against each source.
+ * canonical content consistent, its meeting present, its sources non-empty,
+ * each source with its own stored identity and exactly one kind of original,
+ * chosen by its format, and its passages validated against each source.
+ *
+ * The stored canonical content is the transcript's, and each source's
+ * extracted text must canonicalise to it. Several sources may back one
+ * canonical transcript, with distinct originals (formats or bytes), but every
+ * source identity is its own: no source may reuse another source's id.
  */
 function parseTranscript(value: unknown, what: string): Transcript {
   const record = transcriptRecord(value, what, TRANSCRIPT_RECORD_KEYS);
@@ -805,7 +830,6 @@ function parseTranscript(value: unknown, what: string): Transcript {
     throw new ValidationError(`${what}.sources must not be empty`);
   }
   const sources: TranscriptSource[] = [];
-  let format: ImportFormat | undefined;
   const seen = new Set<string>();
   for (let index = 0; index < rawSources.length; index += 1) {
     const raw = rawSources[index];
@@ -816,13 +840,7 @@ function parseTranscript(value: unknown, what: string): Transcript {
       (raw as Record<string, unknown>).format,
       `${what}.sources[${index}].format`,
     );
-    if (format === undefined) format = sourceFormat;
-    else if (sourceFormat !== format) {
-      throw new ValidationError(`${what}.sources[${index}].format must equal the transcript format`);
-    }
-    const source = "originalText" in (raw as Record<string, unknown>)
-      ? parseSource(raw, `${what}.sources[${index}]`, id, sourceFormat, SOURCE_PASTE_KEYS, true)
-      : parseSource(raw, `${what}.sources[${index}]`, id, sourceFormat, SOURCE_FILE_KEYS);
+    const source = parseSource(raw, `${what}.sources[${index}]`, id, sourceFormat);
     if (seen.has(source.id)) {
       throw new ValidationError(`${what}.sources[${index}].id is duplicated`);
     }
@@ -839,11 +857,14 @@ function parseTranscript(value: unknown, what: string): Transcript {
 
 /**
  * Validate the stored transcript list against the loaded records and return it
- * detached. A transcript is unique by identity, its meeting must exist and its
- * engagement is resolved through the meeting's authoritative parents, so the
- * meeting's stored client and engagement links are the only ones trusted. Two
- * transcripts in one engagement cannot share the canonical content, even
- * though their originals may differ. A stored source or passage identity is
+ * detached. A transcript is unique by identity and belongs to exactly one
+ * meeting; the meeting must exist and its engagement is resolved through the
+ * meeting's authoritative parents, so the meeting's stored client and
+ * engagement links are the only ones trusted. The canonical content of a
+ * transcript is unique within its engagement, even when two transcripts'
+ * originals differ: one canonical transcript belongs to one meeting, so no
+ * engagement may hold the same canonical content twice. The same content in a
+ * different engagement is not a clash. A stored source or passage identity is
  * kept as stored and never regenerated.
  */
 function parseTranscripts(value: unknown, state: State): readonly Transcript[] {
@@ -851,7 +872,7 @@ function parseTranscripts(value: unknown, state: State): readonly Transcript[] {
     throw new ValidationError("transcripts must be an array");
   }
   const seenIds = new Set<string>();
-  const engagementOf = new Map<string, string>();
+  const seenContent = new Map<string, string>();
   return value.map((raw, index) => {
     const transcript = parseTranscript(raw, `transcripts[${index}]`);
     if (seenIds.has(transcript.id)) {
@@ -873,13 +894,17 @@ function parseTranscripts(value: unknown, state: State): readonly Transcript[] {
         `transcripts[${index}] meeting ${JSON.stringify(meeting.id)} has invalid parent links`,
       );
     }
-    const previous = engagementOf.get(transcript.id);
-    if (previous !== undefined && previous !== meeting.engagementId) {
+    // The canonical content is unique within the engagement the meeting
+    // authoritatively belongs to.
+    const key = `${meeting.engagementId}\u0000${transcript.canonicalText}`;
+    const previous = seenContent.get(key);
+    if (previous !== undefined) {
       throw new ValidationError(
-        `transcript ${JSON.stringify(transcript.id)} belongs to two engagements`,
+        `engagement ${JSON.stringify(meeting.engagementId)} holds duplicate canonical transcript content ` +
+          `(${JSON.stringify(previous)} and ${JSON.stringify(transcript.id)})`,
       );
     }
-    engagementOf.set(transcript.id, meeting.engagementId);
+    seenContent.set(key, transcript.id);
     return transcript;
   });
 }

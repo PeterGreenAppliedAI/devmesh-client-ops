@@ -106,6 +106,17 @@ function documentWithEveryFamily(overrides: Record<string, unknown> = {}) {
   };
 }
 
+/**
+ * The same document at schema 5, which predates the transcripts: it keeps the
+ * journal fields but carries no transcript list. Tests use it to check that
+ * the schema-5 rules still hold alongside the schema-6 rules.
+ */
+function documentAtSchemaFive(): Record<string, unknown> {
+  const document = documentWithEveryFamily({ schemaVersion: 5 }) as Record<string, unknown>;
+  delete document.transcripts;
+  return document;
+}
+
 /** A valid base event; overrides are untyped so malformed values can be built. */
 function event(overrides: Record<string, unknown> = {}): ActivityEvent {
   return {
@@ -375,7 +386,9 @@ describe("activity journal storage", () => {
 
   it("refuses a schema 5 document that lacks or misplaces the journal fields", async () => {
     const dir = tempDir();
-    const base = documentWithEveryFamily();
+    // A version 5 document: the journal fields are required and the transcripts
+    // do not exist yet, so the base carries the journal and no transcript list.
+    const base = documentAtSchemaFive();
     const withoutActivity = { ...base };
     delete (withoutActivity as Record<string, unknown>).activity;
     await assertRefused(dir, withoutActivity, /invalid/);

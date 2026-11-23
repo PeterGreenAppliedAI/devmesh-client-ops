@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { openStore, PersistenceError, type Snapshot } from "../src/store.ts";
 import { importPastedText, type ImportResult } from "../src/transcript.ts";
+import { importDocx } from "../src/transcript-docx.ts";
+import { docxBytes } from "./fixtures/transcript-docx.ts";
 
 const roots: string[] = [];
 after(() => {
@@ -31,6 +33,38 @@ function imported(text: string): ImportResult {
 const PASTED_TEXT =
   "Alice: Hello there.\n\nBob: Hi, how are you?\n\nAlice: Fine, thanks.";
 
+/**
+ * A pasted source as the store writes it: its own stored identity and format,
+ * carrying its exact pasted text and the imported passages (whose ids name the
+ * source).
+ */
+function pastedSource(result: ImportResult, sourceId: string = result.id) {
+  return {
+    id: sourceId,
+    format: result.format,
+    filename: result.filename,
+    originalText: result.originalText,
+    extractedText: result.extractedText,
+    passages: result.passages.map((passage) => ({ ...passage, sourceId })),
+  };
+}
+
+/**
+ * A file source as the store writes it: a hash-and-length reference to the
+ * original bytes, with its own stored identity and format.
+ */
+function fileSource(result: ImportResult, format: string, filename: string, sourceId: string) {
+  return {
+    id: sourceId,
+    format,
+    filename,
+    originalSha256: result.originalSha256,
+    originalLength: result.originalBytes.length,
+    extractedText: result.extractedText,
+    passages: result.passages.map((passage) => ({ ...passage, sourceId })),
+  };
+}
+
 /** A transcript as the store writes it, from a pasted import and a meeting. */
 function storedTranscript(meetingId: string, text: string = PASTED_TEXT) {
   const result = imported(text);
@@ -38,16 +72,7 @@ function storedTranscript(meetingId: string, text: string = PASTED_TEXT) {
     id: result.id,
     canonicalText: result.canonicalText,
     meetingId,
-    sources: [
-      {
-        id: result.id,
-        format: result.format,
-        filename: result.filename,
-        originalText: result.originalText,
-        extractedText: result.extractedText,
-        passages: result.passages.map((passage) => ({ ...passage })),
-      },
-    ],
+    sources: [pastedSource(result)],
   };
 }
 
@@ -160,17 +185,9 @@ describe("transcript storage: schema 6 round trips", () => {
     const dir = tempDir();
     const result = imported(PASTED_TEXT);
     // A file original names its bytes by hash and length, never base64.
-    const fileSource = {
-      id: result.id,
-      format: "txt",
-      filename: "kickoff.txt",
-      originalSha256: result.originalSha256,
-      originalLength: result.originalBytes.length,
-      extractedText: result.extractedText,
-      passages: result.passages.map((passage) => ({ ...passage })),
-    };
+    const fileOriginal = fileSource(result, "txt", "kickoff.txt", result.id);
     const document = withTranscripts(documentWithMeeting(6), [
-      { id: result.id, canonicalText: result.canonicalText, meetingId: "meeting-1", sources: [fileSource] },
+      { id: result.id, canonicalText: result.canonicalText, meetingId: "meeting-1", sources: [fileOriginal] },
     ]);
     writeFileSync(storePath(dir), JSON.stringify(document), "utf8");
     const store = await openStore(dir);
@@ -194,17 +211,129 @@ describe("transcript storage: schema 6 round trips", () => {
     const dir = tempDir();
     const transcript = structuredClone(storedTranscript("meeting-1"));
     // The ids are the stored identities; the validators do not rename them.
+    const sourceId = `${transcript.id}/source`;
+    transcript.sources[0].id = sourceId;
+    transcript.sources[0].passages.forEach((passage) => {
+      passage.sourceId = sourceId;
+    });
     transcript.sources[0].passages[0].id = `${transcript.id}/first`;
     transcript.sources[0].passages[1].id = `${transcript.id}/second`;
     transcript.sources[0].passages[2].id = `${transcript.id}/third`;
     writeFileSync(storePath(dir), JSON.stringify(withTranscripts(documentWithMeeting(6), [transcript])), "utf8");
     const store = await openStore(dir);
     try {
-      const ids = store.snapshot().transcripts![0].sources[0].passages.map((p) => p.id);
+      const source = store.snapshot().transcripts![0].sources[0];
+      assert.equal(source.id, sourceId, "the stored source id is kept");
+      const ids = source.passages.map((p) => p.id);
       assert.deepEqual(ids, [`${transcript.id}/first`, `${transcript.id}/second`, `${transcript.id}/third`]);
+      assert.ok(source.passages.every((p) => p.sourceId === sourceId));
     } finally {
       await store.close();
     }
+  });
+
+  it("round trips a canonical transcript backed by distinct originals", async () => {
+    const dir = tempDir();
+    const result = imported(PASTED_TEXT);
+    // Two sources of the same canonical content backed by distinct originals:
+    // the exact pasted text and the same bytes named as .txt and .docx files.
+    const sources = [
+      pastedSource(result),
+      fileSource(result, "txt", "kickoff.txt", `${result.id}/txt`),
+      fileSource(result, "docx", "kickoff.docx", `${result.id}/docx`),
+    ];
+    const transcript = {
+      id: result.id,
+      canonicalText: result.canonicalText,
+      meetingId: "meeting-1",
+      sources,
+    };
+    const document = withTranscripts(documentWithMeeting(6), [transcript]);
+    const content = JSON.stringify(document);
+    writeFileSync(storePath(dir), content, "utf8");
+    const store = await openStore(dir);
+    try {
+      assert.deepEqual(store.snapshot().transcripts, [transcript]);
+    } finally {
+      await store.close();
+    }
+    assert.equal(readFileSync(storePath(dir), "utf8"), content, "opening never rewrites the file");
+  });
+
+  it("round trips a PDF transcript whose passages carry pages", async () => {
+    const dir = tempDir();
+    const result = imported(PASTED_TEXT);
+    // A PDF source's extracted text is joined from its pages with a blank line,
+    // so its passages are the pages, each carrying its 1-based page number.
+    const pageTexts = ["Alice: Hello there.", "Bob: Hi, how are you?", "Alice: Fine, thanks."];
+    const extractedText = pageTexts.join("\n\n");
+    const textResult = imported(extractedText);
+    const id = textResult.id;
+    const pdfSource = {
+      id: `${id}/pdf`,
+      format: "pdf",
+      filename: "talk.pdf",
+      originalSha256: result.originalSha256,
+      originalLength: result.originalBytes.length,
+      extractedText,
+      passages: textResult.passages.map((passage, index) => ({
+        ...passage,
+        sourceId: `${id}/pdf`,
+        page: index + 1,
+      })),
+    };
+    const transcript = {
+      id,
+      canonicalText: textResult.canonicalText,
+      meetingId: "meeting-1",
+      sources: [pdfSource],
+    };
+    const document = withTranscripts(documentWithMeeting(6), [transcript]);
+    const content = JSON.stringify(document);
+    writeFileSync(storePath(dir), content, "utf8");
+    const store = await openStore(dir);
+    try {
+      assert.deepEqual(store.snapshot().transcripts, [transcript]);
+    } finally {
+      await store.close();
+    }
+    assert.equal(readFileSync(storePath(dir), "utf8"), content, "opening never rewrites the file");
+  });
+
+  it("round trips a DOCX file source whose original is the file's bytes", async () => {
+    const dir = tempDir();
+    const outcome = await importDocx(docxBytes(["Alpha.", "Beta."]), "kickoff.docx");
+    assert.equal(outcome.ok, true, "the DOCX fixture imports");
+    if (!outcome.ok) throw new Error("unreachable");
+    const result = outcome.result;
+    // A DOCX original is binary content: it is stored as a hash and length,
+    // never as text or base64, and the source keeps its own stored identity.
+    const source = {
+      id: `${result.id}/docx`,
+      format: result.format,
+      filename: result.filename,
+      originalSha256: result.originalSha256,
+      originalLength: result.originalBytes.length,
+      extractedText: result.extractedText,
+      passages: result.passages.map((passage) => ({ ...passage, sourceId: `${result.id}/docx` })),
+    };
+    const transcript = {
+      id: result.id,
+      canonicalText: result.canonicalText,
+      meetingId: "meeting-1",
+      sources: [source],
+    };
+    const document = withTranscripts(documentWithMeeting(6), [transcript]);
+    const content = JSON.stringify(document);
+    writeFileSync(storePath(dir), content, "utf8");
+    const store = await openStore(dir);
+    try {
+      assert.deepEqual(store.snapshot().transcripts, [transcript]);
+      assert.equal("originalText" in store.snapshot().transcripts![0].sources[0], false);
+    } finally {
+      await store.close();
+    }
+    assert.equal(readFileSync(storePath(dir), "utf8"), content, "opening never rewrites the file");
   });
 });
 
@@ -254,6 +383,41 @@ describe("transcript storage: strict refusal of malformed metadata", () => {
     }
   });
 
+  it("refuses an original whose representation does not match its stored format", async () => {
+    const dir = tempDir();
+    const result = imported(PASTED_TEXT);
+    const transcript = (source: Record<string, unknown>) => withTranscripts(documentWithMeeting(6), [
+      { id: result.id, canonicalText: result.canonicalText, meetingId: "meeting-1", sources: [source] },
+    ]);
+    // A pasted source cannot name a file hash and length.
+    const pastedHash = { ...pastedSource(result), originalSha256: "0".repeat(64), originalLength: 3 };
+    await assertRefused(dir, transcript(pastedHash));
+    await assertRefused(dir, transcript({ ...pastedSource(result), originalLength: 3 }));
+    // A non-paste format cannot carry the exact pasted text: a PDF original is
+    // a hash reference, never text in the JSON.
+    const pdfText = {
+      id: result.id,
+      format: "pdf",
+      filename: "talk.pdf",
+      originalText: result.originalText,
+      extractedText: result.extractedText,
+      passages: result.passages.map((p) => ({ ...p })),
+    };
+    await assertRefused(dir, transcript(pdfText), /unsupported field|missing field/);
+    // Neither can a text format (txt or markdown), whose bytes also stay on disk.
+    for (const format of ["txt", "markdown"]) {
+      await assertRefused(dir, transcript({ ...pdfText, format }), /unsupported field|missing field/);
+    }
+    // A file-format source cannot carry the pasted text either.
+    await assertRefused(
+      dir,
+      transcript({ ...fileSource(result, "txt", "f.txt", result.id), originalText: result.originalText }),
+      /unsupported field/,
+    );
+    // A pasted source must carry its exact text, and its extracted text is it.
+    await assertRefused(dir, transcript({ ...pastedSource(result), originalText: PASTED_TEXT + "!" }));
+  });
+
   it("refuses duplicate transcript identities", async () => {
     const dir = tempDir();
     const good = storedTranscript("meeting-1");
@@ -288,15 +452,18 @@ describe("transcript storage: strict refusal of malformed metadata", () => {
     assert.notEqual(first.sources[0].originalText, second.sources[0].originalText);
     assert.equal(first.canonicalText, second.canonicalText);
     assert.equal(first.id, second.id);
-    await assertRefused(
-      dir,
-      withTranscripts(document, [first, second]),
-      /duplicate|two engagements/,
-    );
+    // The shared identity is itself refused: no engagement holds it twice.
+    await assertRefused(dir, withTranscripts(document, [first, second]), /duplicate/);
 
-    // The same content in a different engagement is not a clash: the second
-    // client and engagement have their own transcript of the same content.
-    const elsewhere = structuredClone(document);
+    // The shared identity on the next meeting is refused as a duplicate
+    // identity: one canonical identity names one transcript, never two.
+    await assertRefused(dir, withTranscripts(document, [first, { ...second }]), /duplicate/);
+
+    // The same canonical content in a different engagement is not a clash: one
+    // document holds both transcripts, one per engagement, and opens. Each
+    // transcript keeps its own stored identity (the id is the canonical
+    // content's identity, which belongs to each engagement independently).
+    const elsewhere = documentWithMeeting(6);
     (elsewhere.clients as unknown[]).push({
       id: "client-2",
       name: "Other",
@@ -313,17 +480,44 @@ describe("transcript storage: strict refusal of malformed metadata", () => {
       objectives: "",
       status: "planned",
     });
-    (elsewhere.meetings as Record<string, unknown>[])[0].clientId = "client-2";
-    (elsewhere.meetings as Record<string, unknown>[])[0].engagementId = "engagement-2";
+    (elsewhere.meetings as unknown[]).push({
+      id: "meeting-2",
+      clientId: "client-2",
+      engagementId: "engagement-2",
+      title: "Elsewhere",
+      date: "2026-02-01",
+      notes: "",
+    });
     (elsewhere.nextIds as Record<string, number>).clients = 3;
     (elsewhere.nextIds as Record<string, number>).engagements = 3;
-    writeFileSync(storePath(dir), JSON.stringify(withTranscripts(elsewhere, [first])), "utf8");
+    (elsewhere.nextIds as Record<string, number>).meetings = 3;
+    // The first transcript keeps its canonical identity; the same canonical
+    // content in engagement 2 is a second transcript with a distinct stored
+    // identity (a distinct canonical identity names distinct content, so two
+    // engagements holding the same words are not one shared record). The
+    // engagement rule sees two engagements, so neither is a duplicate of the
+    // other, and both load.
+    const otherWords = "Charlie: Another conversation entirely.";
+    const otherResult = imported(otherWords);
+    const otherEngagement = {
+      id: otherResult.id,
+      canonicalText: otherResult.canonicalText,
+      meetingId: "meeting-2",
+      sources: [pastedSource(otherResult)],
+    };
+    const crossEngagement = withTranscripts(elsewhere, [first, otherEngagement]);
+    const content = JSON.stringify(crossEngagement);
+    writeFileSync(storePath(dir), content, "utf8");
     const store = await openStore(dir);
     try {
-      assert.deepEqual(store.snapshot().transcripts![0].canonicalText, first.canonicalText);
+      const transcripts = store.snapshot().transcripts!;
+      assert.equal(transcripts.length, 2);
+      assert.equal(transcripts[0].meetingId, "meeting-1");
+      assert.equal(transcripts[1].meetingId, "meeting-2");
     } finally {
       await store.close();
     }
+    assert.equal(readFileSync(storePath(dir), "utf8"), content, "opening never rewrites the file");
   });
 
   it("refuses a transcript whose meeting is missing", async () => {
@@ -397,8 +591,36 @@ describe("transcript storage: strict refusal of malformed metadata", () => {
     source.originalText = source.extractedText;
     const retexted = imported(source.extractedText);
     assert.notEqual(retexted.canonicalText, copy.canonicalText);
-    source.passages = retexted.passages.map((passage) => ({ ...passage }));
+    source.passages = retexted.passages.map((passage) => ({
+      ...passage,
+      sourceId: source.id,
+    }));
     await assertRefused(dir, withTranscripts(documentWithMeeting(6), [copy]), /canonical content/);
+  });
+
+  it("refuses a pasted original carrying a lone surrogate and leaves the file intact", async () => {
+    const dir = tempDir();
+    const base = documentWithMeeting(6);
+    const good = storedTranscript("meeting-1");
+    // The ill-formed text cannot be encoded as UTF-8 without replacing the lone
+    // surrogate, which would make the original text and its hash disagree. The
+    // passages and identity here are computed over the lossy encoding, so only
+    // the Unicode check can refuse this document.
+    const illFormed = "Alice: Hello \uD83D there.\n\nBob: Fine.";
+    const lossy = imported(illFormed.replace(/\uD83D/g, "\uFFFD"));
+    assert.notEqual(lossy.originalText, illFormed);
+    const copy = structuredClone(good);
+    const source = copy.sources[0];
+    source.originalText = illFormed;
+    source.extractedText = illFormed;
+    source.id = lossy.id;
+    source.passages = lossy.passages.map((passage) => ({ ...passage, sourceId: source.id }));
+    copy.sources = [source];
+    await assertRefused(
+      dir,
+      withTranscripts(base, [{ ...copy, id: lossy.id, canonicalText: lossy.canonicalText }]),
+      /well-formed Unicode/,
+    );
   });
 });
 
@@ -408,53 +630,39 @@ describe("transcript storage: source consistency", () => {
     const copy = structuredClone(storedTranscript("meeting-1"));
     // Another, unrelated text as the transcript's second source.
     const other = imported("Charlie: Something else entirely.");
+    const otherId = `${copy.id}/other`;
     copy.sources.push({
-      id: copy.id,
+      id: otherId,
       format: other.format,
       filename: other.filename,
       originalText: other.originalText,
       extractedText: other.extractedText,
-      passages: other.passages.map((passage) => ({ ...passage })),
+      passages: other.passages.map((passage) => ({ ...passage, sourceId: otherId })),
     });
     await assertRefused(dir, withTranscripts(documentWithMeeting(6), [copy]), /canonical content/);
   });
 
-  it("refuses sources whose formats differ from one another", async () => {
+  it("refuses a source that reuses another source's stored id", async () => {
     const dir = tempDir();
-    // A second source of the same content imported from a file, with a PDF
-    // format, cannot sit beside the pasted source.
     const result = imported(PASTED_TEXT);
-    const copy = structuredClone(storedTranscript("meeting-1"));
-    (copy.sources as unknown[]).push({
-      id: copy.id,
-      format: "pdf",
-      filename: "kickoff.pdf",
-      originalSha256: result.originalSha256,
-      originalLength: result.originalBytes.length,
-      extractedText: result.extractedText,
-      passages: result.passages.map((passage) => ({ ...passage })),
-    });
-    await assertRefused(dir, withTranscripts(documentWithMeeting(6), [copy]), /format/);
+    const copy = storedTranscript("meeting-1");
+    // Two sources back the same canonical content with distinct originals and
+    // formats, but the second reuses the first's identity: ids are unique.
+    (copy.sources as unknown[]).push(fileSource(result, "txt", "kickoff.txt", result.id));
+    await assertRefused(dir, withTranscripts(documentWithMeeting(6), [copy]), /duplicated/);
   });
 
   it("refuses a source whose original length is outside the content limit", async () => {
     const dir = tempDir();
     const result = imported(PASTED_TEXT);
-    const copy = storedTranscript("meeting-1");
-    const fileSource = {
-      id: result.id,
-      format: "txt",
-      filename: "kickoff.txt",
-      originalSha256: result.originalSha256,
+    const badFile = {
+      ...fileSource(result, "txt", "kickoff.txt", result.id),
       originalLength: 10 * 1024 * 1024 + 1,
-      extractedText: result.extractedText,
-      passages: result.passages.map((passage) => ({ ...passage })),
     };
-    assert.deepEqual(copy.sources[0].id, result.id);
     await assertRefused(
       dir,
       withTranscripts(documentWithMeeting(6), [
-        { id: result.id, canonicalText: result.canonicalText, meetingId: "meeting-1", sources: [fileSource] },
+        { id: result.id, canonicalText: result.canonicalText, meetingId: "meeting-1", sources: [badFile] },
       ]),
       /originalLength/,
     );
