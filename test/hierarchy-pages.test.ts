@@ -6,6 +6,7 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { after, describe, it } from "node:test";
 import { escapeHtml, renderForm } from "../src/html.ts";
+import { matchHierarchyPath } from "../src/hierarchy-pages.ts";
 import {
   DEFAULT_PORT,
   DATA_DIRECTORY_NAME,
@@ -1267,7 +1268,7 @@ describe("hierarchy pages", () => {
       assert.match(empty.body, /New engagement/);
       const createEngagement = `<a href="/clients/${client.id}/engagements/new">New engagement</a>`;
       for (const title of [
-        "Current tasks (open or in progress)",
+        "Current tasks (open, in progress or waiting)",
         "Open blockers",
         "Open questions",
         "Decisions",
@@ -1302,7 +1303,7 @@ describe("hierarchy pages", () => {
       const filled = await send(server.origin, { path: `/clients/${client.id}` });
       assert.equal(filled.status, 200);
       for (const title of [
-        "Current tasks (open or in progress)",
+        "Current tasks (open, in progress or waiting)",
         "Open blockers",
         "Open questions",
         "Decisions",
@@ -1324,7 +1325,7 @@ describe("hierarchy pages", () => {
       // The work sections name the engagement in the client's own engagement
       // list, which is the choice; the client's empty work sections never
       // open it as if it had been chosen.
-      for (const title of ["Current tasks (open or in progress)", "Open blockers", "Open questions", "Decisions", "Meeting history"]) {
+      for (const title of ["Current tasks (open, in progress or waiting)", "Open blockers", "Open questions", "Decisions", "Meeting history"]) {
         assert.ok(!sectionOf(filled.body, title).includes(`/engagements/${engagement.id}`), title);
       }
     } finally {
@@ -1901,6 +1902,49 @@ describe("hierarchy pages", () => {
   });
 });
 
+describe("hierarchy pages link to their boards", () => {
+  it("offers a board link on the client, engagement and project pages", async () => {
+    const server = await running();
+    try {
+      const client = await server.store.createClient({ name: "Acme" });
+      const engagement = await server.store.createEngagement({ clientId: client.id, name: "Delivery" });
+      const project = await server.store.createProject({ engagementId: engagement.id, name: "Project" });
+      const clientPage = await send(server.origin, { path: `/clients/${client.id}` });
+      assert.match(clientPage.body, new RegExp(`href="/clients/${client.id}/kanban">Client board</a>`));
+      const engagementPage = await send(server.origin, { path: `/engagements/${engagement.id}` });
+      assert.match(engagementPage.body, new RegExp(`href="/engagements/${engagement.id}/kanban">Engagement board</a>`));
+      const projectPage = await send(server.origin, { path: `/projects/${project.id}` });
+      assert.match(projectPage.body, new RegExp(`href="/projects/${project.id}/kanban">Project board</a>`));
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("lists a waiting task in the client's current-task section", async () => {
+    const server = await running();
+    try {
+      const client = await server.store.createClient({ name: "Acme" });
+      const engagement = await server.store.createEngagement({ clientId: client.id, name: "Delivery" });
+      const waiting = await server.store.createTask({
+        clientId: client.id,
+        engagementId: engagement.id,
+        title: "Waiting work",
+        status: "waiting",
+      });
+      const overview = await send(server.origin, { path: `/clients/${client.id}` });
+      assert.equal(overview.status, 200);
+      const heading = escapeHtml("Current tasks (open, in progress or waiting)");
+      const start = overview.body.indexOf(`<h2>${heading}</h2>`);
+      assert.ok(start >= 0, "the current-task heading names waiting");
+      const section = overview.body.slice(start, overview.body.indexOf("</section>", start));
+      assert.match(section, new RegExp(`href="/tasks/${waiting.id}"`));
+      assert.match(section, /<span class="badge">waiting<\/span>/);
+    } finally {
+      await server.close();
+    }
+  });
+});
+
 describe("hierarchy route matching", () => {
   it("registers the canonical list and detail routes plus explicit forms", async () => {
     const store = await openStore(tempDir());
@@ -1918,6 +1962,11 @@ describe("hierarchy route matching", () => {
       assert.deepEqual(match("/clients/client-1/engagements/new"), { pattern: "/clients/:id/engagements/new", id: "client-1" });
       assert.deepEqual(match("/projects/project-1"), { pattern: "/projects/:id", id: "project-1" });
       assert.deepEqual(match("/projects/new"), { pattern: "/projects/new", id: "" });
+      // The canonical hierarchy matcher names only hierarchy paths; a board
+      // path is matched earlier, by the board table.
+      for (const path of ["/kanban", "/tasks/task-1/move"]) {
+        assert.equal(matchHierarchyPath(path), null, path);
+      }
       // Paths outside the hierarchy patterns are not matched.
       for (const path of ["/", "/health", "/unknown", "/clients/", "/clients/client-1/other"]) {
         assert.equal(match(path), null, path);

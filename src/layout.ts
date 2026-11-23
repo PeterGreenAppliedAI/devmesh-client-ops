@@ -11,8 +11,10 @@
  * parent.
  *
  * Navigation lists the active (not effectively archived) clients, marks the
- * client of the current page, and always offers Home, Clients, New client and
- * Archived.
+ * client of the current page, and always offers Home, Clients, Kanban, New
+ * client and Archived. Kanban is global, so every application page links to
+ * the whole-workspace board, and a board page for a recorded scope carries the
+ * same known ancestry as that record's detail page.
  * The laptop sidebar is persistent; the phone top menu is a native `details`
  * control, so it opens and closes from the keyboard with no script (the
  * document's content security policy forbids scripts).
@@ -172,6 +174,10 @@ function ancestryFor(
   const [family, rawId] = segments;
   if (family === undefined) return [];
   if (family === "health") return [];
+  if (family === "kanban") return [];
+  // A board page for one record's scope (`/clients/:id/kanban`) shows the same
+  // known chain as that record's detail page, because its first two segments
+  // name the record; the trailing `kanban` segment does not change the chain.
   if (family === "clients") {
     if (rawId === undefined || rawId === "new") return [];
     const id = decodeId(rawId);
@@ -317,6 +323,7 @@ function navigationItems(context: LayoutContext): string {
   const fixed = [
     { id: "", name: "Home", href: "/" },
     { id: "", name: "Clients", href: "/clients" },
+    { id: "", name: "Kanban", href: "/kanban" },
     { id: "", name: "New client", href: "/clients/new" },
     { id: "", name: "Archived", href: "/archived" },
   ];

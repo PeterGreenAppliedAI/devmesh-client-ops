@@ -26,6 +26,7 @@ import type { WorkRoute } from "./work-pages.ts";
 import { matchMeetingPath, meetingRoutes, routeForMeetingPattern, type MeetingPath } from "./meeting-pages.ts";
 import type { MeetingRoute } from "./meeting-pages.ts";
 import { archivedRoutes, archiveRoutes, matchArchivePath, type ArchivePath, type ArchiveRoute } from "./archive-pages.ts";
+import { kanbanRoutes, matchKanbanPath, routeForKanbanPattern, type KanbanPath, type KanbanRoute } from "./kanban-pages.ts";
 import { openStore, type Store } from "./store.ts";
 
 export function health(): { status: "ok" } {
@@ -122,7 +123,7 @@ export interface Application {
  * what a match is and how it maps to a guarded route.
  */
 export interface HierarchyPathMatch {
-  readonly pattern: HierarchyPath | WorkPath | MeetingPath | ArchivePath | "/archived";
+  readonly pattern: HierarchyPath | WorkPath | MeetingPath | ArchivePath | KanbanPath | "/archived";
   readonly id: string;
 }
 
@@ -143,6 +144,7 @@ export function registerRoutes(store: Store): Routes {
   const meetings = meetingRoutes(store);
   const archive = archiveRoutes(store);
   const archived = archivedRoutes(store).archived;
+  const kanban = kanbanRoutes(store);
   const table: PathRouteTable<HierarchyPathMatch> = {
     match: (path: string) => {
       // The archive endpoints and the archived discovery page are matched
@@ -154,6 +156,11 @@ export function registerRoutes(store: Store): Routes {
       if (path.split("?")[0] === "/archived") return { pattern: "/archived", id: "" };
       const matched = matchHierarchyPath(path);
       if (matched !== null) return matched;
+      // The board paths (`/kanban`, `/:family/:id/kanban` and
+      // `/tasks/:id/move`) are fixed shapes, matched before work paths so
+      // their exact segments are never read as a work route.
+      const board = matchKanbanPath(path);
+      if (board !== null) return board;
       const work = matchWorkPath(path);
       if (work !== null) return work;
       return matchMeetingPath(path);
@@ -172,11 +179,13 @@ export function registerRoutes(store: Store): Routes {
         const route = method === "POST" ? action.post : undefined;
         return route === undefined ? undefined : adaptRoute(route);
       }
-      const route = isWorkPath(matched.pattern)
-        ? routeForWorkPattern(work, matched.pattern, method)
-        : isMeetingPath(matched.pattern)
-          ? routeForMeetingPattern(meetings, matched.pattern, method)
-          : routeForPattern(hierarchy, matched.pattern as HierarchyPath, method);
+      const route = isKanbanPath(matched.pattern)
+        ? routeForKanbanPattern(kanban, matched.pattern, method)
+        : isWorkPath(matched.pattern)
+          ? routeForWorkPattern(work, matched.pattern, method)
+          : isMeetingPath(matched.pattern)
+            ? routeForMeetingPattern(meetings, matched.pattern, method)
+            : routeForPattern(hierarchy, matched.pattern as HierarchyPath, method);
       return route === undefined ? undefined : adaptRoute(route);
     },
   };
@@ -195,6 +204,19 @@ const WORK_PATTERNS: readonly WorkPath[] = Object.freeze([
   "/projects/:id/items/new",
 ]);
 
+/** The fixed board patterns; a matched pattern outside every list is a hierarchy pattern. */
+const KANBAN_PATTERNS: readonly KanbanPath[] = Object.freeze([
+  "/kanban",
+  "/clients/:id/kanban",
+  "/engagements/:id/kanban",
+  "/projects/:id/kanban",
+  "/tasks/:id/move",
+]);
+
+function isKanbanPath(pattern: string): pattern is KanbanPath {
+  return (KANBAN_PATTERNS as readonly string[]).includes(pattern);
+}
+
 function isWorkPath(pattern: string): pattern is WorkPath {
   return (WORK_PATTERNS as readonly string[]).includes(pattern);
 }
@@ -212,7 +234,7 @@ function isMeetingPath(pattern: string): pattern is MeetingPath {
 }
 
 /** Adapt a hierarchy, work, meeting or archive route to the shell's generic route interface. */
-function adaptRoute(route: HierarchyRoute | WorkRoute | MeetingRoute | ArchiveRoute): { readonly method: "GET" | "POST"; render(request: RouteRequest): Promise<RouteResult> | RouteResult } {
+function adaptRoute(route: HierarchyRoute | WorkRoute | MeetingRoute | ArchiveRoute | KanbanRoute): { readonly method: "GET" | "POST"; render(request: RouteRequest): Promise<RouteResult> | RouteResult } {
   return {
     method: route.method,
     render: (request: RouteRequest) => route.render(request),

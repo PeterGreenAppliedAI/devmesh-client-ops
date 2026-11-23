@@ -439,7 +439,11 @@ function clientShowPage(client: Client, snapshot: Snapshot, store: Store): Page 
     };
   });
 
-  const currentTasks = tasks.filter((task) => task.status === "open" || task.status === "in_progress");
+  // Current tasks include waiting: the actionable and waiting statuses are all
+  // still live work, so open, in_progress and waiting are current; done is not.
+  const currentTasks = tasks.filter(
+    (task) => task.status === "open" || task.status === "in_progress" || task.status === "waiting",
+  );
   const blockers = items.filter((item) => item.kind === "blocker" && item.state === "open");
   const questions = items.filter((item) => item.kind === "question" && item.state === "open");
   const decisions = items.filter((item) => item.kind === "decision");
@@ -494,6 +498,7 @@ function clientShowPage(client: Client, snapshot: Snapshot, store: Store): Page 
       { label: "Home", href: "/" },
       { label: "Clients", href: "/clients" },
       { label: "Edit client", href: `/clients/${encodeURIComponent(clientId)}/edit` },
+      { label: "Client board", href: `/clients/${encodeURIComponent(clientId)}/kanban` },
     ],
     [
       {
@@ -526,7 +531,7 @@ function clientShowPage(client: Client, snapshot: Snapshot, store: Store): Page 
               })
             : `<ul>${countLines.join("")}</ul>`,
       },
-      cardSection("Current tasks (open or in progress)", taskCardList(currentTasks), {
+      cardSection("Current tasks (open, in progress or waiting)", taskCardList(currentTasks), {
         empty: "No current tasks.",
         nextStep,
       }),
@@ -630,6 +635,7 @@ function engagementShowPage(engagement: Engagement, snapshot: Snapshot, store: S
       { label: "Clients", href: "/clients" },
       { label: client.name, href: `/clients/${encodeURIComponent(client.id)}` },
       { label: "Edit engagement", href: `/engagements/${encodeURIComponent(engagement.id)}/edit` },
+      { label: "Engagement board", href: `/engagements/${encodeURIComponent(engagement.id)}/kanban` },
     ],
     sections,
   );
@@ -647,6 +653,7 @@ function projectShowPage(project: Project, snapshot: Snapshot, store: Store): Pa
       { label: client.name, href: `/clients/${encodeURIComponent(client.id)}` },
       { label: engagement.name, href: `/engagements/${encodeURIComponent(engagement.id)}` },
       { label: "Edit project", href: `/projects/${encodeURIComponent(project.id)}/edit` },
+      { label: "Project board", href: `/projects/${encodeURIComponent(project.id)}/kanban` },
     ],
     [
       {

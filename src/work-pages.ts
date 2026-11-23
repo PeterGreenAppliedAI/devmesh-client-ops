@@ -515,9 +515,8 @@ export function workSection(
 // Form controls and values
 // ---------------------------------------------------------------------------
 
-// The task form's status choices omit `waiting` until the boards expose it, so
-// a submitted waiting value fails the form's own validation as an invalid
-// choice and is refused through the usual FormError handling.
+// Every task status is offered, `waiting` included: the temporary gate that
+// refused a submitted waiting value is gone now the boards expose it.
 const STATUS_OPTIONS = TASK_FORM_STATUSES.map((status) => ({ value: status, label: status }));
 const PRIORITY_OPTIONS = TASK_PRIORITIES.map((priority) => ({ value: priority, label: priority }));
 const KIND_OPTIONS = ITEM_KINDS.map((kind) => ({ value: kind, label: kind }));
@@ -689,32 +688,6 @@ function suppliedValues(
   return values;
 }
 
-/**
- * The problem with a submitted task status the form does not offer, or null
- * when the status is omitted or offered. The form's choices omit `waiting`
- * until the boards expose it, so a submitted waiting value is refused here,
- * through the usual FormError handling, with a correctable message naming the
- * statuses the form permits. The refusal carries the rejected value so the presentation
- * boundary associates it with the status select, never with an incidental word
- * of the message such as `title`. A value the store would also refuse (an
- * unknown status) is left to the form's ordinary validation and the store, so
- * its message and its field marking stay exactly as before.
- */
-function refusedTaskStatus(
-  values: Readonly<Record<string, string>>,
-): (ValidationError & { readonly value: string }) | null {
-  if (!Object.hasOwn(values, "status")) return null;
-  const status = values["status"];
-  if ((TASK_FORM_STATUSES as readonly string[]).includes(status)) return null;
-  if (!(TASK_STATUSES as readonly string[]).includes(status)) return null;
-  // The wording the form uses for its permitted choices, so the correction
-  // message never names a status the form refuses.
-  const error = new ValidationError(
-    `task.status must be one of ${TASK_FORM_STATUSES.join(", ")}`,
-  ) as ValidationError & { value: string };
-  error.value = status;
-  return error;
-}
 
 /** The store's task edit for the supplied values; a blank project clears it. */
 function taskEdit(values: Readonly<Record<string, string>>, create: boolean): TaskEdit {
@@ -806,14 +779,10 @@ function formFailure(
   snapshot?: Snapshot,
   recordFamily: ArchiveFamily | null = null,
   notice = "",
-  refusedStatus: (ValidationError & { readonly value: string }) | null = null,
 ): FormError | null {
   if (!(error instanceof ValidationError) && !(error instanceof MissingRecordError)) {
     return null;
   }
-  // The refused value of the form's own status check, when this refusal is
-  // that check's error; it associates the refusal with the status select.
-  const refusedValue = refusedStatus === error ? refusedStatus.value : undefined;
   const base = record ?? {};
   const filled: Record<string, string> = {};
   for (const field of fields) {
@@ -828,15 +797,7 @@ function formFailure(
       filled[field.name] = omittedControlValue(field, base) ?? "";
     }
   }
-  // A submission the form refused as an unoffered status is associated with
-  // the status select, never with an incidental word of the message such as
-  // `title`; every other refusal keeps its usual association.
-  const errors = fieldErrorsFor(
-    error.message,
-    filled,
-    fields,
-    refusedValue === undefined ? associateSelected(selected) : { field: "status", value: refusedValue },
-  );
+  const errors = fieldErrorsFor(error.message, filled, fields, associateSelected(selected));
   // A record hidden by an archive keeps its page marked after a refused save;
   // a creation form under an archived scope carries the parent's notice.
   const archive =
@@ -1181,8 +1142,6 @@ export function workRoutes(store: Store): WorkRoutes {
       // unknown project is a correctable error, a blank one creates
       // engagement-only work.
       selected = withSelectedProject(snap, scope, text(request.form, "projectId"));
-      const refused = refusedTaskStatus(values);
-      if (refused !== null) throw refused;
       const input = {
         ...taskEdit(values, true),
         clientId: scope.client.id,
@@ -1202,7 +1161,6 @@ export function workRoutes(store: Store): WorkRoutes {
         snap,
         "tasks",
         createFormNotice(snap, scope, text(request.form, "projectId"), urlProject),
-        refusedTaskStatus(values),
       );
       if (failure !== null) throw failure;
       throw error;
@@ -1312,8 +1270,6 @@ export function workRoutes(store: Store): WorkRoutes {
     const stored = target.snap.tasks.find((candidate) => candidate.id === recordId)!;
     try {
       if (target.conflict !== null) throw target.conflict;
-      const refused = refusedTaskStatus(values);
-      if (refused !== null) throw refused;
       await store.updateTask(task.id, taskEdit(values, false));
       return redirect(`/tasks/${encodeURIComponent(task.id)}`);
     } catch (error) {
@@ -1327,7 +1283,6 @@ export function workRoutes(store: Store): WorkRoutes {
         target.snap,
         "tasks",
         "",
-        refusedTaskStatus(values),
       );
       if (failure !== null) throw failure;
       throw error;
