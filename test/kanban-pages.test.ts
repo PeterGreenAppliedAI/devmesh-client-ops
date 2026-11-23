@@ -342,8 +342,16 @@ describe("board pages over HTTP", () => {
       assert.equal(form.controls.get("clientId"), h.client.id);
       assert.equal(form.controls.get("engagementId"), h.engagement.id);
       assert.equal(form.controls.get("projectId"), "");
-      // The button is a native submit control with a text label.
-      assert.match(openColumn, /<button type="submit">Move to Actionable \(open\)<\/button>/);
+      // The button is a native submit control with a text label, and the
+      // status select offers every board status with the card's own selected.
+      assert.match(openColumn, /<button type="submit">Move<\/button>/);
+      assert.match(
+        openColumn,
+        /<select id="field-status-[^"]+" name="status"><option value="open" selected>Actionable \(open\)<\/option>/,
+      );
+      for (const value of ["in_progress", "waiting", "done"]) {
+        assert.match(openColumn, new RegExp(`<option value="${value}">`), value);
+      }
 
       // The scope navigation offers all → client → engagement → project.
       assert.match(reply.body, /<a href="\/clients\/[^"]+\/kanban">Acme &lt;client&gt;<\/a>/);
@@ -418,6 +426,54 @@ describe("board pages over HTTP", () => {
     }
   });
 
+  it("offers a keyboard-native status select on each card and moves through it", async () => {
+    const server = await running();
+    try {
+      const h = await hierarchy(server.store);
+      const task = await server.store.createTask({
+        clientId: h.client.id,
+        engagementId: h.engagement.id,
+        title: "Keyboard",
+        status: "open",
+      });
+      const board = await send(server.origin, { path: "/kanban" });
+      const form = parseForm(columnOf(board.body, "Actionable: open"));
+      // The rendered control is a native select on the card's own status.
+      assert.equal(form.controls.get("status"), "open");
+      // Submit it unchanged: a movement to the status the card already holds
+      // is still offered and redirects without any other edit.
+      const sameReply = await send(server.origin, {
+        method: "POST",
+        path: form.action,
+        form: Object.fromEntries(form.controls),
+      });
+      assert.equal(sameReply.status, 303);
+      assert.equal(redirectTarget(sameReply), "/kanban");
+      const stillOpen = server.store.snapshot().tasks.find((candidate) => candidate.id === task.id);
+      assert.ok(stillOpen !== undefined);
+      assert.equal(stillOpen.status, "open");
+
+      // Choosing a different status through the same rendered select moves it.
+      form.controls.set("status", "waiting");
+      const movedReply = await send(server.origin, {
+        method: "POST",
+        path: form.action,
+        form: Object.fromEntries(form.controls),
+      });
+      assert.equal(movedReply.status, 303);
+      assert.equal(redirectTarget(movedReply), "/kanban");
+      const moved = server.store.snapshot().tasks.find((candidate) => candidate.id === task.id);
+      assert.ok(moved !== undefined);
+      assert.equal(moved.status, "waiting");
+      const after = await send(server.origin, { path: "/kanban" });
+      assert.deepEqual(columnTaskIds(columnOf(after.body, "Waiting: waiting")), [task.id]);
+      // The waiting card's rendered select shows the new status selected.
+      assert.match(columnOf(after.body, "Waiting: waiting"), /<option value="waiting" selected>/);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("moves a card through the rendered controls and redirects to the validated scope", async () => {
     const server = await running();
     try {
@@ -430,6 +486,9 @@ describe("board pages over HTTP", () => {
       });
       const board = await send(server.origin, { path: "/kanban" });
       const form = parseForm(columnOf(board.body, "Actionable: open"));
+      // The rendered form shows the card's own status; the movement submits a
+      // different one through the status select a browser would submit.
+      assert.equal(form.controls.get("status"), "open");
       form.controls.set("status", "in_progress");
       // A stray field is ignored: it is never an edit.
       const reply = await send(server.origin, {
@@ -467,6 +526,7 @@ describe("board pages over HTTP", () => {
       const form = parseForm(columnOf(board.body, "Actionable: open"));
       assert.equal(form.controls.get("scopeKind"), "project");
       assert.equal(form.controls.get("scopeId"), h.project.id);
+      assert.equal(form.controls.get("status"), "open");
       form.controls.set("status", "done");
       const reply = await send(server.origin, {
         method: "POST",
@@ -582,6 +642,34 @@ describe("board movement refusals", () => {
       assert.equal((reply.body.match(/aria-invalid="true"/g) ?? []).length, 1);
       assert.match(reply.body, /<select[^>]*\sid="field-status"[^>]*\saria-invalid="true"/);
       // Nothing was written.
+      assert.equal(JSON.stringify(server.store.snapshot()), before);
+
+      // A conflicting assertion alongside an invalid status is refused as a
+      // plain 400 with no write, never turned into a correctable form: the
+      // identity is checked before any correction is rendered.
+      for (const extra of [
+        { id: "task-999" },
+        { clientId: h.otherClient.id },
+        { projectId: h.secondProject.id },
+      ] as Record<string, string>[]) {
+        const conflict = await send(server.origin, {
+          method: "POST",
+          path: `/tasks/${task.id}/move`,
+          form: { status: "paused", scopeKind: "all", scopeId: "", ...extra },
+        });
+        assert.equal(conflict.status, 400, JSON.stringify(extra));
+        assert.equal(conflict.headers.location, undefined, JSON.stringify(extra));
+        assert.doesNotMatch(conflict.body, /role="alert"/, JSON.stringify(extra));
+      }
+      // A task outside the submitted scope alongside an invalid status is also
+      // a plain 400 with no write.
+      const outside = await send(server.origin, {
+        method: "POST",
+        path: `/tasks/${task.id}/move`,
+        form: { status: "paused", scopeKind: "project", scopeId: h.secondProject.id },
+      });
+      assert.equal(outside.status, 400);
+      assert.equal(outside.headers.location, undefined);
       assert.equal(JSON.stringify(server.store.snapshot()), before);
 
       // A corrected resubmission of the kept form saves and redirects to the
@@ -803,7 +891,12 @@ describe("board archives", () => {
       // The archived project is left out of the scope navigation, but the
       // project's own board URL stays reachable.
       assert.doesNotMatch(reply.body, new RegExp(`href="/projects/${h.project.id}/kanban"`));
-      assert.equal(task.status, "open");
+      // Read the current stored task: the board never wrote anything.
+      const stored = server.store.snapshot().tasks.find((candidate) => candidate.id === task.id);
+      assert.ok(stored !== undefined);
+      assert.equal(stored.status, "open");
+      assert.equal(stored.archived ?? false, false);
+      assert.equal(stored.title, "Hidden");
     } finally {
       await server.close();
     }

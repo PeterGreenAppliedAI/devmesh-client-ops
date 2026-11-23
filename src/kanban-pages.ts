@@ -38,10 +38,12 @@ import {
   type Redirect,
 } from "./html.ts";
 import {
+  assertTaskIdentity,
   requireBoardScope,
   requireBoardStatus,
   requireExpectations,
   selectKanban,
+  taskInScope,
   type BoardScope,
   type KanbanBoard,
   type KanbanGroup,
@@ -242,13 +244,15 @@ function findScopeName<T extends { readonly id: string; readonly name: string }>
 /**
  * One linked card: the task title links to its detail page, then its status,
  * priority, owner, due date and its actual client, engagement and optional
- * project are shown as escaped text links to those records.
+ * project are shown as escaped text links to those records, and its own move
+ * form follows inside the same card.
  */
 function card(
   task: Task,
   client: Client | undefined,
   engagement: Engagement | undefined,
   project: Project | undefined,
+  move: string,
 ): string {
   const clientLink =
     client === undefined
@@ -274,6 +278,7 @@ function card(
     `<dt>Engagement</dt><dd>${engagementLink}</dd>`,
     `<dt>Project</dt><dd>${projectLink}</dd>`,
     `</dl>`,
+    move,
     `</li>`,
   ].join("");
 }
@@ -294,11 +299,13 @@ function scopeRecord(snapshot: Snapshot, board: KanbanBoard): Client | Engagemen
 }
 
 /**
- * The move form of one column: a POST to the task's own move endpoint with the
+ * The move form of one card: a POST to the task's own move endpoint with the
  * new status, the validated scope and the record's current identity as the
- * assertions the store compares. A task already in this status is still offered
- * (a move to its own status records no event); every control is native, so the
- * form works from the keyboard with no script.
+ * assertions the store compares. The status is a native select, shown on the
+ * card's own status, so a keyboard user chooses any of the four statuses
+ * directly and submits that choice; every control is native, so the form
+ * works from the keyboard with no script. A task already in the chosen status
+ * is still offered (a move to its own status records no event).
  */
 function moveForm(
   task: Task,
@@ -307,15 +314,21 @@ function moveForm(
 ): string {
   const hidden = (name: string, value: string): string =>
     `<input type="hidden" name="${escapeHtml(name)}" value="${escapeHtml(value)}">`;
+  const id = `field-status-${escapeHtml(task.id)}`;
+  const options = moveStatusOptions()
+    .map((option) => {
+      const selected = option.value === status ? " selected" : "";
+      return `<option value="${escapeHtml(option.value)}"${selected}>${escapeHtml(option.label)}</option>`;
+    })
+    .join("");
   return `<form class="move-form" method="post" action="${escapeHtml(`/tasks/${encodeURIComponent(task.id)}/move`)}">${
-    hidden("status", status) +
     hidden("scopeKind", scope.kind) +
     hidden("scopeId", scope.kind === "all" ? "" : scope.id) +
     hidden("id", task.id) +
     hidden("clientId", task.clientId) +
     hidden("engagementId", task.engagementId) +
     hidden("projectId", task.projectId ?? "")
-  }<button type="submit">Move to ${escapeHtml(GROUP_LABELS[status])} (${escapeHtml(status)})</button></form>`;
+  }<label for="${id}">Move to</label><select id="${id}" name="status">${options}</select><button type="submit">Move</button></form>`;
 }
 
 /** The markup of one board column: its heading, empty state and cards. */
@@ -334,12 +347,13 @@ function column(
   }
   const cards = group.tasks
     .map((task) =>
-      `<div class="board-card-wrap">${card(
+      card(
         task,
         lookup.clients.get(task.clientId),
         lookup.engagements.get(task.engagementId),
         task.projectId === undefined ? undefined : lookup.projects.get(task.projectId),
-      )}${moveForm(task, group.kind, board.scope)}</div>`,
+        moveForm(task, group.kind, board.scope),
+      ),
     )
     .join("");
   return `<section class="board-column column-${escapeHtml(group.kind)}">${heading}<ul class="card-list">${cards}</ul></section>`;
@@ -389,7 +403,7 @@ export const BOARD_STYLE = [
   ".board{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1rem;align-items:start}",
   ".board-column{min-width:0;border:1px solid #b8b8b8;border-radius:6px;padding:.5rem;background:#f7f7f7}",
   ".board-column h2{font-size:1.05rem;margin:.25rem 0 .5rem}",
-  ".board-column .card-list,.board-column .board-card-wrap{display:block}",
+  ".board-column .card-list{display:block;list-style:none;margin:0;padding:0}",
   ".board-card{list-style:none;margin:0 0 .75rem;padding:.5rem;border:1px solid #d0d0d0;border-radius:4px;background:#ffffff;overflow-wrap:anywhere}",
   ".board-card .card-fields{display:grid;grid-template-columns:auto minmax(0,1fr);gap:.1rem .5rem;margin:.35rem 0}",
   ".board-card .card-fields dt{font-weight:600}",
@@ -545,11 +559,21 @@ export function kanbanRoutes(store: Store): KanbanRoutes {
     if (scope.kind === "engagement") findScopeRecord(snap.engagements, scope.id, "engagement");
     if (scope.kind === "project") findScopeRecord(snap.projects, scope.id, "project");
     const expected = submittedExpectations(form);
+    // The identity assertions and the scope membership are checked against the
+    // current record here, before any correction is rendered, so a conflict is
+    // refused as a plain 400 with no write even alongside an invalid status.
+    // The store checks the same assertions again inside its queue at commit
+    // time, so a movement queued behind another write is still judged by the
+    // state it writes to. Both checks are pure and never write.
+    assertTaskIdentity(task, expected);
+    if (!taskInScope(task, scope)) {
+      throw new ValidationError(`task ${JSON.stringify(task.id)} is outside the board scope`);
+    }
     if (!(TASK_STATUS_VALUES as readonly string[]).includes(submittedStatus)) {
       // Correctable: the submitted status is retained (even an unoffered one),
-      // the validated scope's hidden fields are kept, and the status select is
-      // the marked control.
-      const values = moveValues(task, submittedStatus, scope);
+      // the validated scope and the (already checked) submitted assertions are
+      // kept, and the status select is the marked control.
+      const values = moveValues(submittedStatus, scope, expected);
       const fields = moveFields(scope);
       const message = `task.status must be one of ${TASK_STATUS_VALUES.join(", ")}`;
       throw new FormError(
@@ -611,22 +635,23 @@ function moveFields(scope: BoardScope): readonly FieldSpec[] {
 
 /**
  * The submitted values kept for a status correction: the submitted status, the
- * validated scope (server-built, never a submitted id), the target task's own
- * id and its current links as assertions, so a corrected resubmission names the
- * same record and scope.
+ * validated scope (server-built, never a submitted id) and the submitted
+ * identity assertions the target task already matched, so a corrected
+ * resubmission names the same record and scope. An assertion the submission did
+ * not carry stays absent, exactly as it was submitted.
  */
 function moveValues(
-  task: Task,
   submittedStatus: string,
   scope: BoardScope,
+  expected: TaskIdentityExpectation,
 ): Record<string, string> {
-  return {
+  const values: Record<string, string> = {
     status: submittedStatus,
     scopeKind: scope.kind,
     scopeId: scope.kind === "all" ? "" : scope.id,
-    id: task.id,
-    clientId: task.clientId,
-    engagementId: task.engagementId,
-    projectId: task.projectId ?? "",
   };
+  for (const key of ["id", "clientId", "engagementId", "projectId"] as const) {
+    if (expected[key] !== undefined) values[key] = expected[key];
+  }
+  return values;
 }
