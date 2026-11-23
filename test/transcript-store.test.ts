@@ -27,9 +27,9 @@ import {
 } from "../src/store.ts";
 import { openTranscriptStore, type TranscriptStore } from "../src/transcript-store.ts";
 import { ORIGINALS_DIRECTORY, type OriginalFileSystem } from "../src/transcript-files.ts";
-import { importPastedText } from "../src/transcript.ts";
-import { docxBytes } from "./fixtures/transcript-docx.ts";
-import { pdfBytes } from "./fixtures/transcript-pdf.ts";
+import { importPastedText, MAX_CONTENT_BYTES } from "../src/transcript.ts";
+import { docxBytes, docxOfLength } from "./fixtures/transcript-docx.ts";
+import { pdfBytes, pdfOfLength } from "./fixtures/transcript-pdf.ts";
 
 const roots: string[] = [];
 after(() => {
@@ -52,6 +52,15 @@ function encoder(text: string): Uint8Array {
 
 function sha256(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+/** Assert a rejection is a classified parser refusal carrying `refusalCode`. */
+function refusal(error: unknown, refusalCode: string): boolean {
+  assert.ok(error instanceof ValidationError, String(error));
+  assert.equal((error as { code?: string }).code, "parser_refused");
+  assert.equal((error as { refusal?: { code: string } }).refusal?.code, refusalCode);
+  assert.ok(Array.isArray((error as { refusal?: { supportedExports: unknown } }).refusal?.supportedExports));
+  return true;
 }
 
 function fsError(code: string): Error & { code: string } {
@@ -284,8 +293,8 @@ describe("transcript store: equivalence across formats", () => {
         { meetingId: first.meeting.id },
       );
       assert.notEqual(second.transcript.id, first.transcript.id);
-      assert.equal(second.outcome, "separate_transcript");
-      assert.equal(ts.transcripts().length, 2);
+      assert.equal(second.outcome, "new_transcript");
+      assert.equal(ts.transcripts().length, 1);
     } finally {
       await ts.close();
     }
@@ -544,7 +553,7 @@ describe("transcript store: another target meeting", () => {
 });
 
 describe("transcript store: replacement refusal and separate engagements", () => {
-  it("never replaces an existing attachment with different content", async () => {
+  it("never replaces the attachment of a meeting that carries notes", async () => {
     const dir = tempDir();
     const { ts, parents } = await freshStore(dir);
     try {
@@ -553,43 +562,147 @@ describe("transcript store: replacement refusal and separate engagements", () =>
         createFor(parents),
       );
       const firstSourceIds = first.sourceIds;
+      // A meeting that already holds a transcript and carries notes.
+      const meeting = await ts.store.createMeeting({
+        ...parents,
+        title: "With notes",
+        date: "2026-07-08",
+        notes: "Some notes",
+      });
+      const attached = await ts.importTranscript(
+        { kind: "paste", text: "Its own transcript." },
+        { meetingId: meeting.id },
+      );
+      assert.equal(attached.outcome, "new_transcript");
+      const attachedSourceIds = attached.sourceIds;
+      // Different content aimed at that meeting becomes its own new transcript,
+      // never a replacement of the attachment it holds.
       const second = await ts.importTranscript(
         { kind: "paste", text: "A completely different conversation." },
-        { meetingId: first.meeting.id },
+        { meetingId: meeting.id },
       );
-      assert.equal(second.outcome, "separate_transcript");
-      assert.notEqual(second.transcript.id, first.transcript.id);
-      assert.equal(second.meeting.id, first.meeting.id);
-      // The first transcript and its sources are unchanged.
-      const stored = ts.transcripts().find((t) => t.id === first.transcript.id)!;
-      assert.deepEqual(stored.sources.map((s) => s.id), firstSourceIds);
-      assert.equal(stored.canonicalText, first.transcript.canonicalText);
+      assert.equal(second.outcome, "new_transcript");
+      assert.equal(second.meeting.id, meeting.id);
+      assert.equal(second.explanation?.code, "new_transcript");
+      // The existing attachments and their sources are unchanged.
+      const stored = ts.transcripts().find((t) => t.id === attached.transcript.id)!;
+      assert.deepEqual(stored.sources.map((s) => s.id), attachedSourceIds);
+      assert.equal(ts.transcripts().length, 2);
+      // The first meeting's transcript is untouched too.
+      const untouched = ts.transcripts().find((t) => t.id === first.transcript.id)!;
+      assert.deepEqual(untouched.sources.map((s) => s.id), firstSourceIds);
+    } finally {
+      await ts.close();
+    }
+  });
+
+  it("rejects different content for an already-attached target before writing", async () => {
+    const dir = tempDir();
+    const { ts, parents } = await freshStore(dir);
+    try {
+      // An empty (notes-only) meeting, created as a manual record.
+      const meeting = await ts.store.createMeeting({
+        ...parents,
+        title: "First attachment",
+        date: "2026-08-09",
+        notes: "",
+      });
+      const first = await ts.importTranscript(
+        { kind: "paste", text: "The first attachment." },
+        { meetingId: meeting.id },
+      );
+      assert.equal(first.outcome, "attached");
+      const meetingBefore = ts.store.snapshot().meetings.find((m) => m.id === meeting.id)!;
+      const eventsBefore = activity(ts.store).length;
+      // Different content aimed at the same, now-attached meeting: refused
+      // before anything is written.
+      await assert.rejects(
+        ts.importTranscript(
+          { kind: "paste", text: "Content that would replace it." },
+          { meetingId: meeting.id },
+        ),
+        ValidationError,
+      );
+      // Nothing changed: the attachment, the meeting and the journal are as they
+      // were before the refused attempt.
+      assert.equal(ts.transcripts().length, 1);
+      assert.deepEqual(ts.transcripts()[0].sources.map((s) => s.id), first.sourceIds);
+      assert.deepEqual(ts.store.snapshot().meetings.find((m) => m.id === meeting.id), meetingBefore);
+      assert.equal(activity(ts.store).length, eventsBefore);
+    } finally {
+      await ts.close();
+    }
+  });
+
+  it("scopes an attachment to the target's engagement, not the first engagement", async () => {
+    const dir = tempDir();
+    const { ts, parents } = await freshStore(dir);
+    try {
+      const first = await ts.importTranscript(
+        { kind: "paste", text: "Shared words." },
+        createFor(parents),
+      );
+      const other = await ts.store.createClient({ name: "Other client" });
+      const otherEngagement = await ts.store.createEngagement({ clientId: other.id, name: "Other eng" });
+      const target = await ts.store.createMeeting({
+        clientId: other.id,
+        engagementId: otherEngagement.id,
+        title: "Elsewhere",
+        date: "2026-09-10",
+        notes: "",
+      });
+      // The same words are new content in the target's engagement: they attach
+      // to that target with their own source, not to the first engagement's
+      // canonical meeting.
+      const elsewhere = await ts.importTranscript(
+        { kind: "paste", text: "Shared words." },
+        { meetingId: target.id },
+      );
+      assert.equal(elsewhere.outcome, "attached");
+      assert.equal(elsewhere.transcript.id, first.transcript.id);
+      assert.equal(elsewhere.meeting.id, target.id);
+      assert.equal(elsewhere.canonicalMeetingId, undefined);
+      assert.equal(elsewhere.attachedOriginal, true);
+      assert.equal(ts.transcripts().length, 2);
+      // The first engagement's transcript is not appended to.
+      const firstStored = ts.transcripts().find((t) => t.meetingId === first.meeting.id)!;
+      assert.deepEqual(firstStored.sources.map((s) => s.id), first.sourceIds);
+      // A repeat aimed at the target reuses that engagement's own transcript
+      // and leaves the first engagement's canonical meeting alone.
+      const repeat = await ts.importTranscript(
+        { kind: "paste", text: "Shared words." },
+        { meetingId: target.id },
+      );
+      assert.equal(repeat.outcome, "reused");
+      assert.equal(repeat.meeting.id, target.id);
+      assert.deepEqual(repeat.sourceIds, elsewhere.sourceIds);
       assert.equal(ts.transcripts().length, 2);
     } finally {
       await ts.close();
     }
   });
 
-  it("keeps the same words in separate engagements as separate transcripts", async () => {
+  it("reads a source in its own engagement when the id is held once", async () => {
     const dir = tempDir();
     const { ts, parents } = await freshStore(dir);
     try {
       const other = await ts.store.createClient({ name: "Other client" });
       const otherEngagement = await ts.store.createEngagement({ clientId: other.id, name: "Other eng" });
-      const first = await ts.importTranscript(
-        { kind: "paste", text: "Shared words." },
-        createFor(parents),
-      );
+      const first = await ts.importTranscript({ kind: "paste", text: "One engagement." }, createFor(parents));
       const elsewhere = await ts.importTranscript(
-        { kind: "paste", text: "Shared words." },
-        createFor({ clientId: other.id, engagementId: otherEngagement.id }, { title: "Elsewhere" }),
+        { kind: "paste", text: "Another engagement." },
+        createFor({ clientId: other.id, engagementId: otherEngagement.id }),
       );
-      assert.equal(elsewhere.outcome, "created", "a different engagement is a separate scope");
-      assert.equal(elsewhere.transcript.id, first.transcript.id);
-      assert.notEqual(elsewhere.meeting.id, first.meeting.id);
-      assert.equal(ts.transcripts().length, 2);
-      const events = activity(ts.store);
-      assert.equal(events.filter((event) => event.targetKind === "meeting" && event.action === "create").length, 2);
+      const firstRead = await ts.readSource(first.transcript.id, first.sourceIds[0]);
+      const elsewhereRead = await ts.readSource(elsewhere.transcript.id, elsewhere.sourceIds[0]);
+      assert.equal(firstRead.engagementId, parents.engagementId);
+      assert.equal(elsewhereRead.engagementId, otherEngagement.id);
+      assert.equal(firstRead.meetingId, first.meeting.id);
+      assert.equal(elsewhereRead.meetingId, elsewhere.meeting.id);
+      assert.equal(firstRead.transcriptId, first.transcript.id);
+      assert.equal(elsewhereRead.transcriptId, elsewhere.transcript.id);
+      assert.equal(firstRead.extractedText, "One engagement.");
+      assert.equal(elsewhereRead.extractedText, "Another engagement.");
     } finally {
       await ts.close();
     }

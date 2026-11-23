@@ -1746,6 +1746,28 @@ class StoreImpl implements Store {
   }
 
   /**
+   * Run an unexposed store operation inside this store's own mutation queue, so
+   * it is serialized with every ordinary create, edit and save of the store: no
+   * other mutation can interleave with the operation between reading the
+   * committed state and committing its result. The operation is refused like a
+   * mutation when the store is closed or blocked. A failed operation publishes
+   * nothing and rejects with its own error.
+   */
+  async runExclusive<T>(operation: () => Promise<T>): Promise<T> {
+    return this.enqueue(operation);
+  }
+
+  /**
+   * Persist the committed state as an unchanged no-op, through the ordinary
+   * no-op save path. The draft is built without a change and saved exactly as
+   * any other write is; no event is recorded. A save failure rejects and adds
+   * nothing, exactly as for a mutation.
+   */
+  async commitNoop(mutate: (draft: State) => MutationChange<unknown>): Promise<unknown> {
+    return this.enqueue(() => this.commit(mutate));
+  }
+
+  /**
    * Rebuild and persist the transcript list, then publish the new committed
    * state. The caller's build is applied to a draft of the committed state and
    * validated exactly as reopening validates it, before anything is written.
