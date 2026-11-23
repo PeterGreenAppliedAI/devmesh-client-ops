@@ -456,6 +456,61 @@ describe("each effective create, edit, archive and restore records one event", (
     }
   });
 
+  it("treats a stored false flag like an absent one for edits and restores", async () => {
+    // Seed a workspace, then store the archivable records with an explicit
+    // `archived: false` instead of no flag. The document validator accepts both
+    // spellings as the same active state.
+    const dir = tempDir();
+    const seed = await openStore(dir, { now: clock() });
+    let w: Awaited<ReturnType<typeof workspace>>;
+    let journalLength: number;
+    let counter: number;
+    try {
+      w = await workspace(seed);
+      journalLength = seed.snapshot().activity!.length;
+      counter = JSON.parse(readFileSync(storePath(dir), "utf8")).nextActivityId;
+    } finally {
+      await seed.close();
+    }
+    const document = JSON.parse(readFileSync(storePath(dir), "utf8"));
+    for (const family of ARCHIVE_FAMILIES) {
+      const record = document[famPlural(family)].find(
+        (entry: { id: string }) => entry.id === recordOf(w, family).id,
+      );
+      record.archived = false;
+    }
+    writeFileSync(storePath(dir), JSON.stringify(document));
+
+    const store = await openStore(dir, { now: clock() });
+    try {
+      const reopened = store.snapshot();
+      for (const family of ARCHIVE_FAMILIES) {
+        const record = (reopened[famPlural(family) as keyof typeof reopened] as readonly { id: string; archived?: boolean }[]).find(
+          (entry) => entry.id === recordOf(w, family).id,
+        );
+        assert.equal(record?.archived, false, `${family} loaded with an explicit false`);
+      }
+      assert.deepEqual(recorded(store), targets(store.snapshot().activity!), "journal loads as stored");
+      const before = recorded(store).length;
+      for (const family of ARCHIVE_FAMILIES) {
+        const id = recordOf(w, family).id;
+        // A no-op edit of a false-flagged record records nothing.
+        await sameEdit(store, family, id);
+        assert.equal(recorded(store).length, before, `${family} edit of a false-flagged record`);
+        // Restoring a false-flagged record is the same no-op as restoring an
+        // unflagged one: no event, and the counter does not advance.
+        await archive(store, family, id, false);
+        assert.equal(recorded(store).length, before, `${family} restore of a false-flagged record`);
+      }
+      // Each no-op still persisted the record it was given.
+      const saved = JSON.parse(readFileSync(storePath(dir), "utf8"));
+      assert.equal(saved.activity.length, journalLength, "no event reached disk");
+      assert.equal(saved.nextActivityId, counter, "and the event counter did not advance");
+    } finally {
+      await store.close();
+    }
+  });
+
   it("records nothing for reads, startup, failed validation or unknown ids", async () => {
     const dir = tempDir();
     const store = await openStore(dir, { now: clock() });
