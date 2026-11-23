@@ -19,8 +19,10 @@
  * - The workspace writer owns put operations: they are serialized through one
  *   queue, so two puts never interleave their temporary files or publications.
  * - A put creates the owned `originals` directory when it is absent (and makes
- *   that new directory entry durable where the platform requires it), so a
- *   normal workspace is usable on first put without manual preparation.
+ *   that new directory entry durable where the platform requires it) and makes
+ *   the `originals` directory itself durable on every put, including a retry
+ *   that finds it already present, so a normal workspace is usable on first
+ *   put and a reuse is still durably published before a reference is returned.
  * - A put writes a unique, same-directory temporary file in full (every short
  *   write is retried by the byte offset), flushes it, closes it and only then
  *   atomically publishes it under its hash name. On platforms with directory
@@ -29,6 +31,9 @@
  *   skipped by checking the platform, never by catching an error.
  * - A reference is returned only after publication and, where the platform
  *   requires it, the directory flush, so the caller gets a usable reference.
+ *   Creating `originals` adds an entry to the workspace directory, so on the
+ *   first put both the workspace directory (holding the new `originals` entry)
+ *   and the `originals` directory are flushed, parents before children.
  * - Retrying after an earlier publication failure satisfies the same rules: a
  *   put checks for an existing hash-named file first and never overwrites one,
  *   and a verified reuse still runs the directory-durability step before a
@@ -59,7 +64,7 @@ import {
   unlinkSync,
   writeSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 /** The inclusive limit, in bytes, for an original file. */
 export const MAX_ORIGINAL_BYTES = 10 * 1024 * 1024;
@@ -131,7 +136,11 @@ export interface OriginalFileSystem {
   unlinkSync(path: string): void;
   /** Read a file's exact bytes. */
   readFileSync(path: string): Uint8Array;
-  /** Flush and close a directory, for platforms that require it. */
+  /**
+   * Flush and close a directory, for platforms that require it. On POSIX the
+   * default implementation opens the directory, flushes it and closes it through
+   * this adapter's own open, flush and close operations.
+   */
   fsyncDirectorySync(path: string): void;
 }
 
@@ -373,7 +382,7 @@ class OriginalStoreImpl implements OriginalStore {
       // matching bytes is a successful reuse, and mismatching bytes are refused
       // untouched by `readIfPresent`. A reuse still satisfies the platform's
       // directory-durability requirement before a usable reference is returned.
-      this.fsyncDirectory();
+      this.fsyncDirectory(this.directory, "the originals directory");
       return reference(sha256, existing);
     }
 
@@ -383,14 +392,14 @@ class OriginalStoreImpl implements OriginalStore {
     // mismatching file is refused without replacement.
     const again = this.readIfPresent(sha256);
     if (again !== null) {
-      this.fsyncDirectory();
+      this.fsyncDirectory(this.directory, "the originals directory");
       return reference(sha256, again);
     }
 
     this.publish(sha256, target, content);
     // The rename is the publication; on POSIX the directory flush makes it
     // durable. Either failure is reported, and the published original is kept.
-    this.fsyncDirectory();
+    this.fsyncDirectory(this.directory, "the originals directory");
     return reference(sha256, content);
   }
 
@@ -463,10 +472,15 @@ class OriginalStoreImpl implements OriginalStore {
   }
 
   /**
-   * Create the owned originals directory when it is absent, then make the new
-   * directory entry durable where the platform requires it. Creating an already
-   * existing directory is not a failure and never replaces anything. A failure
-   * to create it is reported as a persistence failure.
+   * Create the owned originals directory when it is absent and make the
+   * `originals` directory durable on every put, retries included. Creating it
+   * adds an entry to the workspace directory, so on the first put both the
+   * workspace directory (holding that new entry) and the `originals` directory
+   * are flushed, parents before children; on a later put, when `originals`
+   * already exists, the workspace directory is left alone and only `originals`
+   * is flushed, so retries still complete the durability step. Creating an
+   * already existing directory is not a failure and never replaces anything. A
+   * failure to create or check it is reported as a persistence failure.
    */
   private prepareDirectory(): void {
     let present: boolean;
@@ -475,26 +489,30 @@ class OriginalStoreImpl implements OriginalStore {
     } catch (cause) {
       throw new OriginalPersistenceError("Failed to check for the originals directory", { cause });
     }
-    if (present) return;
-    try {
-      this.fs.mkdirSync(this.directory, { recursive: true });
-    } catch (cause) {
-      throw new OriginalPersistenceError("Failed to create the originals directory", { cause });
+    if (!present) {
+      try {
+        this.fs.mkdirSync(this.directory, { recursive: true });
+      } catch (cause) {
+        throw new OriginalPersistenceError("Failed to create the originals directory", { cause });
+      }
+      // The new entry in the workspace directory is flushed before anything is
+      // written into `originals`, so the parent is durable before its child.
+      this.fsyncDirectory(dirname(this.directory), "the workspace directory");
     }
-    // The new directory entry is flushed before anything is written into it, on
-    // the platforms that require it.
-    this.fsyncDirectory();
+    // The `originals` directory is flushed on every put, so a first use, a
+    // retry after an earlier failure and a reopening all complete this step.
+    this.fsyncDirectory(this.directory, "the originals directory");
   }
 
-  /** Flush the originals directory where the platform requires it. */
-  private fsyncDirectory(): void {
+  /** Flush a directory where the platform requires it, reporting failures. */
+  private fsyncDirectory(path: string, label: string): void {
     if (this.platform === "win32") return;
     try {
-      this.fs.fsyncDirectorySync(this.directory);
+      this.fs.fsyncDirectorySync(path);
     } catch (cause) {
       throw cause instanceof OriginalPersistenceError
         ? cause
-        : new OriginalPersistenceError("Failed to flush the originals directory", { cause });
+        : new OriginalPersistenceError(`Failed to flush ${label}`, { cause });
     }
   }
 
