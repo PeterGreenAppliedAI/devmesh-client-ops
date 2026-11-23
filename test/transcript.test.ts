@@ -95,7 +95,9 @@ describe("TXT and MD files", () => {
     assert.equal(result.filename, "README.MD");
     assert.equal(result.extractedText, md);
     assert.equal(result.canonicalText, "# Title - item");
-    assert.equal(imported(importFileBytes(new TextEncoder().encode(md), "notes.markdown")).format, "markdown");
+    // Only the authorized `.txt` and `.md` extensions are accepted; other
+    // extensions, including `.markdown`, are refused.
+    refused(importFileBytes(new TextEncoder().encode(md), "notes.markdown"), "unsupported_format");
   });
 
   it("copies the input buffer so later mutation cannot change the result", () => {

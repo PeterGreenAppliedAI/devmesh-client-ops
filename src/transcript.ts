@@ -350,7 +350,7 @@ export function importPastedText(text: unknown): ImportOutcome {
 function formatOfFilename(filename: string): ImportFormat | null {
   const lower = filename.toLowerCase();
   if (lower.endsWith(".txt")) return "txt";
-  if (lower.endsWith(".md") || lower.endsWith(".markdown")) return "markdown";
+  if (lower.endsWith(".md")) return "markdown";
   return null;
 }
 
