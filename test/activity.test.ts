@@ -12,6 +12,7 @@ import {
   readdirSync,
   rmSync,
   writeFileSync,
+  renameSync as renameSyncImpl,
   writeSync as writeSyncImpl,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -927,6 +928,7 @@ describe("record and event atomicity under persistence failures", () => {
   /** A failure state the tests toggle between saves. */
   interface FailureState {
     failWrites: boolean;
+    failRenames: boolean;
   }
 
   function failingFs(state: FailureState): Partial<FileSystem> {
@@ -934,6 +936,10 @@ describe("record and event atomicity under persistence failures", () => {
       writeSync: (fd: number, data: Uint8Array) => {
         if (state.failWrites) throw fsError("EIO");
         return writeSyncImpl(fd, data);
+      },
+      renameSync: (oldPath: string, newPath: string) => {
+        if (state.failRenames) throw fsError("EIO");
+        renameSyncImpl(oldPath, newPath);
       },
     };
   }
@@ -950,10 +956,47 @@ describe("record and event atomicity under persistence failures", () => {
     }
   }
 
+  it("keeps records, journal and counter when the rename fails", async () => {
+    const { dir, w } = await seeded();
+    const committed = readFileSync(storePath(dir), "utf8");
+    const state: FailureState = { failWrites: false, failRenames: true };
+    const store = await openStore(dir, { fs: failingFs(state), now: clock() });
+    try {
+      const before = store.snapshot();
+      await assert.rejects(store.updateClient(w.client.id, { name: "Renamed" }), PersistenceError);
+      await assert.rejects(store.createClient({ name: "New" }), PersistenceError);
+      await assert.rejects(store.setArchived("client", w.client.id, true), PersistenceError);
+      // Neither the record nor its event is published or written, and the
+      // temporary file is cleaned up rather than left behind.
+      assert.deepEqual(store.snapshot(), before);
+      assert.equal(readFileSync(storePath(dir), "utf8"), committed);
+      assert.deepEqual(tempFiles(dir), []);
+      // The event counter did not advance with the rejected attempts: the next
+      // successful mutation allocates the id the journal expected.
+      state.failRenames = false;
+      const created = await store.createClient({ name: "New" });
+      const journal = store.snapshot().activity!;
+      assert.deepEqual(
+        targets(journal.slice(before.activity!.length)),
+        [`create:client:${created.id}`],
+      );
+      assert.equal(
+        journal[journal.length - 1].id,
+        before.activity![before.activity!.length - 1].id + 1,
+        "the next event takes the next id",
+      );
+      const saved = JSON.parse(readFileSync(storePath(dir), "utf8"));
+      assert.deepEqual(saved.clients.map((c: { id: string }) => c.id).slice(-1), [created.id]);
+      assert.equal(saved.activity[saved.activity.length - 1].id, journal[journal.length - 1].id);
+    } finally {
+      await store.close();
+    }
+  });
+
   it("keeps prior data and records no event when the write fails before rename", async () => {
     const { dir, w } = await seeded();
     const committed = readFileSync(storePath(dir), "utf8");
-    const state: FailureState = { failWrites: false };
+    const state: FailureState = { failWrites: false, failRenames: false };
     const store = await openStore(dir, { fs: failingFs(state), now: clock() });
     try {
       state.failWrites = true;
