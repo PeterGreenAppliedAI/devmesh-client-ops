@@ -18,11 +18,13 @@
  *
  * - The workspace writer owns put operations: they are serialized through one
  *   queue, so two puts never interleave their temporary files or publications.
- * - A put creates the owned `originals` directory when it is absent (and makes
- *   that new directory entry durable where the platform requires it) and makes
- *   the `originals` directory itself durable on every put, including a retry
- *   that finds it already present, so a normal workspace is usable on first
- *   put and a reuse is still durably published before a reference is returned.
+ * - A put creates the owned `originals` directory when it is absent and makes
+ *   both the workspace directory (whose entry names `originals`) and the
+ *   `originals` directory itself durable on every put, parents before children,
+ *   including a retry that finds it already present. A normal workspace is
+ *   usable on first put, and a retry after an earlier failure completes the
+ *   same durability step even when `originals` already exists, so a reference
+ *   is never returned before the directory entries are durable.
  * - A put writes a unique, same-directory temporary file in full (every short
  *   write is retried by the byte offset), flushes it, closes it and only then
  *   atomically publishes it under its hash name. On platforms with directory
@@ -30,13 +32,14 @@
  *   Windows the rename itself is the durability point, so the directory step is
  *   skipped by checking the platform, never by catching an error.
  * - A reference is returned only after publication and, where the platform
- *   requires it, the directory flush, so the caller gets a usable reference.
- *   Creating `originals` adds an entry to the workspace directory, so on the
- *   first put both the workspace directory (holding the new `originals` entry)
- *   and the `originals` directory are flushed, parents before children.
+ *   requires it, the directory flushes, so the caller gets a usable reference.
+ *   Creating `originals` adds an entry to the workspace directory; because an
+ *   earlier workspace flush may have failed or crashed, the workspace directory
+ *   and the `originals` directory are both flushed on every put, parents before
+ *   children, so a retry or reopening completes that step.
  * - Retrying after an earlier publication failure satisfies the same rules: a
  *   put checks for an existing hash-named file first and never overwrites one,
- *   and a verified reuse still runs the directory-durability step before a
+ *   and a verified reuse still runs the directory-durability steps before a
  *   reference is returned.
  *
  * Reuse and verification: before reusing an existing original its bytes are
@@ -381,7 +384,8 @@ class OriginalStoreImpl implements OriginalStore {
       // Existing bytes are reused only when they verify; a hash that names
       // matching bytes is a successful reuse, and mismatching bytes are refused
       // untouched by `readIfPresent`. A reuse still satisfies the platform's
-      // directory-durability requirement before a usable reference is returned.
+      // directory-durability requirements (the workspace directory and
+      // `originals`) before a usable reference is returned.
       this.fsyncDirectory(this.directory, "the originals directory");
       return reference(sha256, existing);
     }
@@ -473,14 +477,15 @@ class OriginalStoreImpl implements OriginalStore {
 
   /**
    * Create the owned originals directory when it is absent and make the
-   * `originals` directory durable on every put, retries included. Creating it
-   * adds an entry to the workspace directory, so on the first put both the
-   * workspace directory (holding that new entry) and the `originals` directory
-   * are flushed, parents before children; on a later put, when `originals`
-   * already exists, the workspace directory is left alone and only `originals`
-   * is flushed, so retries still complete the durability step. Creating an
-   * already existing directory is not a failure and never replaces anything. A
-   * failure to create or check it is reported as a persistence failure.
+   * directory entries durable on every put, retries included. Creating it adds
+   * an entry to the workspace directory; because an earlier workspace flush may
+   * have failed or the process may have crashed, the workspace directory (whose
+   * entry names `originals`) is flushed on every put before the `originals`
+   * directory, parents before children. So a first use, a retry after a
+   * workspace-directory flush failure and a reopened store all complete that
+   * step even when `originals` already exists. Creating an already existing
+   * directory is not a failure and never replaces anything. A failure to create
+   * or check it is reported as a persistence failure.
    */
   private prepareDirectory(): void {
     let present: boolean;
@@ -495,11 +500,14 @@ class OriginalStoreImpl implements OriginalStore {
       } catch (cause) {
         throw new OriginalPersistenceError("Failed to create the originals directory", { cause });
       }
-      // The new entry in the workspace directory is flushed before anything is
-      // written into `originals`, so the parent is durable before its child.
-      this.fsyncDirectory(dirname(this.directory), "the workspace directory");
     }
-    // The `originals` directory is flushed on every put, so a first use, a
+    // The workspace directory holds the `originals` entry; flush it first on
+    // every put, parents before children, so a first use, a retry after an
+    // earlier workspace flush failure and a reopening all make that entry
+    // durable before anything is written or reused inside `originals`. Flushing
+    // a directory whose entry has not changed is harmless.
+    this.fsyncDirectory(dirname(this.directory), "the workspace directory");
+    // The `originals` directory is flushed next on every put, so a first use, a
     // retry after an earlier failure and a reopening all complete this step.
     this.fsyncDirectory(this.directory, "the originals directory");
   }

@@ -565,20 +565,22 @@ describe("original store: injected persistence failures", () => {
     assert.deepEqual(temporaryFiles(root), []);
 
     // A verified retry of an unreopen store reuses the published bytes and
-    // satisfies durability again on the same adapter: only `originals` is
-    // flushed now that the directory exists.
+    // satisfies durability again on the same adapter: prepare flushes the
+    // workspace directory and `originals` on every put, then the reuse flushes
+    // `originals` again.
     const retried = await store.put(bytes);
     assertReference(retried, bytes);
     assert.deepEqual(flushed, [
       root,
       join(root, ORIGINALS_DIRECTORY),
       join(root, ORIGINALS_DIRECTORY),
-      // The retry: prepare's flush of the existing `originals`, then the
-      // reuse's durability flush.
+      // The retry: prepare's workspace-directory flush, prepare's `originals`
+      // flush, then the reuse's durability flush.
+      root,
       join(root, ORIGINALS_DIRECTORY),
       join(root, ORIGINALS_DIRECTORY),
     ]);
-    // A fresh store reusing the original runs the durability step too.
+    // A fresh store reusing the original runs the durability steps too.
     const reopenedFlushed: string[] = [];
     const reopened = openOriginalStore(root, {
       platform: "linux",
@@ -590,8 +592,13 @@ describe("original store: injected persistence failures", () => {
     });
     const reused = await reopened.put(bytes);
     assert.equal(reused.sha256, hash);
-    // A reopened store flushes `originals` in prepare and again for the reuse.
-    assert.deepEqual(reopenedFlushed, [join(root, ORIGINALS_DIRECTORY), join(root, ORIGINALS_DIRECTORY)]);
+    // A reopened store flushes the workspace directory and `originals` in
+    // prepare and again for the reuse.
+    assert.deepEqual(reopenedFlushed, [
+      root,
+      join(root, ORIGINALS_DIRECTORY),
+      join(root, ORIGINALS_DIRECTORY),
+    ]);
   });
 
   it("completes the durability step on a retry when originals already exists", async () => {
@@ -622,10 +629,15 @@ describe("original store: injected persistence failures", () => {
     });
     const ref = await reopened.put(bytes);
     assertReference(ref, bytes);
-    // The workspace directory is not flushed again (its entry already exists),
-    // but the retry flushes `originals`: once in prepare and once for the new
-    // publication, so the durability step is completed on retry.
-    assert.deepEqual(flushed, [join(root, ORIGINALS_DIRECTORY), join(root, ORIGINALS_DIRECTORY)]);
+    // The retry flushes the workspace directory first (its entry may not have
+    // been made durable by the failed attempt) and then `originals`, once in
+    // prepare and once for the new publication, so the durability steps are
+    // completed on retry.
+    assert.deepEqual(flushed, [
+      root,
+      join(root, ORIGINALS_DIRECTORY),
+      join(root, ORIGINALS_DIRECTORY),
+    ]);
     assert.deepEqual(publishedFiles(root), [ref.sha256]);
   });
 
@@ -633,24 +645,44 @@ describe("original store: injected persistence failures", () => {
     const root = workspace();
     const bytes = new TextEncoder().encode("directory open fails");
     mkdirSync(join(root, ORIGINALS_DIRECTORY), { recursive: true });
-    const plain = realFs();
+    const opened: string[] = [];
     let directoryOpens = 0;
     const store = openOriginalStore(root, {
       platform: "linux",
       fs: adapter({
-        // Only the directory open fails, and only after the prepare step's
-        // flush; the file's own open is unaffected. The failure is reported when
-        // the publication's directory flush opens it.
+        // Every directory open goes through the injected interface: prepare's
+        // workspace-directory flush, prepare's `originals` flush and the
+        // publication's `originals` flush each open a simulated directory
+        // handle, never a real foreign-platform directory. Only the
+        // publication's open fails, so the intended failure is reached. The
+        // temporary file's own open is real.
         openSync: (path, flags) => {
-          if (flags === "r" && path === join(root, ORIGINALS_DIRECTORY)) {
+          if (flags === "r" && (path === root || path === join(root, ORIGINALS_DIRECTORY))) {
             directoryOpens += 1;
-            if (directoryOpens > 1) throw fsError("EACCES");
+            // The first two directory opens are prepare's; the third is the
+            // publication's directory flush, which fails.
+            if (directoryOpens === 3) throw fsError("EACCES");
+            return directoryAwareOpen(opened, path, flags);
           }
-          return plain.openSync(path, flags);
+          return realFs().openSync(path, flags);
+        },
+        closeSync: (fd) => {
+          if (!isDirectoryHandle(fd)) realFs().closeSync(fd);
+        },
+        fsyncSync: (fd) => {
+          if (!isDirectoryHandle(fd)) realFs().fsyncSync(fd);
         },
       }),
     });
-    await assert.rejects(store.put(bytes), OriginalPersistenceError);
+    await assert.rejects(store.put(bytes), (error: unknown) => {
+      assert.ok(error instanceof OriginalPersistenceError);
+      assert.match(error.message, /originals directory/);
+      return true;
+    });
+    // The intended failure was reached: prepare opened both directories, and
+    // the publication's directory open was the third and injected failure.
+    assert.equal(directoryOpens, 3, "the injected publication directory open was reached");
+    assert.deepEqual(opened, [root, join(root, ORIGINALS_DIRECTORY)]);
     // The rename already published the original; it is kept.
     assert.deepEqual(publishedFiles(root), [sha256(bytes)]);
     assert.deepEqual(temporaryFiles(root), []);
@@ -664,9 +696,10 @@ describe("original store: injected persistence failures", () => {
     const store = openOriginalStore(root, {
       platform: "linux",
       fs: adapter({
-        // A simulated directory handle; the file's open is real. The simulated
-        // directory handle's flush succeeds during prepare and fails on its
-        // second flush, the publication's, so the failure is reported there.
+        // A simulated directory handle; the file's open is real. Prepare opens
+        // and flushes the workspace directory, then `originals`; the
+        // publication's `originals` flush is the third and fails, so the
+        // failure is reported there.
         openSync: (path, flags) => {
           if (flags === "r" && (path === root || path === join(root, ORIGINALS_DIRECTORY))) {
             return directoryAwareOpen([], path, flags);
@@ -682,11 +715,16 @@ describe("original store: injected persistence failures", () => {
             return;
           }
           directoryFlushes.push(fd);
-          if (directoryFlushes.length > 1) throw fsError("EIO");
+          if (directoryFlushes.length === 3) throw fsError("EIO");
         },
       }),
     });
-    await assert.rejects(store.put(bytes), OriginalPersistenceError);
+    await assert.rejects(store.put(bytes), (error: unknown) => {
+      assert.ok(error instanceof OriginalPersistenceError);
+      assert.match(error.message, /originals directory/);
+      return true;
+    });
+    assert.equal(directoryFlushes.length, 3, "the injected publication directory flush was reached");
     assert.deepEqual(publishedFiles(root), [sha256(bytes)]);
     assert.deepEqual(temporaryFiles(root), []);
   });
@@ -810,14 +848,15 @@ describe("original store: platform directory durability", () => {
       join(root, ORIGINALS_DIRECTORY),
       join(root, ORIGINALS_DIRECTORY),
     ]);
-    // A reuse also satisfies the durability step: prepare flushes `originals`
-    // and the reuse flushes it again, with the workspace directory left alone
-    // because its entry already exists.
+    // A reuse also satisfies the durability steps: prepare flushes the
+    // workspace directory and `originals`, then the reuse flushes `originals`
+    // again.
     await store.put(bytes);
     assert.deepEqual(opened, [
       root,
       join(root, ORIGINALS_DIRECTORY),
       join(root, ORIGINALS_DIRECTORY),
+      root,
       join(root, ORIGINALS_DIRECTORY),
       join(root, ORIGINALS_DIRECTORY),
     ]);
@@ -837,6 +876,11 @@ describe("original store: platform directory durability", () => {
     });
     await store.put(bytes);
     assert.deepEqual(order[0], root, "the workspace directory entry is flushed first");
+    assert.deepEqual(order[1], join(root, ORIGINALS_DIRECTORY));
+    // A retry also flushes the workspace directory before `originals`.
+    order.length = 0;
+    await store.put(bytes);
+    assert.deepEqual(order[0], root, "the retry flushes the workspace directory first");
     assert.deepEqual(order[1], join(root, ORIGINALS_DIRECTORY));
   });
 
@@ -860,6 +904,29 @@ describe("original store: platform directory durability", () => {
     assert.deepEqual(flushed, [root], "the failure stopped before writing into originals");
     assert.deepEqual(publishedFiles(root), []);
     assert.deepEqual(temporaryFiles(root), []);
+
+    // Retrying after that workspace-directory flush failure: `mkdirSync` left
+    // `originals` present, so prepare must still flush the workspace directory
+    // before `originals` and then publish. The same store, now succeeding,
+    // completes the durability step rather than skipping it.
+    const retryFlushed: string[] = [];
+    const retrying = openOriginalStore(root, {
+      platform: "linux",
+      fs: adapter({
+        fsyncDirectorySync: (path) => {
+          retryFlushed.push(path);
+        },
+      }),
+    });
+    const retried = await retrying.put(new TextEncoder().encode("workspace flush fails"));
+    assertReference(retried, new TextEncoder().encode("workspace flush fails"));
+    assert.deepEqual(retryFlushed, [
+      root,
+      join(root, ORIGINALS_DIRECTORY),
+      join(root, ORIGINALS_DIRECTORY),
+    ]);
+    assert.deepEqual(publishedFiles(root), [retried.sha256]);
+    assert.deepEqual(temporaryFiles(root), []);
   });
 
   it("reports a directory flush failure on POSIX instead of treating it as a skip", async () => {
@@ -881,10 +948,11 @@ describe("original store: platform directory durability", () => {
           if (!isDirectoryHandle(fd)) realFs().closeSync(fd);
         },
         fsyncSync: (fd) => {
-          // Only the publication's directory flush fails; prepare's succeeds.
+          // The publication's directory flush is the third; prepare's workspace
+          // and `originals` flushes succeed.
           if (isDirectoryHandle(fd)) {
             flushes.push("directory");
-            if (flushes.length > 1) throw fsError("EIO");
+            if (flushes.length === 3) throw fsError("EIO");
             return;
           }
           realFs().fsyncSync(fd);
@@ -894,7 +962,7 @@ describe("original store: platform directory durability", () => {
     await assert.rejects(store.put(bytes), OriginalPersistenceError);
     assert.deepEqual(
       flushes,
-      ["directory", "directory"],
+      ["directory", "directory", "directory"],
       "the injected publication directory flush was reached",
     );
     assert.deepEqual(publishedFiles(root), [sha256(bytes)]);
@@ -924,8 +992,9 @@ describe("original store: platform directory durability", () => {
           if (isDirectoryHandle(fd)) {
             closeCalls += 1;
             closed.push(fd);
-            // Prepare's directory close succeeds; the publication's fails.
-            if (closeCalls > 1) throw fsError("EIO");
+            // Prepare's workspace and `originals` closes succeed; the
+            // publication's closes third and fails.
+            if (closeCalls === 3) throw fsError("EIO");
             return;
           }
           realFs().closeSync(fd);
@@ -933,7 +1002,7 @@ describe("original store: platform directory durability", () => {
       }),
     });
     await assert.rejects(store.put(bytes), OriginalPersistenceError);
-    assert.deepEqual(closed.length, 2, "the injected publication directory close was reached");
+    assert.equal(closeCalls, 3, "the injected publication directory close was reached");
     assert.deepEqual(publishedFiles(root), [sha256(bytes)]);
     assert.deepEqual(temporaryFiles(root), []);
   });
