@@ -857,15 +857,16 @@ function parseTranscript(value: unknown, what: string): Transcript {
 
 /**
  * Validate the stored transcript list against the loaded records and return it
- * detached. A transcript is unique by identity and belongs to exactly one
- * meeting; the meeting must exist and its engagement is resolved through the
- * meeting's authoritative parents, so the meeting's stored client and
- * engagement links are the only ones trusted. The canonical content of a
- * transcript is unique within its engagement, even when two transcripts'
- * originals differ: one canonical transcript belongs to one meeting, so no
- * engagement may hold the same canonical content twice. The same content in a
- * different engagement is not a clash. A stored source or passage identity is
- * kept as stored and never regenerated.
+ * detached. Each transcript belongs to exactly one meeting; the meeting must
+ * exist and its engagement is resolved through the meeting's authoritative
+ * parents, so the meeting's stored client and engagement links are the only
+ * ones trusted. A transcript is an engagement-wide record: its identity and
+ * its canonical content are unique within its engagement, even when two
+ * transcripts' originals differ, so no engagement may hold the same
+ * transcript twice. The same content in a different engagement is a different
+ * transcript, not a clash, so identical canonical content may exist once in
+ * each of several engagements. A stored source or passage identity is kept as
+ * stored and never regenerated.
  */
 function parseTranscripts(value: unknown, state: State): readonly Transcript[] {
   if (!Array.isArray(value)) {
@@ -875,12 +876,6 @@ function parseTranscripts(value: unknown, state: State): readonly Transcript[] {
   const seenContent = new Map<string, string>();
   return value.map((raw, index) => {
     const transcript = parseTranscript(raw, `transcripts[${index}]`);
-    if (seenIds.has(transcript.id)) {
-      throw new ValidationError(
-        `transcripts contains duplicate id ${JSON.stringify(transcript.id)}`,
-      );
-    }
-    seenIds.add(transcript.id);
     const meeting = state.meetings.find((m) => m.id === transcript.meetingId);
     if (meeting === undefined) {
       throw new ValidationError(
@@ -894,8 +889,17 @@ function parseTranscripts(value: unknown, state: State): readonly Transcript[] {
         `transcripts[${index}] meeting ${JSON.stringify(meeting.id)} has invalid parent links`,
       );
     }
-    // The canonical content is unique within the engagement the meeting
-    // authoritatively belongs to.
+    // The identity and the canonical content are unique within the engagement
+    // the meeting authoritatively belongs to. A distinct engagement is a
+    // distinct scope, so the same identity there is a different transcript.
+    const idKey = `${meeting.engagementId}\u0000${transcript.id}`;
+    if (seenIds.has(idKey)) {
+      throw new ValidationError(
+        `engagement ${JSON.stringify(meeting.engagementId)} holds duplicate transcript id ` +
+          JSON.stringify(transcript.id),
+      );
+    }
+    seenIds.add(idKey);
     const key = `${meeting.engagementId}\u0000${transcript.canonicalText}`;
     const previous = seenContent.get(key);
     if (previous !== undefined) {

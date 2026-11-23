@@ -460,9 +460,10 @@ describe("transcript storage: strict refusal of malformed metadata", () => {
     await assertRefused(dir, withTranscripts(document, [first, { ...second }]), /duplicate/);
 
     // The same canonical content in a different engagement is not a clash: one
-    // document holds both transcripts, one per engagement, and opens. Each
-    // transcript keeps its own stored identity (the id is the canonical
-    // content's identity, which belongs to each engagement independently).
+    // document holds both transcripts, one per engagement, and opens. The
+    // canonical identity is engagement-wide, so the same words may be one
+    // transcript in engagement 1 and a different transcript in engagement 2,
+    // each keeping its stored identity.
     const elsewhere = documentWithMeeting(6);
     (elsewhere.clients as unknown[]).push({
       id: "client-2",
@@ -492,19 +493,16 @@ describe("transcript storage: strict refusal of malformed metadata", () => {
     (elsewhere.nextIds as Record<string, number>).engagements = 3;
     (elsewhere.nextIds as Record<string, number>).meetings = 3;
     // The first transcript keeps its canonical identity; the same canonical
-    // content in engagement 2 is a second transcript with a distinct stored
-    // identity (a distinct canonical identity names distinct content, so two
-    // engagements holding the same words are not one shared record). The
-    // engagement rule sees two engagements, so neither is a duplicate of the
-    // other, and both load.
-    const otherWords = "Charlie: Another conversation entirely.";
-    const otherResult = imported(otherWords);
+    // content in engagement 2 is a transcript in that engagement's own scope,
+    // not a duplicate of the first. Both engagements hold the identical
+    // canonical content, and the document loads with both transcripts.
     const otherEngagement = {
-      id: otherResult.id,
-      canonicalText: otherResult.canonicalText,
+      id: first.id,
+      canonicalText: first.canonicalText,
       meetingId: "meeting-2",
-      sources: [pastedSource(otherResult)],
+      sources: [pastedSource(imported(PASTED_TEXT))],
     };
+    assert.equal(otherEngagement.id, first.id, "both engagements hold one canonical identity");
     const crossEngagement = withTranscripts(elsewhere, [first, otherEngagement]);
     const content = JSON.stringify(crossEngagement);
     writeFileSync(storePath(dir), content, "utf8");
