@@ -106,9 +106,7 @@ export type TranscriptImportOutcome =
   | "created"
   | "attached"
   | "reused"
-  | "new_source"
-  /** New content given its own transcript on the supplied meeting. */
-  | "new_transcript";
+  | "new_source";
 
 /** A difference between the supplied metadata and what is preserved. */
 export interface TranscriptConflict {
@@ -128,8 +126,7 @@ export interface TranscriptExplanation {
     | "attached_notes_only"
     | "other_meeting"
     | "new_original"
-    | "exact_repeat"
-    | "new_transcript";
+    | "exact_repeat";
   readonly message: string;
 }
 
@@ -333,7 +330,7 @@ interface NormalizedCreate {
 
 /** What a commit resolves with, before the committed records are looked up. */
 interface CommittedOutcome {
-  readonly outcome: "created" | "attached" | "reused" | "new_source" | "new_transcript";
+  readonly outcome: "created" | "attached" | "reused" | "new_source";
   /** The engagement that authoritatively holds the transcript. */
   readonly engagementId: string;
   readonly meetingId: string;
