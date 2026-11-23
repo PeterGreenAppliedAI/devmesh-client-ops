@@ -181,7 +181,7 @@ function isBytes(value: unknown): value is Uint8Array {
   return value instanceof Uint8Array;
 }
 
-function sha256Hex(bytes: Uint8Array): string {
+export function sha256Hex(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
@@ -189,7 +189,7 @@ function utf8Bytes(text: string): Uint8Array {
   return new TextEncoder().encode(text);
 }
 
-function utf8Length(text: string): number {
+export function utf8Length(text: string): number {
   return Buffer.byteLength(text, "utf8");
 }
 

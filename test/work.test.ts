@@ -816,7 +816,7 @@ describe("work persistence", () => {
     // the events of this session's own effective mutations, the new task and
     // the client's rename.
     const saved = JSON.parse(readFileSync(storePath(dir), "utf8"));
-    assert.equal(saved.schemaVersion, 5);
+    assert.equal(saved.schemaVersion, 6);
     assert.equal(saved.tasks.length, 1);
     assert.deepEqual(
       saved.activity.map((e: { action: string; targetKind: string; targetId: string }) =>

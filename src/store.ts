@@ -59,6 +59,19 @@ import {
   type ActivityEvent,
   type ActivityTargetKind,
 } from "./activity.ts";
+import {
+  canonicalIdentityOf,
+  canonicalize,
+  IMPORT_FORMATS,
+  MAX_CONTENT_BYTES,
+  sha256Hex,
+  utf8Length,
+  validatePassage,
+  type ImportFormat,
+  type Passage,
+  type PassageLocation,
+  type PassageRange,
+} from "./transcript.ts";
 
 export type {
   ActivityAction,
@@ -97,16 +110,18 @@ export {
 } from "./model.ts";
 
 /**
- * Version 5 carries the hierarchy, the work collections, archival flags and the
- * activity journal.
+ * Version 6 carries the hierarchy, the work collections, archival flags, the
+ * activity journal and the transcript metadata.
  */
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 /** Version 1 stored only the client/engagement/project hierarchy. */
 const LEGACY_SCHEMA_VERSION = 1;
 /** Version 3 stored the hierarchy and work collections, without archival flags. */
 const WORK_SCHEMA_VERSION = 3;
 /** Version 4 added archival flags but predates the activity journal. */
 const FLAGS_SCHEMA_VERSION = 4;
+/** Version 5 added the activity journal but predates the transcripts. */
+const JOURNAL_SCHEMA_VERSION = 5;
 const STORE_FILE = "workspace.json";
 const LOCK_FILE = "workspace.lock";
 const WORK_KEYS = ["tasks", "items", "meetings"] as const;
@@ -123,7 +138,9 @@ const FLAGS_STATE_KEYS = [
   "nextIds",
 ] as const;
 const ACTIVITY_KEYS = ["activity", "nextActivityId"] as const;
-const STATE_KEYS = [...FLAGS_STATE_KEYS, ...ACTIVITY_KEYS] as const;
+const TRANSCRIPT_KEYS = ["transcripts"] as const;
+const JOURNAL_STATE_KEYS = [...FLAGS_STATE_KEYS, ...ACTIVITY_KEYS] as const;
+const STATE_KEYS = [...JOURNAL_STATE_KEYS, ...TRANSCRIPT_KEYS] as const;
 
 /** Input fields accepted when creating a client. */
 export interface ClientCreate {
@@ -235,6 +252,52 @@ export interface MeetingEdit extends Partial<
   engagementId?: string;
 }
 
+/**
+ * One stored transcript source: the original content a transcript was imported
+ * from and the text extracted from it. The source identity is stored, never
+ * regenerated on load.
+ *
+ * A source's original content is either a file original, named by the SHA-256
+ * of its exact bytes together with the byte length (the bytes stay on disk as
+ * a hash reference; they are never base64 in the JSON) or an exact pasted
+ * original, kept as its own JSON string. Exactly one of the two is present.
+ * `extractedText` is the text extracted from the original, and the passages
+ * carry its ranges and locations.
+ */
+export interface TranscriptSource {
+  /** The source identity, equal to the transcript's canonical identity. */
+  readonly id: string;
+  readonly format: ImportFormat;
+  /** The display filename. */
+  readonly filename: string;
+  /** The SHA-256 hex digest of the file original's exact bytes. */
+  readonly originalSha256?: string;
+  /** The file original's exact byte length. */
+  readonly originalLength?: number;
+  /** The exact pasted original text, for a pasted source. */
+  readonly originalText?: string;
+  /** The text extracted from the original content. */
+  readonly extractedText: string;
+  /** The passages of the extracted text, with their stored identities. */
+  readonly passages: readonly Passage[];
+}
+
+/**
+ * One canonical transcript: its identity, canonical content, the meeting it
+ * belongs to and its sources. A transcript belongs to one meeting, and its
+ * canonical content is unique within that meeting's engagement.
+ */
+export interface Transcript {
+  /** The canonical transcript identity: `sha256:` plus the canonical content's hash. */
+  readonly id: string;
+  /** The canonical content: the source text with whitespace runs collapsed. */
+  readonly canonicalText: string;
+  /** The meeting the transcript belongs to. */
+  readonly meetingId: string;
+  /** The sources the transcript was imported from, each with stored identities. */
+  readonly sources: readonly TranscriptSource[];
+}
+
 /** Detached, read-only view of the committed state. */
 export interface Snapshot {
   readonly clients: readonly Client[];
@@ -248,6 +311,11 @@ export interface Snapshot {
    * an absent journal means no events have been recorded.
    */
   readonly activity?: readonly ActivityEvent[];
+  /**
+   * The stored transcript metadata. Snapshots built by hand may omit it; an
+   * absent list means no transcripts have been stored.
+   */
+  readonly transcripts?: readonly Transcript[];
 }
 
 /** Internal file-system adapter, injectable so tests can simulate failures. */
@@ -375,6 +443,7 @@ interface State {
   nextIds: Record<string, number>;
   activity: ActivityEvent[];
   nextActivityId: number;
+  transcripts: Transcript[];
 }
 
 /**
@@ -444,6 +513,9 @@ function toJson(state: State): string {
     tasks: state.tasks,
     items: state.items,
     meetings: state.meetings,
+    // Transcript metadata is stored exactly as validated: the stored source
+    // and passage identities, original hash/length or pasted original text.
+    transcripts: state.transcripts,
     activity: state.activity,
     // The journal counter is the next event id to allocate. It is serialized as
     // it stands: the ceiling is a valid stored value, meaning the journal is
@@ -478,6 +550,7 @@ function emptyState(): State {
     nextIds: {},
     activity: [],
     nextActivityId: 1,
+    transcripts: [],
   };
 }
 
@@ -488,6 +561,366 @@ function idSuffix(kind: Kind, id: string): number | null {
   if (!/^[1-9][0-9]*$/.test(suffix)) return null;
   const value = Number(suffix);
   return Number.isSafeInteger(value) ? value : null;
+}
+
+const HASH = /^[0-9a-f]{64}$/;
+const IDENTITY = /^sha256:[0-9a-f]{64}$/;
+const TRANSCRIPT_RECORD_KEYS = [
+  "id",
+  "canonicalText",
+  "meetingId",
+  "sources",
+] as const;
+const SOURCE_FILE_KEYS = [
+  "id",
+  "format",
+  "filename",
+  "originalSha256",
+  "originalLength",
+  "extractedText",
+  "passages",
+] as const;
+const SOURCE_PASTE_KEYS = [
+  "id",
+  "format",
+  "filename",
+  "originalText",
+  "extractedText",
+  "passages",
+] as const;
+
+function transcriptRecord(
+  value: unknown,
+  what: string,
+  keys: readonly string[],
+): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new ValidationError(`${what} must be an object`);
+  }
+  const record = value as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    if (!keys.includes(key)) {
+      throw new ValidationError(`${what} has unsupported field ${JSON.stringify(key)}`);
+    }
+  }
+  for (const key of keys) {
+    if (!Object.prototype.hasOwnProperty.call(record, key)) {
+      throw new ValidationError(`${what} is missing field ${JSON.stringify(key)}`);
+    }
+  }
+  return record;
+}
+
+function transcriptString(value: unknown, what: string): string {
+  if (typeof value !== "string") throw new ValidationError(`${what} must be a string`);
+  return value;
+}
+
+function transcriptNonblank(value: unknown, what: string): string {
+  const text = transcriptString(value, what);
+  if (text.trim() === "") throw new ValidationError(`${what} must be a nonblank string`);
+  return text;
+}
+
+function transcriptFormat(value: unknown, what: string): ImportFormat {
+  if (typeof value !== "string" || !(IMPORT_FORMATS as readonly string[]).includes(value)) {
+    throw new ValidationError(`${what} must be one of ${IMPORT_FORMATS.join(", ")}`);
+  }
+  return value as ImportFormat;
+}
+
+/** Require a value to be the canonical content of `text`, within the limit. */
+function requireCanonicalText(text: string, canonicalText: unknown, identity: unknown, what: string): void {
+  if (utf8Length(text) > MAX_CONTENT_BYTES) {
+    throw new ValidationError(`${what} exceeds the content limit`);
+  }
+  if (canonicalText !== canonicalize(text)) {
+    throw new ValidationError(`${what}.canonicalText is not the canonical content`);
+  }
+  if (identity !== canonicalIdentityOf(text)) {
+    throw new ValidationError(`${what}.id does not match the canonical content`);
+  }
+}
+
+/**
+ * Validate one stored transcript source and return it detached. The source
+ * identity is the transcript's canonical identity. Exactly one kind of original
+ * is present: a file original is its SHA-256 hash and exact byte length (never
+ * base64 content), and a pasted original is its exact text. The extracted text
+ * is the authority for the passages: every passage must name the stored source
+ * identity, keep its stored id, sit at an in-bounds range that matches its
+ * text, and carry its real line and column. Ids are never regenerated.
+ */
+function parseSource(
+  value: unknown,
+  what: string,
+  transcriptId: string,
+  format: ImportFormat,
+  keys: readonly string[],
+  allowPasted = false,
+): TranscriptSource {
+  const record = transcriptRecord(value, what, keys);
+  const id = transcriptNonblank(record.id, `${what}.id`);
+  if (id !== transcriptId) {
+    throw new ValidationError(`${what}.id must equal the transcript id`);
+  }
+  if (transcriptFormat(record.format, `${what}.format`) !== format) {
+    throw new ValidationError(`${what}.format must equal the transcript format`);
+  }
+  const filename = transcriptNonblank(record.filename, `${what}.filename`);
+  const extractedText = transcriptString(record.extractedText, `${what}.extractedText`);
+  requireCanonicalText(extractedText, canonicalize(extractedText), id, what);
+
+  if (allowPasted) {
+    // A pasted original is its exact text; the extracted text is the same text.
+    const originalText = transcriptString(record.originalText, `${what}.originalText`);
+    if (originalText !== extractedText) {
+      throw new ValidationError(`${what}.extractedText must equal the pasted original text`);
+    }
+    return {
+      id,
+      format,
+      filename,
+      originalText,
+      extractedText,
+      passages: parsePassages(record.passages, extractedText, id, what),
+    };
+  }
+
+  const originalSha256 = transcriptString(record.originalSha256, `${what}.originalSha256`);
+  if (!HASH.test(originalSha256)) {
+    throw new ValidationError(`${what}.originalSha256 must be a lowercase hex SHA-256`);
+  }
+  const originalLength = record.originalLength;
+  if (
+    typeof originalLength !== "number" ||
+    !Number.isSafeInteger(originalLength) ||
+    originalLength < 0 ||
+    originalLength > MAX_CONTENT_BYTES
+  ) {
+    throw new ValidationError(
+      `${what}.originalLength must be a non-negative safe integer within the content limit`,
+    );
+  }
+
+  return {
+    id,
+    format,
+    filename,
+    originalSha256,
+    originalLength,
+    extractedText,
+    passages: parsePassages(record.passages, extractedText, id, what),
+  };
+}
+
+/**
+ * Validate the stored passages of one source against its extracted text and
+ * return them detached, keeping the stored identities exactly. Every passage
+ * names the source, its id is unique, its range is in bounds and matches its
+ * text, it does not overlap the passage before it, its location is the real
+ * line and column, and a page-based source's pages never go backwards.
+ */
+function parsePassages(
+  value: unknown,
+  extractedText: string,
+  id: string,
+  what: string,
+): readonly Passage[] {
+  if (!Array.isArray(value)) {
+    throw new ValidationError(`${what}.passages must be an array`);
+  }
+  const passages = value as readonly unknown[];
+  if (passages.length === 0) {
+    throw new ValidationError(`${what}.passages must not be empty`);
+  }
+  const breaks = lineBreaks(extractedText);
+  const seen = new Set<string>();
+  const validated: Passage[] = [];
+  let previousEnd = 0;
+  let previousPage = 0;
+  for (let index = 0; index < passages.length; index += 1) {
+    let passage: Passage;
+    try {
+      passage = validatePassage(passages[index]);
+    } catch (cause) {
+      throw new ValidationError(
+        `${what}.passages[${index}] is invalid: ${cause instanceof Error ? cause.message : "unknown"}`,
+      );
+    }
+    if (passage.sourceId !== id) {
+      throw new ValidationError(`${what}.passages[${index}].sourceId must equal the source id`);
+    }
+    if (seen.has(passage.id)) {
+      throw new ValidationError(`${what}.passages[${index}].id is duplicated`);
+    }
+    seen.add(passage.id);
+    if (passage.range.end > extractedText.length || passage.range.start > extractedText.length) {
+      throw new ValidationError(`${what}.passages[${index}] range runs past the extracted text`);
+    }
+    if (extractedText.slice(passage.range.start, passage.range.end) !== passage.text) {
+      throw new ValidationError(`${what}.passages[${index}] text does not match its exact range`);
+    }
+    if (passage.range.start < previousEnd) {
+      throw new ValidationError(`${what}.passages[${index}] overlaps the previous passage`);
+    }
+    const { line, column } = locateLineColumn(extractedText, passage.range.start, breaks);
+    if (passage.location.line !== line || passage.location.column !== column) {
+      throw new ValidationError(`${what}.passages[${index}] location is not the real line and column`);
+    }
+    if (passage.page !== undefined) {
+      if (passage.page < previousPage) {
+        throw new ValidationError(`${what}.passages[${index}] page goes backwards`);
+      }
+      previousPage = passage.page;
+    }
+    previousEnd = passage.range.end;
+    validated.push(passage);
+  }
+  return validated;
+}
+
+/**
+ * Validate one stored transcript: exact keys and types, its identity and
+ * canonical content consistent, its meeting present, its sources non-empty
+ * with unique identities equal to the transcript identity and exactly one kind
+ * of original each, and its passages validated against each source.
+ */
+function parseTranscript(value: unknown, what: string): Transcript {
+  const record = transcriptRecord(value, what, TRANSCRIPT_RECORD_KEYS);
+  const id = transcriptString(record.id, `${what}.id`);
+  if (!IDENTITY.test(id)) {
+    throw new ValidationError(`${what}.id must be sha256: plus lowercase hex`);
+  }
+  const canonicalText = transcriptString(record.canonicalText, `${what}.canonicalText`);
+  requireCanonicalText(canonicalText, canonicalText, id, what);
+  // The canonical content is the content of a source: every source's extracted
+  // text must canonicalise to it, so a transcript cannot mix unrelated content.
+  const meetingId = transcriptNonblank(record.meetingId, `${what}.meetingId`);
+  if (!Array.isArray(record.sources)) {
+    throw new ValidationError(`${what}.sources must be an array`);
+  }
+  const rawSources = record.sources as readonly unknown[];
+  if (rawSources.length === 0) {
+    throw new ValidationError(`${what}.sources must not be empty`);
+  }
+  const sources: TranscriptSource[] = [];
+  let format: ImportFormat | undefined;
+  const seen = new Set<string>();
+  for (let index = 0; index < rawSources.length; index += 1) {
+    const raw = rawSources[index];
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+      throw new ValidationError(`${what}.sources[${index}] must be an object`);
+    }
+    const sourceFormat = transcriptFormat(
+      (raw as Record<string, unknown>).format,
+      `${what}.sources[${index}].format`,
+    );
+    if (format === undefined) format = sourceFormat;
+    else if (sourceFormat !== format) {
+      throw new ValidationError(`${what}.sources[${index}].format must equal the transcript format`);
+    }
+    const source = "originalText" in (raw as Record<string, unknown>)
+      ? parseSource(raw, `${what}.sources[${index}]`, id, sourceFormat, SOURCE_PASTE_KEYS, true)
+      : parseSource(raw, `${what}.sources[${index}]`, id, sourceFormat, SOURCE_FILE_KEYS);
+    if (seen.has(source.id)) {
+      throw new ValidationError(`${what}.sources[${index}].id is duplicated`);
+    }
+    if (canonicalize(source.extractedText) !== canonicalText) {
+      throw new ValidationError(
+        `${what}.sources[${index}].extractedText is not the transcript's canonical content`,
+      );
+    }
+    seen.add(source.id);
+    sources.push(source);
+  }
+  return { id, canonicalText, meetingId, sources };
+}
+
+/**
+ * Validate the stored transcript list against the loaded records and return it
+ * detached. A transcript is unique by identity, its meeting must exist and its
+ * engagement is resolved through the meeting's authoritative parents, so the
+ * meeting's stored client and engagement links are the only ones trusted. Two
+ * transcripts in one engagement cannot share the canonical content, even
+ * though their originals may differ. A stored source or passage identity is
+ * kept as stored and never regenerated.
+ */
+function parseTranscripts(value: unknown, state: State): readonly Transcript[] {
+  if (!Array.isArray(value)) {
+    throw new ValidationError("transcripts must be an array");
+  }
+  const seenIds = new Set<string>();
+  const engagementOf = new Map<string, string>();
+  return value.map((raw, index) => {
+    const transcript = parseTranscript(raw, `transcripts[${index}]`);
+    if (seenIds.has(transcript.id)) {
+      throw new ValidationError(
+        `transcripts contains duplicate id ${JSON.stringify(transcript.id)}`,
+      );
+    }
+    seenIds.add(transcript.id);
+    const meeting = state.meetings.find((m) => m.id === transcript.meetingId);
+    if (meeting === undefined) {
+      throw new ValidationError(
+        `transcripts[${index}] references missing meeting ${JSON.stringify(transcript.meetingId)}`,
+      );
+    }
+    try {
+      requireWorkParents(state, meeting.clientId, meeting.engagementId, meeting.projectId);
+    } catch (cause) {
+      throw new ValidationError(
+        `transcripts[${index}] meeting ${JSON.stringify(meeting.id)} has invalid parent links`,
+      );
+    }
+    const previous = engagementOf.get(transcript.id);
+    if (previous !== undefined && previous !== meeting.engagementId) {
+      throw new ValidationError(
+        `transcript ${JSON.stringify(transcript.id)} belongs to two engagements`,
+      );
+    }
+    engagementOf.set(transcript.id, meeting.engagementId);
+    return transcript;
+  });
+}
+
+/** The line breaks in `text`, as UTF-16 offsets; a `\r\n` counts once at its `\r`. */
+function lineBreaks(text: string): number[] {
+  const offsets: number[] = [];
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code === 13) {
+      offsets.push(index);
+      if (text.charCodeAt(index + 1) === 10) index += 1;
+    } else if (code === 10) {
+      offsets.push(index);
+    }
+  }
+  return offsets;
+}
+
+/** The 1-based line and column of an offset, found in the sorted `breaks` list. */
+function locateLineColumn(
+  text: string,
+  offset: number,
+  breaks: readonly number[],
+): { line: number; column: number } {
+  let low = 0;
+  let high = breaks.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (breaks[middle] < offset) low = middle + 1;
+    else high = middle;
+  }
+  let lineStart = 0;
+  if (low > 0) {
+    const previous = breaks[low - 1];
+    lineStart =
+      text.charCodeAt(previous) === 13 && text.charCodeAt(previous + 1) === 10
+        ? previous + 2
+        : previous + 1;
+  }
+  return { line: low + 1, column: offset - lineStart + 1 };
 }
 
 function parseState(text: string): State {
@@ -504,6 +937,7 @@ function parseState(text: string): State {
   const version = record.schemaVersion;
   if (
     version !== SCHEMA_VERSION &&
+    version !== JOURNAL_SCHEMA_VERSION &&
     version !== FLAGS_SCHEMA_VERSION &&
     version !== WORK_SCHEMA_VERSION &&
     version !== LEGACY_SCHEMA_VERSION
@@ -517,25 +951,40 @@ function parseState(text: string): State {
   // predate archival flags: they are accepted as active records, and no flag is
   // invented for them. Versions 1, 3 and 4 predate the activity journal: they
   // are accepted with an empty journal in memory and the file is not rewritten
-  // at open time. Each version keeps the strict key rules of its own
-  // generation: version 1 must contain exactly the hierarchy keys, so a
-  // document that mentions a work collection or a work counter while claiming
-  // the old version is refused rather than guessed at. Versions 3 and 4 must
-  // contain exactly the hierarchy plus the work collections, and version 5 must
-  // contain exactly those plus the journal. Only versions 4 and 5 may carry an
-  // `archived` field, and only as a boolean; `true` means archived and `false`
-  // means active, read exactly as an absent flag.
+  // at open time. Versions 1 to 5 predate the transcripts: they are accepted
+  // with an empty transcript list, and no transcript is invented for them.
+  // Each version keeps the strict key rules of its own generation: version 1
+  // must contain exactly the hierarchy keys, so a document that mentions a work
+  // collection or a work counter while claiming the old version is refused
+  // rather than guessed at. Versions 3 and 4 must contain exactly the hierarchy
+  // plus the work collections, version 5 must contain exactly those plus the
+  // journal, and version 6 must contain exactly those plus the transcripts.
+  // Only versions 4, 5 and 6 may carry an `archived` field, and only as a
+  // boolean; `true` means archived and `false` means active, read exactly as an
+  // absent flag.
   const legacy = version === LEGACY_SCHEMA_VERSION;
-  const journal = version === SCHEMA_VERSION;
-  const flagsAllowed = version === SCHEMA_VERSION || version === FLAGS_SCHEMA_VERSION;
+  const journal =
+    version === SCHEMA_VERSION || version === JOURNAL_SCHEMA_VERSION;
+  const transcripts = version === SCHEMA_VERSION;
+  const flagsAllowed =
+    version === SCHEMA_VERSION || version === JOURNAL_SCHEMA_VERSION || version === FLAGS_SCHEMA_VERSION;
   const allowedKeys = legacy
     ? LEGACY_STATE_KEYS
-    : journal
+    : transcripts
       ? STATE_KEYS
-      : FLAGS_STATE_KEYS;
+      : journal
+        ? JOURNAL_STATE_KEYS
+        : FLAGS_STATE_KEYS;
   for (const key of Object.keys(record)) {
     if (!(allowedKeys as readonly string[]).includes(key)) {
       throw new PersistenceError(`Stored data has unsupported field ${JSON.stringify(key)}`);
+    }
+  }
+  if (!transcripts && version !== LEGACY_SCHEMA_VERSION) {
+    if ("transcripts" in record) {
+      throw new PersistenceError(
+        `Stored schema version ${version} cannot contain transcripts`,
+      );
     }
   }
   if (legacy) {
@@ -704,6 +1153,16 @@ function parseState(text: string): State {
       }
     }
   }
+  if (transcripts) {
+    // A malformed transcript refuses the whole document rather than being
+    // repaired. Opening never rewrites the file, and the file is left intact
+    // when opening is refused.
+    try {
+      state.transcripts = [...parseTranscripts(record.transcripts, state)];
+    } catch (cause) {
+      throw new PersistenceError(`Stored transcripts are invalid: ${(cause as Error)?.message}`, { cause });
+    }
+  }
   return state;
 }
 
@@ -716,6 +1175,7 @@ function snapshotOf(state: State): Snapshot {
     items: clone(state.items),
     meetings: clone(state.meetings),
     activity: clone(state.activity),
+    transcripts: clone(state.transcripts),
   });
 }
 
