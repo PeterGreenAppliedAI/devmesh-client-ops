@@ -18,6 +18,7 @@ import {
   BusyStoreError,
   clone,
   deepFreeze,
+  LEGACY_TASK_STATUSES,
   MissingRecordError,
   parseClient,
   parseEngagement,
@@ -41,6 +42,15 @@ import {
   type WorkItem,
 } from "./model.ts";
 import { requireArchiveArguments, type ArchiveKind } from "./archive.ts";
+import {
+  assertTaskIdentity,
+  requireBoardScope,
+  requireBoardStatus,
+  requireExpectations,
+  taskInScope,
+  type BoardScope,
+  type TaskIdentityExpectation,
+} from "./kanban.ts";
 import {
   allocateActivityId,
   parseActivity,
@@ -274,6 +284,9 @@ export interface WorkFilter {
   engagementId?: string;
   projectId?: string;
 }
+
+/** The read-only board a movement may target: see `kanban.ts`. */
+export type { BoardScope, TaskIdentityExpectation } from "./kanban.ts";
 
 /** Internal options accepted by openStore; only tests pass them. */
 export interface StoreOptions {
@@ -564,6 +577,20 @@ function parseState(text: string): State {
         if (!flagsAllowed && parsed.archived !== undefined) {
           throw new ValidationError(
             `Stored schema version ${version} cannot contain an archived flag`,
+          );
+        }
+        // Schema 5 added the task status `waiting`. The legacy schemas keep
+        // their old status rules, so a legacy task must still hold one of the
+        // three original statuses rather than being read under the new rule.
+        if (
+          key === "tasks" &&
+          !journal &&
+          !(LEGACY_TASK_STATUSES as readonly string[]).includes(
+            (parsed as Task).status,
+          )
+        ) {
+          throw new ValidationError(
+            `Stored schema version ${version} cannot contain task status ${JSON.stringify((parsed as Task).status)}`,
           );
         }
       } catch (cause) {
@@ -1102,6 +1129,19 @@ export interface Store {
   setArchived(kind: ArchiveKind, id: string, archived: boolean): Promise<void>;
   /** Tasks of a client, optionally narrowed to one engagement or project. */
   listTasks(filter: WorkFilter): readonly Task[];
+  /**
+   * Replace one task's status inside the mutation queue, after checking the
+   * record against the board scope and the optional identity assertions. Any
+   * status may change to any other status; the previous status is not
+   * remembered. Only the status and the transactional edit event change, and a
+   * movement to the status the task already holds records no event.
+   */
+  moveTask(
+    id: string,
+    status: TaskStatus,
+    scope: BoardScope,
+    expected?: TaskIdentityExpectation,
+  ): Promise<Task>;
   /** Work items of a client, optionally narrowed to one engagement or project. */
   listItems(filter: WorkFilter): readonly WorkItem[];
   /** Meetings of a client, optionally narrowed to one engagement or project. */
@@ -1646,6 +1686,41 @@ class StoreImpl implements Store {
 
   listTasks(filter: WorkFilter): readonly Task[] {
     return selectWork(this.state.tasks, filter);
+  }
+
+  moveTask(
+    id: string,
+    status: TaskStatus,
+    scope: BoardScope,
+    expected?: TaskIdentityExpectation,
+  ): Promise<Task> {
+    // A movement is an ordinary mutation: it enters the queue first, so a
+    // closed or blocked store refuses it exactly as it refuses every other
+    // mutation. The scope, the new status, the assertions and finally the
+    // record are validated inside the queued operation against the current
+    // committed state, so a movement queued behind another write sees the
+    // record as that write left it. A bad argument or a conflicting assertion
+    // is refused before anything is written.
+    return this.enqueue(() =>
+      this.commit((draft: State) => {
+        const checkedScope = requireBoardScope(scope);
+        requireBoardStatus(status);
+        const assertions = requireExpectations(expected);
+        const current = findRecord(draft.tasks, id, "task");
+        assertTaskIdentity(current, assertions);
+        if (!taskInScope(current, checkedScope)) {
+          throw new ValidationError(
+            `task ${JSON.stringify(current.id)} is outside the board scope`,
+          );
+        }
+        // Rebuild the record with the new status; every other field, including
+        // links, due date and the archival flag, is untouched. The record is
+        // parsed again so the rebuilt record is still strictly valid.
+        const updated = parseTask({ ...current, status });
+        draft.tasks = draft.tasks.map((t) => (t.id === id ? updated : t));
+        return editedChange("task", updated, current);
+      }),
+    );
   }
 
   listItems(filter: WorkFilter): readonly WorkItem[] {

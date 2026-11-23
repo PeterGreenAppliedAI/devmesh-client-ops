@@ -197,20 +197,36 @@ describe("dashboard selection", () => {
     });
   });
 
-  it("excludes done and undated tasks and keeps open and in-progress dated tasks", async () => {
+  it("excludes done and undated tasks and keeps open, in-progress and waiting dated tasks", async () => {
     await withStore(async (store) => {
       const client = await store.createClient({ name: "Acme" });
       const engagement = await store.createEngagement({ clientId: client.id, name: "Delivery" });
       const base = { clientId: client.id, engagementId: engagement.id };
       const open = await store.createTask({ ...base, title: "Open", status: "open", dueDate: "2026-11-21" });
       const inProgress = await store.createTask({ ...base, title: "In progress", status: "in_progress", dueDate: "2026-11-23" });
+      const waiting = await store.createTask({ ...base, title: "Waiting", status: "waiting", dueDate: "2026-11-24" });
       await store.createTask({ ...base, title: "Done", status: "done", dueDate: "2026-11-21" });
       await store.createTask({ ...base, title: "Open undated", status: "open" });
       await store.createTask({ ...base, title: "In progress undated", status: "in_progress" });
+      await store.createTask({ ...base, title: "Waiting undated", status: "waiting" });
 
       const dashboard = selectDashboard(store.snapshot(), "2026-11-22");
       assert.deepEqual(rowIds(dashboard, "overdue"), [open.id]);
-      assert.deepEqual(rowIds(dashboard, "due_soon"), [inProgress.id]);
+      assert.deepEqual(rowIds(dashboard, "due_soon"), [inProgress.id, waiting.id]);
+
+      // The waiting task keeps its due date; moving it to done on the board
+      // takes it out of both due sections exactly as for any done task.
+      await store.moveTask(waiting.id, "done", { kind: "all" });
+      const after = selectDashboard(store.snapshot(), "2026-11-22");
+      assert.ok(!rowIds(after, "due_soon").includes(waiting.id));
+      assert.ok(!rowIds(after, "overdue").includes(waiting.id));
+
+      // Moving it back to waiting, with the date unchanged, makes it eligible
+      // again under the same range.
+      await store.moveTask(waiting.id, "waiting", { kind: "all" });
+      const again = selectDashboard(store.snapshot(), "2026-11-22");
+      assert.deepEqual(rowIds(again, "due_soon"), [inProgress.id, waiting.id]);
+      assert.equal(store.snapshot().tasks.find((task) => task.id === waiting.id)?.dueDate, "2026-11-24");
     });
   });
 

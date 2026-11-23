@@ -26,6 +26,7 @@ import {
   type StartedServer,
 } from "../src/server.ts";
 import { health as healthOf } from "../src/index.ts";
+import { selectKanban } from "../src/kanban.ts";
 import { MissingRecordError, openStore, ValidationError, type Store } from "../src/store.ts";
 
 const roots: string[] = [];
@@ -96,6 +97,7 @@ function instrumentedStore(inner: Store, calls: Calls): Store {
     updateMeeting: (id, edit) => count(() => inner.updateMeeting(id, edit)),
     setArchived: (kind, id, archived) => count(() => inner.setArchived(kind, id, archived)),
     listTasks: (filter) => inner.listTasks(filter),
+    moveTask: (id, status, scope, expected) => count(() => inner.moveTask(id, status, scope, expected)),
     listItems: (filter) => inner.listItems(filter),
     listMeetings: (filter) => inner.listMeetings(filter),
     close: () => inner.close(),
@@ -709,6 +711,9 @@ describe("canonical origin and Host checks", () => {
     const dueSoon = await store.createTask({
       clientId: alpha.id, engagementId: alphaEngagement.id, title: "Due soon", status: "in_progress", dueDate: "2026-11-29",
     });
+    const waiting = await store.createTask({
+      clientId: alpha.id, engagementId: alphaEngagement.id, title: "Waiting task", status: "waiting", dueDate: "2026-11-24",
+    });
     const done = await store.createTask({
       clientId: alpha.id, engagementId: alphaEngagement.id, title: "Done", status: "done", dueDate: "2026-11-20",
     });
@@ -742,6 +747,8 @@ describe("canonical origin and Host checks", () => {
       assert.match(sectionOf("Overdue tasks"), new RegExp(`href="/tasks/${overdue.id}"`));
       assert.ok(!sectionOf("Overdue tasks").includes(`href="/tasks/${done.id}"`));
       assert.match(sectionOf("Tasks due soon"), new RegExp(`href="/tasks/${dueSoon.id}"`));
+      // A waiting task with a due date is eligible in the due sections too.
+      assert.match(sectionOf("Tasks due soon"), new RegExp(`href="/tasks/${waiting.id}"`));
       assert.ok(sectionOf("Tasks due soon").includes("2026-11-22 to 2026-11-29"));
       // An open blocker is shown; the question on the archived client is not.
       assert.match(sectionOf("Open blockers"), new RegExp(`href="/items/${blocker.id}"`));
@@ -751,9 +758,22 @@ describe("canonical origin and Host checks", () => {
       // Escaped, linked ancestry and the record's own link.
       assert.ok(!home.body.includes("<client>"));
       assert.ok(home.body.includes("Alpha &lt;client&gt;"));
+      // Selecting a board from the same snapshot is a read: the waiting task
+      // appears in its own group and the selection triggers no write.
+      const board = selectKanban(store.snapshot(), { kind: "client", id: alpha.id });
+      const waitingGroup = board.groups.find((group) => group.kind === "waiting");
+      assert.deepEqual(waitingGroup?.tasks.map((task) => task.id), [waiting.id]);
       // Serving the dashboard is a read: no mutation ran.
       assert.equal(calls.mutations, writesBeforeRender);
       assert.equal(calls.get, 1);
+
+      // The instrumented store wraps the movement too: a movement is counted,
+      // and the board then reflects its new group.
+      await store.moveTask(waiting.id, "done", { kind: "client", id: alpha.id });
+      assert.equal(calls.mutations, writesBeforeRender + 1);
+      const afterMove = selectKanban(store.snapshot(), { kind: "client", id: alpha.id });
+      assert.deepEqual(afterMove.groups.find((group) => group.kind === "waiting")?.tasks, []);
+      assert.ok(afterMove.groups.find((group) => group.kind === "done")?.tasks.some((task) => task.id === waiting.id));
     } finally {
       await server.close();
       await store.close();
