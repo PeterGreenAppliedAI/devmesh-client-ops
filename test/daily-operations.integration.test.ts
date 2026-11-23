@@ -3,18 +3,22 @@
  * end through the real rendered forms and links, over loopback HTTP, against a
  * temporary on-disk store.
  *
- * The fixture is synthetic only: two clients (one with a project-scoped and an
- * engagement-scoped engagement, one with a planned engagement and no project),
- * assigned and unassigned high-priority tasks, waiting/done tasks, work items
- * of the attention kinds and meetings on engagement and project scopes.
+ * The fixture is synthetic only: two clients (one with an active engagement
+ * that carries a project and a finished engagement, one with a planned
+ * engagement and no project), assigned and unassigned high-priority tasks, an
+ * actionable normal-priority task, waiting/done tasks, work items of the
+ * attention kinds and meetings on engagement and project scopes.
  *
- * The suite follows the dashboard's summary links to every record, walks every
- * board scope and back to all work, moves a high-priority actionable task to
- * waiting and then to done from the rendered movement controls, and observes
- * the dashboard date, membership and activity changes. It asserts that reads
- * and a submitted movement that the scope check refuses leave the records and
- * the journal untouched, then closes both the store and the server and reopens
- * them to confirm the records, the history and the dashboard survive.
+ * The suite follows the dashboard's summary links to every record and requests
+ * the destination of every create's 303 redirect, walks every board scope by
+ * the hrefs the all-work board renders and back to all work, puts an
+ * engagement on hold from its rendered edit form, and moves a high-priority
+ * actionable task to waiting and then to done by selecting the options the
+ * rendered movement controls offer. It observes the dashboard date, membership,
+ * priority, engagement and activity changes. It asserts that reads, a no-op
+ * movement and refused movements leave the stored records and the journal
+ * untouched, then closes both the store and the server and reopens them to
+ * confirm the records, the history and the dashboard survive.
  *
  * The home clock (which selects the reference day) is injected through
  * `appRoutes`, and the registered feature routes are kept beside it, so a test
@@ -82,6 +86,8 @@ interface RequestOptions {
   readonly method?: string;
   readonly path?: string;
   readonly form?: Record<string, string>;
+  /** The Host header, when it differs from the base origin. */
+  readonly host?: string;
 }
 
 /** Send a request over loopback HTTP with the canonical Host header. */
@@ -97,6 +103,8 @@ function send(base: string, options: RequestOptions = {}): Promise<Reply> {
     headers["content-type"] = "application/x-www-form-urlencoded";
     headers.origin = base;
   }
+  // A destination request may name a different host (a followed Location).
+  if (options.host !== undefined) headers.host = options.host;
   return new Promise((resolve, reject) => {
     const req = httpRequest(
       {
@@ -138,10 +146,23 @@ function unescapeHtml(value: string): string {
  * The internal target of a redirect, which a browser follows as a GET with the
  * same origin. Movement and create posts redirect this way (303).
  */
-function follow(reply: Reply): string {
+function redirectTarget(reply: Reply): string {
   assert.equal(reply.status, 303, reply.body);
   const location = String(reply.headers.location ?? "");
   assert.ok(location.startsWith("/") && !location.startsWith("//"), `internal location, got ${location}`);
+  return location;
+}
+
+/**
+ * Follow a redirect like a browser: request the returned Location and assert
+ * that its destination is a rendered page (200 HTML). Returns the target.
+ */
+async function follow(base: string, reply: Reply | Promise<Reply>): Promise<string> {
+  const location = redirectTarget(await reply);
+  const url = new URL(location, base);
+  const destination = await send(base, { path: url.pathname + url.search, host: url.host });
+  assert.equal(destination.status, 200, `the redirect destination ${location} is rendered`);
+  assert.match(String(destination.headers["content-type"]), /^text\/html; charset=utf-8/);
   return location;
 }
 
@@ -149,6 +170,8 @@ function follow(reply: Reply): string {
 interface ParsedForm {
   readonly action: string;
   readonly controls: Map<string, string>;
+  /** The option values each rendered select offered, keyed by control name. */
+  readonly options: ReadonlyMap<string, readonly string[]>;
 }
 
 /** The first form of a page, or the form whose action ends a given way. */
@@ -166,6 +189,7 @@ function parseForm(document: string, actionEndsWith?: string): ParsedForm {
   const action = /<form[^>]*\saction="([^"]*)"/.exec(form[0]);
   assert.ok(action !== null, "the form has an action");
   const controls = new Map<string, string>();
+  const offered = new Map<string, readonly string[]>();
   const inner = form[1];
   for (const match of inner.matchAll(/<textarea[^>]*name="([^"]+)"[^>]*>([\s\S]*?)<\/textarea>/g)) {
     controls.set(unescapeHtml(match[1]), unescapeHtml(match[2]));
@@ -175,10 +199,23 @@ function parseForm(document: string, actionEndsWith?: string): ParsedForm {
   }
   for (const match of inner.matchAll(/<select[^>]*name="([^"]+)"[^>]*>([\s\S]*?)<\/select>/g)) {
     const options = [...match[2].matchAll(/<option value="([^"]*)"([^>]*)>([\s\S]*?)<\/option>/g)];
+    const values = options.map((option) => unescapeHtml(option[1]));
+    offered.set(unescapeHtml(match[1]), values);
     const selectedOption = options.find((option) => option[2].includes("selected")) ?? options[0];
     controls.set(unescapeHtml(match[1]), selectedOption === undefined ? "" : unescapeHtml(selectedOption[1]));
   }
-  return { action: unescapeHtml(action[1]), controls };
+  return { action: unescapeHtml(action[1]), controls, options: offered };
+}
+
+/**
+ * Choose a rendered select's offered option, exactly as selecting it in the
+ * browser. A value the page did not offer fails the milestone.
+ */
+function chooseOption(form: ParsedForm, name: string, value: string): void {
+  const offered = form.options.get(name);
+  assert.ok(offered !== undefined, `the form has the select ${name}`);
+  assert.ok(offered.includes(value), `the ${name} select offers ${value}; offered ${offered.join(", ")}`);
+  form.controls.set(name, value);
 }
 
 /** The main content region, so the global client navigation is excluded. */
@@ -278,6 +315,25 @@ function snapshotOf(observation: Observation): string {
   return JSON.stringify(observation);
 }
 
+/**
+ * The authoritative stored state as JSON: every record and the whole journal,
+ * read straight from the store rather than through a rendered page. It is
+ * captured before and after reads, so a read that altered a single field once
+ * cannot establish the baseline it is compared with.
+ */
+async function readStore(store: Store): Promise<unknown> {
+  const snapshot = store.snapshot();
+  return structuredClone({
+    clients: snapshot.clients,
+    engagements: snapshot.engagements,
+    projects: snapshot.projects,
+    tasks: snapshot.tasks,
+    items: snapshot.items,
+    meetings: snapshot.meetings,
+    activity: snapshot.activity,
+  });
+}
+
 /** The journal of a snapshot; an opened schema-5 store always carries one. */
 function journalOf(snapshot: Snapshot): readonly ActivityEvent[] {
   assert.ok(snapshot.activity !== undefined, "the store carries a journal");
@@ -296,6 +352,10 @@ interface FixtureIds {
   readonly alphaEngagement: string;
   readonly alphaProject: string;
   readonly betaEngagement: string;
+  /** The engagement moved to on hold during the milestone (filled in later). */
+  readonly onHoldEngagement: string;
+  /** The completed engagement, which is never unfinished. */
+  readonly completedEngagement: string;
   readonly high: string;
   readonly highUnassigned: string;
   readonly done: string;
@@ -350,10 +410,12 @@ async function create(
   const form = parseForm((await send(base, { path })).body);
   for (const [key, value] of Object.entries(values)) {
     assert.ok(form.controls.has(key), `${path} form has control ${key}`);
-    form.controls.set(key, value);
+    if (form.options.has(key)) chooseOption(form, key, value);
+    else form.controls.set(key, value);
   }
   const reply = await submit(base, form);
-  return follow(reply);
+  // The create redirects (303) to the new record's page; request it.
+  return follow(base, reply);
 }
 
 function idOf(location: string): string {
@@ -396,6 +458,8 @@ describe("F2 daily operations integration", () => {
       meetings: [] as string[],
       engagements: [] as string[],
       projects: [] as string[],
+      onHoldEngagement: "",
+      completedEngagement: "",
     };
     let beforeRefusal: string;
     let beforeRestart: string;
@@ -437,6 +501,15 @@ describe("F2 daily operations integration", () => {
       }));
       created.engagements.push(created.alphaEngagement, created.betaEngagement);
       created.projects.push(created.alphaProject);
+      // Two finished engagements of the first client that never count as
+      // unfinished: an on-hold one (unfinished by status) is kept below, while
+      // a completed one must stay out of the engagement overview.
+      created.completedEngagement = idOf(await create(base, `/clients/${created.alphaClient}/engagements/new`, {
+        name: "Archived audit",
+        objectives: "Already delivered",
+        status: "completed",
+      }));
+      created.engagements.push(created.completedEngagement);
 
       // -- Tasks: assigned/unassigned, actionable/waiting/done, dated/undated.
       // The high-priority actionable task the milestone moves.
@@ -489,7 +562,18 @@ describe("F2 daily operations integration", () => {
         context: "Other client",
         projectId: "",
       }));
-      created.tasks.push(created.high, created.highUnassigned, waiting, created.done, betaHigh);
+      // An actionable non-high task with a date inside the due-soon range: it
+      // is dated like the high tasks but must never reach the priority section.
+      const normalSoon = idOf(await create(base, `/projects/${created.alphaProject}/tasks/new`, {
+        title: "Book the room",
+        status: "open",
+        priority: "normal",
+        owner: "",
+        dueDate: day(1),
+        context: "Actionable, normal priority",
+        projectId: created.alphaProject,
+      }));
+      created.tasks.push(created.high, created.highUnassigned, waiting, created.done, betaHigh, normalSoon);
 
       // -- Work items of the attention kinds and a decision (never shown). ---
       const itemKinds: Array<[string, string, string]> = [
@@ -534,6 +618,8 @@ describe("F2 daily operations integration", () => {
       })));
 
       const ids: FixtureIds = {
+        onHoldEngagement: created.onHoldEngagement,
+        completedEngagement: created.completedEngagement,
         alphaClient: created.alphaClient,
         betaClient: created.betaClient,
         engagements: created.engagements,
@@ -550,9 +636,12 @@ describe("F2 daily operations integration", () => {
       };
 
       // The journal recorded one create per record, and nothing else yet.
-      assert.equal(journalOf(app.store.snapshot()).length, created.tasks.length + created.items.length + created.meetings.length + 5);
+      assert.equal(journalOf(app.store.snapshot()).length, created.tasks.length + created.items.length + created.meetings.length + 6);
 
       // -- The dashboard at the fixed reference day. -------------------------
+      // The authoritative state before any page is read: the full stored
+      // snapshot, records and journal, taken straight from the store.
+      const beforeReads = await readStore(app.store);
       const home = await send(base, { path: "/" });
       assert.equal(home.status, 200);
       assert.match(String(home.headers["content-type"]), /^text\/html; charset=utf-8/);
@@ -578,10 +667,11 @@ describe("F2 daily operations integration", () => {
       const overdue = sectionOf(home.body, "Overdue tasks");
       assert.deepEqual(idsLinked(overdue, "/tasks"), [ids.high]);
       assert.ok(overdue.includes(escapeHtml(`${day(-1)} to ${day(-1)}`)));
-      // Due soon: today..today+7, holding the waiting task and the other
-      // client's dated high task, with the range text.
+      // Due soon: today..today+7, holding the dated waiting task, the other
+      // client's high task and the normal-priority task, ordered by due date,
+      // with the range text.
       const dueSoon = sectionOf(home.body, "Tasks due soon");
-      assert.deepEqual([...idsLinked(dueSoon, "/tasks")].sort(), [ids.tasks[2], ids.tasks[4]].sort());
+      assert.deepEqual(idsLinked(dueSoon, "/tasks"), [ids.tasks[5], ids.tasks[2], ids.tasks[4]]);
       assert.ok(dueSoon.includes(escapeHtml(`${TODAY} to ${day(7)}`)));
       assert.ok(!dueSoon.includes(`href="/tasks/${ids.done}"`), "a done task is never due");
       // Open blockers: the engagement-scoped blocker only (not the closed one).
@@ -605,6 +695,7 @@ describe("F2 daily operations integration", () => {
       assert.deepEqual([...idsLinked(high, "/tasks")].sort(), [ids.high, ids.highUnassigned, ids.tasks[4]].sort());
       assert.ok(!high.includes(`href="/tasks/${ids.tasks[2]}"`), "a waiting task is not actionable");
       assert.ok(!high.includes(`href="/tasks/${ids.done}"`), "a done task is not actionable");
+      assert.ok(!high.includes(`href="/tasks/${ids.tasks[5]}"`), "a normal-priority task is never high-priority");
       assert.ok(high.includes('<span class="badge">high</span>'));
       // Waiting tasks: the engagement-scoped waiting task.
       assert.deepEqual(idsLinked(sectionOf(home.body, "Waiting tasks"), "/tasks"), [ids.tasks[2]]);
@@ -616,10 +707,21 @@ describe("F2 daily operations integration", () => {
       // Recent activity lists current records, newest first: the last creates.
       const activity = sectionOf(home.body, "Recent activity");
       assert.ok(activity.includes('<span class="action">create</span>'));
+      // The newest row is the last create, stamped by the journal clock.
       const latest = /<span class="detail">([^<]+)<\/span>/.exec(activity)?.[1];
       assert.equal(latest, escapeHtml(instant(journalOf(app.store.snapshot()).length).toISOString()));
+      // Every dated due-soon task, high or not, is listed; the priority section
+      // holds exactly the high ones, so a non-high task is never there.
+      assert.deepEqual(
+        [...idsLinked(dueSoon, "/tasks")].sort(),
+        [ids.tasks[2], ids.tasks[4], ids.tasks[5]].sort(),
+      );
+      // The completed engagement is never an unfinished engagement, though its
+      // create is recent activity like any other.
+      assert.ok(!engagementsSection.includes(`href="/engagements/${created.completedEngagement}"`));
+      const newestCreate = activity.slice(activity.indexOf('<li class="card">'), activity.indexOf("</li>"));
 
-      // -- Reads change nothing: snapshot the state, then read every scope. --
+      // -- Reads change nothing: read every scope, then compare the store. --
       beforeRefusal = snapshotOf(await observe(base, ids));
       // Follow the dashboard's summary links to the existing records. Each
       // record row links its own detail page, its client, engagement and, when
@@ -664,29 +766,56 @@ describe("F2 daily operations integration", () => {
         targetLinks += 1;
       }
       assert.ok(targetLinks > 0, "the activity section links record pages");
-      // Reads recorded nothing: no event was added and no record changed.
+      // Reads recorded nothing: no event was added and no record changed. The
+      // stored snapshot taken before the very first page read is the baseline,
+      // so a read that changed a record once cannot establish it.
       assert.equal(snapshotOf(await observe(base, ids)), beforeRefusal);
+      assert.deepEqual(await readStore(app.store), beforeReads, "reads leave the store untouched");
 
       // -- Every board scope, and back to all work. --------------------------
-      const scopes: Array<{ path: string; tasks: readonly string[] }> = [
-        { path: "/kanban", tasks: [...ids.tasks] },
-        { path: `/clients/${ids.alphaClient}/kanban`, tasks: [ids.high, ids.highUnassigned, ids.tasks[2], ids.done] },
-        { path: `/engagements/${ids.alphaEngagement}/kanban`, tasks: [ids.high, ids.highUnassigned, ids.tasks[2], ids.done] },
-        { path: `/projects/${ids.alphaProject}/kanban`, tasks: [ids.high, ids.done] },
-        { path: `/clients/${ids.betaClient}/kanban`, tasks: [ids.tasks[4]] },
-        { path: `/engagements/${ids.betaEngagement}/kanban`, tasks: [ids.tasks[4]] },
-      ];
-      for (const scope of scopes) {
-        const board = await send(base, { path: scope.path });
-        assert.equal(board.status, 200, scope.path);
-        assert.ok(board.body.includes('aria-current="page"'), `${scope.path} marks itself current`);
+      const expectedTasks: Readonly<Record<string, readonly string[]>> = {
+        "/kanban": [...ids.tasks],
+        [`/clients/${ids.alphaClient}/kanban`]: [ids.high, ids.highUnassigned, ids.tasks[2], ids.done, ids.tasks[5]],
+        [`/engagements/${ids.alphaEngagement}/kanban`]: [ids.high, ids.highUnassigned, ids.tasks[2], ids.done, ids.tasks[5]],
+        [`/projects/${ids.alphaProject}/kanban`]: [ids.high, ids.done, ids.tasks[5]],
+        [`/clients/${ids.betaClient}/kanban`]: [ids.tasks[4]],
+        [`/engagements/${ids.betaEngagement}/kanban`]: [ids.tasks[4]],
+        [`/engagements/${ids.completedEngagement}/kanban`]: [],
+      };
+      const scopeOfPath = (path: string): { kind: string; id: string } => {
+        if (path === "/kanban") return { kind: "all", id: "" };
+        const [, family, id] = path.split("/");
+        return { kind: family.slice(0, -1), id };
+      };
+      /** Read one board page and check it is the scope's own board. */
+      const readBoard = async (path: string): Promise<string> => {
+        const board = await send(base, { path });
+        assert.equal(board.status, 200, path);
+        assert.ok(board.body.includes('aria-current="page"'), `${path} marks itself current`);
         // The scope navigation offers every scope plus all work, and the page
         // links back to all work and home.
         const scopeNav = mainContentOf(board.body);
-        for (const href of ["/kanban", `/clients/${ids.alphaClient}/kanban`, `/clients/${ids.betaClient}/kanban`, `/engagements/${ids.alphaEngagement}/kanban`, `/engagements/${ids.betaEngagement}/kanban`, `/projects/${ids.alphaProject}/kanban`]) {
-          assert.ok(scopeNav.includes(`href="${href}"`), `${scope.path} links ${href}`);
+        for (const href of Object.keys(expectedTasks)) {
+          assert.ok(scopeNav.includes(`href="${href}"`), `${path} links ${href}`);
         }
         assert.ok(scopeNav.includes('href="/"'), "the board links home");
+        return board.body;
+      };
+      // The navigation is driven by the hrefs the all-work board renders, not
+      // by constructed paths: each extracted scope link opens its own board.
+      const allWorkBoard = await readBoard("/kanban");
+      const scopeLinks = linksOf(mainContentOf(allWorkBoard)).filter((href) => href.endsWith("/kanban"));
+      assert.ok(scopeLinks.includes("/kanban"), "all work offers a link to itself");
+      for (const path of Object.keys(expectedTasks)) {
+        assert.ok(scopeLinks.includes(path), `the all-work board navigates to ${path}`);
+      }
+      assert.deepEqual(
+        [...scopeLinks].sort(),
+        Object.keys(expectedTasks).sort(),
+        "the boards offer exactly the fixture's scopes plus all work",
+      );
+      for (const path of scopeLinks) {
+        const board = await readBoard(path);
         // Every visible task of the scope is in exactly one column.
         const cards = new Map<string, string>();
         const groupStatus: Record<string, string> = {
@@ -696,8 +825,8 @@ describe("F2 daily operations integration", () => {
           "Completed: done": "done",
         };
         for (const title of Object.keys(groupStatus)) {
-          const column = columnOf(board.body, title);
-          assert.ok(column !== "", `${scope.path} has the ${title} column`);
+          const column = columnOf(board, title);
+          assert.ok(column !== "", `${path} has the ${title} column`);
           for (const [id, card] of boardCards(column)) {
             assert.ok(!cards.has(id), `${id} appears once`);
             cards.set(id, card);
@@ -705,37 +834,72 @@ describe("F2 daily operations integration", () => {
             assert.equal(parseForm(card, `/tasks/${id}/move`).controls.get("status"), groupStatus[title]);
           }
         }
-        assert.deepEqual([...cards.keys()].sort(), [...scope.tasks].sort(), `${scope.path} shows its own tasks`);
+        assert.deepEqual([...cards.keys()].sort(), [...expectedTasks[path]].sort(), `${path} shows its own tasks`);
         // The project-scope board never shows engagement-only work.
-        if (scope.path === `/projects/${ids.alphaProject}/kanban`) {
+        if (path === `/projects/${ids.alphaProject}/kanban`) {
           assert.ok(!cards.has(ids.highUnassigned), "a project board excludes project-less work");
         }
         // A card's movement form names the board's own scope and the record's
         // identity links, so a submission is checked against the exact record.
-        const scopeOf = ((): { kind: string; id: string } => {
-          if (scope.path === "/kanban") return { kind: "all", id: "" };
-          const [, family, id] = scope.path.split("/");
-          return { kind: family.slice(0, -1), id };
-        })();
+        const scope = scopeOfPath(path);
         for (const [id, card] of cards) {
           const form = parseForm(card, `/tasks/${id}/move`);
           assert.equal(form.controls.get("id"), id);
-          assert.equal(form.controls.get("scopeKind"), scopeOf.kind);
-          assert.equal(form.controls.get("scopeId"), scopeOf.id);
+          assert.equal(form.controls.get("scopeKind"), scope.kind);
+          assert.equal(form.controls.get("scopeId"), scope.id);
           const expectedClient = id === ids.tasks[4] ? ids.betaClient : ids.alphaClient;
           assert.equal(form.controls.get("clientId"), expectedClient);
           assert.equal(
             form.controls.get("projectId"),
-            id === ids.high || id === ids.done ? ids.alphaProject : "",
+            id === ids.high || id === ids.done || id === ids.tasks[5] ? ids.alphaProject : "",
           );
         }
       }
-      // Back to all work from the project scope, as the board's link does.
-      const backBoard = await send(base, { path: "/kanban" });
-      assert.equal(backBoard.status, 200);
-      assert.ok(backBoard.body.includes('<a href="/kanban" aria-current="page">All work</a>'));
+      // Back to all work from a narrowed board, through the href it renders.
+      const projectBoard = await readBoard(`/projects/${ids.alphaProject}/kanban`);
+      const backHref = linksOf(mainContentOf(projectBoard)).find((href) => href === "/kanban");
+      assert.ok(backHref !== undefined, "the project board links back to all work");
+      const backBoard = await readBoard(backHref);
+      assert.ok(backBoard.includes('<a href="/kanban" aria-current="page">All work</a>'));
       // The board navigation is a read too: the state is unchanged.
       assert.equal(snapshotOf(await observe(base, ids)), beforeRefusal);
+      assert.deepEqual(await readStore(app.store), beforeReads, "board reads leave the store untouched");
+
+      // -- Putting an engagement on hold keeps it unfinished. ----------------
+      // The engagement's own record page links its edit form; the rendered
+      // status select offers on hold, and saving it keeps the engagement in the
+      // unfinished overview.
+      const engagementPage = await send(base, { path: `/engagements/${ids.alphaEngagement}` });
+      assert.equal(engagementPage.status, 200);
+      const editHref = linksOf(mainContentOf(engagementPage.body)).find((href) =>
+        href === `/engagements/${ids.alphaEngagement}/edit`,
+      );
+      assert.ok(editHref !== undefined, "the engagement page links its edit form");
+      const editPage = await send(base, { path: editHref });
+      assert.equal(editPage.status, 200);
+      const holdForm = parseForm(editPage.body);
+      assert.equal(holdForm.action, editHref);
+      assert.equal(holdForm.controls.get("status"), "active");
+      assert.ok((holdForm.options.get("status") ?? []).includes("on_hold"), "the form offers on hold");
+      chooseOption(holdForm, "status", "on_hold");
+      assert.equal(await follow(base, await submit(base, holdForm)), `/engagements/${ids.alphaEngagement}`);
+      const onHoldState = app.store.snapshot();
+      assert.equal(
+        onHoldState.engagements.find((engagement) => engagement.id === ids.alphaEngagement)!.status,
+        "on_hold",
+      );
+      // The dashboard overview still lists it, and its current status badge says
+      // on hold; the completed engagement stays out.
+      const onHoldHome = await send(base, { path: "/" });
+      const onHoldSection = sectionOf(onHoldHome.body, "Engagements in progress");
+      assert.deepEqual(idsLinked(onHoldSection, "/engagements"), [ids.betaEngagement, ids.alphaEngagement]);
+      assert.ok(onHoldSection.includes('<span class="badge">on_hold</span>'));
+      assert.ok(!onHoldSection.includes(`href="/engagements/${ids.completedEngagement}"`));
+      const onHoldEvent = journalOf(onHoldState)[journalOf(onHoldState).length - 1];
+      assert.deepEqual(
+        { action: onHoldEvent.action, targetKind: onHoldEvent.targetKind, targetId: onHoldEvent.targetId },
+        { action: "edit", targetKind: "engagement", targetId: ids.alphaEngagement },
+      );
 
       // -- A high-priority actionable task to waiting, then to done. --------
       const beforeMove = app.store.snapshot();
@@ -743,18 +907,23 @@ describe("F2 daily operations integration", () => {
       const card = boardCards(columnOf(allBoard.body, "Actionable: open")).get(ids.high);
       assert.ok(card !== undefined, "the high task is actionable on all work");
       const moveForm = parseForm(card, `/tasks/${ids.high}/move`);
+      // The rendered select offers every status the milestone uses, on the
+      // task's own status.
+      assert.equal(moveForm.controls.get("status"), "open");
+      assert.deepEqual([...(moveForm.options.get("status") ?? [])].sort(), ["done", "in_progress", "open", "waiting"]);
       // Submit the form as rendered (moving to its own status): no event.
       const noop = await submit(base, moveForm);
-      assert.equal(follow(noop), "/kanban");
+      assert.equal(await follow(base, noop), "/kanban");
       // A movement to the status the task already holds is a no-op: neither the
       // journal nor the records change.
       assert.equal(JSON.stringify(app.store.snapshot()), JSON.stringify(beforeMove), "a no-op movement changes nothing");
-      // Move the task to waiting from the rendered select.
-      moveForm.controls.set("status", "waiting");
+      // Move the task to waiting by choosing the option the card offers it.
+      chooseOption(moveForm, "status", "waiting");
       const moved = await submit(base, moveForm);
-      const destination = follow(moved);
+      const destination = await follow(base, moved);
       assert.equal(destination, "/kanban");
       const afterWaiting = app.store.snapshot();
+      const afterWaitingStore = await readStore(app.store);
       // Exactly one movement event was recorded, stamped by the journal clock.
       assert.equal(journalOf(afterWaiting).length, journalOf(beforeMove).length + 1);
       const event = journalOf(afterWaiting)[journalOf(afterWaiting).length - 1];
@@ -779,7 +948,7 @@ describe("F2 daily operations integration", () => {
       // Recent activity now shows the movement as its newest action, linking
       // the task's current record.
       const activityAfter = sectionOf(afterWaitingHome.body, "Recent activity");
-      const newest = activityAfter.slice(activityAfter.indexOf("<li"), activityAfter.indexOf("</li>"));
+      const newest = activityAfter.slice(activityAfter.indexOf('<li class="card">'), activityAfter.indexOf("</li>"));
       assert.ok(newest.includes('<span class="action">edit</span>'));
       assert.ok(newest.includes(`href="/tasks/${ids.high}"`));
       assert.ok(newest.includes(escapeHtml(instant(journalOf(afterWaiting).length).toISOString())));
@@ -802,6 +971,7 @@ describe("F2 daily operations integration", () => {
       assert.equal(refused.status, 400);
       assert.match(String(refused.headers["content-type"]), /^text\/plain/);
       assert.equal(snapshotOf(await observe(base, ids)), refusedState, "a refused movement changes nothing");
+      assert.deepEqual(await readStore(app.store), afterWaitingStore, "a refused movement leaves the store untouched");
       // A conflicting identity assertion is refused without a write.
       const forged = parseForm(card, `/tasks/${ids.high}/move`);
       forged.controls.set("status", "done");
@@ -823,8 +993,9 @@ describe("F2 daily operations integration", () => {
         boardCards(columnOf(waitingBoard.body, "Waiting: waiting")).get(ids.high)!,
         `/tasks/${ids.high}/move`,
       );
-      doneForm.controls.set("status", "done");
-      assert.equal(follow(await submit(base, doneForm)), "/kanban");
+      assert.equal(doneForm.controls.get("status"), "waiting", "the waiting card starts on waiting");
+      chooseOption(doneForm, "status", "done");
+      assert.equal(await follow(base, await submit(base, doneForm)), "/kanban");
       const afterDone = app.store.snapshot();
       assert.equal(journalOf(afterDone).length, journalOf(afterWaiting).length + 1);
       const doneEvent = journalOf(afterDone)[journalOf(afterDone).length - 1];
@@ -833,11 +1004,18 @@ describe("F2 daily operations integration", () => {
         { action: "edit", targetKind: "task", targetId: ids.high },
       );
       assert.equal(afterDone.tasks.find((task) => task.id === ids.high)!.status, "done");
-      // The dashboard no longer lists a dated done task anywhere.
+      // The dashboard no longer lists a dated done task anywhere, and the
+      // completed high task has left the high-priority section too.
       const afterDoneHome = await send(base, { path: "/" });
       assert.ok(!sectionOf(afterDoneHome.body, "Waiting tasks").includes(`href="/tasks/${ids.high}"`));
       assert.ok(!sectionOf(afterDoneHome.body, "Overdue tasks").includes(`href="/tasks/${ids.high}"`));
       assert.ok(!sectionOf(afterDoneHome.body, "Tasks due soon").includes(`href="/tasks/${ids.high}"`));
+      assert.ok(!sectionOf(afterDoneHome.body, "High-priority tasks").includes(`href="/tasks/${ids.high}"`), "a done task is not high-priority actionable");
+      assert.deepEqual(
+        [...idsLinked(sectionOf(afterDoneHome.body, "High-priority tasks"), "/tasks")].sort(),
+        [ids.highUnassigned, ids.tasks[4]].sort(),
+        "the high-priority section keeps only the open high tasks",
+      );
       // Its current record page shows the done status and stays reachable.
       const donePage = await send(base, { path: `/tasks/${ids.high}` });
       assert.equal(donePage.status, 200);
