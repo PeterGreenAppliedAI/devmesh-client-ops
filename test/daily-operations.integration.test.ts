@@ -23,9 +23,12 @@
  * Every GET is bracketed by an authoritative stored snapshot (records and
  * journal) taken straight from the store: during fixture setup each new-form
  * GET and each redirect-destination GET is compared with the store before and
- * after it, separately from the intentional POST between them. The whole-workspace
- * read batches, the board reads, the refused movement and the post-restart
- * reads are bracketed the same way, and the journal is compared separately.
+ * after it, separately from the intentional POST between them. After each
+ * intentional POST the stored state is captured before its redirect GET, so the
+ * destination read is compared with what the POST saved (engagement edits and
+ * both task movements included). The whole-workspace read batches, the board
+ * reads, the refused movement and the post-restart reads are bracketed the same
+ * way, and the journal is compared separately.
  *
  * The home clock (which selects the reference day) is injected through
  * `appRoutes`, and the registered feature routes are kept beside it, so a test
@@ -998,8 +1001,16 @@ describe("F2 daily operations integration", () => {
       assert.equal(holdForm.controls.get("status"), "active");
       assert.ok((holdForm.options.get("status") ?? []).includes("on_hold"), "the form offers on hold");
       chooseOption(holdForm, "status", "on_hold");
-      assert.equal(await follow(base, await submit(base, holdForm)), `/engagements/${ids.alphaEngagement}`);
+      const holdReply = await submit(base, holdForm);
+      // The intentional POST is the one mutation; capture the stored state now,
+      // before the redirect destination GET, so a read that changed a record
+      // cannot become the baseline.
       const onHoldState = app.store.snapshot();
+      const onHoldStore = await readStore(app.store);
+      const onHoldJournal = JSON.stringify(journalOf(onHoldState));
+      assert.equal(await follow(base, holdReply), `/engagements/${ids.alphaEngagement}`);
+      assert.deepEqual(await readStore(app.store), onHoldStore, "reading the edited engagement changes no record");
+      assert.equal(JSON.stringify(journalOf(app.store.snapshot())), onHoldJournal, "reading the edited engagement records no event");
       assert.equal(
         onHoldState.engagements.find((engagement) => engagement.id === ids.alphaEngagement)!.status,
         "on_hold",
@@ -1036,10 +1047,16 @@ describe("F2 daily operations integration", () => {
       // Move the task to waiting by choosing the option the card offers it.
       chooseOption(moveForm, "status", "waiting");
       const moved = await submit(base, moveForm);
-      const destination = await follow(base, moved);
-      assert.equal(destination, "/kanban");
+      // Capture the stored state after the intentional POST and before the
+      // redirect destination GET, so the read is compared with what the POST
+      // saved, not with a state the read itself produced.
       const afterWaiting = app.store.snapshot();
       const afterWaitingStore = await readStore(app.store);
+      const afterWaitingJournal = JSON.stringify(journalOf(afterWaiting));
+      const destination = await follow(base, moved);
+      assert.equal(destination, "/kanban");
+      assert.deepEqual(await readStore(app.store), afterWaitingStore, "reading the movement destination changes no record");
+      assert.equal(JSON.stringify(journalOf(app.store.snapshot())), afterWaitingJournal, "reading the movement destination records no event");
       // Exactly one movement event was recorded, stamped by the journal clock.
       assert.equal(journalOf(afterWaiting).length, journalOf(beforeMove).length + 1);
       const event = journalOf(afterWaiting)[journalOf(afterWaiting).length - 1];
@@ -1111,8 +1128,14 @@ describe("F2 daily operations integration", () => {
       );
       assert.equal(doneForm.controls.get("status"), "waiting", "the waiting card starts on waiting");
       chooseOption(doneForm, "status", "done");
-      assert.equal(await follow(base, await submit(base, doneForm)), "/kanban");
+      const doneReply = await submit(base, doneForm);
+      // Again, capture the stored state after the POST, before its redirect GET.
       const afterDone = app.store.snapshot();
+      const afterDoneStore = await readStore(app.store);
+      const afterDoneJournal = JSON.stringify(journalOf(afterDone));
+      assert.equal(await follow(base, doneReply), "/kanban");
+      assert.deepEqual(await readStore(app.store), afterDoneStore, "reading the completion destination changes no record");
+      assert.equal(JSON.stringify(journalOf(app.store.snapshot())), afterDoneJournal, "reading the completion destination records no event");
       assert.equal(journalOf(afterDone).length, journalOf(afterWaiting).length + 1);
       const doneEvent = journalOf(afterDone)[journalOf(afterDone).length - 1];
       assert.deepEqual(
