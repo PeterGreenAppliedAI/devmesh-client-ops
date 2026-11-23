@@ -117,6 +117,14 @@ function event(overrides: Record<string, unknown> = {}): ActivityEvent {
   } as ActivityEvent;
 }
 
+/** The instant the fixed clock used by these tests returns. */
+const fixedAt = "2026-02-03T04:05:06.007Z";
+
+/** A fixed clock that returns the given instant (default `fixedAt`) every call. */
+function clock(at: string = fixedAt): () => Date {
+  return () => new Date(at);
+}
+
 /** Write a document, expect opening to fail, and check file and lock are kept. */
 async function assertRefused(dir: string, value: unknown, pattern?: RegExp): Promise<void> {
   const content = JSON.stringify(value);
@@ -139,27 +147,39 @@ async function hierarchy(store: Store) {
 }
 
 describe("activity journal storage", () => {
-  it("starts new workspaces with an empty journal and round-trips it", async () => {
+  it("starts new workspaces with an empty journal and records each create", async () => {
     const dir = tempDir();
-    const store = await openStore(dir);
+    const store = await openStore(dir, { now: clock() });
     try {
       const snapshot = store.snapshot();
       assert.deepEqual(snapshot.activity, []);
 
-      // The first ordinary save writes the schema 5 document with an empty
-      // journal; opening an empty directory writes nothing on its own.
+      // Opening an empty directory writes nothing on its own: the journal is
+      // empty until the first successful create, which writes schema 5 and
+      // records its own event with that create.
+      assert.equal(existsSync(storePath(dir)), false);
       await hierarchy(store);
+      assert.deepEqual(store.snapshot().activity, [
+        event({ id: 1, action: "create", targetKind: "client", targetId: "client-1" }),
+        event({ id: 2, action: "create", targetKind: "engagement", targetId: "engagement-1" }),
+        event({ id: 3, action: "create", targetKind: "project", targetId: "project-1" }),
+      ]);
     } finally {
       await store.close();
     }
     const saved = JSON.parse(readFileSync(storePath(dir), "utf8"));
     assert.equal(saved.schemaVersion, 5);
-    assert.deepEqual(saved.activity, []);
-    assert.equal(saved.nextActivityId, 1);
+    assert.deepEqual(saved.activity, [
+      event({ id: 1, action: "create", targetKind: "client", targetId: "client-1" }),
+      event({ id: 2, action: "create", targetKind: "engagement", targetId: "engagement-1" }),
+      event({ id: 3, action: "create", targetKind: "project", targetId: "project-1" }),
+    ]);
+    assert.equal(saved.nextActivityId, 4);
 
     const reopened = await openStore(dir);
     try {
-      assert.deepEqual(reopened.snapshot().activity, []);
+      assert.deepEqual(reopened.snapshot().activity, saved.activity);
+      assert.deepEqual(reopened.snapshot().clients, saved.clients);
     } finally {
       await reopened.close();
     }
@@ -180,7 +200,7 @@ describe("activity journal storage", () => {
       JSON.stringify(documentWithEveryFamily({ activity: journal, nextActivityId: 8 })),
       "utf8",
     );
-    const store = await openStore(dir);
+    const store = await openStore(dir, { now: clock(fixedAt) });
     try {
       const snapshot = store.snapshot();
       assert.deepEqual(snapshot.activity, journal);
@@ -189,19 +209,24 @@ describe("activity journal storage", () => {
       assert.ok(Object.isFrozen(snapshot.activity));
       assert.ok(Object.isFrozen(snapshot.activity![0]));
       assert.notEqual(snapshot.activity, store.snapshot().activity);
-      // An ordinary save rewrites the journal unchanged at the current schema.
+      // An effective edit keeps the stored journal and appends its own event
+      // after the ids already used, at the current schema.
       await store.updateClient("client-1", { name: "Renamed" });
+      const edited = store.snapshot().activity!;
+      assert.deepEqual(edited.slice(0, journal.length), journal);
+      assert.deepEqual(edited.at(-1), event({ id: 8, action: "edit", targetId: "client-1" }));
     } finally {
       await store.close();
     }
     const saved = JSON.parse(readFileSync(storePath(dir), "utf8"));
     assert.equal(saved.schemaVersion, 5);
-    assert.deepEqual(saved.activity, journal);
-    assert.equal(saved.nextActivityId, 8);
+    assert.deepEqual(saved.activity.slice(0, journal.length), journal);
+    assert.equal(saved.activity.length, journal.length + 1);
+    assert.equal(saved.nextActivityId, 9);
 
     const reopened = await openStore(dir);
     try {
-      assert.deepEqual(reopened.snapshot().activity, journal);
+      assert.deepEqual(reopened.snapshot().activity, saved.activity);
       assert.equal(reopened.snapshot().clients[0].name, "Renamed");
     } finally {
       await reopened.close();
@@ -252,7 +277,7 @@ describe("activity journal storage", () => {
       const dir = tempDir();
       const content = JSON.stringify(document);
       writeFileSync(storePath(dir), content, "utf8");
-      const store = await openStore(dir);
+      const store = await openStore(dir, { now: clock() });
       try {
         const snapshot = store.snapshot();
         assert.deepEqual(snapshot.activity, [], `schema ${(document as { schemaVersion: number }).schemaVersion} journal`);
@@ -263,21 +288,28 @@ describe("activity journal storage", () => {
         await store.close();
       }
       assert.equal(readFileSync(storePath(dir), "utf8"), content);
-      // An ordinary successful save upgrades to schema 5 with an empty journal.
+      // An ordinary successful save upgrades to schema 5. No event is invented
+      // for records that already existed: the journal starts with the save's own
+      // event, if that save changed a record effectively.
       if ((document as { schemaVersion: number }).schemaVersion === 4) {
-        const saving = await openStore(dir);
+        const saving = await openStore(dir, { now: clock() });
         try {
+          // Restoring the already-archived client changes the record, so the
+          // save's event is recorded; the records that predate the journal get
+          // none invented for them.
           await saving.setArchived("client", "client-1", false);
         } finally {
           await saving.close();
         }
         const saved = JSON.parse(readFileSync(storePath(dir), "utf8"));
         assert.equal(saved.schemaVersion, 5);
-        assert.deepEqual(saved.activity, []);
-        assert.equal(saved.nextActivityId, 1);
+        assert.deepEqual(saved.activity, [
+          event({ id: 1, action: "restore", targetKind: "client", targetId: "client-1" }),
+        ]);
+        assert.equal(saved.nextActivityId, 2);
       }
       if ((document as { schemaVersion: number }).schemaVersion === 1) {
-        const saving = await openStore(dir);
+        const saving = await openStore(dir, { now: clock(fixedAt) });
         try {
           await saving.updateClient("client-1", { name: "Renamed" });
         } finally {
@@ -285,8 +317,10 @@ describe("activity journal storage", () => {
         }
         const saved = JSON.parse(readFileSync(storePath(dir), "utf8"));
         assert.equal(saved.schemaVersion, 5);
-        assert.deepEqual(saved.activity, []);
-        assert.equal(saved.nextActivityId, 1);
+        assert.deepEqual(saved.activity, [
+          event({ id: 1, action: "edit", targetKind: "client", targetId: "client-1" }),
+        ]);
+        assert.equal(saved.nextActivityId, 2);
       }
     }
   });
@@ -500,7 +534,7 @@ describe("activity journal storage", () => {
       JSON.stringify(documentWithEveryFamily({ activity, nextActivityId: 3 })),
       "utf8",
     );
-    const store = await openStore(dir);
+    const store = await openStore(dir, { now: clock() });
     try {
       assert.deepEqual(store.snapshot().activity, activity);
     } finally {
@@ -531,35 +565,51 @@ describe("activity journal storage", () => {
     } finally {
       await store.close();
     }
-    assert.equal(JSON.parse(readFileSync(storePath(dir), "utf8")).nextActivityId, 3);
+    assert.equal(store.snapshot().activity!.length, 3);
+    assert.equal(JSON.parse(readFileSync(storePath(dir), "utf8")).nextActivityId, 4);
   });
 
-  it("accepts an exhausted journal and keeps its ceiling counter on save", async () => {
+  it("refuses an exhausted journal's event allocation and keeps its ceiling counter", async () => {
     // The highest usable event id is the ceiling minus one; the counter that
     // follows it is the ceiling itself, which the task allows as a stored
     // value. It is not clamped, and the exhausted journal can still be saved.
+    // Every effective mutation is rejected with a PersistenceError before
+    // anything is persisted or published, because the allocation is refused for
+    // it. A no-op records no event and so needs no allocation: it saves as
+    // before at the unchanged, exhausted counter.
     const dir = tempDir();
     const highest = Number.MAX_SAFE_INTEGER - 1;
     const activity = [event({ id: highest })];
-    writeFileSync(
-      storePath(dir),
-      JSON.stringify(documentWithEveryFamily({ activity, nextActivityId: Number.MAX_SAFE_INTEGER })),
-      "utf8",
+    const content = JSON.stringify(
+      documentWithEveryFamily({ activity, nextActivityId: Number.MAX_SAFE_INTEGER }),
     );
-    const store = await openStore(dir);
+    writeFileSync(storePath(dir), content, "utf8");
+    const store = await openStore(dir, { now: clock() });
     try {
       assert.deepEqual(store.snapshot().activity, activity);
-      await store.updateClient("client-1", { name: "Renamed" });
+      await assert.rejects(store.updateClient("client-1", { name: "Renamed" }), PersistenceError);
+      await assert.rejects(store.createClient({ name: "New" }), PersistenceError);
+      assert.deepEqual(store.snapshot().activity, activity);
+      assert.equal(store.snapshot().clients[0].name, "Acme");
+      assert.equal(readFileSync(storePath(dir), "utf8"), content);
+      // A no-op keeps normal save behaviour: it persists and records nothing.
+      await store.setArchived("client", "client-1", false);
+      assert.deepEqual(store.snapshot().activity, activity);
+      assert.equal(
+        JSON.parse(readFileSync(storePath(dir), "utf8")).nextActivityId,
+        Number.MAX_SAFE_INTEGER,
+      );
     } finally {
       await store.close();
     }
-    const saved = JSON.parse(readFileSync(storePath(dir), "utf8"));
-    assert.equal(saved.nextActivityId, Number.MAX_SAFE_INTEGER);
-    assert.deepEqual(saved.activity, activity);
 
     const reopened = await openStore(dir);
     try {
       assert.equal(reopened.snapshot().activity![0].id, highest);
+      assert.equal(
+        JSON.parse(readFileSync(storePath(dir), "utf8")).nextActivityId,
+        Number.MAX_SAFE_INTEGER,
+      );
     } finally {
       await reopened.close();
     }
@@ -624,23 +674,28 @@ describe("activity journal storage", () => {
       JSON.stringify(documentWithEveryFamily({ activity: [event({ id: 9 })], nextActivityId: 10 })),
       "utf8",
     );
-    const store = await openStore(dir);
+    const store = await openStore(dir, { now: clock() });
     try {
       const task = await store.createTask({
         clientId: "client-1",
         engagementId: "engagement-1",
         title: "Next task",
       });
-      // Record ids continue from the record counters and event ids are untouched.
+      // Record ids continue from the record counters; the create's event takes
+      // the journal's next id, not a record counter.
       assert.equal(task.id, "task-2");
       assert.equal(store.snapshot().activity![0].id, 9);
+      assert.deepEqual(store.snapshot().activity![1], event({ id: 10, action: "create", targetKind: "task", targetId: "task-2" }));
     } finally {
       await store.close();
     }
     const saved = JSON.parse(readFileSync(storePath(dir), "utf8"));
     assert.equal(saved.nextIds.tasks, 3);
-    assert.equal(saved.nextActivityId, 10);
-    assert.deepEqual(saved.activity, [event({ id: 9 })]);
+    assert.equal(saved.nextActivityId, 11);
+    assert.deepEqual(saved.activity, [
+      event({ id: 9 }),
+      event({ id: 10, action: "create", targetKind: "task", targetId: "task-2" }),
+    ]);
   });
 
   it("keeps a hand-built snapshot's missing journal as empty", async () => {

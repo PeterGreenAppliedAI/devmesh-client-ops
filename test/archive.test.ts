@@ -23,8 +23,10 @@ import {
   openStore,
   PersistenceError,
   ValidationError,
+  type ActivityEvent,
   type FileSystem,
   type Store,
+  type StoreOptions,
 } from "../src/store.ts";
 
 const roots: string[] = [];
@@ -40,6 +42,20 @@ function tempDir(): string {
 
 function storePath(dir: string): string {
   return join(dir, "workspace.json");
+}
+
+/** A fixed clock for activity events: one canonical instant for every call. */
+const fixedAt = "2026-02-03T04:05:06.007Z";
+const clock: () => Date = () => new Date(fixedAt);
+
+/** Open a store whose journal events are stamped by the fixed clock. */
+function openArchiveStore(dir: string, options: StoreOptions = {}): Promise<Store> {
+  return openStore(dir, { ...options, now: clock });
+}
+
+/** Assert a store's activity journal equals the expected events exactly. */
+function assertJournal(store: Store, expected: ActivityEvent[]): void {
+  assert.deepEqual(store.snapshot().activity, expected);
 }
 
 function fsError(code: string): NodeJS.ErrnoException {
@@ -148,7 +164,7 @@ describe("archival flags", () => {
 
   it("archives and restores each family, preserving fields and sibling records", async () => {
     for (const kind of kinds) {
-      const store = await openStore(tempDir());
+      const store = await openArchiveStore(tempDir());
       try {
         const w = await workspace(store);
         // A real sibling in the same collection, unaffected by the flag.
@@ -205,7 +221,7 @@ describe("archival flags", () => {
   it("persists flags across restart and removes the flag when restored", async () => {
     for (const kind of kinds) {
       const dir = tempDir();
-      const store = await openStore(dir);
+      const store = await openArchiveStore(dir);
       const record = await (async () => {
         try {
           const w = await workspace(store);
@@ -217,7 +233,7 @@ describe("archival flags", () => {
         }
       })();
       assert.equal(storedRecord(dir, kind, record).archived, true, `${kind} stored as true`);
-      const reopened = await openStore(dir);
+      const reopened = await openArchiveStore(dir);
       try {
         assert.equal(
           recordOf(reopened.snapshot(), kind, record)?.archived,
@@ -234,7 +250,7 @@ describe("archival flags", () => {
       } finally {
         await reopened.close();
       }
-      const again = await openStore(dir);
+      const again = await openArchiveStore(dir);
       try {
         assert.equal(
           "archived" in recordOf(again.snapshot(), kind, record)!,
@@ -249,7 +265,7 @@ describe("archival flags", () => {
 
   it("follows normal commit rules on repeated archive and unarchive across families", async () => {
     const dir = tempDir();
-    const store = await openStore(dir);
+    const store = await openArchiveStore(dir);
     try {
       const w = await workspace(store);
       const ids = idsOf(w);
@@ -271,9 +287,36 @@ describe("archival flags", () => {
           }
         }
       }
+      // Every effective flip records exactly one event, and a repeat of the
+      // flag already held is a no-op that saves as before. Each family starts
+      // active and the loop requests true, true, false, false per round, so
+      // every round records one archive and one restore.
+      const recorded = store.snapshot().activity!.map((e) => `${e.action}:${e.targetKind}:${e.targetId}`);
+      const expectedJournal = [
+        `create:client:${ids.client}`,
+        `create:engagement:${ids.engagement}`,
+        `create:project:${ids.project}`,
+        `create:task:${ids.task}`,
+        `create:item:${ids.item}`,
+        `create:meeting:${w.meeting.id}`,
+      ];
+      for (const kind of kinds) {
+        for (let round = 0; round < 3; round += 1) {
+          expectedJournal.push(`archive:${kind}:${ids[kind]}`);
+          expectedJournal.push(`restore:${kind}:${ids[kind]}`);
+        }
+      }
+      assert.deepEqual(recorded, expectedJournal, "one event per effective flip, none for repeats");
+      const journal = store.snapshot().activity!;
+      assert.deepEqual(
+        journal.map((e) => e.id),
+        journal.map((_, index) => index + 1),
+        "event ids are allocated in order from 1",
+      );
+      assert.equal(journal.every((e) => e.at === fixedAt), true, "every event uses the clock");
       // The persisted document reflects the final restored state.
       await store.close();
-      const reopened = await openStore(dir);
+      const reopened = await openArchiveStore(dir);
       try {
         for (const kind of kinds) {
           assert.equal(
@@ -302,6 +345,20 @@ describe("archival flags", () => {
         assert.equal(task2.id, "task-2", "task counter advanced past archival");
         const item2 = await reopened.createItem({ ...links, kind: "follow_up", title: "Fresh item" });
         assert.equal(item2.id, "item-2", "item counter advanced past archival");
+        // Event ids are independent of the record counters: the journal grows
+        // by exactly one event per create, in order.
+        const journal = reopened.snapshot().activity!;
+        assert.deepEqual(
+          journal.slice(-5).map((e) => `${e.action}:${e.targetKind}:${e.targetId}`),
+          [
+            "create:client:client-2",
+            "create:engagement:engagement-2",
+            "create:project:project-2",
+            "create:task:task-2",
+            "create:item:item-2",
+          ],
+          "creates recorded while record counters advance",
+        );
       } finally {
         await reopened.close();
       }
@@ -312,7 +369,7 @@ describe("archival flags", () => {
 
   it("preserves counters and flags across ordinary edits", async () => {
     const dir = tempDir();
-    const store = await openStore(dir);
+    const store = await openArchiveStore(dir);
     try {
       const w = await workspace(store);
       const initialCounters = JSON.parse(readFileSync(storePath(dir), "utf8")).nextIds;
@@ -362,7 +419,7 @@ describe("archival flags", () => {
       await store.setArchived("client", w.client.id, true);
       // After a restart the edits and the archival flags are both still there.
       await store.close();
-      const reopened = await openStore(dir);
+      const reopened = await openArchiveStore(dir);
       try {
         assert.equal(reopened.snapshot().clients[0].archived, true);
         const task = reopened.snapshot().tasks.find((t) => t.id === w.task.id)!;
@@ -377,7 +434,7 @@ describe("archival flags", () => {
   });
 
   it("keeps independently archived children when restoring a parent", async () => {
-    const store = await openStore(tempDir());
+    const store = await openArchiveStore(tempDir());
     try {
       const w = await workspace(store);
       const extraTask = await store.createTask({
@@ -441,7 +498,7 @@ describe("archival flags", () => {
 
   it("rejects invalid arguments and unknown ids without mutating", async () => {
     const dir = tempDir();
-    const store = await openStore(dir);
+    const store = await openArchiveStore(dir);
     try {
       const w = await workspace(store);
       const before = store.snapshot();
@@ -504,7 +561,7 @@ describe("archival flags", () => {
           : { clients: 2, engagements: 2, projects: 2 },
       };
       writeFileSync(storePath(dir), JSON.stringify(document), "utf8");
-      const store = await openStore(dir);
+      const store = await openArchiveStore(dir);
       try {
         const snapshot = store.snapshot();
         assert.equal("archived" in snapshot.clients[0], false, `v${version} client active`);
@@ -518,7 +575,7 @@ describe("archival flags", () => {
       for (const extra of [{ archived: true }, { archive: [] }]) {
         const content = JSON.stringify({ ...document, ...extra });
         writeFileSync(storePath(dir), content, "utf8");
-        await assert.rejects(openStore(dir), PersistenceError);
+        await assert.rejects(openArchiveStore(dir), PersistenceError);
         assert.equal(readFileSync(storePath(dir), "utf8"), content);
       }
     }
@@ -555,7 +612,7 @@ describe("archival flags", () => {
           nextIds: { clients: 2, engagements: 2, projects: 2, tasks: 2, items: 2 },
         };
         writeFileSync(storePath(dir), JSON.stringify(document), "utf8");
-        const store = await openStore(dir);
+        const store = await openArchiveStore(dir);
         try {
           const snapshot = store.snapshot();
           const record = recordOf(snapshot, kind, id)!;
@@ -619,7 +676,7 @@ describe("archival flags", () => {
     for (const value of cases) {
       const content = JSON.stringify(value);
       writeFileSync(storePath(dir), content, "utf8");
-      await assert.rejects(openStore(dir), PersistenceError);
+      await assert.rejects(openArchiveStore(dir), PersistenceError);
       assert.equal(readFileSync(storePath(dir), "utf8"), content, "data left untouched");
       assert.equal(existsSync(join(dir, "workspace.lock")), false, "lock released");
     }
@@ -638,7 +695,7 @@ describe("archival flags", () => {
       }),
       "utf8",
     );
-    const store = await openStore(dir);
+    const store = await openArchiveStore(dir);
     try {
       assert.equal(store.snapshot().clients[0].archived, true);
       assert.equal("archived" in store.snapshot().clients[1], false);
@@ -650,7 +707,7 @@ describe("archival flags", () => {
 
 describe("inherited visibility", () => {
   it("archives an unflagged project through an archived client without an engagement flag", async () => {
-    const store = await openStore(tempDir());
+    const store = await openArchiveStore(tempDir());
     try {
       const w = await workspace(store);
       const snapshot = () => store.snapshot();
@@ -672,7 +729,7 @@ describe("inherited visibility", () => {
   });
 
   it("resolves real records through their stored parent chains", async () => {
-    const store = await openStore(tempDir());
+    const store = await openArchiveStore(tempDir());
     try {
       const w = await workspace(store);
       const snapshot = () => store.snapshot();
@@ -759,7 +816,7 @@ describe("inherited visibility", () => {
   });
 
   it("does not change descendants when a parent is archived", async () => {
-    const store = await openStore(tempDir());
+    const store = await openArchiveStore(tempDir());
     try {
       const w = await workspace(store);
       const before = store.snapshot();
@@ -821,7 +878,7 @@ describe("archival persistence failures", () => {
   /** Seed a persisted workspace and return its directory and record ids. */
   async function seeded(): Promise<{ dir: string; ids: Record<ArchiveKind, string> }> {
     const dir = tempDir();
-    const setup = await openStore(dir);
+    const setup = await openArchiveStore(dir);
     try {
       const w = await workspace(setup);
       return { dir, ids: idsOf(w) };
@@ -835,7 +892,7 @@ describe("archival persistence failures", () => {
     const committed = readFileSync(storePath(dir), "utf8");
 
     const { fs, state } = failingFs();
-    const store = await openStore(dir, { fs });
+    const store = await openArchiveStore(dir, { fs });
     try {
       assert.equal("archived" in store.snapshot().clients[0], false);
       state.failWrites = true;
@@ -851,7 +908,7 @@ describe("archival persistence failures", () => {
     } finally {
       await store.close();
     }
-    const reopened = await openStore(dir);
+    const reopened = await openArchiveStore(dir);
     try {
       assert.equal(reopened.snapshot().clients[0].archived, true);
     } finally {
@@ -863,7 +920,7 @@ describe("archival persistence failures", () => {
     for (const kind of ["task", "item"] as const) {
       const { dir, ids } = await seeded();
       const { fs, state } = failingFs();
-      const store = await openStore(dir, { fs });
+      const store = await openArchiveStore(dir, { fs });
       try {
         // Reach an archived state, then fail a repeat archive: the record stays
         // archived in memory and on disk, and the failure is rejected.
@@ -902,7 +959,7 @@ describe("archival persistence failures", () => {
       } finally {
         await store.close();
       }
-      const reopened = await openStore(dir);
+      const reopened = await openArchiveStore(dir);
       try {
         assert.equal(recordOf(reopened.snapshot(), kind, ids[kind])?.archived, true);
       } finally {
@@ -916,7 +973,7 @@ describe("archival persistence failures", () => {
     const committed = readFileSync(storePath(dir), "utf8");
 
     const { fs, state } = failingFs();
-    const store = await openStore(dir, { fs, platform: "linux" });
+    const store = await openArchiveStore(dir, { fs, platform: "linux" });
     state.flushes = 0;
     state.failFirstFlush = true;
     try {
@@ -939,7 +996,7 @@ describe("archival persistence failures", () => {
     const committed = readFileSync(storePath(dir), "utf8");
 
     const { fs, state } = failingFs();
-    const store = await openStore(dir, { fs, platform: "linux" });
+    const store = await openArchiveStore(dir, { fs, platform: "linux" });
     // Fail the replacement's flush and the restore's flush alike.
     state.failFlushes = true;
     try {
@@ -961,7 +1018,7 @@ describe("archival persistence failures", () => {
     // Reopening reads whatever the disk holds; the restored previous bytes are
     // the committed state.
     assert.equal(readFileSync(storePath(dir), "utf8"), committed);
-    const reopened = await openStore(dir);
+    const reopened = await openArchiveStore(dir);
     try {
       assert.equal("archived" in reopened.snapshot().clients[0], false);
       await reopened.setArchived("client", ids.client, true);
@@ -973,7 +1030,7 @@ describe("archival persistence failures", () => {
 
   it("refuses mutations on a closed store with lifecycle precedence", async () => {
     const dir = tempDir();
-    const store = await openStore(dir);
+    const store = await openArchiveStore(dir);
     const w = await workspace(store);
     await store.close();
     // A closed store refuses the mutation with a persistence error, exactly as
@@ -988,7 +1045,7 @@ describe("archival persistence failures", () => {
       PersistenceError,
     );
     // Reopening shows nothing was published.
-    const reopened = await openStore(dir);
+    const reopened = await openArchiveStore(dir);
     try {
       assert.equal("archived" in reopened.snapshot().clients[0], false);
     } finally {
@@ -999,7 +1056,7 @@ describe("archival persistence failures", () => {
   it("refuses archival on a blocked store before validating arguments", async () => {
     const { dir, ids } = await seeded();
     const { fs, state } = failingFs();
-    const store = await openStore(dir, { fs, platform: "linux" });
+    const store = await openArchiveStore(dir, { fs, platform: "linux" });
     state.failFlushes = true;
     try {
       await assert.rejects(store.setArchived("client", ids.client, true), PersistenceError);

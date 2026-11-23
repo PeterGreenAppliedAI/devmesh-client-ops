@@ -15,6 +15,7 @@ import {
   type Task,
   type WorkItem,
 } from "./model.ts";
+import { isEffectivelyArchived, type ArchiveState } from "./archive.ts";
 
 /** The actions a journal event can describe. */
 export type ActivityAction = "create" | "edit" | "archive" | "restore";
@@ -279,4 +280,70 @@ export function allocateActivityId(
   }
   state.nextActivityId = next + 1;
   return next;
+}
+
+/** The number of events the recent-activity view keeps. */
+export const RECENT_ACTIVITY_LIMIT = 20;
+
+/**
+ * The stored snapshot an activity view reads: the records, the journal (absent
+ * meaning empty) and enough of the hierarchy to resolve archival ancestry.
+ */
+export interface ActivityView {
+  readonly clients: readonly Client[];
+  readonly engagements: readonly Engagement[];
+  readonly projects: readonly Project[];
+  readonly tasks: readonly Task[];
+  readonly items: readonly WorkItem[];
+  readonly meetings: readonly Meeting[];
+  readonly activity?: readonly ActivityEvent[];
+}
+
+/**
+ * Resolve the current record an event targets, by the target's family. A record
+ * that no longer exists is not resolved; a meeting never carries a flag but
+ * still inherits its parents' visibility.
+ */
+function currentTarget(
+  view: ActivityView,
+  event: ActivityEvent,
+): Client | Engagement | Project | Task | WorkItem | Meeting | undefined {
+  const records = view[`${event.targetKind}s` as keyof ActivityView] as
+    | readonly { id: string }[]
+    | undefined;
+  return records?.find((record) => record.id === event.targetId) as
+    | Client
+    | Engagement
+    | Project
+    | Task
+    | WorkItem
+    | Meeting
+    | undefined;
+}
+
+/**
+ * Select the latest visible activity: events whose current target exists and is
+ * not effectively archived, resolved against the current records and their
+ * current ancestry (never the historical names, links or flags). Events are
+ * ordered by timestamp descending, then by event id descending, and the first
+ * 20 are kept. There is no date cutoff, and an absent or empty journal yields
+ * an empty list. The result is detached and frozen.
+ */
+export function selectRecentActivity(
+  snapshot: ActivityView,
+): readonly ActivityEvent[] {
+  const journal = snapshot.activity ?? [];
+  const archiveState: ArchiveState = snapshot;
+  const visible = journal.filter((event) => {
+    const target = currentTarget(snapshot, event);
+    if (target === undefined) return false;
+    return !isEffectivelyArchived(archiveState, target);
+  });
+  // Timestamps are canonical, equal-length UTC instants, so the stored text
+  // compares chronologically as well as lexically.
+  const ordered = [...visible].sort((a, b) => {
+    if (a.at !== b.at) return a.at < b.at ? 1 : -1;
+    return b.id - a.id;
+  });
+  return deepFreeze(clone(ordered.slice(0, RECENT_ACTIVITY_LIMIT)));
 }
