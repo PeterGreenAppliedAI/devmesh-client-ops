@@ -468,15 +468,13 @@ class TranscriptStoreImpl implements TranscriptStore {
    * bytes of the prepared import, returning that stored source when it does.
    */
   private existingSource(transcript: Transcript, prepared: PreparedImport): TranscriptSource | undefined {
-    const wanted = prepared.file
-      ? `sha256:${sha256Hex(prepared.result.originalBytes)}`
-      : `text:${sha256Hex(new TextEncoder().encode(prepared.result.originalText))}`;
+    const wantedSha256 = sha256Hex(prepared.result.originalBytes);
     return transcript.sources.find((source) => {
       if (isPasted(source) !== !prepared.file) return false;
       if (!prepared.file) {
         return source.originalText === prepared.result.originalText;
       }
-      return source.originalSha256 !== undefined && `sha256:${source.originalSha256}` === wanted;
+      return source.originalSha256 === wantedSha256;
     });
   }
 
