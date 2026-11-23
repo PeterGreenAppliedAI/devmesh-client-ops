@@ -72,6 +72,22 @@ function invalidClock(): () => Date {
   return () => "not a date" as unknown as Date;
 }
 
+/** A clock that returns a Date with no instant (`new Date(NaN)`). */
+function invalidDateClock(): () => Date {
+  return () => new Date(Number.NaN);
+}
+
+/** A date-like object whose instant conversion throws. */
+function throwingDateClock(): () => Date {
+  return () =>
+    ({
+      getUTCFullYear: () => 2026,
+      toISOString: () => {
+        throw new RangeError("Invalid time value");
+      },
+    }) as unknown as Date;
+}
+
 function fsError(code: string): NodeJS.ErrnoException {
   const error = new Error(code) as NodeJS.ErrnoException;
   error.code = code;
@@ -523,7 +539,7 @@ describe("the journal's clock and counter", () => {
     }
   });
 
-  it("stamps no-op and effective mutations alike, keeping a stamp only for an event", async () => {
+  it("reads the clock only for a mutation that records an event", async () => {
     const calls: number[] = [];
     const counting = await openStore(tempDir(), {
       now: () => {
@@ -535,19 +551,19 @@ describe("the journal's clock and counter", () => {
       const c = await counting.createClient({ name: "Acme" });
       assert.equal(calls.length, 1);
       const before = recorded(counting).length;
-      // A no-op takes its timestamp inside the commit too, and records nothing.
+      // A no-op records no event, so it never reads the clock.
       await counting.updateClient(c.id, { name: "Acme" });
-      assert.equal(calls.length, 2, "the no-op read the clock");
-      assert.equal(recorded(counting).length, before, "but kept no event");
+      assert.equal(calls.length, 1, "the no-op did not read the clock");
+      assert.equal(recorded(counting).length, before, "and records nothing");
       await counting.updateClient(c.id, { name: "Renamed" });
-      assert.equal(calls.length, 3);
+      assert.equal(calls.length, 2, "the effective edit read the clock");
       assert.equal(recorded(counting).length, before + 1);
     } finally {
       await counting.close();
     }
   });
 
-  it("rejects a no-op mutation too when the clock fails", async () => {
+  it("saves a no-op mutation normally even when the clock fails", async () => {
     const dir = tempDir();
     const seed = await openStore(dir, { now: clock() });
     let clientId: string;
@@ -556,21 +572,28 @@ describe("the journal's clock and counter", () => {
     } finally {
       await seed.close();
     }
-    const committed = readFileSync(storePath(dir), "utf8");
     const store = await openStore(dir, { now: failingClock() });
     try {
       const before = store.snapshot();
-      await assert.rejects(store.updateClient(clientId, { name: "Acme" }), PersistenceError);
-      await assert.rejects(store.setArchived("client", clientId, false), PersistenceError);
-      assert.deepEqual(store.snapshot(), before);
-      assert.equal(readFileSync(storePath(dir), "utf8"), committed);
+      // The no-op needs no timestamp, so it persists exactly as before.
+      const result = await store.updateClient(clientId, { name: "Acme" });
+      assert.equal(result.name, "Acme");
+      await store.setArchived("client", clientId, false);
+      assert.deepEqual(recorded(store), targets(before.activity!));
+      const saved = JSON.parse(readFileSync(storePath(dir), "utf8"));
+      assert.deepEqual(saved.activity, before.activity, "and on disk");
     } finally {
       await store.close();
     }
   });
 
   it("rejects a throwing or invalid clock with PersistenceError and publishes nothing", async () => {
-    for (const makeClock of [failingClock, invalidClock]) {
+    for (const makeClock of [
+      failingClock,
+      invalidClock,
+      invalidDateClock,
+      throwingDateClock,
+    ]) {
       const dir = tempDir();
       const seed = await openStore(dir, { now: clock() });
       let clientId: string;

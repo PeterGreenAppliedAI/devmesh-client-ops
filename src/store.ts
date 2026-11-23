@@ -286,11 +286,11 @@ export interface StoreOptions {
   platform?: string;
   /**
    * The clock that stamps journal events; defaults to the server clock
-   * (`() => new Date()`). It is read inside the serialized commit, after the
-   * mutation has been built and validated, so events are stamped in commit
-   * order. A no-op mutation still takes its timestamp, exactly as the task's
-   * rule for an invalid clock applies to every mutation, including a no-op one;
-   * the stamp is simply not kept because no event is recorded.
+   * (`() => new Date()`). It is read inside the serialized commit of a mutation
+   * that records an event, after the mutation has been built and validated, so
+   * events are stamped in commit order. A mutation that records no event does
+   * not read it. If it fails or returns a value that is not a canonical instant,
+   * the whole mutation is rejected as a persistence failure.
    */
   now?: () => Date;
 }
@@ -862,13 +862,22 @@ function requireParentId(value: unknown, field: string, kind: string): string {
  * refused rather than padded or truncated.
  */
 function canonicalInstant(date: Date): string {
-  const year = date.getUTCFullYear();
-  if (year < 0 || year > 9999) {
+  let year: number;
+  let iso: string;
+  try {
+    // An invalid `Date` (for example `new Date(NaN)`) has no instant: reading
+    // its year yields NaN and `toISOString` throws a `RangeError`. Both are
+    // turned into a persistence failure here, never a raw conversion error.
+    year = date.getUTCFullYear();
+    iso = date.toISOString();
+  } catch (cause) {
+    throw new PersistenceError("The activity clock returned an invalid date", { cause });
+  }
+  if (typeof iso !== "string" || Number.isNaN(year) || year < 0 || year > 9999) {
     throw new PersistenceError(
       "The activity clock returned an instant outside the canonical year range",
     );
   }
-  const iso = date.toISOString();
   // `toISOString` spells years 0 to 9999 as four digits already; a signed or
   // extended year would not be canonical.
   if (iso.length !== 24) {
@@ -1310,13 +1319,14 @@ class StoreImpl implements Store {
     }
     const draft: State = clone(this.state);
     const change = mutate(draft);
-    // The clock is read for every mutation that reaches this point, a no-op
-    // included, so a failing or invalid clock rejects it as a persistence
-    // failure before anything is persisted; a no-op then discards the stamp.
-    const at = this.clock();
     if (change.event !== undefined) {
-      // The event is appended to the same draft the record change was made in,
-      // so the record and its event are saved by the one write below.
+      // The clock is read only for a mutation that records an event, so a no-op
+      // mutation keeps its ordinary persistence and failure behaviour. A
+      // failing or invalid clock rejects it as a persistence failure before
+      // anything is persisted. The event is appended to the same draft the
+      // record change was made in, so the record and its event are saved by the
+      // one write below.
+      const at = this.clock();
       let id: number;
       try {
         // An exhausted or inconsistent journal counter rejects the whole
