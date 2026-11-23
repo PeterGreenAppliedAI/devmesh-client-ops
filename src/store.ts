@@ -41,13 +41,27 @@ import {
   type WorkItem,
 } from "./model.ts";
 import { requireArchiveArguments, type ArchiveKind } from "./archive.ts";
-import { parseActivity, type ActivityEvent } from "./activity.ts";
+import {
+  allocateActivityId,
+  parseActivity,
+  parseActivityEvent,
+  type ActivityAction,
+  type ActivityEvent,
+  type ActivityTargetKind,
+} from "./activity.ts";
 
-export type { ActivityAction, ActivityEvent, ActivityTargetKind } from "./activity.ts";
+export type {
+  ActivityAction,
+  ActivityEvent,
+  ActivityTargetKind,
+  ActivityView,
+} from "./activity.ts";
 export {
   ACTIVITY_ACTIONS,
   ACTIVITY_TARGET_KINDS,
   parseActivityEvent,
+  RECENT_ACTIVITY_LIMIT,
+  selectRecentActivity,
 } from "./activity.ts";
 
 export type {
@@ -270,6 +284,12 @@ export interface StoreOptions {
    * Windows skip or the POSIX directory flush on any operating system.
    */
   platform?: string;
+  /**
+   * The clock that stamps journal events; defaults to the server clock
+   * (`() => new Date()`). It is called inside the serialized commit, after
+   * validation, so events are stamped in commit order.
+   */
+  now?: () => Date;
 }
 
 /** A collection of records that a store persists. */
@@ -832,6 +852,132 @@ function requireParentId(value: unknown, field: string, kind: string): string {
   return value;
 }
 
+/**
+ * Format a validated instant as the canonical UTC text the journal stores: a
+ * calendar date and time with exactly three fractional digits and a trailing
+ * `Z`. Years outside the four-digit range a canonical timestamp can spell are
+ * refused rather than padded or truncated.
+ */
+function canonicalInstant(date: Date): string {
+  const year = date.getUTCFullYear();
+  if (year < 0 || year > 9999) {
+    throw new PersistenceError(
+      "The activity clock returned an instant outside the canonical year range",
+    );
+  }
+  const iso = date.toISOString();
+  // `toISOString` spells years 0 to 9999 as four digits already; a signed or
+  // extended year would not be canonical.
+  if (iso.length !== 24) {
+    throw new PersistenceError(
+      "The activity clock returned an instant outside the canonical year range",
+    );
+  }
+  return iso;
+}
+
+/**
+ * The outcome of a mutation that is about to be persisted: the validated
+ * resulting value the operation resolves with, and, when the mutation changed
+ * the record effectively, the journal event it earns. A no-op mutation has no
+ * `event` and records nothing.
+ */
+interface MutationChange<T> {
+  readonly value: T;
+  readonly event?: {
+    readonly action: ActivityAction;
+    readonly targetKind: ActivityTargetKind;
+    readonly targetId: string;
+  };
+}
+
+/**
+ * Whether two record values are the same validated record, treating an absent
+ * archival flag and `false` as equivalent: that is the only difference the two
+ * spellings may show.
+ */
+function recordsMatch(before: object, after: object): boolean {
+  const normalize = (record: object) => ({
+    ...(record as Record<string, unknown>),
+    archived: (record as { archived?: boolean }).archived === true,
+  });
+  return JSON.stringify(normalize(before)) === JSON.stringify(normalize(after));
+}
+
+/**
+ * The change of an edit, or undefined when nothing actually changed. The
+ * comparison uses the validated resulting record values, with absent and
+ * `false` archival flags equivalent, so an edit that only respells a flag, or
+ * that supplies the values already stored, is a no-op and records no event.
+ */
+function editedChange<T extends object & { id: string }>(
+  targetKind: ActivityTargetKind,
+  updated: T,
+  current: object,
+): MutationChange<T> {
+  return recordsMatch(current, updated)
+    ? { value: updated }
+    : {
+        value: updated,
+        event: { action: "edit", targetKind, targetId: updated.id },
+      };
+}
+
+/**
+ * The change of an archive or restore, or undefined when the record already
+ * holds the requested flag (absent or `false` means active), so respelling the
+ * flag is a no-op that records no event.
+ */
+function archivedChange<T extends object & { id: string }>(
+  updated: T,
+  current: object,
+  targetKind: ActivityTargetKind,
+  archived: boolean,
+): MutationChange<T> {
+  const already = (current as { archived?: boolean }).archived === archived;
+  return already
+    ? { value: updated }
+    : {
+        value: updated,
+        event: {
+          action: archived ? "archive" : "restore",
+          targetKind,
+          targetId: updated.id,
+        },
+      };
+}
+
+/**
+ * Apply one validated archive or restore to the draft and report its change.
+ * The event's target kind is the validated archival kind.
+ */
+function applyArchivedChange(
+  draft: State,
+  args: { kind: ArchiveKind; id: string; archived: boolean },
+): MutationChange<void> {
+  const key = ARCHIVE_COLLECTION_KEYS[args.kind];
+  const items = draft[key];
+  const current = findRecord(
+    items as readonly { id: string }[],
+    args.id,
+    args.kind,
+  );
+  // Rebuild the record so `true` adds the flag and `false` drops it; every
+  // other field, including links and counters, is untouched. The record is
+  // parsed again so a rebuilt record is still strictly valid.
+  const rebuilt: Record<string, unknown> = { ...current };
+  if (args.archived) rebuilt.archived = true;
+  else delete rebuilt.archived;
+  const updated = collections[key].parse(rebuilt, args.kind);
+  const index = items.findIndex((item) => item.id === args.id);
+  (items as unknown[])[index] = updated;
+  // `true` archives and `false` removes the flag. When the record already
+  // holds the requested flag value, this is a no-op: the record is rebuilt
+  // (respelled) and persisted as before, but no event is recorded.
+  const change = archivedChange(updated, current, args.kind, args.archived);
+  return { value: undefined, event: change.event };
+}
+
 function errorCode(cause: unknown): string | undefined {
   if (typeof cause !== "object" || cause === null) return undefined;
   const code = (cause as { code?: unknown }).code;
@@ -929,6 +1075,7 @@ export interface Store {
 class StoreImpl implements Store {
   private state: State;
   private readonly fs: FileSystem;
+  private readonly now: () => Date;
   private readonly directory: string;
   private readonly storePath: string;
   private readonly lockPath: string;
@@ -943,9 +1090,10 @@ class StoreImpl implements Store {
    */
   private blocked: PersistenceError | null = null;
 
-  constructor(state: State, fs: FileSystem, directory: string) {
+  constructor(state: State, fs: FileSystem, directory: string, now: () => Date) {
     this.state = state;
     this.fs = fs;
+    this.now = now;
     this.directory = directory;
     this.storePath = join(directory, STORE_FILE);
     this.lockPath = join(directory, LOCK_FILE);
@@ -1135,7 +1283,22 @@ class StoreImpl implements Store {
     return cleanupFailure;
   }
 
-  private async commit<T>(mutate: (draft: State) => T): Promise<T> {
+  /**
+   * Run one mutation against a draft of the committed state and persist it.
+   *
+   * A create, an effective edit or an archive/restore returns a recorded change,
+   * which appends exactly one journal event here: the id and canonical UTC
+   * timestamp are allocated inside this serialized commit, after the mutation's
+   * own validation and before the draft is persisted, so the event is saved with
+   * the record change in the same write. A no-op mutation returns no change; it
+   * is still persisted exactly as before but records no event. Reads, opening
+   * the store and failed validation never reach here, so they record nothing.
+   * If the clock fails or the event counter is exhausted, the whole mutation is
+   * rejected before anything is persisted or published.
+   */
+  private async commit<T>(
+    mutate: (draft: State) => MutationChange<T>,
+  ): Promise<T> {
     // An earlier operation may have failed recovery while this one waited.
     if (this.blocked) {
       throw new PersistenceError(
@@ -1144,14 +1307,49 @@ class StoreImpl implements Store {
       );
     }
     const draft: State = clone(this.state);
-    const result = mutate(draft);
+    const change = mutate(draft);
+    if (process.env.DEBUG_T8) console.error("DBG", JSON.stringify(change.event), JSON.stringify(change.value));
+    if (change.event !== undefined) {
+      const at = this.clock();
+      // The event is appended to the same draft the record change was made in,
+      // so the record and its event are saved by the one write below.
+      let id: number;
+      try {
+        // An exhausted or inconsistent journal counter rejects the whole
+        // mutation as a persistence failure, publishing nothing.
+        id = allocateActivityId(draft);
+      } catch (cause) {
+        throw new PersistenceError("Failed to allocate the next activity event id", { cause });
+      }
+      draft.activity.push({
+        id,
+        at,
+        action: change.event.action,
+        targetKind: change.event.targetKind,
+        targetId: change.event.targetId,
+      });
+    }
     await this.persist(draft);
-    return clone(result);
+    return clone(change.value);
+  }
+
+  /** Read the clock for a journal event, refusing a failure or invalid value. */
+  private clock(): string {
+    let value: unknown;
+    try {
+      value = this.now();
+    } catch (cause) {
+      throw new PersistenceError("The activity clock failed", { cause });
+    }
+    if (!(value instanceof Date)) {
+      throw new PersistenceError("The activity clock returned an invalid date");
+    }
+    return canonicalInstant(value);
   }
 
   createClient(input: ClientCreate): Promise<Client> {
     return this.enqueue(() =>
-      this.commit((draft) => {
+      this.commit((draft: State) => {
         const fields = supplied(input, [
           "name",
           "background",
@@ -1172,14 +1370,17 @@ class StoreImpl implements Store {
           objectives: "objectives" in fields ? fields.objectives : "",
         });
         draft.clients.push(client);
-        return client;
+        return {
+          value: client,
+          event: { action: "create", targetKind: "client", targetId: client.id },
+        };
       }),
     );
   }
 
   updateClient(id: string, edit: ClientEdit): Promise<Client> {
     return this.enqueue(() =>
-      this.commit((draft) => {
+      this.commit((draft: State) => {
         const current = findRecord(draft.clients, id, "client");
         const changes = supplied(edit, [
           "name",
@@ -1191,14 +1392,14 @@ class StoreImpl implements Store {
         ]);
         const updated = parseClient({ ...current, ...changes });
         draft.clients = draft.clients.map((c) => (c.id === id ? updated : c));
-        return updated;
+        return editedChange("client", updated, current);
       }),
     );
   }
 
   createEngagement(input: EngagementCreate): Promise<Engagement> {
     return this.enqueue(() =>
-      this.commit((draft) => {
+      this.commit((draft: State) => {
         const clientId = requireParentId(input.clientId, "clientId", "client");
         findRecord(draft.clients, clientId, "client");
         const fields = supplied(input, ["name", "objectives", "status"]);
@@ -1210,26 +1411,29 @@ class StoreImpl implements Store {
           status: "status" in fields ? fields.status : "planned",
         });
         draft.engagements.push(engagement);
-        return engagement;
+        return {
+          value: engagement,
+          event: { action: "create", targetKind: "engagement", targetId: engagement.id },
+        };
       }),
     );
   }
 
   updateEngagement(id: string, edit: EngagementEdit): Promise<Engagement> {
     return this.enqueue(() =>
-      this.commit((draft) => {
+      this.commit((draft: State) => {
         const current = findRecord(draft.engagements, id, "engagement");
         const changes = supplied(edit, ["name", "objectives", "status"]);
         const updated = parseEngagement({ ...current, ...changes });
         draft.engagements = draft.engagements.map((e) => (e.id === id ? updated : e));
-        return updated;
+        return editedChange("engagement", updated, current);
       }),
     );
   }
 
   createProject(input: ProjectCreate): Promise<Project> {
     return this.enqueue(() =>
-      this.commit((draft) => {
+      this.commit((draft: State) => {
         const engagementId = requireParentId(input.engagementId, "engagementId", "engagement");
         findRecord(draft.engagements, engagementId, "engagement");
         const fields = supplied(input, ["name", "objectives", "status"]);
@@ -1241,26 +1445,29 @@ class StoreImpl implements Store {
           status: "status" in fields ? fields.status : "planned",
         });
         draft.projects.push(project);
-        return project;
+        return {
+          value: project,
+          event: { action: "create", targetKind: "project", targetId: project.id },
+        };
       }),
     );
   }
 
   updateProject(id: string, edit: ProjectEdit): Promise<Project> {
     return this.enqueue(() =>
-      this.commit((draft) => {
+      this.commit((draft: State) => {
         const current = findRecord(draft.projects, id, "project");
         const changes = supplied(edit, ["name", "objectives", "status"]);
         const updated = parseProject({ ...current, ...changes });
         draft.projects = draft.projects.map((p) => (p.id === id ? updated : p));
-        return updated;
+        return editedChange("project", updated, current);
       }),
     );
   }
 
   createTask(input: TaskCreate): Promise<Task> {
     return this.enqueue(() =>
-      this.commit((draft) => {
+      this.commit((draft: State) => {
         const parents = workParentFields(draft, input);
         const fields = supplied(input, [
           "title",
@@ -1282,14 +1489,17 @@ class StoreImpl implements Store {
           context: "context" in fields ? fields.context : "",
         });
         draft.tasks.push(task);
-        return task;
+        return {
+          value: task,
+          event: { action: "create", targetKind: "task", targetId: task.id },
+        };
       }),
     );
   }
 
   updateTask(id: string, edit: TaskEdit): Promise<Task> {
     return this.enqueue(() =>
-      this.commit((draft) => {
+      this.commit((draft: State) => {
         const current = findRecord(draft.tasks, id, "task");
         const { clear, ...parents } = editedParents(draft, current, edit);
         const changes = supplied(edit, [
@@ -1303,14 +1513,14 @@ class StoreImpl implements Store {
         const base = { ...current, projectId: clear ? undefined : parents.projectId };
         const updated = parseTask({ ...base, ...parents, ...changes });
         draft.tasks = draft.tasks.map((t) => (t.id === id ? updated : t));
-        return updated;
+        return editedChange("task", updated, current);
       }),
     );
   }
 
   createItem(input: WorkItemCreate): Promise<WorkItem> {
     return this.enqueue(() =>
-      this.commit((draft) => {
+      this.commit((draft: State) => {
         const parents = workParentFields(draft, input);
         const fields = supplied(input, ["kind", "title", "context", "state"]);
         const item = parseWorkItem({
@@ -1322,28 +1532,31 @@ class StoreImpl implements Store {
           state: "state" in fields ? fields.state : "open",
         });
         draft.items.push(item);
-        return item;
+        return {
+          value: item,
+          event: { action: "create", targetKind: "item", targetId: item.id },
+        };
       }),
     );
   }
 
   updateItem(id: string, edit: WorkItemEdit): Promise<WorkItem> {
     return this.enqueue(() =>
-      this.commit((draft) => {
+      this.commit((draft: State) => {
         const current = findRecord(draft.items, id, "item");
         const { clear, ...parents } = editedParents(draft, current, edit);
         const changes = supplied(edit, ["kind", "title", "context", "state"]);
         const base = { ...current, projectId: clear ? undefined : parents.projectId };
         const updated = parseWorkItem({ ...base, ...parents, ...changes });
         draft.items = draft.items.map((i) => (i.id === id ? updated : i));
-        return updated;
+        return editedChange("item", updated, current);
       }),
     );
   }
 
   createMeeting(input: MeetingCreate): Promise<Meeting> {
     return this.enqueue(() =>
-      this.commit((draft) => {
+      this.commit((draft: State) => {
         const parents = workParentFields(draft, input);
         const fields = supplied(input, ["title", "date", "notes"]);
         const meeting = parseMeeting({
@@ -1354,21 +1567,24 @@ class StoreImpl implements Store {
           notes: "notes" in fields ? fields.notes : "",
         });
         draft.meetings.push(meeting);
-        return meeting;
+        return {
+          value: meeting,
+          event: { action: "create", targetKind: "meeting", targetId: meeting.id },
+        };
       }),
     );
   }
 
   updateMeeting(id: string, edit: MeetingEdit): Promise<Meeting> {
     return this.enqueue(() =>
-      this.commit((draft) => {
+      this.commit((draft: State) => {
         const current = findRecord(draft.meetings, id, "meeting");
         const { clear, ...parents } = editedParents(draft, current, edit);
         const changes = supplied(edit, ["title", "date", "notes"]);
         const base = { ...current, projectId: clear ? undefined : parents.projectId };
         const updated = parseMeeting({ ...base, ...parents, ...changes });
         draft.meetings = draft.meetings.map((m) => (m.id === id ? updated : m));
-        return updated;
+        return editedChange("meeting", updated, current);
       }),
     );
   }
@@ -1380,27 +1596,14 @@ class StoreImpl implements Store {
     // after that is the record looked up; a bad argument is refused without
     // writing anything.
     return this.enqueue(() =>
-      this.commit((draft) => {
+      this.commit((draft: State) => {
         const args = requireArchiveArguments(kind, id, archived);
-        const key = ARCHIVE_COLLECTION_KEYS[args.kind];
-        const items = draft[key];
-        const current = findRecord(
-          items as readonly { id: string }[],
-          args.id,
-          args.kind,
-        );
-        // Rebuild the record so `true` adds the flag and `false` drops it;
-        // every other field, including links and counters, is untouched. The
-        // record is parsed again so a rebuilt record is still strictly valid.
-        const rebuilt: Record<string, unknown> = { ...current };
-        if (args.archived) rebuilt.archived = true;
-        else delete rebuilt.archived;
-        const updated = collections[key].parse(rebuilt, args.kind);
-        const index = items.findIndex((item) => item.id === args.id);
-        (items as unknown[])[index] = updated;
+        return applyArchivedChange(draft, args);
       }),
     );
   }
+
+
 
   listTasks(filter: WorkFilter): readonly Task[] {
     return selectWork(this.state.tasks, filter);
@@ -1529,6 +1732,11 @@ export async function openStore(
       throw new PersistenceError("Failed to acquire store ownership", { cause });
     }
 
+    const now = options.now ?? (() => new Date());
+    if (typeof now !== "function") {
+      throw new PersistenceError("The activity clock must be a function");
+    }
+
     let state = emptyState();
     if (fs.existsSync(storePath)) {
       let text: string;
@@ -1539,7 +1747,7 @@ export async function openStore(
       }
       state = parseState(text);
     }
-    return new StoreImpl(state, fs, directory);
+    return new StoreImpl(state, fs, directory, now);
   } catch (error) {
     if (lockCreated) {
       try {
