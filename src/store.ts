@@ -629,8 +629,8 @@ function parseState(text: string): State {
   if (journal) {
     // A schema 5 document must carry both journal fields. The journal is
     // validated against the records just parsed: every target must exist, ids
-    // must be unique and increasing, and the counter must be able to advance
-    // past them. No event is invented for older documents, and a malformed
+    // must be unique, and the counter must be able to advance past them. No
+    // event is invented for older documents, and a malformed
     // journal refuses the whole document rather than being repaired.
     try {
       const parsed = parseActivity(record.activity, record.nextActivityId, state);

@@ -79,6 +79,15 @@ const ACTIVITY_EVENT_KEYS = [
 
 const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
+/**
+ * The stored text is also compared with its own length, so a match cannot hide
+ * trailing text: a JavaScript `$` anchor also matches just before a final
+ * newline, which would otherwise let a non-canonical value through.
+ */
+function isCanonicalInstant(text: string): boolean {
+  return ISO_INSTANT.test(text) && text.length === 24;
+}
+
 function requireText(value: unknown, what: string): string {
   if (typeof value !== "string") {
     throw new ValidationError(`${what} must be a string`);
@@ -94,8 +103,7 @@ function requireText(value: unknown, what: string): string {
  */
 function requireTimestamp(value: unknown, what: string): string {
   const text = requireText(value, what);
-  const match = ISO_INSTANT.exec(text);
-  if (!match) {
+  if (!isCanonicalInstant(text)) {
     throw new ValidationError(`${what} must be a canonical UTC ISO timestamp`);
   }
   const [year, month, day] = text.slice(0, 10).split("-").map(Number);
