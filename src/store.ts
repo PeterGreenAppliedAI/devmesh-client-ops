@@ -59,6 +59,7 @@ import {
   type ActivityEvent,
   type ActivityTargetKind,
 } from "./activity.ts";
+import { openOriginalStore, type OriginalFileSystem, type OriginalStore } from "./transcript-files.ts";
 import {
   canonicalIdentityOf,
   canonicalize,
@@ -330,7 +331,11 @@ export interface Snapshot {
 export interface FileSystem {
   existsSync(path: string): boolean;
   mkdirSync(path: string, options: { recursive: true }): void;
-  readFileSync(path: string, encoding: "utf8"): string;
+  /**
+   * Read a file's text when the `"utf8"` encoding is given, or its exact bytes
+   * when no encoding is given (for verifying an original file's content).
+   */
+  readFileSync(path: string, encoding?: "utf8"): string | Uint8Array;
   /**
    * Open a file for exclusive creation; fails with EEXIST if it already exists.
    * It also opens a directory for reading when flushing it, with the "r" flag.
@@ -368,6 +373,12 @@ export type { BoardScope, TaskIdentityExpectation } from "./kanban.ts";
 export interface StoreOptions {
   fs?: Partial<FileSystem>;
   /**
+   * Overrides for the original-file store's file operations, so a test can
+   * fail an original's publication or verification through the interface the
+   * store accepts. Only tests pass them.
+   */
+  originalsFs?: Partial<OriginalFileSystem>;
+  /**
    * The platform whose directory-durability rules apply; defaults to
    * `process.platform`. Only tests pass it, so they can exercise either the
    * Windows skip or the POSIX directory flush on any operating system.
@@ -382,6 +393,15 @@ export interface StoreOptions {
    * the whole mutation is rejected as a persistence failure.
    */
   now?: () => Date;
+}
+
+/**
+ * Validate the stored transcript list against the loaded records and return it
+ * detached, exactly as opening a document validates it. A transcript store uses
+ * this to keep its stored metadata identical to what reopening would accept.
+ */
+export function validateTranscripts(value: unknown, snapshot: Snapshot): readonly Transcript[] {
+  return parseTranscripts(value, clone(snapshot) as State);
 }
 
 /** A collection of records that a store persists. */
@@ -500,7 +520,10 @@ function defaultFileSystem(platform: string): FileSystem {
   const fs: FileSystem = {
     existsSync,
     mkdirSync: (path, options) => mkdirSync(path, options),
-    readFileSync: (path, encoding) => readFileSync(path, encoding),
+    readFileSync: ((path: string, encoding?: "utf8"): string | Uint8Array =>
+    encoding === undefined
+      ? new Uint8Array(readFileSync(path))
+      : (readFileSync(path, "utf8") as string)) as FileSystem["readFileSync"],
     openSync: (path, flags) => openSync(path, flags),
     writeSync: (fd, data) => writeSync(fd, data),
     fsyncSync: (fd) => fsyncSync(fd),
@@ -1447,6 +1470,21 @@ interface MutationChange<T> {
 }
 
 /**
+ * What a transcript commit resolves with: the committed meeting, the canonical
+ * transcript and its sources, and whether the commit created a meeting, wrote
+ * a new original or only recorded the metadata.
+ */
+export interface TranscriptCommit {
+  readonly meetingId: string;
+  readonly transcriptId: string;
+  readonly sourceIds: readonly string[];
+  /** True when this commit created a meeting (one create event). */
+  readonly createdMeeting: boolean;
+  /** True when this commit attached a new original (one edit event). */
+  readonly attachedOriginal: boolean;
+}
+
+/**
  * Whether two record values are the same validated record, treating an absent
  * archival flag and `false` as equivalent: that is the only difference the two
  * spellings may show.
@@ -1646,6 +1684,11 @@ class StoreImpl implements Store {
   private readonly directory: string;
   private readonly storePath: string;
   private readonly lockPath: string;
+  /**
+   * The original-file store for this workspace, used to publish and verify
+   * transcript originals before the metadata that names them is committed.
+   */
+  private readonly originals: OriginalStore;
   private queue: Promise<unknown> = Promise.resolve();
   private closed = false;
   private lockReleased = false;
@@ -1657,17 +1700,91 @@ class StoreImpl implements Store {
    */
   private blocked: PersistenceError | null = null;
 
-  constructor(state: State, fs: FileSystem, directory: string, now: () => Date) {
+  constructor(
+    state: State,
+    fs: FileSystem,
+    directory: string,
+    now: () => Date,
+    originals: OriginalStore,
+  ) {
     this.state = state;
     this.fs = fs;
     this.now = now;
     this.directory = directory;
     this.storePath = join(directory, STORE_FILE);
     this.lockPath = join(directory, LOCK_FILE);
+    this.originals = originals;
   }
 
   snapshot(): Snapshot {
     return snapshotOf(this.state);
+  }
+
+  /** Refuse an adapter read that did not return text where text is required. */
+  private requireText(value: string | Uint8Array, message: string): string {
+    if (typeof value !== "string") {
+      throw new PersistenceError(message);
+    }
+    return value;
+  }
+
+  /** True once the store has been closed or blocked. */
+  unavailable(): PersistenceError | null {
+    if (this.closed) return new PersistenceError("Store is closed");
+    return this.blocked;
+  }
+
+  /** The original-file store over the same workspace directory. */
+  originalFiles(): OriginalStore {
+    return this.originals;
+  }
+
+  /** The next meeting id that a create would allocate, without advancing. */
+  nextMeetingId(): string {
+    const next = this.state.nextIds.meetings ?? 1;
+    return `meeting-${next}`;
+  }
+
+  /**
+   * Rebuild and persist the transcript list, then publish the new committed
+   * state. The caller's build is applied to a draft of the committed state and
+   * validated exactly as reopening validates it, before anything is written.
+   * The activity event, when earned, is stamped and allocated inside this
+   * serialized write, so a meeting create or an attachment and its event are
+   * saved by one write. Persistence failures publish nothing.
+   */
+  async commitTranscripts(
+    mutate: (draft: State) => MutationChange<TranscriptCommit>,
+  ): Promise<TranscriptCommit> {
+    if (this.closed) throw new PersistenceError("Store is closed");
+    if (this.blocked) {
+      throw new PersistenceError(
+        "The store cannot accept further mutations until it is reopened",
+        { cause: this.blocked },
+      );
+    }
+    const draft: State = clone(this.state);
+    const change = mutate(draft);
+    const transcripts = validateTranscripts(clone(draft.transcripts), draft);
+    draft.transcripts = [...transcripts];
+    if (change.event !== undefined) {
+      const at = this.clock();
+      let id: number;
+      try {
+        id = allocateActivityId(draft);
+      } catch (cause) {
+        throw new PersistenceError("Failed to allocate the next activity event id", { cause });
+      }
+      draft.activity.push({
+        id,
+        at,
+        action: change.event.action,
+        targetKind: change.event.targetKind,
+        targetId: change.event.targetId,
+      });
+    }
+    await this.persist(draft);
+    return clone(change.value);
   }
 
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {
@@ -1693,7 +1810,8 @@ class StoreImpl implements Store {
     return run;
   }
 
-  private nextId(draft: State, key: CounterKey): string {
+  /** Allocate the next id of a collection in the persisted draft. */
+  nextId(draft: State, key: CounterKey): string {
     const next = draft.nextIds[key] ?? 1;
     const items = draft[key] as readonly { id: string }[];
     const kind = collections[key].kind;
@@ -2232,7 +2350,7 @@ class StoreImpl implements Store {
     if (this.lockReleased) return;
     try {
       try {
-        this.fs.readFileSync(this.lockPath, "utf8");
+        this.requireText(this.fs.readFileSync(this.lockPath, "utf8"), "Failed to release store ownership");
       } catch (cause) {
         if (isMissing(cause)) {
           this.lockReleased = true;
@@ -2344,13 +2462,23 @@ export async function openStore(
     if (fs.existsSync(storePath)) {
       let text: string;
       try {
-        text = fs.readFileSync(storePath, "utf8");
+        const read = fs.readFileSync(storePath, "utf8");
+        if (typeof read !== "string") {
+          throw new PersistenceError("Failed to read workspace data as text");
+        }
+        text = read;
       } catch (cause) {
         throw new PersistenceError("Failed to read workspace data", { cause });
       }
       state = parseState(text);
     }
-    return new StoreImpl(state, fs, directory, now);
+    // The original store shares the workspace directory and, on POSIX, its
+    // directory-durability rules; it never reads or writes workspace.json.
+    const originals = openOriginalStore(directory, {
+      platform,
+      ...(options.originalsFs === undefined ? {} : { fs: options.originalsFs }),
+    });
+    return new StoreImpl(state, fs, directory, now, originals);
   } catch (error) {
     if (lockCreated) {
       try {
