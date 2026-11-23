@@ -297,7 +297,26 @@ describe("dashboard selection", () => {
       // No section contains a decision.
       const allIds = dashboard.sections.flatMap((section) => section.rows.map((row) => row.id));
       assert.ok(!allIds.includes(decision.id));
-      assert.equal(allIds.filter((id) => [blocker.id, question.id, commitment.id, waiting.id, followUp.id].includes(id)).length, 5);
+      // Exhaustive membership: take the task/item attention rows from every
+      // section (excluding only the activity and engagement row kinds, which
+      // are not records of the task or item families) and compare the whole
+      // set of ids with the expected records, so an unexpected row fails.
+      const attentionIds = dashboard.sections
+        .flatMap((section) =>
+          section.rows.filter((row) => row.kind === "task" || row.kind === "item"),
+        )
+        .map((row) => row.id);
+      assert.deepEqual(
+        [...attentionIds].sort(),
+        [blocker.id, question.id, commitment.id, waiting.id, followUp.id].sort(),
+      );
+      assert.equal(attentionIds.length, 5);
+      // Each of the five records is listed once per section that qualifies it
+      // and never twice within one section.
+      for (const section of dashboard.sections) {
+        const ids = section.rows.map((row) => row.id);
+        assert.equal(new Set(ids).size, ids.length, `${section.kind} lists no record twice`);
+      }
     });
   });
 
@@ -716,6 +735,22 @@ describe("dashboard rendering", () => {
       ]) {
         assert.ok(section.includes(`href="${href}"`), href);
       }
+      // The engagement event targets the engagement itself: its label and
+      // detail link name the engagement id, resolved from the record, not a
+      // link field it does not carry.
+      const rows = selectDashboard(store.snapshot(), "2026-11-22").sections.find(
+        (candidate) => candidate.kind === "recent_activity",
+      )!.rows;
+      const engagementEvent = rows.find(
+        (row) => row.targetKind === "engagement" && row.href === `/engagements/${engagement.id}`,
+      );
+      assert.ok(engagementEvent !== undefined, "the engagement's create event is shown");
+      assert.equal(engagementEvent.id, String(engagementEvent.id));
+      assert.equal(engagementEvent.title, "Delivery");
+      assert.equal(engagementEvent.engagementId, engagement.id);
+      assert.equal(engagementEvent.engagementName, "Delivery");
+      assert.equal(engagementEvent.clientId, client.id);
+      assert.equal(engagementEvent.clientName, "Acme");
     } finally {
       await store.close();
     }
@@ -771,14 +806,34 @@ describe("dashboard high-priority tasks", () => {
       const highOpen = await store.createTask({
         ...base, title: "High open", priority: "high", status: "open", dueDate: "2026-11-25",
       });
-      await store.setArchived("task", progressHigh.id, true);
 
+      // Before any archive, both an open and an in-progress high task are
+      // included, ordered by due date then id with the undated in-progress
+      // task last.
       const dashboard = selectDashboard(store.snapshot(), "2026-11-22");
-      // Dated high tasks by due date then id; undated last; archived excluded.
-      const expected = [highOpen, openHigh]
-        .sort((a, b) => (a.dueDate! < b.dueDate! ? -1 : a.dueDate! > b.dueDate! ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+      const byDueThenId = (a: { dueDate?: string; id: string }, b: { dueDate?: string; id: string }): number => {
+        const left = a.dueDate ?? null;
+        const right = b.dueDate ?? null;
+        if (left !== right) {
+          if (left === null) return 1;
+          if (right === null) return -1;
+          return left < right ? -1 : 1;
+        }
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+      };
+      const expected = [highOpen, openHigh, progressHigh]
+        .sort(byDueThenId)
         .map((task) => task.id);
       assert.deepEqual(rowIds(dashboard, "high_priority"), expected);
+      assert.ok(rowIds(dashboard, "high_priority").includes(progressHigh.id));
+      // The undated in-progress task sorts after every dated one.
+      assert.equal(rowIds(dashboard, "high_priority").at(-1), progressHigh.id);
+      // The in-progress row shows its actual status and priority.
+      const progressRow = dashboard.sections
+        .find((section) => section.kind === "high_priority")!
+        .rows.find((row) => row.id === progressHigh.id)!;
+      assert.deepEqual([...progressRow.badges], ["in_progress", "high"]);
+      assert.equal(progressRow.detail, "");
       assert.ok(!rowIds(dashboard, "high_priority").includes(normalOpen.id));
       assert.ok(!rowIds(dashboard, "high_priority").includes(lowOpen.id));
       assert.deepEqual(rowIds(dashboard, "overdue"), []);
@@ -786,6 +841,16 @@ describe("dashboard high-priority tasks", () => {
         rowIds(dashboard, "due_soon").join(","),
         new RegExp([openHigh.id, highOpen.id].join("|")),
       );
+
+      // Archiving the in-progress task, and the undated-last rule with an
+      // archived member, are tested separately below.
+      await store.setArchived("task", progressHigh.id, true);
+      const archived = selectDashboard(store.snapshot(), "2026-11-22");
+      const expectedAfterArchive = [highOpen, openHigh]
+        .sort(byDueThenId)
+        .map((task) => task.id);
+      assert.deepEqual(rowIds(archived, "high_priority"), expectedAfterArchive);
+      assert.ok(!rowIds(archived, "high_priority").includes(progressHigh.id));
     });
   });
 
@@ -1031,13 +1096,31 @@ describe("dashboard recent activity", () => {
       await store.setArchived("task", task.id, true);
       const dashboard = selectDashboard(store.snapshot(), "2026-11-22");
       const activity = dashboard.sections.find((section) => section.kind === "recent_activity")!;
-      // The archived task's create and archive events are invisible, and so is
-      // the engagement create: this engagement is the archived task's parent,
-      // so it is itself effectively archived. Only the client create remains.
+      // The archived task's create and archive events are invisible. Archiving
+      // a child leaves its engagement visible, so the engagement's own create
+      // event is retained; only the client and engagement creates remain.
       assert.deepEqual(
-        activity.rows.map((row) => row.href),
-        [`/clients/${client.id}`],
+        activity.rows.map((row) => row.targetKind).sort(),
+        ["client", "engagement"],
       );
+      assert.equal(
+        activity.rows.filter((row) => row.targetKind === "engagement").length,
+        1,
+      );
+      assert.deepEqual(
+        activity.rows.map((row) => row.href).sort(),
+        [`/clients/${client.id}`, `/engagements/${engagement.id}`].sort(),
+      );
+      // The engagement event resolves its own identity: its detail link is its
+      // own id, and its client link is the client stored on the engagement.
+      const engagementRow = activity.rows.find((row) => row.targetKind === "engagement")!;
+      assert.equal(engagementRow.href, `/engagements/${engagement.id}`);
+      assert.equal(engagementRow.title, "Delivery");
+      assert.equal(engagementRow.engagementId, engagement.id);
+      assert.equal(engagementRow.engagementName, "Delivery");
+      assert.equal(engagementRow.action, "create");
+      assert.equal(engagementRow.clientId, client.id);
+      assert.equal(engagementRow.clientName, "Acme");
     } finally {
       await store.close();
     }

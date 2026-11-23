@@ -399,13 +399,16 @@ export function selectDashboard(
     // A client has no parent; every other family carries its client and
     // engagement links, while a project names only its engagement and reaches
     // its client through the engagement's own stored link, exactly as the
-    // archive helpers do.
+    // archive helpers do. An engagement is its own record: its engagement id
+    // is the target id itself, never a link field it does not carry.
     const engagementId =
-      kind === "client" ? "" : target.engagementId ?? "";
+      kind === "client" ? "" : kind === "engagement" ? target.id : target.engagementId ?? "";
     const clientId =
       kind === "client"
         ? target.id
-        : target.clientId ?? engagements.get(engagementId)?.clientId ?? "";
+        : kind === "engagement"
+          ? target.clientId ?? ""
+          : target.clientId ?? engagements.get(engagementId)?.clientId ?? "";
     const client = clients.get(clientId);
     const engagement = engagements.get(engagementId);
     if (client === undefined) return null;

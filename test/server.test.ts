@@ -827,6 +827,16 @@ describe("canonical origin and Host checks", () => {
       assert.match(activity, new RegExp(`href="/tasks/${high.id}"`));
       assert.match(activity, new RegExp(`href="/projects/${project.id}"`));
       assert.match(activity, /<span class="action">create<\/span>/);
+      // The engagement's own create event targets the engagement record, so
+      // its detail link and label are the engagement's, with its client link.
+      const engagementAt = activity.indexOf(`href="/engagements/${engagement.id}"`);
+      assert.ok(engagementAt >= 0, "the engagement's create event links its record");
+      const engagementCard = activity.slice(
+        activity.lastIndexOf("<li", engagementAt),
+        activity.indexOf("</li>", engagementAt),
+      );
+      assert.match(engagementCard, new RegExp(`href="/clients/${client.id}"`));
+      assert.match(engagementCard, /<span class="action">create<\/span>/);
       assert.ok(
         activity.indexOf(`href="/items/${followUp.id}"`) < activity.indexOf(`href="/tasks/${high.id}"`),
         "the follow-up create is newer than the task create",
