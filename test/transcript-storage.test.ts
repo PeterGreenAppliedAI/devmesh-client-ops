@@ -250,14 +250,32 @@ describe("transcript storage: schema 6 round trips", () => {
     };
     const document = withTranscripts(documentWithMeeting(6), [transcript]);
     const content = JSON.stringify(document);
+    // Write the document through the store, then reopen it: a save followed by
+    // a fresh open must preserve every source, identity and passage exactly.
     writeFileSync(storePath(dir), content, "utf8");
-    const store = await openStore(dir);
+    const writer = await openStore(dir, { now: () => new Date("2026-02-03T04:05:06.007Z") });
     try {
-      assert.deepEqual(store.snapshot().transcripts, [transcript]);
+      await writer.updateMeeting("meeting-1", { title: "Saved" });
     } finally {
-      await store.close();
+      await writer.close();
     }
-    assert.equal(readFileSync(storePath(dir), "utf8"), content, "opening never rewrites the file");
+    const saved = JSON.parse(readFileSync(storePath(dir), "utf8"));
+    assert.equal(saved.schemaVersion, 6);
+    assert.deepEqual(saved.transcripts, [transcript], "the save wrote every source");
+    assert.equal(saved.meetings[0].title, "Saved");
+
+    const reopened = await openStore(dir);
+    try {
+      assert.deepEqual(reopened.snapshot().transcripts, [transcript], "all sources persist across a save and reopen");
+      assert.equal(reopened.snapshot().transcripts![0].sources.length, 3);
+    } finally {
+      await reopened.close();
+    }
+    assert.deepEqual(
+      JSON.parse(readFileSync(storePath(dir), "utf8")).transcripts,
+      [transcript],
+      "reopening never rewrites the file",
+    );
   });
 
   it("round trips a PDF transcript whose passages carry pages", async () => {
