@@ -118,13 +118,25 @@ function emptySnapshot(): Snapshot {
 }
 
 describe("dashboard selection", () => {
-  it("shows six sections in order even when the workspace is empty", async () => {
+  it("shows the six attention sections in their order, then the added sections, even when the workspace is empty", async () => {
     await withStore(async (store) => {
       const dashboard = selectDashboard(store.snapshot(), "2026-11-22");
       assert.equal(dashboard.today, "2026-11-22");
       assert.deepEqual(
         dashboard.sections.map((section) => section.kind),
-        ["overdue", "due_soon", "blocker", "question", "commitment", "waiting"],
+        [
+          "overdue",
+          "due_soon",
+          "blocker",
+          "question",
+          "commitment",
+          "waiting",
+          "high_priority",
+          "waiting_tasks",
+          "follow_up",
+          "recent_activity",
+          "engagement",
+        ],
       );
       assert.deepEqual(
         dashboard.sections.map((section) => section.title),
@@ -135,6 +147,11 @@ describe("dashboard selection", () => {
           "Open questions",
           "Open commitments",
           "Open waiting items",
+          "High-priority tasks",
+          "Waiting tasks",
+          "Open follow-ups",
+          "Recent activity",
+          "Engagements in progress",
         ],
       );
       for (const section of dashboard.sections) assert.equal(section.rows.length, 0);
@@ -255,7 +272,7 @@ describe("dashboard selection", () => {
     });
   });
 
-  it("covers every item kind and state, retaining snapshot order and excluding decisions and follow-ups", async () => {
+  it("covers every item kind and state, retaining snapshot order and excluding decisions", async () => {
     await withStore(async (store) => {
       const client = await store.createClient({ name: "Acme" });
       const engagement = await store.createEngagement({ clientId: client.id, name: "Delivery" });
@@ -264,24 +281,42 @@ describe("dashboard selection", () => {
       const question = await store.createItem({ ...base, kind: "question", title: "Question", state: "open" });
       const commitment = await store.createItem({ ...base, kind: "commitment", title: "Commitment", state: "open" });
       const waiting = await store.createItem({ ...base, kind: "waiting", title: "Waiting", state: "open" });
-      // Closed items of every kind and open decisions/follow-ups are excluded.
-      for (const kind of ["blocker", "question", "commitment", "waiting"] as const) {
+      const followUp = await store.createItem({ ...base, kind: "follow_up", title: "Follow-up", state: "open" });
+      // Closed items of every kind and open decisions are excluded.
+      for (const kind of ["blocker", "question", "commitment", "waiting", "follow_up"] as const) {
         await store.createItem({ ...base, kind, title: `Closed ${kind}`, state: "closed" });
       }
       const decision = await store.createItem({ ...base, kind: "decision", title: "Decision", state: "open" });
-      const followUp = await store.createItem({ ...base, kind: "follow_up", title: "Follow-up", state: "open" });
 
       const dashboard = selectDashboard(store.snapshot(), "2026-11-22");
       assert.deepEqual(rowIds(dashboard, "blocker"), [blocker.id]);
       assert.deepEqual(rowIds(dashboard, "question"), [question.id]);
       assert.deepEqual(rowIds(dashboard, "commitment"), [commitment.id]);
       assert.deepEqual(rowIds(dashboard, "waiting"), [waiting.id]);
-      // No section contains a decision or a follow-up.
+      assert.deepEqual(rowIds(dashboard, "follow_up"), [followUp.id]);
+      // No section contains a decision.
       const allIds = dashboard.sections.flatMap((section) => section.rows.map((row) => row.id));
       assert.ok(!allIds.includes(decision.id));
-      assert.ok(!allIds.includes(followUp.id));
-      assert.deepEqual(allIds.sort(), [blocker.id, question.id, commitment.id, waiting.id].sort());
-      assert.equal(allIds.length, 4);
+      // Exhaustive membership: take the task/item attention rows from every
+      // section (excluding only the activity and engagement row kinds, which
+      // are not records of the task or item families) and compare the whole
+      // set of ids with the expected records, so an unexpected row fails.
+      const attentionIds = dashboard.sections
+        .flatMap((section) =>
+          section.rows.filter((row) => row.kind === "task" || row.kind === "item"),
+        )
+        .map((row) => row.id);
+      assert.deepEqual(
+        [...attentionIds].sort(),
+        [blocker.id, question.id, commitment.id, waiting.id, followUp.id].sort(),
+      );
+      assert.equal(attentionIds.length, 5);
+      // Each of the five records is listed once per section that qualifies it
+      // and never twice within one section.
+      for (const section of dashboard.sections) {
+        const ids = section.rows.map((row) => row.id);
+        assert.equal(new Set(ids).size, ids.length, `${section.kind} lists no record twice`);
+      }
     });
   });
 
@@ -430,20 +465,30 @@ describe("dashboard rendering", () => {
     };
   }
 
-  it("renders all six named sections with links, ancestry, dates and escaped text", async () => {
+  it("renders every named section in order, with links, ancestry, dates and escaped text", async () => {
     const { store, ids } = await seeded();
     try {
       const page = renderDashboard(store.snapshot(), fixedClock("2026-11-22"));
       const document = page.html;
-      for (const title of [
+      const titles = [
         "Overdue tasks",
         "Tasks due soon",
         "Open blockers",
         "Open questions",
         "Open commitments",
         "Open waiting items",
-      ]) {
-        assert.match(document, new RegExp(`<h2>${escapeHtml(title)}</h2>`));
+        "High-priority tasks",
+        "Waiting tasks",
+        "Open follow-ups",
+        "Recent activity",
+        "Engagements in progress",
+      ];
+      let last = -1;
+      for (const title of titles) {
+        const at = document.indexOf(`<h2>${escapeHtml(title)}</h2>`);
+        assert.ok(at >= 0, title);
+        assert.ok(at > last, `${title} keeps its place after the section before it`);
+        last = at;
       }
 
       const overdue = sectionOf(document, "Overdue tasks");
@@ -509,8 +554,15 @@ describe("dashboard rendering", () => {
     const { store, ids } = await seeded();
     try {
       const document = renderDashboard(store.snapshot(), fixedClock("2026-11-22")).html;
-      // Sections without rows say nothing needs attention and link to /clients.
-      for (const title of ["Open commitments", "Open waiting items"]) {
+      // Attention sections without rows say nothing needs attention and link
+      // to /clients; the added attention sections do the same.
+      for (const title of [
+        "Open commitments",
+        "Open waiting items",
+        "High-priority tasks",
+        "Waiting tasks",
+        "Open follow-ups",
+      ]) {
         const section = sectionOf(document, title);
         assert.ok(section.includes("Nothing needs attention here."), title);
         assert.ok(section.includes('href="/clients"'), title);
@@ -518,13 +570,34 @@ describe("dashboard rendering", () => {
       }
       // A populated section does not carry the empty state.
       assert.ok(!sectionOf(document, "Overdue tasks").includes("Nothing needs attention here."));
+      // The added sections that are not attention sets have their own empty
+      // text and do not offer the client list as a next step for attention.
+      // The seeded store recorded every create, so the activity section is
+      // populated and the engagement section is empty here.
+      const activity = sectionOf(document, "Recent activity");
+      assert.ok(activity.includes('href="/tasks/'));
+      assert.ok(!activity.includes("No recorded activity yet."));
+      const engagements = sectionOf(document, "Engagements in progress");
+      assert.match(engagements, new RegExp(`<a href="/engagements/${ids.engagement}">`));
+      assert.ok(engagements.includes('<span class="badge">planned</span>'));
+      // Empty added sections that are not attention sets say so explicitly.
+      const empty = renderDashboard(
+        { ...store.snapshot(), engagements: [], activity: [] },
+        fixedClock("2026-11-22"),
+      ).html;
+      assert.ok(sectionOf(empty, "Engagements in progress").includes(
+        "No unfinished engagements (planned, active or on hold).",
+      ));
+      assert.ok(!sectionOf(empty, "Engagements in progress").includes('href="/clients"'));
+      assert.ok(sectionOf(empty, "Recent activity").includes("No recorded activity yet."));
+      assert.ok(!sectionOf(empty, "Recent activity").includes('href="/clients"'));
       void ids;
     } finally {
       await store.close();
     }
   });
 
-  it("renders an entirely empty dashboard as six empty sections that link to /clients", async () => {
+  it("renders an entirely empty dashboard as explicit empty sections", async () => {
     const store = await openStore(tempDir());
     try {
       const document = renderDashboard(store.snapshot(), fixedClock("2026-11-22")).html;
@@ -541,8 +614,526 @@ describe("dashboard rendering", () => {
         assert.ok(section.includes("Nothing needs attention here."), title);
         assert.ok(section.includes('href="/clients"'), title);
       }
+      for (const [title, text] of [
+        ["High-priority tasks", "Nothing needs attention here."],
+        ["Waiting tasks", "Nothing needs attention here."],
+        ["Open follow-ups", "Nothing needs attention here."],
+        ["Recent activity", "No recorded activity yet."],
+        ["Engagements in progress", "No unfinished engagements (planned, active or on hold)."],
+      ] as const) {
+        const section = sectionOf(document, title);
+        assert.ok(section.length > 0, title);
+        assert.ok(section.includes(text), title);
+      }
     } finally {
       await store.close();
     }
+  });
+
+  it("links a task's actual project beside its client and engagement", async () => {
+    const store = await openStore(tempDir());
+    try {
+      const client = await store.createClient({ name: "Acme" });
+      const engagement = await store.createEngagement({ clientId: client.id, name: "Delivery" });
+      const project = await store.createProject({ engagementId: engagement.id, name: "Phase <one>" });
+      const task = await store.createTask({
+        clientId: client.id, engagementId: engagement.id, projectId: project.id,
+        title: "Project task", priority: "high", dueDate: "2026-11-21",
+      });
+      const item = await store.createItem({
+        clientId: client.id, engagementId: engagement.id, projectId: project.id,
+        kind: "blocker", title: "Project blocker", state: "open",
+      });
+      const document = renderDashboard(store.snapshot(), fixedClock("2026-11-22")).html;
+      for (const title of ["Overdue tasks", "High-priority tasks"]) {
+        const section = sectionOf(document, title);
+        assert.match(section, new RegExp(`href="/tasks/${task.id}"`), title);
+        assert.match(section, new RegExp(`project <a href="/projects/${project.id}">Phase &lt;one&gt;</a>`), title);
+      }
+      assert.match(
+        sectionOf(document, "Open blockers"),
+        new RegExp(`project <a href="/projects/${project.id}">Phase &lt;one&gt;</a>`),
+      );
+      assert.match(sectionOf(document, "Open blockers"), new RegExp(`href="/items/${item.id}"`));
+    } finally {
+      await store.close();
+    }
+  });
+
+  it("renders engagement rows linking the engagement and its client", async () => {
+    const store = await openStore(tempDir());
+    try {
+      const client = await store.createClient({ name: "Acme <Ltd>" });
+      const engagement = await store.createEngagement({ clientId: client.id, name: "Discovery & design" });
+      await store.createEngagement({ clientId: client.id, name: "Completed one", status: "completed" });
+      const document = renderDashboard(store.snapshot(), fixedClock("2026-11-22")).html;
+      const section = sectionOf(document, "Engagements in progress");
+      assert.match(section, new RegExp(`<a href="/engagements/${engagement.id}">Discovery &amp; design</a>`));
+      assert.match(section, new RegExp(`client <a href="/clients/${client.id}">Acme &lt;Ltd&gt;</a>`));
+      assert.ok(section.includes('<span class="badge">planned</span>'));
+      assert.ok(!section.includes("Completed one"));
+    } finally {
+      await store.close();
+    }
+  });
+
+  it("renders recent activity with current labels, the action and target links", async () => {
+    const store = await openStore(tempDir());
+    try {
+      const client = await store.createClient({ name: "Acme <Ltd>" });
+      const engagement = await store.createEngagement({ clientId: client.id, name: "Discovery & design" });
+      const project = await store.createProject({ engagementId: engagement.id, name: "Phase" });
+      const task = await store.createTask({
+        clientId: client.id, engagementId: engagement.id, projectId: project.id,
+        title: "Renamed task", dueDate: "2026-11-21",
+      });
+      await store.updateTask(task.id, { title: "Current <task>" });
+      const document = renderDashboard(store.snapshot(), fixedClock("2026-11-22")).html;
+      const section = sectionOf(document, "Recent activity");
+      // The label is the record as it is now, never the stored title.
+      assert.match(section, new RegExp(`<a href="/tasks/${task.id}">Current &lt;task&gt;</a>`));
+      assert.match(section, new RegExp(`href="/clients/${client.id}">Acme &lt;Ltd&gt;</a>`));
+      assert.match(section, new RegExp(`href="/engagements/${engagement.id}">Discovery &amp; design</a>`));
+      assert.ok(section.includes('<span class="action">edit</span>'));
+      assert.ok(section.includes('<span class="action">create</span>'));
+      assert.ok(!section.includes("Renamed task"));
+      // Every recorded event carries a timestamp shown as text.
+      assert.match(section, /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/);
+    } finally {
+      await store.close();
+    }
+  });
+
+  it("lists the current targets of activity events for every record family, linking detail routes", async () => {
+    const store = await openStore(tempDir());
+    try {
+      const client = await store.createClient({ name: "Acme" });
+      const engagement = await store.createEngagement({ clientId: client.id, name: "Delivery" });
+      const project = await store.createProject({ engagementId: engagement.id, name: "Project" });
+      const item = await store.createItem({
+        clientId: client.id, engagementId: engagement.id, kind: "decision", title: "Decide", state: "open",
+      });
+      const meeting = await store.createMeeting({
+        clientId: client.id, engagementId: engagement.id, title: "Kickoff", date: "2026-01-05",
+      });
+      const section = sectionOf(
+        renderDashboard(store.snapshot(), fixedClock("2026-11-22")).html,
+        "Recent activity",
+      );
+      // A project names only its engagement; its client is resolved through
+      // that engagement's stored link, so every family's target is shown.
+      const projectAt = section.indexOf(`href="/projects/${project.id}"`);
+      assert.ok(projectAt >= 0, "a project's create links its detail page");
+      const card = section.slice(section.lastIndexOf("<li", projectAt), section.indexOf("</li>", projectAt));
+      assert.match(card, new RegExp(`client <a href="/clients/${client.id}">Acme</a>`));
+      assert.match(card, new RegExp(`engagement <a href="/engagements/${engagement.id}">Delivery</a>`));
+      for (const href of [
+        `/clients/${client.id}`,
+        `/engagements/${engagement.id}`,
+        `/items/${item.id}`,
+        `/meetings/${meeting.id}`,
+      ]) {
+        assert.ok(section.includes(`href="${href}"`), href);
+      }
+      // The engagement event targets the engagement itself: its label and
+      // detail link name the engagement id, resolved from the record, not a
+      // link field it does not carry.
+      const rows = selectDashboard(store.snapshot(), "2026-11-22").sections.find(
+        (candidate) => candidate.kind === "recent_activity",
+      )!.rows;
+      const engagementEvent = rows.find(
+        (row) => row.targetKind === "engagement" && row.href === `/engagements/${engagement.id}`,
+      );
+      assert.ok(engagementEvent !== undefined, "the engagement's create event is shown");
+      assert.equal(engagementEvent.id, String(engagementEvent.id));
+      assert.equal(engagementEvent.title, "Delivery");
+      assert.equal(engagementEvent.engagementId, engagement.id);
+      assert.equal(engagementEvent.engagementName, "Delivery");
+      assert.equal(engagementEvent.clientId, client.id);
+      assert.equal(engagementEvent.clientName, "Acme");
+    } finally {
+      await store.close();
+    }
+  });
+
+  it("renders reads without mutating the snapshot and leaves stored events untouched", async () => {
+    const store = await openStore(tempDir());
+    try {
+      const client = await store.createClient({ name: "Acme" });
+      const engagement = await store.createEngagement({ clientId: client.id, name: "Delivery" });
+      await store.createTask({
+        clientId: client.id, engagementId: engagement.id, title: "Task", priority: "high", dueDate: "2026-11-21",
+      });
+      await store.createItem({
+        clientId: client.id, engagementId: engagement.id, kind: "follow_up", title: "Follow-up", state: "open",
+      });
+      await store.createItem({
+        clientId: client.id, engagementId: engagement.id, kind: "commitment", title: "Commitment", state: "open",
+      });
+      const before = store.snapshot();
+      const copy = JSON.parse(JSON.stringify(before)) as Snapshot;
+      const journal = JSON.stringify(before.activity);
+      renderDashboard(before, fixedClock("2026-11-22"));
+      selectDashboard(before, "2026-11-22");
+      assert.deepEqual(JSON.parse(JSON.stringify(before)), copy);
+      assert.equal(JSON.stringify(store.snapshot().activity), journal);
+    } finally {
+      await store.close();
+    }
+  });
+});
+
+describe("dashboard high-priority tasks", () => {
+  it("shows only high-priority open or in-progress tasks, dated or not, and never falls back", async () => {
+    await withStore(async (store) => {
+      const client = await store.createClient({ name: "Acme" });
+      const engagement = await store.createEngagement({ clientId: client.id, name: "Delivery" });
+      const base = { clientId: client.id, engagementId: engagement.id };
+      const openHigh = await store.createTask({
+        ...base, title: "Open high", priority: "high", status: "open", dueDate: "2026-11-25",
+      });
+      const progressHigh = await store.createTask({
+        ...base, title: "Progress high", priority: "high", status: "in_progress",
+      });
+      await store.createTask({ ...base, title: "Waiting high", priority: "high", status: "waiting", dueDate: "2026-11-25" });
+      await store.createTask({ ...base, title: "Done high", priority: "high", status: "done", dueDate: "2026-11-25" });
+      const normalOpen = await store.createTask({
+        ...base, title: "Normal open", priority: "normal", status: "open", dueDate: "2026-11-25",
+      });
+      const lowOpen = await store.createTask({
+        ...base, title: "Low open", priority: "low", status: "open", dueDate: "2026-11-25",
+      });
+      const highOpen = await store.createTask({
+        ...base, title: "High open", priority: "high", status: "open", dueDate: "2026-11-25",
+      });
+
+      // Before any archive, both an open and an in-progress high task are
+      // included, ordered by due date then id with the undated in-progress
+      // task last.
+      const dashboard = selectDashboard(store.snapshot(), "2026-11-22");
+      const byDueThenId = (a: { dueDate?: string; id: string }, b: { dueDate?: string; id: string }): number => {
+        const left = a.dueDate ?? null;
+        const right = b.dueDate ?? null;
+        if (left !== right) {
+          if (left === null) return 1;
+          if (right === null) return -1;
+          return left < right ? -1 : 1;
+        }
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+      };
+      const expected = [highOpen, openHigh, progressHigh]
+        .sort(byDueThenId)
+        .map((task) => task.id);
+      assert.deepEqual(rowIds(dashboard, "high_priority"), expected);
+      assert.ok(rowIds(dashboard, "high_priority").includes(progressHigh.id));
+      // The undated in-progress task sorts after every dated one.
+      assert.equal(rowIds(dashboard, "high_priority").at(-1), progressHigh.id);
+      // The in-progress row shows its actual status and priority.
+      const progressRow = dashboard.sections
+        .find((section) => section.kind === "high_priority")!
+        .rows.find((row) => row.id === progressHigh.id)!;
+      assert.deepEqual([...progressRow.badges], ["in_progress", "high"]);
+      assert.equal(progressRow.detail, "");
+      assert.ok(!rowIds(dashboard, "high_priority").includes(normalOpen.id));
+      assert.ok(!rowIds(dashboard, "high_priority").includes(lowOpen.id));
+      assert.deepEqual(rowIds(dashboard, "overdue"), []);
+      assert.match(
+        rowIds(dashboard, "due_soon").join(","),
+        new RegExp([openHigh.id, highOpen.id].join("|")),
+      );
+
+      // Archiving the in-progress task, and the undated-last rule with an
+      // archived member, are tested separately below.
+      await store.setArchived("task", progressHigh.id, true);
+      const archived = selectDashboard(store.snapshot(), "2026-11-22");
+      const expectedAfterArchive = [highOpen, openHigh]
+        .sort(byDueThenId)
+        .map((task) => task.id);
+      assert.deepEqual(rowIds(archived, "high_priority"), expectedAfterArchive);
+      assert.ok(!rowIds(archived, "high_priority").includes(progressHigh.id));
+    });
+  });
+
+  it("keeps high-priority rows distinct within the section when they also qualify for a date section", async () => {
+    await withStore(async (store) => {
+      const client = await store.createClient({ name: "Acme" });
+      const engagement = await store.createEngagement({ clientId: client.id, name: "Delivery" });
+      const task = await store.createTask({
+        clientId: client.id, engagementId: engagement.id, title: "Both",
+        priority: "high", status: "open", dueDate: "2026-11-21",
+      });
+      const dashboard = selectDashboard(store.snapshot(), "2026-11-22");
+      assert.deepEqual(rowIds(dashboard, "overdue"), [task.id]);
+      assert.deepEqual(rowIds(dashboard, "high_priority"), [task.id]);
+      // Overlapping sections list the record once each, and never twice within one.
+      assert.equal(rowIds(dashboard, "overdue").filter((id) => id === task.id).length, 1);
+      assert.equal(rowIds(dashboard, "high_priority").filter((id) => id === task.id).length, 1);
+    });
+  });
+});
+
+describe("dashboard waiting tasks", () => {
+  it("shows every waiting task, dated or undated, sorted by due date then id with undated last", async () => {
+    await withStore(async (store) => {
+      const client = await store.createClient({ name: "Acme" });
+      const engagement = await store.createEngagement({ clientId: client.id, name: "Delivery" });
+      const base = { clientId: client.id, engagementId: engagement.id };
+      const datedLater = await store.createTask({ ...base, title: "Dated later", status: "waiting", dueDate: "2026-11-30" });
+      const datedPast = await store.createTask({ ...base, title: "Dated past", status: "waiting", dueDate: "2026-11-21" });
+      const datedSoon = await store.createTask({ ...base, title: "Dated soon", status: "waiting", dueDate: "2026-11-23" });
+      const undatedA = await store.createTask({ ...base, title: "Undated A", status: "waiting" });
+      const undatedB = await store.createTask({ ...base, title: "Undated B", status: "waiting" });
+      await store.createTask({ ...base, title: "Open dated", status: "open", dueDate: "2026-11-21" });
+
+      const dashboard = selectDashboard(store.snapshot(), "2026-11-22");
+      const undatedIds = [undatedA.id, undatedB.id].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+      assert.deepEqual(
+        rowIds(dashboard, "waiting_tasks"),
+        [datedPast.id, datedSoon.id, datedLater.id, ...undatedIds],
+      );
+      // Dated waiting tasks also qualify for the date sections.
+      assert.ok(rowIds(dashboard, "overdue").includes(datedPast.id));
+      assert.ok(rowIds(dashboard, "due_soon").includes(datedSoon.id));
+      // Undated waiting tasks appear only in the waiting section.
+      assert.ok(!rowIds(dashboard, "overdue").includes(undatedA.id));
+      assert.ok(!rowIds(dashboard, "due_soon").includes(undatedB.id));
+    });
+  });
+
+  it("drops a done task from the waiting section and restores it when moved back", async () => {
+    await withStore(async (store) => {
+      const client = await store.createClient({ name: "Acme" });
+      const engagement = await store.createEngagement({ clientId: client.id, name: "Delivery" });
+      const task = await store.createTask({
+        clientId: client.id, engagementId: engagement.id, title: "Waiting", status: "waiting", dueDate: "2026-11-24",
+      });
+      assert.deepEqual(rowIds(selectDashboard(store.snapshot(), "2026-11-22"), "waiting_tasks"), [task.id]);
+      await store.moveTask(task.id, "done", { kind: "all" });
+      const done = selectDashboard(store.snapshot(), "2026-11-22");
+      assert.deepEqual(rowIds(done, "waiting_tasks"), []);
+      assert.ok(!rowIds(done, "due_soon").includes(task.id));
+      await store.moveTask(task.id, "waiting", { kind: "all" });
+      const back = selectDashboard(store.snapshot(), "2026-11-22");
+      assert.deepEqual(rowIds(back, "waiting_tasks"), [task.id]);
+      assert.ok(rowIds(back, "due_soon").includes(task.id));
+    });
+  });
+});
+
+describe("dashboard open follow-ups", () => {
+  it("lists every open follow-up in snapshot order and drops a closed one", async () => {
+    await withStore(async (store) => {
+      const client = await store.createClient({ name: "Acme" });
+      const engagement = await store.createEngagement({ clientId: client.id, name: "Delivery" });
+      const base = { clientId: client.id, engagementId: engagement.id };
+      const first = await store.createItem({ ...base, kind: "follow_up", title: "First", state: "open" });
+      const second = await store.createItem({ ...base, kind: "follow_up", title: "Second", state: "open" });
+      const third = await store.createItem({ ...base, kind: "follow_up", title: "Third", state: "open" });
+      await store.createItem({ ...base, kind: "follow_up", title: "Closed", state: "closed" });
+
+      assert.deepEqual(
+        rowIds(selectDashboard(store.snapshot(), "2026-11-22"), "follow_up"),
+        [first.id, second.id, third.id],
+      );
+      await store.updateItem(second.id, { state: "closed" });
+      assert.deepEqual(
+        rowIds(selectDashboard(store.snapshot(), "2026-11-22"), "follow_up"),
+        [first.id, third.id],
+      );
+    });
+  });
+});
+
+describe("dashboard unfinished engagements", () => {
+  it("includes planned, active and on-hold engagements ordered by client name, engagement name then id", async () => {
+    await withStore(async (store) => {
+      const zeta = await store.createClient({ name: "Zeta" });
+      const alpha = await store.createClient({ name: "Alpha" });
+      const beta = await store.createClient({ name: "Beta" });
+      const zetaActive = await store.createEngagement({ clientId: zeta.id, name: "Active one" });
+      const alphaPlanned = await store.createEngagement({ clientId: alpha.id, name: "Planned one", status: "planned" });
+      const alphaOnHold = await store.createEngagement({ clientId: alpha.id, name: "On hold one", status: "on_hold" });
+      const alphaActive = await store.createEngagement({ clientId: alpha.id, name: "Active one" });
+      const betaActive = await store.createEngagement({ clientId: beta.id, name: "Active one" });
+      await store.createEngagement({ clientId: alpha.id, name: "Done one", status: "completed" });
+      // An archived active engagement is effectively archived and excluded.
+      const archived = await store.createEngagement({ clientId: beta.id, name: "Archived one" });
+      await store.setArchived("engagement", archived.id, true);
+
+      const dashboard = selectDashboard(store.snapshot(), "2026-11-22");
+      assert.deepEqual(
+        rowIds(dashboard, "engagement"),
+        [alphaActive.id, alphaOnHold.id, alphaPlanned.id, betaActive.id, zetaActive.id],
+      );
+      // Restoring the archived engagement makes it visible again.
+      await store.setArchived("engagement", archived.id, false);
+      assert.ok(rowIds(selectDashboard(store.snapshot(), "2026-11-22"), "engagement").includes(archived.id));
+    });
+  });
+
+  it("orders engagements with equal names by id", async () => {
+    await withStore(async (store) => {
+      const client = await store.createClient({ name: "Acme" });
+      // Create in reverse order; the store ids increase with creation, so the
+      // expected order is ascending id whatever the store's own list order.
+      const second = await store.createEngagement({ clientId: client.id, name: "Same" });
+      const first = await store.createEngagement({ clientId: client.id, name: "Same" });
+      const [lower, upper] = first.id < second.id ? [first, second] : [second, first];
+      assert.deepEqual(
+        rowIds(selectDashboard(store.snapshot(), "2026-11-22"), "engagement"),
+        [lower.id, upper.id],
+      );
+    });
+  });
+});
+
+describe("dashboard archives", () => {
+  it("excludes effectively archived records from every added section", async () => {
+    await withStore(async (store) => {
+      const client = await store.createClient({ name: "Alpha" });
+      const engagement = await store.createEngagement({ clientId: client.id, name: "Delivery" });
+      const project = await store.createProject({ engagementId: engagement.id, name: "Project" });
+      const base = { clientId: client.id, engagementId: engagement.id };
+      const high = await store.createTask({
+        ...base, title: "High", priority: "high", status: "open", dueDate: "2026-11-21",
+      });
+      const waiting = await store.createTask({
+        ...base, title: "Waiting", status: "waiting", projectId: project.id,
+      });
+      const followUp = await store.createItem({ ...base, kind: "follow_up", title: "Follow-up", state: "open" });
+      const archivedClient = await store.createClient({ name: "Archived" });
+      const archivedEngagement = await store.createEngagement({ clientId: archivedClient.id, name: "Gone" });
+      const hiddenTask = await store.createTask({
+        clientId: archivedClient.id, engagementId: archivedEngagement.id,
+        title: "Hidden", priority: "high", status: "waiting", dueDate: "2026-11-21",
+      });
+      const hiddenFollowUp = await store.createItem({
+        clientId: archivedClient.id, engagementId: archivedEngagement.id,
+        kind: "follow_up", title: "Hidden follow-up", state: "open",
+      });
+      const sorted = (ids: string[]): string[] => ids.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+      const before = selectDashboard(store.snapshot(), "2026-11-22");
+      assert.deepEqual(rowIds(before, "high_priority"), [high.id]);
+      // The dated waiting task precedes the undated one.
+      assert.deepEqual(rowIds(before, "waiting_tasks"), [hiddenTask.id, waiting.id]);
+      assert.deepEqual(rowIds(before, "follow_up"), sorted([followUp.id, hiddenFollowUp.id]));
+      assert.ok(rowIds(before, "engagement").includes(archivedEngagement.id));
+
+      await store.setArchived("client", archivedClient.id, true);
+      const after = selectDashboard(store.snapshot(), "2026-11-22");
+      assert.deepEqual(rowIds(after, "high_priority"), [high.id]);
+      assert.deepEqual(rowIds(after, "waiting_tasks"), [waiting.id]);
+      assert.deepEqual(rowIds(after, "follow_up"), [followUp.id]);
+      assert.ok(!rowIds(after, "engagement").includes(archivedEngagement.id));
+      // The archived records also leave the recent-activity view.
+      const activity = after.sections.find((section) => section.kind === "recent_activity")!;
+      assert.ok(!activity.rows.some((row) => row.href.includes(hiddenTask.id)));
+      assert.ok(!activity.rows.some((row) => row.href.includes(hiddenFollowUp.id)));
+
+      // A directly archived project hides its waiting task and follow-up.
+      await store.setArchived("project", project.id, true);
+      const projectArchived = selectDashboard(store.snapshot(), "2026-11-22");
+      assert.deepEqual(rowIds(projectArchived, "waiting_tasks"), []);
+      assert.ok(!projectArchived.sections.find((section) => section.kind === "waiting_tasks")!.rows.some(
+        (row) => row.projectId === project.id,
+      ));
+    });
+  });
+});
+
+describe("dashboard recent activity", () => {
+  /** A fixed clock whose events are stamped one second apart from a base instant. */
+  function tickingClock(): () => Date {
+    let n = 0;
+    return () => new Date(Date.UTC(2026, 10, 20, 12, 0, 0) + n++ * 1000);
+  }
+
+  it("keeps the latest 20 visible events, newest first, with current labels", async () => {
+    const dir = tempDir();
+    const store = await openStore(dir, { now: tickingClock() });
+    try {
+      const client = await store.createClient({ name: "Acme" });
+      const engagement = await store.createEngagement({ clientId: client.id, name: "Delivery" });
+      const base = { clientId: client.id, engagementId: engagement.id };
+      // 25 dated overdue tasks, each create an event; then an edit of one of
+      // them stamps the newest event.
+      const tasks = [];
+      for (let index = 0; index < 25; index += 1) {
+        tasks.push(await store.createTask({ ...base, title: `Task ${index}`, dueDate: "2026-11-21" }));
+      }
+      const edited = tasks[3];
+      await store.updateTask(edited.id, { title: "Edited task" });
+
+      const dashboard = selectDashboard(store.snapshot(), "2026-11-22");
+      const activity = dashboard.sections.find((section) => section.kind === "recent_activity")!;
+      assert.equal(activity.rows.length, 20);
+      // Newest first: the edit leads, then the latest creates in reverse order.
+      assert.equal(activity.rows[0].action, "edit");
+      assert.equal(activity.rows[0].href, `/tasks/${edited.id}`);
+      assert.equal(activity.rows[0].title, "Edited task");
+      const created = tasks.slice(-19).reverse();
+      assert.deepEqual(
+        activity.rows.slice(1).map((row) => row.href),
+        created.map((task) => `/tasks/${task.id}`),
+      );
+      // Each row resolves the current record: the edited task's label is the
+      // new title, and none of the rows carries a stale title.
+      assert.ok(!activity.rows.some((row) => row.title === "Task 3"));
+    } finally {
+      await store.close();
+    }
+  });
+
+  it("keeps events for records that no longer exist out of the view without failing", async () => {
+    const dir = tempDir();
+    const store = await openStore(dir, { now: tickingClock() });
+    try {
+      const client = await store.createClient({ name: "Acme" });
+      const engagement = await store.createEngagement({ clientId: client.id, name: "Delivery" });
+      const task = await store.createTask({
+        clientId: client.id, engagementId: engagement.id, title: "Will be archived", dueDate: "2026-11-21",
+      });
+      await store.setArchived("task", task.id, true);
+      const dashboard = selectDashboard(store.snapshot(), "2026-11-22");
+      const activity = dashboard.sections.find((section) => section.kind === "recent_activity")!;
+      // The archived task's create and archive events are invisible. Archiving
+      // a child leaves its engagement visible, so the engagement's own create
+      // event is retained; only the client and engagement creates remain.
+      assert.deepEqual(
+        activity.rows.map((row) => row.targetKind).sort(),
+        ["client", "engagement"],
+      );
+      assert.equal(
+        activity.rows.filter((row) => row.targetKind === "engagement").length,
+        1,
+      );
+      assert.deepEqual(
+        activity.rows.map((row) => row.href).sort(),
+        [`/clients/${client.id}`, `/engagements/${engagement.id}`].sort(),
+      );
+      // The engagement event resolves its own identity: its detail link is its
+      // own id, and its client link is the client stored on the engagement.
+      const engagementRow = activity.rows.find((row) => row.targetKind === "engagement")!;
+      assert.equal(engagementRow.href, `/engagements/${engagement.id}`);
+      assert.equal(engagementRow.title, "Delivery");
+      assert.equal(engagementRow.engagementId, engagement.id);
+      assert.equal(engagementRow.engagementName, "Delivery");
+      assert.equal(engagementRow.action, "create");
+      assert.equal(engagementRow.clientId, client.id);
+      assert.equal(engagementRow.clientName, "Acme");
+    } finally {
+      await store.close();
+    }
+  });
+
+  it("is empty when the journal is absent or empty", async () => {
+    const dashboard = selectDashboard(emptySnapshot(), "2026-11-22");
+    const activity = dashboard.sections.find((section) => section.kind === "recent_activity")!;
+    assert.deepEqual(activity.rows, []);
+    const withEmpty = selectDashboard({ ...emptySnapshot(), activity: [] }, "2026-11-22");
+    assert.deepEqual(
+      withEmpty.sections.find((section) => section.kind === "recent_activity")!.rows,
+      [],
+    );
   });
 });

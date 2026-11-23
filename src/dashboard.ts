@@ -11,27 +11,48 @@
  *
  * Nothing here reads or writes the store: the snapshot is the read, and the
  * result is a fresh value, so a dashboard render cannot mutate a record.
+ *
+ * The board keeps the six original attention sections in their order and adds
+ * the sections the owner asked for: high-priority actionable tasks, waiting
+ * tasks, open follow-ups, recent activity and the unfinished engagements. A
+ * record may qualify for more than one section (a dated waiting task is both
+ * overdue/due soon and waiting), but it is listed at most once within any one
+ * section.
  */
 import { isEffectivelyArchived, type ArchiveState } from "./archive.ts";
+import { selectRecentActivity, type ActivityEvent, type ActivityTargetKind } from "./activity.ts";
 import { escapeHtml, renderPage, type Page } from "./html.ts";
 import type { Snapshot, WorkItem } from "./store.ts";
 import { link } from "./work-pages.ts";
 
-/** The six attention sections, in the order the home page shows them. */
+/** The attention sections, in the order the home page shows them. */
 export type DashboardSectionKind =
   | "overdue"
   | "due_soon"
   | "blocker"
   | "question"
   | "commitment"
-  | "waiting";
+  | "waiting"
+  | "high_priority"
+  | "waiting_tasks"
+  | "follow_up"
+  | "recent_activity"
+  | "engagement";
 
 /** How many calendar days ahead of today "due soon" extends (today + 7). */
 export const DUE_SOON_DAYS = 7;
 
-/** One qualifying record: where it links, what it says and who owns it. */
+/**
+ * One qualifying record: where it links, what it says and who owns it.
+ *
+ * A task or item row links its own record and its actual client, engagement
+ * and (when it has one) project. An engagement row (kind "engagement") links
+ * its engagement and client. A recent-activity row (kind "activity") links its
+ * current target record, its client and (unless the target is a client) its
+ * engagement.
+ */
 export interface DashboardRow {
-  readonly kind: "task" | "item";
+  readonly kind: "task" | "item" | "engagement" | "activity";
   readonly id: string;
   readonly title: string;
   /** The record's detail URL, internal and already escaped. */
@@ -40,10 +61,17 @@ export interface DashboardRow {
   readonly clientName: string;
   readonly engagementId: string;
   readonly engagementName: string;
+  /** The actual project the record belongs to, when it has one. */
+  readonly projectId?: string;
+  readonly projectName?: string;
   /** The task's due date, or the work item's kind text; shown as-is. */
   readonly detail: string;
-  /** For a task, its status; for an item, its kind and state. */
+  /** For a task, its status and priority; for an item, its kind and state. */
   readonly badges: readonly string[];
+  /** For a recent-activity row, the action performed. */
+  readonly action?: string;
+  /** For a recent-activity row, the record family of its current target. */
+  readonly targetKind?: ActivityTargetKind;
 }
 
 /** One section: its kind, title, rows (in display order) and range text. */
@@ -56,9 +84,15 @@ export interface DashboardSection {
    * "2026-11-22 to 2026-11-29", or null for a section that has no range.
    */
   readonly range: string | null;
+  /**
+   * False for a section whose rows are not workspace records needing attention
+   * (recent activity and the engagement overview), so its empty state says so
+   * rather than offering the client list as a next step.
+   */
+  readonly attention?: boolean;
 }
 
-/** The dashboard's result: the reference day and the six sections in order. */
+/** The dashboard's result: the reference day and the sections in order. */
 export interface Dashboard {
   readonly today: string;
   readonly sections: readonly DashboardSection[];
@@ -71,10 +105,34 @@ const SECTION_TITLES: Readonly<Record<DashboardSectionKind, string>> = Object.fr
   question: "Open questions",
   commitment: "Open commitments",
   waiting: "Open waiting items",
+  high_priority: "High-priority tasks",
+  waiting_tasks: "Waiting tasks",
+  follow_up: "Open follow-ups",
+  recent_activity: "Recent activity",
+  engagement: "Engagements in progress",
 });
 
-/** The work-item kinds that have their own section; decisions and follow-ups do not. */
-const ITEM_SECTION_KINDS: ReadonlySet<string> = new Set(["blocker", "question", "commitment", "waiting"]);
+/** The work-item kinds that have their own attention section; decisions do not. */
+const ITEM_SECTION_KINDS: ReadonlySet<string> = new Set([
+  "blocker",
+  "question",
+  "commitment",
+  "waiting",
+  "follow_up",
+]);
+
+/**
+ * The task statuses that count as actionable: high-priority tasks are shown
+ * only when open or in progress, never when waiting or done.
+ */
+const ACTIONABLE_TASK_STATUSES: ReadonlySet<string> = new Set(["open", "in_progress"]);
+
+/** The engagement statuses that are unfinished: planned, active and on hold. */
+const UNFINISHED_ENGAGEMENT_STATUSES: ReadonlySet<string> = new Set([
+  "planned",
+  "active",
+  "on_hold",
+]);
 
 /**
  * True when `value` is a real YYYY-MM-DD calendar date. The selector compares
@@ -129,18 +187,51 @@ function byId<T extends { readonly id: string }>(records: readonly T[]): Map<str
 }
 
 /**
- * Compute the six attention sections from one snapshot at one reference day.
+ * True when `at` is a canonical UTC instant (YYYY-MM-DDTHH:MM:SS.mmmZ). The
+ * dashboard orders activity by this stored text, which only compares
+ * chronologically for that exact shape, so any other value is refused.
+ */
+function isCanonicalInstant(text: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(text) && text.length === 24;
+}
+
+/** The detail route path of a record family's current target. */
+function targetHref(kind: ActivityTargetKind, id: string): string {
+  const family = kind === "item" ? "items" : `${kind}s`;
+  return `/${family}/${encodeURIComponent(id)}`;
+}
+
+/** The current display title of a record family's target. */
+function targetTitle(
+  kind: ActivityTargetKind,
+  record: { readonly title?: string; readonly name?: string },
+): string {
+  if (kind === "client" || kind === "engagement" || kind === "project") {
+    return record.name ?? "";
+  }
+  return record.title ?? "";
+}
+
+/**
+ * Compute the attention sections from one snapshot at one reference day.
  *
- * Tasks are eligible when they are open, in progress or waiting and carry a due
- * date; done and undated tasks never appear. Overdue is a date before today, due
- * soon is today through today+7 inclusive (eight calendar dates). Items are
- * eligible when their kind has a section and their state is open; decisions
- * and follow-ups have no section. Effectively archived records (the record's
- * own flag or any of its current ancestors') are excluded throughout.
+ * Tasks are eligible for the date sections when they are open, in progress or
+ * waiting and carry a due date; done and undated tasks never appear there.
+ * Overdue is a date before today, due soon is today through today+7 inclusive
+ * (eight calendar dates). High-priority tasks are open or in progress tasks of
+ * high priority, dated or not, ordered by due date then id with undated tasks
+ * last; normal and low tasks never fall back into this section. Waiting tasks
+ * are every waiting task (dated or undated) and are eligible for the date
+ * sections too. Items are eligible when their kind has a section and their
+ * state is open; decisions have no section. Unfinished engagements are the
+ * planned, active and on-hold ones, ordered by client name, engagement name
+ * and id. Recent activity is the latest 20 visible events. Effectively
+ * archived records (the record's own flag or any of its current ancestors')
+ * are excluded throughout.
  *
- * Task groups are sorted by ascending due date, then by id. Item groups keep
- * the snapshot's own order, so the rows are exactly the qualifying records in
- * the order the store reported them, never truncated.
+ * Task groups are sorted by ascending due date (undated last), then by id.
+ * Item groups keep the snapshot's own order, so the rows are exactly the
+ * qualifying records in the order the store reported them, never truncated.
  */
 export function selectDashboard(
   snapshot: Snapshot,
@@ -152,6 +243,7 @@ export function selectDashboard(
   const state: ArchiveState = snapshot;
   const clients = byId(snapshot.clients);
   const engagements = byId(snapshot.engagements);
+  const projects = byId(snapshot.projects);
   const lastDueSoon = addCalendarDays(referenceDate, DUE_SOON_DAYS);
 
   // The ancestry of a record: its client and its engagement. The store refuses
@@ -165,10 +257,24 @@ export function selectDashboard(
     return { clientName: client.name, engagementName: engagement.name };
   };
 
+  // The actual project a task or item belongs to, when its link resolves. A
+  // record whose project is directly archived is itself effectively archived
+  // and never reaches a row, so a shown project link always names a visible
+  // project.
+  const projectOf = (
+    record: { readonly projectId?: string },
+  ): { projectId: string; projectName: string } | null => {
+    if (record.projectId === undefined) return null;
+    const project = projects.get(record.projectId);
+    if (project === undefined) return null;
+    return { projectId: project.id, projectName: project.name };
+  };
+
   const taskRow = (task: Snapshot["tasks"][number]): DashboardRow | null => {
     const names = ancestryOf(task);
     if (names === null) return null;
-    return {
+    const project = projectOf(task);
+    const row: DashboardRow = {
       kind: "task",
       id: task.id,
       title: task.title,
@@ -180,12 +286,14 @@ export function selectDashboard(
       detail: task.dueDate ?? "",
       badges: [task.status, task.priority],
     };
+    return project === null ? row : { ...row, ...project };
   };
 
   const itemRow = (item: WorkItem): DashboardRow | null => {
     const names = ancestryOf(item);
     if (names === null) return null;
-    return {
+    const project = projectOf(item);
+    const row: DashboardRow = {
       kind: "item",
       id: item.id,
       title: item.title,
@@ -197,28 +305,53 @@ export function selectDashboard(
       detail: item.kind,
       badges: [item.kind, item.state],
     };
+    return project === null ? row : { ...row, ...project };
   };
 
-  const eligibleTasks = snapshot.tasks
-    .filter((task) => !isEffectivelyArchived(state, task))
-    .filter(
-      (task) =>
-        (task.status === "open" ||
-          task.status === "in_progress" ||
-          task.status === "waiting") &&
-        task.dueDate !== undefined &&
-        isCalendarDate(task.dueDate),
-    );
+  const engagementRow = (engagement: Snapshot["engagements"][number]): DashboardRow | null => {
+    const client = clients.get(engagement.clientId);
+    if (client === undefined) return null;
+    return {
+      kind: "engagement",
+      id: engagement.id,
+      title: engagement.name,
+      href: `/engagements/${encodeURIComponent(engagement.id)}`,
+      clientId: client.id,
+      clientName: client.name,
+      engagementId: engagement.id,
+      engagementName: engagement.name,
+      detail: engagement.status,
+      badges: [engagement.status],
+    };
+  };
 
-  const overdueTasks = eligibleTasks
+  const visibleTasks = snapshot.tasks.filter((task) => !isEffectivelyArchived(state, task));
+  const datedTasks = visibleTasks.filter(
+    (task) =>
+      (task.status === "open" ||
+        task.status === "in_progress" ||
+        task.status === "waiting") &&
+      task.dueDate !== undefined &&
+      isCalendarDate(task.dueDate),
+  );
+
+  const overdueTasks = datedTasks
     .filter((task) => (task.dueDate as string) < referenceDate)
     .sort(compareTasks);
-  const dueSoonTasks = eligibleTasks
+  const dueSoonTasks = datedTasks
     .filter(
       (task) =>
         (task.dueDate as string) >= referenceDate &&
         (task.dueDate as string) <= lastDueSoon,
     )
+    .sort(compareTasks);
+
+  const highPriorityTasks = visibleTasks
+    .filter((task) => task.priority === "high" && ACTIONABLE_TASK_STATUSES.has(task.status))
+    .sort(compareTasks);
+
+  const waitingTasks = visibleTasks
+    .filter((task) => task.status === "waiting")
     .sort(compareTasks);
 
   const eligibleItems = snapshot.items.filter(
@@ -228,12 +361,92 @@ export function selectDashboard(
       !isEffectivelyArchived(state, item),
   );
 
+  const unfinishedEngagements = snapshot.engagements
+    .filter(
+      (engagement) =>
+        UNFINISHED_ENGAGEMENT_STATUSES.has(engagement.status) &&
+        !isEffectivelyArchived(state, engagement),
+    )
+    .sort((left, right) => {
+      const clientA = clients.get(left.clientId)?.name ?? "";
+      const clientB = clients.get(right.clientId)?.name ?? "";
+      if (clientA < clientB) return -1;
+      if (clientA > clientB) return 1;
+      if (left.name < right.name) return -1;
+      if (left.name > right.name) return 1;
+      if (left.id < right.id) return -1;
+      if (left.id > right.id) return 1;
+      return 0;
+    });
+
+  // The recent-activity rows resolve each visible event's current target, so
+  // the label and links are the record as it is now, never a stored history.
+  const activityRow = (event: ActivityEvent): DashboardRow | null => {
+    const kind = event.targetKind;
+    const records = snapshot[`${kind}s` as keyof Snapshot] as
+      | readonly { id: string }[]
+      | undefined;
+    if (records === undefined) return null;
+    const record = records.find((candidate) => candidate.id === event.targetId);
+    if (record === undefined) return null;
+    const target = record as unknown as {
+      readonly id: string;
+      readonly title?: string;
+      readonly name?: string;
+      readonly clientId?: string;
+      readonly engagementId?: string;
+    };
+    // A client has no parent; every other family carries its client and
+    // engagement links, while a project names only its engagement and reaches
+    // its client through the engagement's own stored link, exactly as the
+    // archive helpers do. An engagement is its own record: its engagement id
+    // is the target id itself, never a link field it does not carry.
+    const engagementId =
+      kind === "client" ? "" : kind === "engagement" ? target.id : target.engagementId ?? "";
+    const clientId =
+      kind === "client"
+        ? target.id
+        : kind === "engagement"
+          ? target.clientId ?? ""
+          : target.clientId ?? engagements.get(engagementId)?.clientId ?? "";
+    const client = clients.get(clientId);
+    const engagement = engagements.get(engagementId);
+    if (client === undefined) return null;
+    if (kind !== "client" && engagement === undefined) return null;
+    return {
+      kind: "activity",
+      id: String(event.id),
+      title: targetTitle(kind, target),
+      href: targetHref(kind, event.targetId),
+      clientId: client.id,
+      clientName: client.name,
+      engagementId,
+      engagementName: engagement?.name ?? "",
+      detail: event.at,
+      badges: [kind],
+      action: event.action,
+      targetKind: kind,
+    };
+  };
+  // A stored timestamp that cannot be ordered would silently misorder the
+  // activity, so it is refused rather than guessed at; the response boundary
+  // then answers with its generic 500.
+  const journal = snapshot.activity ?? [];
+  if (!journal.every((event) => isCanonicalInstant(event.at))) {
+    throw new Error("stored activity timestamp is not a canonical UTC instant");
+  }
+  const activityRows = selectRecentActivity(snapshot)
+    .map(activityRow)
+    .filter((row): row is DashboardRow => row !== null);
+
   const rowsOf = (
     tasks: readonly Snapshot["tasks"][number][],
     items: readonly WorkItem[] = [],
+    engagements: readonly Snapshot["engagements"][number][] = [],
   ): readonly DashboardRow[] => [
     ...tasks.map(taskRow).filter((row): row is DashboardRow => row !== null),
     ...items.map(itemRow).filter((row): row is DashboardRow => row !== null),
+    ...engagements.map(engagementRow).filter((row): row is DashboardRow => row !== null),
   ];
 
   const itemRows = (kind: string): readonly DashboardRow[] =>
@@ -283,19 +496,57 @@ export function selectDashboard(
         rows: itemRows("waiting"),
         range: null,
       },
+      {
+        kind: "high_priority",
+        title: SECTION_TITLES.high_priority,
+        rows: rowsOf(highPriorityTasks),
+        range: null,
+      },
+      {
+        kind: "waiting_tasks",
+        title: SECTION_TITLES.waiting_tasks,
+        rows: rowsOf(waitingTasks),
+        range: null,
+      },
+      {
+        kind: "follow_up",
+        title: SECTION_TITLES.follow_up,
+        rows: itemRows("follow_up"),
+        range: null,
+      },
+      {
+        kind: "recent_activity",
+        title: SECTION_TITLES.recent_activity,
+        rows: activityRows,
+        range: null,
+        attention: false,
+      },
+      {
+        kind: "engagement",
+        title: SECTION_TITLES.engagement,
+        rows: rowsOf([], [], unfinishedEngagements),
+        range: null,
+        attention: false,
+      },
     ],
   };
 }
 
-/** Ascending due date, then ascending id, for a task-like row. */
+/**
+ * Ascending due date, then ascending id, for a task-like row. Undated tasks
+ * sort after every dated one, as the owner asked.
+ */
 function compareTasks(
   left: { readonly dueDate?: string; readonly id: string },
   right: { readonly dueDate?: string; readonly id: string },
 ): number {
-  const a = left.dueDate ?? "";
-  const b = right.dueDate ?? "";
-  if (a < b) return -1;
-  if (a > b) return 1;
+  const a = left.dueDate ?? null;
+  const b = right.dueDate ?? null;
+  if (a !== b) {
+    if (a === null) return 1;
+    if (b === null) return -1;
+    return a < b ? -1 : 1;
+  }
   if (left.id < right.id) return -1;
   if (left.id > right.id) return 1;
   return 0;
@@ -308,35 +559,88 @@ function emptyMessage(section: DashboardSection): string {
       return "No tasks are overdue. Nothing needs attention here.";
     case "due_soon":
       return "No tasks are due in this range. Nothing needs attention here.";
+    case "recent_activity":
+      return "No recorded activity yet.";
+    case "engagement":
+      return "No unfinished engagements (planned, active or on hold).";
     default:
       return `No open ${section.title.replace(/^Open /, "").toLowerCase()} here. Nothing needs attention here.`;
   }
 }
 
-/** One row rendered as a card: its record link, then its client and engagement. */
-function renderRow(row: DashboardRow): string {
+/** One task or item row as a card: its record link, then its ancestry. */
+function renderRecordRow(row: DashboardRow): string {
   const badges = row.badges.map((text) => `<span class="badge">${escapeHtml(text)}</span>`).join(" ");
   const client = `client ${link(`/clients/${encodeURIComponent(row.clientId)}`, row.clientName)}`;
   const engagement = `engagement ${link(`/engagements/${encodeURIComponent(row.engagementId)}`, row.engagementName)}`;
+  const project =
+    row.projectId === undefined
+      ? ""
+      : ` · project ${link(`/projects/${encodeURIComponent(row.projectId)}`, row.projectName ?? "")}`;
   const detail = row.kind === "task" ? `due ${row.detail}` : row.detail;
   return [
     `<li class="card">`,
     link(row.href, row.title),
     ` ${badges}`,
     ` <span class="detail">${escapeHtml(detail)}</span>`,
-    ` <span class="ancestry">${client} · ${engagement}</span>`,
+    ` <span class="ancestry">${client} · ${engagement}${project}</span>`,
     `</li>`,
   ].join("");
+}
+
+/** One engagement row as a card: its engagement link, then its client link. */
+function renderEngagementRow(row: DashboardRow): string {
+  const client = `client ${link(`/clients/${encodeURIComponent(row.clientId)}`, row.clientName)}`;
+  return [
+    `<li class="card">`,
+    link(row.href, row.title),
+    ` <span class="badge">${escapeHtml(row.detail)}</span>`,
+    ` <span class="ancestry">${client}</span>`,
+    `</li>`,
+  ].join("");
+}
+
+/**
+ * One recent-activity row as a card: the current target's record link with its
+ * current label, the action, the timestamp and the ancestry links.
+ */
+function renderActivityRow(row: DashboardRow): string {
+  const target = link(row.href, row.title);
+  const client = link(`/clients/${encodeURIComponent(row.clientId)}`, row.clientName);
+  const ancestry =
+    row.targetKind === "client"
+      ? `client ${client}`
+      : `client ${client} · engagement ${link(`/engagements/${encodeURIComponent(row.engagementId)}`, row.engagementName)}`;
+  return [
+    `<li class="card">`,
+    `<span class="action">${escapeHtml(row.action ?? "")}</span> `,
+    `<span class="target">${target}</span>`,
+    ` <span class="detail">${escapeHtml(row.detail)}</span>`,
+    ` <span class="ancestry">${ancestry}</span>`,
+    `</li>`,
+  ].join("");
+}
+
+function renderRow(row: DashboardRow): string {
+  switch (row.kind) {
+    case "engagement":
+      return renderEngagementRow(row);
+    case "activity":
+      return renderActivityRow(row);
+    default:
+      return renderRecordRow(row);
+  }
 }
 
 function renderSection(section: DashboardSection): string {
   const heading = `<h2>${escapeHtml(section.title)}</h2>`;
   const range = section.range === null ? "" : `<p class="range">${escapeHtml(section.range)}</p>`;
-  const body =
-    section.rows.length === 0
-      ? `<p>${escapeHtml(emptyMessage(section))}</p>\n<p>${link("/clients", "Browse clients")}</p>`
-      : `<ul class="card-list">${section.rows.map(renderRow).join("")}</ul>`;
-  return `<section>${heading}${range}${body}</section>`;
+  if (section.rows.length === 0) {
+    const browse =
+      section.attention === false ? "" : `\n<p>${link("/clients", "Browse clients")}</p>`;
+    return `<section>${heading}${range}<p>${escapeHtml(emptyMessage(section))}</p>${browse}</section>`;
+  }
+  return `<section>${heading}${range}<ul class="card-list">${section.rows.map(renderRow).join("")}</ul></section>`;
 }
 
 /**

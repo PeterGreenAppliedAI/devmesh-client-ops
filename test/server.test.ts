@@ -696,7 +696,7 @@ describe("canonical origin and Host checks", () => {
     }
   });
 
-  it("serves the six-section dashboard at home from the server's injectable clock", async () => {
+  it("serves the dashboard sections at home from the server's injectable clock", async () => {
     const calls = newCalls();
     const store = instrumentedStore(await openStore(tempDir()), calls);
     // Seed a small cross-client workspace through the real store; every write
@@ -774,6 +774,109 @@ describe("canonical origin and Host checks", () => {
       const afterMove = selectKanban(store.snapshot(), { kind: "client", id: alpha.id });
       assert.deepEqual(afterMove.groups.find((group) => group.kind === "waiting")?.tasks, []);
       assert.ok(afterMove.groups.find((group) => group.kind === "done")?.tasks.some((task) => task.id === waiting.id));
+    } finally {
+      await server.close();
+      await store.close();
+    }
+  });
+
+  it("serves the added dashboard sections from the same snapshot and clock", async () => {
+    const calls = newCalls();
+    const store = instrumentedStore(await openStore(tempDir()), calls);
+    const client = await store.createClient({ name: "Acme" });
+    const engagement = await store.createEngagement({ clientId: client.id, name: "Delivery" });
+    const project = await store.createProject({ engagementId: engagement.id, name: "Phase" });
+    const base = { clientId: client.id, engagementId: engagement.id };
+    const high = await store.createTask({ ...base, title: "High", priority: "high", status: "open", dueDate: "2026-11-21" });
+    const waiting = await store.createTask({ ...base, title: "Waiting", status: "waiting", dueDate: "2026-11-25" });
+    const followUp = await store.createItem({ ...base, kind: "follow_up", title: "Follow-up", state: "open" });
+    const writesBeforeRender = calls.mutations;
+    const fixedClock = new Date(2026, 10, 22, 12, 0, 0);
+    const routes = instrumented(appRoutes(store, { now: () => fixedClock }), calls);
+    const server = await startServer({ store, port: 0, routes });
+    try {
+      const home = await send(server.origin, {});
+      assert.equal(home.status, 200);
+      const sectionOf = (title: string): string => {
+        const at = home.body.indexOf(`<h2>${title}</h2>`);
+        assert.ok(at >= 0, title);
+        return home.body.slice(at, home.body.indexOf("</section>", at));
+      };
+      // A high open task and a dated waiting task; both are shown, and the
+      // waiting task also qualifies for the due-soon range.
+      assert.match(sectionOf("High-priority tasks"), new RegExp(`href="/tasks/${high.id}"`));
+      assert.match(sectionOf("High-priority tasks"), /<span class="badge">high<\/span>/);
+      assert.match(sectionOf("Waiting tasks"), new RegExp(`href="/tasks/${waiting.id}"`));
+      assert.match(sectionOf("Tasks due soon"), new RegExp(`href="/tasks/${waiting.id}"`));
+      // Open follow-ups have their own section.
+      assert.match(sectionOf("Open follow-ups"), new RegExp(`href="/items/${followUp.id}"`));
+      // The unfinished engagement links its engagement and its client.
+      assert.match(sectionOf("Engagements in progress"), new RegExp(`<a href="/engagements/${engagement.id}">Delivery</a>`));
+      assert.match(sectionOf("Engagements in progress"), new RegExp(`client <a href="/clients/${client.id}">Acme</a>`));
+      // The high task links its own record and its actual ancestry, including
+      // the engagement's projects only when the record names one.
+      assert.match(sectionOf("High-priority tasks"), new RegExp(`client <a href="/clients/${client.id}">Acme</a>`));
+      assert.match(sectionOf("High-priority tasks"), new RegExp(`engagement <a href="/engagements/${engagement.id}">Delivery</a>`));
+      // The waiting task is ordered after nothing here; it links its record.
+      assert.match(sectionOf("Waiting tasks"), /<span class="badge">waiting<\/span>/);
+      // Recent activity lists the current records, newest first, and the
+      // engagement's project create resolves its client through the
+      // engagement, so every family links its current target.
+      const activity = sectionOf("Recent activity");
+      assert.match(activity, new RegExp(`href="/items/${followUp.id}"`));
+      assert.match(activity, new RegExp(`href="/tasks/${high.id}"`));
+      assert.match(activity, new RegExp(`href="/projects/${project.id}"`));
+      assert.match(activity, /<span class="action">create<\/span>/);
+      // The engagement's own create event targets the engagement record, so
+      // its detail link and label are the engagement's, with its client link.
+      const engagementAt = activity.indexOf(`href="/engagements/${engagement.id}"`);
+      assert.ok(engagementAt >= 0, "the engagement's create event links its record");
+      const engagementCard = activity.slice(
+        activity.lastIndexOf("<li", engagementAt),
+        activity.indexOf("</li>", engagementAt),
+      );
+      assert.match(engagementCard, new RegExp(`href="/clients/${client.id}"`));
+      assert.match(engagementCard, /<span class="action">create<\/span>/);
+      assert.ok(
+        activity.indexOf(`href="/items/${followUp.id}"`) < activity.indexOf(`href="/tasks/${high.id}"`),
+        "the follow-up create is newer than the task create",
+      );
+      // Serving the dashboard is a read: no mutation ran.
+      assert.equal(calls.mutations, writesBeforeRender);
+      assert.equal(calls.get, 1);
+    } finally {
+      await server.close();
+      await store.close();
+    }
+  });
+
+  it("returns a generic 500 when the dashboard render fails", async () => {
+    // The failure is injected through the store interface: a corrupt snapshot
+    // (a stored activity timestamp that cannot be ordered) makes the selector
+    // throw, and the page must still be the server's generic 500, never the
+    // error's text.
+    const calls = newCalls();
+    const store = instrumentedStore(await openStore(tempDir()), calls);
+    await store.createClient({ name: "Acme" });
+    const broken = {
+      ...store,
+      snapshot: () => ({
+        ...store.snapshot(),
+        // A stored timestamp that cannot be ordered would silently misorder
+        // the activity, so it is refused rather than guessed at.
+        activity: [{ id: 1, at: "2026-11-22 12:00:00", action: "create", targetKind: "task", targetId: "ghost" }],
+      }),
+    } as unknown as Store;
+    const routes = instrumented(appRoutes(broken), calls);
+    const server = await startServer({ store, port: 0, routes });
+    try {
+      const reply = await send(server.origin, {});
+      assert.equal(reply.status, 500);
+      assert.match(reply.body, /An unexpected error occurred\./);
+      // The generic page never carries the stored timestamp or a target link.
+      assert.ok(!reply.body.includes("2026-11-22 12:00:00"));
+      assert.ok(!reply.body.includes("/tasks/ghost"));
+      assert.equal(reply.headers["cache-control"], "no-store");
     } finally {
       await server.close();
       await store.close();
