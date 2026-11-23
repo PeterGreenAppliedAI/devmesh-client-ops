@@ -696,7 +696,7 @@ describe("canonical origin and Host checks", () => {
     }
   });
 
-  it("serves the six-section dashboard at home from the server's injectable clock", async () => {
+  it("serves the dashboard sections at home from the server's injectable clock", async () => {
     const calls = newCalls();
     const store = instrumentedStore(await openStore(tempDir()), calls);
     // Seed a small cross-client workspace through the real store; every write
@@ -785,6 +785,7 @@ describe("canonical origin and Host checks", () => {
     const store = instrumentedStore(await openStore(tempDir()), calls);
     const client = await store.createClient({ name: "Acme" });
     const engagement = await store.createEngagement({ clientId: client.id, name: "Delivery" });
+    const project = await store.createProject({ engagementId: engagement.id, name: "Phase" });
     const base = { clientId: client.id, engagementId: engagement.id };
     const high = await store.createTask({ ...base, title: "High", priority: "high", status: "open", dueDate: "2026-11-21" });
     const waiting = await store.createTask({ ...base, title: "Waiting", status: "waiting", dueDate: "2026-11-25" });
@@ -812,10 +813,24 @@ describe("canonical origin and Host checks", () => {
       // The unfinished engagement links its engagement and its client.
       assert.match(sectionOf("Engagements in progress"), new RegExp(`<a href="/engagements/${engagement.id}">Delivery</a>`));
       assert.match(sectionOf("Engagements in progress"), new RegExp(`client <a href="/clients/${client.id}">Acme</a>`));
-      // Recent activity lists the current records, newest first.
+      // The high task links its own record and its actual ancestry, including
+      // the engagement's projects only when the record names one.
+      assert.match(sectionOf("High-priority tasks"), new RegExp(`client <a href="/clients/${client.id}">Acme</a>`));
+      assert.match(sectionOf("High-priority tasks"), new RegExp(`engagement <a href="/engagements/${engagement.id}">Delivery</a>`));
+      // The waiting task is ordered after nothing here; it links its record.
+      assert.match(sectionOf("Waiting tasks"), /<span class="badge">waiting<\/span>/);
+      // Recent activity lists the current records, newest first, and the
+      // engagement's project create resolves its client through the
+      // engagement, so every family links its current target.
       const activity = sectionOf("Recent activity");
       assert.match(activity, new RegExp(`href="/items/${followUp.id}"`));
+      assert.match(activity, new RegExp(`href="/tasks/${high.id}"`));
+      assert.match(activity, new RegExp(`href="/projects/${project.id}"`));
       assert.match(activity, /<span class="action">create<\/span>/);
+      assert.ok(
+        activity.indexOf(`href="/items/${followUp.id}"`) < activity.indexOf(`href="/tasks/${high.id}"`),
+        "the follow-up create is newer than the task create",
+      );
       // Serving the dashboard is a read: no mutation ran.
       assert.equal(calls.mutations, writesBeforeRender);
       assert.equal(calls.get, 1);
@@ -848,7 +863,9 @@ describe("canonical origin and Host checks", () => {
       const reply = await send(server.origin, {});
       assert.equal(reply.status, 500);
       assert.match(reply.body, /An unexpected error occurred\./);
-      assert.ok(!reply.body.includes("Broken"));
+      // The generic page never carries the stored timestamp or a target link.
+      assert.ok(!reply.body.includes("2026-11-22 12:00:00"));
+      assert.ok(!reply.body.includes("/tasks/ghost"));
       assert.equal(reply.headers["cache-control"], "no-store");
     } finally {
       await server.close();

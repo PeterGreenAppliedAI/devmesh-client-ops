@@ -203,9 +203,7 @@ function targetHref(kind: ActivityTargetKind, id: string): string {
 
 /** The current display title of a record family's target. */
 function targetTitle(
-  snapshot: Snapshot,
   kind: ActivityTargetKind,
-  id: string,
   record: { readonly title?: string; readonly name?: string },
 ): string {
   if (kind === "client" || kind === "engagement" || kind === "project") {
@@ -399,9 +397,15 @@ export function selectDashboard(
       readonly engagementId?: string;
     };
     // A client has no parent; every other family carries its client and
-    // engagement links, while a project also names its engagement.
-    const clientId = kind === "client" ? target.id : target.clientId ?? "";
-    const engagementId = target.engagementId ?? "";
+    // engagement links, while a project names only its engagement and reaches
+    // its client through the engagement's own stored link, exactly as the
+    // archive helpers do.
+    const engagementId =
+      kind === "client" ? "" : target.engagementId ?? "";
+    const clientId =
+      kind === "client"
+        ? target.id
+        : target.clientId ?? engagements.get(engagementId)?.clientId ?? "";
     const client = clients.get(clientId);
     const engagement = engagements.get(engagementId);
     if (client === undefined) return null;
@@ -409,7 +413,7 @@ export function selectDashboard(
     return {
       kind: "activity",
       id: String(event.id),
-      title: targetTitle(snapshot, kind, event.targetId, target),
+      title: targetTitle(kind, target),
       href: targetHref(kind, event.targetId),
       clientId: client.id,
       clientName: client.name,

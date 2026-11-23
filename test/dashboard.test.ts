@@ -701,8 +701,13 @@ describe("dashboard rendering", () => {
         renderDashboard(store.snapshot(), fixedClock("2026-11-22")).html,
         "Recent activity",
       );
-      // A project has no client link of its own, so its create event resolves
-      // no ancestry and is not shown; every other family's target is.
+      // A project names only its engagement; its client is resolved through
+      // that engagement's stored link, so every family's target is shown.
+      const projectAt = section.indexOf(`href="/projects/${project.id}"`);
+      assert.ok(projectAt >= 0, "a project's create links its detail page");
+      const card = section.slice(section.lastIndexOf("<li", projectAt), section.indexOf("</li>", projectAt));
+      assert.match(card, new RegExp(`client <a href="/clients/${client.id}">Acme</a>`));
+      assert.match(card, new RegExp(`engagement <a href="/engagements/${engagement.id}">Delivery</a>`));
       for (const href of [
         `/clients/${client.id}`,
         `/engagements/${engagement.id}`,
