@@ -288,14 +288,6 @@ export interface WorkFilter {
 /** The read-only board a movement may target: see `kanban.ts`. */
 export type { BoardScope, TaskIdentityExpectation } from "./kanban.ts";
 
-/** The board scope kinds, in the order a scope selector offers them. */
-export const BOARD_SCOPE_KINDS: readonly BoardScope["kind"][] = [
-  "all",
-  "client",
-  "engagement",
-  "project",
-];
-
 /** Internal options accepted by openStore; only tests pass them. */
 export interface StoreOptions {
   fs?: Partial<FileSystem>;
