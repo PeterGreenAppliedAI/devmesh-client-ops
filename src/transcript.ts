@@ -54,6 +54,7 @@ export const IMPORT_FORMATS: readonly ImportFormat[] = Object.freeze([
 export type ImportRefusalCode =
   | "unsupported_format"
   | "invalid_utf8"
+  | "invalid_text"
   | "whitespace_only"
   | "too_large";
 
@@ -334,14 +335,43 @@ function assemble(
 const PASTE_FILENAME = "Pasted text";
 
 /**
+ * True when `text` is well formed Unicode: every UTF-16 code unit is a code
+ * point on its own except a high surrogate, which must be followed by a low
+ * surrogate. Text with a lone surrogate cannot be encoded as UTF-8 without
+ * replacing it, which would make the original text and the original bytes
+ * disagree, so it is refused rather than silently changed.
+ */
+function isWellFormed(text: string): boolean {
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = text.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * Import pasted text. The text is preserved exactly as given (including its
  * whitespace, line endings and BOM) as the original content; the extracted text
- * is the same text. A non-string argument is a programming error and is
- * refused with `ValidationError`; content problems return a refusal.
+ * is the same text. Ill-formed text carrying a lone surrogate is refused with
+ * guidance before it could be encoded lossily. A non-string argument is a
+ * programming error and is refused with `ValidationError`; content problems
+ * return a refusal.
  */
 export function importPastedText(text: unknown): ImportOutcome {
   if (typeof text !== "string") {
     throw new ValidationError("pasted text must be a string");
+  }
+  if (!isWellFormed(text)) {
+    return refuse(
+      "invalid_text",
+      `The pasted text is not well-formed Unicode (it contains a lone surrogate); import pasted text, or a UTF-8 .txt or .md file.`,
+    );
   }
   return assemble("paste", PASTE_FILENAME, text, utf8Bytes(text));
 }

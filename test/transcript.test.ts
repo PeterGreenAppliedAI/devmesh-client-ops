@@ -167,6 +167,28 @@ describe("refusals", () => {
     assert.throws(() => importFileBytes("text", "a.txt"), /must be a Uint8Array/);
     assert.throws(() => importFileBytes(new Uint8Array([65]), "  "), /nonblank/);
   });
+
+  it("refuses ill-formed pasted Unicode with guidance before lossy encoding", () => {
+    // A lone high or low surrogate cannot be encoded as UTF-8 without being
+    // replaced, so it is refused rather than stored inconsistently.
+    refused(importPastedText("bad \uD800 text"), "invalid_text");
+    refused(importPastedText("\uDC00 lone low"), "invalid_text");
+    refused(importPastedText("\uD800"), "invalid_text");
+    // A refusal carries no usable import and cannot masquerade as one.
+    assert.equal((importPastedText("\uD800") as unknown as Record<string, unknown>).result, undefined);
+    // A well-formed surrogate pair is accepted and preserved exactly.
+    const pair = "\uD83D\uDE00 emoji";
+    const result = imported(importPastedText(pair));
+    assert.equal(result.originalText, pair);
+    assert.equal(result.extractedText, pair);
+    assert.deepEqual(result.originalBytes, new TextEncoder().encode(pair));
+    assert.equal(validateImportResult(result), result);
+    // The replacement character as literal text is a different source from the
+    // lone surrogate, which is refused rather than conflated with it.
+    const replacement = imported(importPastedText(`${String.fromCharCode(0xfffd)} emoji`));
+    assert.notEqual(result.canonicalIdentity, replacement.canonicalIdentity);
+    assert.notEqual(result.canonicalText, replacement.canonicalText);
+  });
 });
 
 describe("size limits", () => {
