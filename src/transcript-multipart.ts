@@ -526,6 +526,27 @@ function findDelimiter(
 }
 
 /**
+ * Find the delimiter that ends a part's payload. A whole delimiter line may
+ * begin exactly at `payloadStart` when the payload is empty: the CRLF that
+ * frames it is the one that ended the header block, which the CRLF scan below
+ * would otherwise skip. Checking this position first makes a close there real,
+ * so the first real close stops the body and its epilogue is ignored rather
+ * than folded into the payload.
+ */
+function findPayloadDelimiter(
+  body: Uint8Array,
+  boundary: Uint8Array,
+  payloadStart: number,
+): { crlfIndex: number; kind: "part" | "close"; after: number } | null {
+  const kind = delimiterKind(body, payloadStart, boundary);
+  if (kind !== null) {
+    const after = kind === "part" ? payloadStart + 2 + boundary.length + 2 : body.length;
+    return { crlfIndex: payloadStart, kind, after };
+  }
+  return findDelimiter(body, boundary, payloadStart, false);
+}
+
+/**
  * Find the CRLF that ends the header line starting at `from`, or -1 when there
  * is none before the end of the body. A bare LF is not a line ending here: it is
  * left inside the line, where the header check refuses it as a control.
@@ -658,7 +679,7 @@ export function decodeMultipart(body: unknown, contentType: unknown): MultipartO
   while (true) {
     const headers = readHeaders(body, cursor, boundary, headerDecoder);
     if (!("payloadStart" in headers)) return headers;
-    const found = findDelimiter(body, boundary, headers.payloadStart, false);
+    const found = findPayloadDelimiter(body, boundary, headers.payloadStart);
     if (found === null) return invalidMultipart("the body has no closing boundary");
     const payload = body.subarray(headers.payloadStart, found.crlfIndex);
     const disposition = headers.disposition;

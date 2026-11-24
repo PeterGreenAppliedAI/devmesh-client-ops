@@ -269,6 +269,52 @@ describe("delimiter recognition and payload preservation", () => {
     assert.equal(accepted(decodeMultipart(body, contentType(BOUNDARY))).fields.a, "one");
   });
 
+  it("stops at a real close that begins exactly where an empty payload starts", () => {
+    // The part's header block is terminated by CRLF CRLF and the closing
+    // delimiter begins immediately at payloadStart, so the CRLF that frames the
+    // close is the one that ended the headers. The close is real and the
+    // apparent parts in the epilogue are never read.
+    const body = concat([
+      `--${BOUNDARY}\r\n`,
+      `Content-Disposition: form-data; name="a"\r\n\r\n`,
+      `--${BOUNDARY}--\r\n`,
+      `\r\n--${BOUNDARY}\r\n`,
+      `Content-Disposition: form-data; name="late"\r\n\r\nepilogue\r\n`,
+      `--${BOUNDARY}--\r\n`,
+    ]);
+    const form = accepted(decodeMultipart(body, contentType(BOUNDARY)));
+    assert.deepEqual(Object.keys(form.fields), ["a"]);
+    assert.equal(form.fields.a, "");
+    assert.equal(Object.hasOwn(form.fields, "late"), false);
+    assert.equal(form.file, null);
+  });
+
+  it("stops at a real close at EOF that begins exactly where an empty payload starts", () => {
+    const body = concat([
+      `--${BOUNDARY}\r\n`,
+      `Content-Disposition: form-data; name="a"\r\n\r\n`,
+      `--${BOUNDARY}--`,
+    ]);
+    const form = accepted(decodeMultipart(body, contentType(BOUNDARY)));
+    assert.deepEqual(Object.keys(form.fields), ["a"]);
+    assert.equal(form.fields.a, "");
+  });
+
+  it("reads a part delimiter that begins exactly where an empty payload starts", () => {
+    // An empty payload followed directly by the next part delimiter is framed by
+    // the CRLF that ended the first part's headers. Both parts decode.
+    const body = concat([
+      `--${BOUNDARY}\r\n`,
+      `Content-Disposition: form-data; name="a"\r\n\r\n`,
+      `--${BOUNDARY}\r\n`,
+      `Content-Disposition: form-data; name="b"\r\n\r\ntwo\r\n`,
+      `--${BOUNDARY}--\r\n`,
+    ]);
+    const form = accepted(decodeMultipart(body, contentType(BOUNDARY)));
+    assert.equal(form.fields.a, "");
+    assert.equal(form.fields.b, "two");
+  });
+
   it("stops at the first real close and ignores the epilogue", () => {
     const epilogue = concat([
       `\r\n--${BOUNDARY}\r\n`,
@@ -607,7 +653,7 @@ describe("headers and parameters", () => {
     assert.equal(form.file?.filename, "a.bin");
   });
 
-  it("accepts an unknown header value with inner non-ASCII whitespace and trailing tabs", () => {
+  it("accepts an unknown header ending in a non-ASCII space and one padded with tabs", () => {
     const body = buildBody(BOUNDARY, [
       { name: "a", value: "one", extraHeaders: ["X-Note: value\u00a0", "X-Tab:\tvalue\t"] },
     ]);
