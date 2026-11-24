@@ -3,9 +3,6 @@ import { describe, it } from "node:test";
 import {
   decodeMultipart,
   FILE_CONTROL,
-  MAX_FILE_BYTES,
-  MAX_MULTIPART_BYTES,
-  MAX_PASTE_BYTES,
   PASTE_CONTROL,
   type MultipartForm,
   type MultipartOutcome,
@@ -113,8 +110,10 @@ function buildBody(
 
 /** Assert a successful decode and return the form. */
 function accepted(outcome: MultipartOutcome): MultipartForm {
-  assert.equal(outcome.ok, true, `expected success, got ${JSON.stringify(outcome)}`);
-  if (!outcome.ok) throw new Error("unreachable");
+  if (!outcome.ok) {
+    // Serialize only the small refusal object, never a form's byte arrays.
+    assert.fail(`expected success, got ${JSON.stringify(outcome.refusal)}`);
+  }
   return outcome;
 }
 
@@ -232,6 +231,41 @@ describe("delimiter recognition and payload preservation", () => {
     assert.deepEqual(form.file?.bytes, expected);
   });
 
+  it("preserves false opening and closing prefixes alongside non-text binary bytes", () => {
+    // A false opening prefix is not at a line start; a false close prefix is
+    // followed by junk. Both sit among bytes that are not valid UTF-8, and the
+    // whole array is returned exactly.
+    const payload = concat([
+      new Uint8Array([0x00, 0xff, 0xfe, 0x80]),
+      `--${BOUNDARY}`,
+      new Uint8Array([0xc3, 0x28]),
+      `\r\n--${BOUNDARY}--x\r\n`,
+      new Uint8Array([0xed, 0xa0, 0x80, 0x01]),
+    ]);
+    const body = buildBody(BOUNDARY, [{ name: FILE_CONTROL, filename: "a.bin", value: payload }]);
+    const form = accepted(decodeMultipart(body, contentType(BOUNDARY)));
+    assert.deepEqual(form.file?.bytes, payload);
+  });
+
+  it("finds the first whole delimiter after a preamble", () => {
+    const body = concat(["preamble\r\n", buildBody(BOUNDARY, [{ name: "a", value: "one" }])]);
+    assert.equal(accepted(decodeMultipart(body, contentType(BOUNDARY))).fields.a, "one");
+  });
+
+  it("finds the first whole delimiter after a binary preamble", () => {
+    const body = concat([
+      new Uint8Array([0x00, 0xff, 0xfe]),
+      `--${BOUNDARY}X\r\n`,
+      buildBody(BOUNDARY, [{ name: "a", value: "one" }]),
+    ]);
+    assert.equal(accepted(decodeMultipart(body, contentType(BOUNDARY))).fields.a, "one");
+  });
+
+  it("ignores a false opening prefix before the real delimiter", () => {
+    const body = concat([`--${BOUNDARY}X\r\n`, buildBody(BOUNDARY, [{ name: "a", value: "one" }])]);
+    assert.equal(accepted(decodeMultipart(body, contentType(BOUNDARY))).fields.a, "one");
+  });
+
   it("stops at the first real close and ignores the epilogue", () => {
     const epilogue = concat([
       `\r\n--${BOUNDARY}\r\n`,
@@ -256,15 +290,16 @@ describe("delimiter recognition and payload preservation", () => {
     );
   });
 
-  it("refuses a body that does not begin with the boundary delimiter", () => {
-    const body = concat(["preamble\r\n", buildBody(BOUNDARY, [{ name: "a", value: "one" }])]);
-    refused(decodeMultipart(body, contentType(BOUNDARY)), "invalid_multipart", 400, /does not start/);
-  });
-
-  it("refuses a boundary delimiter whose suffix is not a valid line ending", () => {
-    // `--boundaryX` is not the full boundary, so the body never opens.
-    const body = concat([`--${BOUNDARY}X\r\n`, buildBody(BOUNDARY, [{ name: "a", value: "one" }])]);
-    refused(decodeMultipart(body, contentType(BOUNDARY)), "invalid_multipart", 400, /does not start/);
+  it("refuses a body whose only delimiter-like bytes are not whole lines", () => {
+    // Every candidate carries a suffix that is neither CRLF nor `--` at EOF, so
+    // none of them is a whole delimiter line and the body never opens.
+    const body = concat([
+      `--${BOUNDARY}X\r\n`,
+      `--${BOUNDARY}--x\r\n`,
+      `--${BOUNDARY}`,
+      " trailing",
+    ]);
+    refused(decodeMultipart(body, contentType(BOUNDARY)), "invalid_multipart", 400, /opening boundary/);
   });
 
   it("requires CRLF framing, refusing bare LF and mixed framing", () => {
@@ -339,6 +374,22 @@ describe("the file control", () => {
     const filename = "C:\\Temp\\reports\\a.txt";
     const body = buildBody(BOUNDARY, [{ name: FILE_CONTROL, filename, value: "x" }]);
     assert.equal(accepted(decodeMultipart(body, contentType(BOUNDARY))).file?.filename, filename);
+  });
+
+  it("preserves a non-ASCII filename with literal backslashes exactly", () => {
+    const filename = "C:\\Temp\\héllo 😀 日本語\\résumé.pdf";
+    const body = buildBody(BOUNDARY, [{ name: FILE_CONTROL, filename, value: "x" }]);
+    assert.equal(accepted(decodeMultipart(body, contentType(BOUNDARY))).file?.filename, filename);
+  });
+
+  it("ignores filename* on a text control instead of treating it as a file part", () => {
+    const body = buildBody(BOUNDARY, [
+      { name: "note", filenameStar: "UTF-8''starred.txt", value: "kept text" },
+    ]);
+    const form = accepted(decodeMultipart(body, contentType(BOUNDARY)));
+    assert.equal(form.fields.note, "kept text");
+    assert.equal(Object.hasOwn(form.fields, "filename*"), false);
+    assert.equal(form.file, null);
   });
 
   it("uses the plain filename and ignores filename* alongside it", () => {
@@ -529,6 +580,21 @@ describe("headers and parameters", () => {
     assert.equal(form.file?.filename, "a.bin");
   });
 
+  it("keeps non-ASCII whitespace in an unknown header value rather than trimming it", () => {
+    const body = buildBody(BOUNDARY, [
+      { name: "a", value: "one", extraHeaders: ["X-Note: value\u00a0", "X-Tab:\tvalue\t"] },
+    ]);
+    assert.equal(accepted(decodeMultipart(body, contentType(BOUNDARY))).fields.a, "one");
+  });
+
+  it("accepts optional whitespace around a quoted parameter value", () => {
+    const body = buildBody(BOUNDARY, [
+      { rawDisposition: "form-data ; name=\"a b\" ; X-Unknown = \"v\"", value: "x" },
+    ]);
+    const form = accepted(decodeMultipart(body, contentType(BOUNDARY)));
+    assert.equal(form.fields["a b"], "x");
+  });
+
   it("accepts quoted and unquoted parameter values", () => {
     const body = buildBody(BOUNDARY, [
       { rawDisposition: "form-data; name=tokenName", value: "x" },
@@ -616,6 +682,16 @@ describe("headers and parameters", () => {
       message: /malformed/,
     },
     {
+      label: "non-ASCII whitespace after a quoted value",
+      spec: { rawDisposition: "form-data; name=\"a\"\u00a0", value: "x" },
+      message: /not a form-data control with one name/,
+    },
+    {
+      label: "a header name prefixed with a byte-order mark",
+      spec: { name: "a", value: "x", extraHeaders: ["\ufeffX-Note: value"] },
+      message: /malformed/,
+    },
+    {
       label: "headers not terminated by CRLF CRLF",
       spec: { name: "a", value: "x", extraHeaders: [] },
       message: /terminated by CRLF CRLF/,
@@ -646,15 +722,10 @@ describe("wrong media type is 415", () => {
     "application/json",
     "text/plain",
     "",
-    "multipart/form-data",
     "multipart/mixed; boundary=x",
-    "multipart/form-data; boundary=",
-    "multipart/form-data; boundary=a; boundary=b",
-    "multipart/form-data; boundary=\"a b \"",
-    `multipart/form-data; boundary=${"a".repeat(71)}`,
-    "multipart/form-data; boundary=has*star",
-    "multipart/form-data; boundary=x junk",
-    "multipart/form-data; charset=utf-8",
+    "multipart/form-datax; boundary=x",
+    "text/multipart/form-data; boundary=x",
+    "multipart/form-data\n",
   ];
   for (const header of headers) {
     it(`refuses Content-Type ${JSON.stringify(header)}`, () => {
@@ -669,6 +740,49 @@ describe("wrong media type is 415", () => {
     });
   }
 
+  // A right media type with a malformed or ambiguous parameter list is invalid
+  // multipart (400), not a wrong media type.
+  const invalidBodies: readonly string[] = [
+    "multipart/form-data",
+    "multipart/form-data; charset=utf-8",
+    "multipart/form-data; boundary=x junk",
+    "multipart/form-data ", 
+    "multipart/form-data; boundary=has*star",
+    "multipart/form-data; boundary=x\njunk",
+    "multipart/form-data; boundary=",
+    "multipart/form-data; boundary=a; boundary=b",
+    "multipart/form-data; boundary=\"a b \"",
+    `multipart/form-data; boundary=${"a".repeat(71)}`,
+    "multipart/form-data; boundary=",
+    "multipart/form-data; boundary=a\n",
+    "multipart/form-data; boundary=\"unterminated",
+    "multipart/form-data; \u00a0boundary=a",
+  ];
+  for (const header of invalidBodies) {
+    it(`refuses malformed boundary parameter in ${JSON.stringify(header)} with 400`, () => {
+      const body = buildBody(BOUNDARY, [{ name: "a", value: "one" }]);
+      refused(
+        decodeMultipart(body, header),
+        "invalid_multipart",
+        400,
+        /boundary parameter/,
+        /multipart\/form-data/,
+      );
+    });
+  }
+
+  it("accepts optional whitespace around the media type and before the parameters", () => {
+    const body = buildBody(BOUNDARY, [{ name: "a", value: "one" }]);
+    for (const header of [
+      ` multipart/form-data; boundary=${BOUNDARY}`,
+      `multipart/form-data ; boundary=${BOUNDARY}`,
+      `multipart/form-data;boundary=${BOUNDARY}`,
+      `multipart/form-data\t; boundary=${BOUNDARY}`,
+    ]) {
+      assert.equal(accepted(decodeMultipart(body, header)).fields.a, "one", header);
+    }
+  });
+
   it("refuses an absent Content-Type with 415", () => {
     const body = buildBody(BOUNDARY, [{ name: "a", value: "one" }]);
     refused(decodeMultipart(body, undefined), "wrong_media_type", 415);
@@ -677,21 +791,25 @@ describe("wrong media type is 415", () => {
 });
 
 describe("size limits are inclusive", () => {
+  // The owner-specified inclusive limits, written out independently of the
+  // decoder's constants: 15 MiB whole body, 10 MiB each for paste and file.
+  const BODY_LIMIT = 15_728_640;
+  const PART_LIMIT = 10_485_760;
   // Framing overhead for a single metadata control with an empty payload.
   const metadataOverhead = buildBody(BOUNDARY, [{ name: "metadata", value: "" }]).length;
 
   it("accepts a body of exactly 15 MiB and refuses one byte more", () => {
     const exact = buildBody(BOUNDARY, [
-      { name: "metadata", value: "a".repeat(MAX_MULTIPART_BYTES - metadataOverhead) },
+      { name: "metadata", value: "a".repeat(BODY_LIMIT - metadataOverhead) },
     ]);
-    assert.equal(exact.length, MAX_MULTIPART_BYTES);
+    assert.equal(exact.length, BODY_LIMIT);
     const form = accepted(decodeMultipart(exact, contentType(BOUNDARY)));
-    assert.equal(form.fields.metadata.length, MAX_MULTIPART_BYTES - metadataOverhead);
+    assert.equal(form.fields.metadata.length, BODY_LIMIT - metadataOverhead);
 
     const over = buildBody(BOUNDARY, [
-      { name: "metadata", value: "a".repeat(MAX_MULTIPART_BYTES - metadataOverhead + 1) },
+      { name: "metadata", value: "a".repeat(BODY_LIMIT - metadataOverhead + 1) },
     ]);
-    assert.equal(over.length, MAX_MULTIPART_BYTES + 1);
+    assert.equal(over.length, BODY_LIMIT + 1);
     refused(
       decodeMultipart(over, contentType(BOUNDARY)),
       "too_large",
@@ -702,11 +820,11 @@ describe("size limits are inclusive", () => {
   });
 
   it("accepts a paste control of exactly 10 MiB and refuses one byte more", () => {
-    const exact = buildBody(BOUNDARY, [{ name: PASTE_CONTROL, value: "a".repeat(MAX_PASTE_BYTES) }]);
+    const exact = buildBody(BOUNDARY, [{ name: PASTE_CONTROL, value: "a".repeat(PART_LIMIT) }]);
     const form = accepted(decodeMultipart(exact, contentType(BOUNDARY)));
-    assert.equal(form.fields[PASTE_CONTROL].length, MAX_PASTE_BYTES);
+    assert.equal(form.fields[PASTE_CONTROL].length, PART_LIMIT);
 
-    const over = buildBody(BOUNDARY, [{ name: PASTE_CONTROL, value: "a".repeat(MAX_PASTE_BYTES + 1) }]);
+    const over = buildBody(BOUNDARY, [{ name: PASTE_CONTROL, value: "a".repeat(PART_LIMIT + 1) }]);
     refused(
       decodeMultipart(over, contentType(BOUNDARY)),
       "too_large",
@@ -717,15 +835,15 @@ describe("size limits are inclusive", () => {
   });
 
   it("accepts a file of exactly 10 MiB and refuses one byte more", () => {
-    const exact = new Uint8Array(MAX_FILE_BYTES).fill(0x42);
+    const exact = new Uint8Array(PART_LIMIT).fill(0x42);
     const body = buildBody(BOUNDARY, [
       { name: FILE_CONTROL, filename: "big.bin", value: exact },
     ]);
     const form = accepted(decodeMultipart(body, contentType(BOUNDARY)));
-    assert.equal(form.file?.bytes.length, MAX_FILE_BYTES);
+    assert.equal(form.file?.bytes.length, PART_LIMIT);
     assert.equal(form.file?.bytes[0], 0x42);
 
-    const over = new Uint8Array(MAX_FILE_BYTES + 1);
+    const over = new Uint8Array(PART_LIMIT + 1);
     const overBody = buildBody(BOUNDARY, [
       { name: FILE_CONTROL, filename: "big.bin", value: over },
     ]);
@@ -739,9 +857,9 @@ describe("size limits are inclusive", () => {
   });
 
   it("accepts metadata over 10 MiB inside a valid body", () => {
-    const length = MAX_PASTE_BYTES + 1024;
+    const length = PART_LIMIT + 1024;
     const body = buildBody(BOUNDARY, [{ name: "metadata", value: "b".repeat(length) }]);
-    assert.equal(body.length <= MAX_MULTIPART_BYTES, true);
+    assert.equal(body.length <= BODY_LIMIT, true);
     const form = accepted(decodeMultipart(body, contentType(BOUNDARY)));
     assert.equal(form.fields.metadata.length, length);
   });

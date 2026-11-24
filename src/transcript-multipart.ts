@@ -15,7 +15,10 @@
  *   `--` (a closing delimiter, allowed at end of body) or CRLF (a part
  *   delimiter). A `--boundary` that is not a whole line, or whose suffix is
  *   anything else, is payload bytes and is preserved exactly.
- * - The first delimiter must be at the start of the body; there is no preamble.
+ * - The first delimiter is the first whole delimiter line, at the start of the
+ *   body or after a CRLF: a preamble before it is ignored, exactly as the spec
+ *   permits, while a false `--boundary` prefix that is not a whole line is not
+ *   a delimiter.
  * - The part delimiter ends with CRLF; header lines end with CRLF; the header
  *   block ends with CRLF CRLF before the payload. Bare LF, lone CR and folded
  *   header lines are refused, so mixed and LF-only framing is refused.
@@ -40,8 +43,8 @@
  * - Text controls are decoded as strict UTF-8 with the byte-order mark and the
  *   payload's own line endings preserved. Invalid UTF-8 refuses the whole
  *   submission.
- * - Only the `file` control may carry a file part (a part with a `filename` or
- *   `filename*` parameter). The `file` control requires its plain `filename`
+ * - Only the `file` control may carry a file part (a part with a plain
+ *   `filename` parameter). The `file` control requires its plain `filename`
  *   parameter; `filename*` is ignored entirely, never decoded and never used as
  *   a fallback. Literal backslashes in a filename are preserved as they are.
  *   An empty filename with zero bytes means no file was selected; a nonempty
@@ -309,15 +312,34 @@ function hasAmbiguousParameter(params: readonly ParsedParameter[]): boolean {
 }
 
 /**
- * Parse the media type and its boundary: only `multipart/form-data` with exactly
- * one well-formed boundary. Returns null on any wrong or ambiguous media type.
+ * Parse the `Content-Type` header. The media type itself decides whether this is
+ * a supported media type at all: after leading optional whitespace it must be
+ * exactly `multipart/form-data` (optionally followed by `;`), or nothing else.
+ * Returns the offset where the parameter list begins, or null for a wrong
+ * media type (415). Invalid parameters after a right media type are 400.
  */
-function parseContentType(header: string): { boundary: string } | null {
-  const text = header.trim();
+function parseContentType(header: string): number | null {
   let index = 0;
-  while (index < text.length && text[index] !== ";") index += 1;
-  if (text.slice(0, index).trim().toLowerCase() !== FORM_DATA_MEDIA_TYPE) return null;
-  const params = parseParameters(text, index);
+  // Optional whitespace (SP / HTAB) before the media type; nothing else.
+  while (index < header.length && (header[index] === " " || header[index] === "\t")) index += 1;
+  const typeStart = index;
+  while (index < header.length && isTokenChar(header[index]) && header[index] !== "/") index += 1;
+  if (header[index] !== "/") return null;
+  index += 1;
+  while (index < header.length && isTokenChar(header[index])) index += 1;
+  if (header.slice(typeStart, index).toLowerCase() !== FORM_DATA_MEDIA_TYPE) return null;
+  // The type must be followed by optional whitespace, then `;` or the end.
+  while (index < header.length && (header[index] === " " || header[index] === "\t")) index += 1;
+  if (index < header.length && header[index] !== ";") return null;
+  return index;
+}
+
+/**
+ * Parse the boundary parameter list of a `multipart/form-data` Content-Type.
+ * Returns null on anything malformed or ambiguous (400).
+ */
+function parseBoundary(header: string, start: number): { boundary: string } | null {
+  const params = parseParameters(header, start);
   if (params === null) return null;
   if (hasAmbiguousParameter(params)) return null;
   let boundary: string | undefined;
@@ -340,18 +362,19 @@ interface Disposition {
   readonly name: string;
   /** The plain `filename` parameter, exactly as submitted, or undefined. */
   readonly filename: string | undefined;
-  /** True when the part carries a `filename` or `filename*` parameter. */
+  /** True when the part carries a plain `filename` parameter. */
   readonly hasFileParameter: boolean;
 }
 
 /**
  * Parse a part's `Content-Disposition` value: `form-data` with exactly one
  * nonempty `name` parameter, plus optional parameters. A duplicated parameter
- * name is ambiguous and refused. `filename*` is recognised only as evidence
- * that the part is a file part: its value is never decoded and never used.
+ * name is ambiguous and refused. A `filename*` parameter is accepted and then
+ * ignored: it is never decoded, never used, and never marks the part as a file
+ * part by itself.
  */
 function parseDisposition(value: string): Disposition | null {
-  const text = value.trim();
+  const text = trimOptionalWhitespace(value);
   let index = 0;
   while (index < text.length && isTokenChar(text[index])) index += 1;
   if (text.slice(0, index).toLowerCase() !== "form-data") return null;
@@ -360,16 +383,14 @@ function parseDisposition(value: string): Disposition | null {
   if (hasAmbiguousParameter(params)) return null;
   let name: string | undefined;
   let filename: string | undefined;
-  let hasFileParameter = false;
   for (const param of params) {
     const lower = param.name.toLowerCase();
     if (lower === "name") name = param.value;
     else if (lower === "filename") filename = param.value;
-    else if (lower === "filename*") hasFileParameter = true;
+    // `filename*` is deliberately ignored: never decoded, never a fallback.
   }
   if (name === undefined || name.length === 0) return null;
-  if (filename !== undefined) hasFileParameter = true;
-  return { name, filename, hasFileParameter };
+  return { name, filename, hasFileParameter: filename !== undefined };
 }
 
 //
@@ -379,6 +400,19 @@ function parseDisposition(value: string): Disposition | null {
 interface PartHeader {
   readonly name: string;
   readonly value: string;
+}
+
+/**
+ * Trim leading and trailing SP / HTAB with two bounded scans. Only those two
+ * characters are optional whitespace; any other byte stays in the value and is
+ * then rejected by the header grammar.
+ */
+function trimOptionalWhitespace(text: string): string {
+  let start = 0;
+  while (start < text.length && (text[start] === " " || text[start] === "\t")) start += 1;
+  let end = text.length;
+  while (end > start && (text[end - 1] === " " || text[end - 1] === "\t")) end -= 1;
+  return text.slice(start, end);
 }
 
 /**
@@ -397,8 +431,7 @@ function parseHeaderLine(line: string): PartHeader | null {
     const code = rawValue.charCodeAt(index);
     if ((code < 0x20 && code !== 0x09) || code === 0x7f) return null;
   }
-  const value = rawValue.replace(/^[ \t]+/, "").replace(/[ \t]+$/, "");
-  return { name, value };
+  return { name, value: trimOptionalWhitespace(rawValue) };
 }
 
 //
@@ -453,15 +486,17 @@ function findDelimiter(
   from: number,
   atBodyStart: boolean,
 ): { crlfIndex: number; kind: "part" | "close"; after: number } | null {
-  if (atBodyStart) {
+  // The first delimiter may be at the body start or after a preamble that ends
+  // in a CRLF; either way it must be a complete delimiter line.
+  const firstIndex = atBodyStart ? 0 : from;
+  if (firstIndex === 0 && atBodyStart) {
     const kind = delimiterKind(body, 0, boundary);
-    if (kind === null) return null;
-    // The part delimiter ends with CRLF, so the headers start after it. A close
-    // at the body start has no parts and its `after` is never used.
-    const after = kind === "part" ? 2 + boundary.length + 2 : body.length;
-    return { crlfIndex: 0, kind, after };
+    if (kind !== null) {
+      const after = kind === "part" ? 2 + boundary.length + 2 : body.length;
+      return { crlfIndex: 0, kind, after };
+    }
   }
-  for (let index = from; index + 1 < body.length; index += 1) {
+  for (let index = firstIndex; index + 1 < body.length; index += 1) {
     if (body[index] !== CR || body[index + 1] !== LF) continue;
     const kind = delimiterKind(body, index + 2, boundary);
     if (kind === null) continue;
@@ -558,8 +593,12 @@ export function decodeMultipart(body: unknown, contentType: unknown): MultipartO
     throw new ValidationError("multipart content type must be a string");
   }
   const header = typeof contentType === "string" ? contentType : "";
-  const media = parseContentType(header);
-  if (media === null) return wrongMedia();
+  const paramsStart = parseContentType(header);
+  if (paramsStart === null) return wrongMedia();
+  const media = parseBoundary(header, paramsStart);
+  if (media === null) {
+    return invalidMultipart("the Content-Type boundary parameter is missing or malformed");
+  }
 
   // The whole body, framing included, is bounded inclusively before parsing.
   if (body.length > MAX_MULTIPART_BYTES) {
@@ -567,14 +606,19 @@ export function decodeMultipart(body: unknown, contentType: unknown): MultipartO
   }
 
   const boundary = new TextEncoder().encode(media.boundary);
-  const headerDecoder = new TextDecoder("utf-8", { fatal: true });
+  // Header lines are decoded without BOM stripping: a byte-order mark in a
+  // header line is an ordinary byte, so the header name is validated exactly as
+  // it appears (and any BOM before a name refuses the line as malformed).
+  const headerDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
   const textDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
   const fields: Record<string, string> = Object.create(null) as Record<string, string>;
   const seen = new Set<string>();
   let file: MultipartFile | null = null;
 
   const opening = findDelimiter(body, boundary, 0, true);
-  if (opening === null) return invalidMultipart("the body does not start with the boundary delimiter");
+  if (opening === null) {
+    return invalidMultipart("the body has no opening boundary delimiter line");
+  }
   if (opening.kind === "close") {
     // A closing delimiter at the body start: a complete submission with no parts.
     return Object.freeze({ ok: true, fields: Object.freeze(fields), file });
