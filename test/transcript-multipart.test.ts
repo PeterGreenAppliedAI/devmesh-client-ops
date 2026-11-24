@@ -6,6 +6,7 @@ import {
   PASTE_CONTROL,
   type MultipartForm,
   type MultipartOutcome,
+  type MultipartRefusal,
 } from "../src/transcript-multipart.ts";
 import { ValidationError } from "../src/model.ts";
 
@@ -110,10 +111,12 @@ function buildBody(
 
 /** Assert a successful decode and return the form. */
 function accepted(outcome: MultipartOutcome): MultipartForm {
-  if (!outcome.ok) {
+  if (outcome.ok !== true) {
     // Serialize only the small refusal object, never a form's byte arrays.
-    assert.fail(`expected success, got ${JSON.stringify(outcome.refusal)}`);
+    const refusal = (outcome as unknown as MultipartRefusal).refusal;
+    assert.fail(`expected a success outcome with ok === true, got ${JSON.stringify(refusal)}`);
   }
+  assert.equal(outcome.ok, true);
   return outcome;
 }
 
@@ -277,6 +280,30 @@ describe("delimiter recognition and payload preservation", () => {
     assert.deepEqual(Object.keys(form.fields), ["a"]);
     assert.equal(Object.hasOwn(form.fields, "late"), false);
     assert.equal(form.file, null);
+  });
+
+  it("refuses a close that arrives before a part's header block is complete", () => {
+    // A quoted boundary containing a colon makes a close line `--a:b--`, whose
+    // `--a` prefix would read as an unknown header name if it were not first
+    // recognised as a delimiter line. The close sits where a header would start,
+    // so the header block never ended: the part is incomplete and refused, and
+    // the apparent parts in the epilogue are never read.
+    const boundary = "a:b";
+    const body = concat([
+      `--${boundary}\r\n`,
+      `Content-Disposition: form-data; name="x"\r\n`,
+      `--${boundary}--\r\n`,
+      `\r\n--${boundary}\r\n`,
+      `Content-Disposition: form-data; name="late"\r\n\r\nepilogue\r\n`,
+      `--${boundary}--\r\n`,
+    ]);
+    refused(
+      decodeMultipart(body, contentType(boundary, true)),
+      "invalid_multipart",
+      400,
+      /no complete header block before a boundary delimiter/,
+      /multipart\/form-data/,
+    );
   });
 
   it("refuses a body with no closing delimiter", () => {
@@ -580,7 +607,7 @@ describe("headers and parameters", () => {
     assert.equal(form.file?.filename, "a.bin");
   });
 
-  it("keeps non-ASCII whitespace in an unknown header value rather than trimming it", () => {
+  it("accepts an unknown header value with inner non-ASCII whitespace and trailing tabs", () => {
     const body = buildBody(BOUNDARY, [
       { name: "a", value: "one", extraHeaders: ["X-Note: value\u00a0", "X-Tab:\tvalue\t"] },
     ]);
@@ -725,7 +752,6 @@ describe("wrong media type is 415", () => {
     "multipart/mixed; boundary=x",
     "multipart/form-datax; boundary=x",
     "text/multipart/form-data; boundary=x",
-    "multipart/form-data\n",
   ];
   for (const header of headers) {
     it(`refuses Content-Type ${JSON.stringify(header)}`, () => {
@@ -740,32 +766,34 @@ describe("wrong media type is 415", () => {
     });
   }
 
-  // A right media type with a malformed or ambiguous parameter list is invalid
-  // multipart (400), not a wrong media type.
-  const invalidBodies: readonly string[] = [
-    "multipart/form-data",
-    "multipart/form-data; charset=utf-8",
-    "multipart/form-data; boundary=x junk",
-    "multipart/form-data ", 
-    "multipart/form-data; boundary=has*star",
-    "multipart/form-data; boundary=x\njunk",
-    "multipart/form-data; boundary=",
-    "multipart/form-data; boundary=a; boundary=b",
-    "multipart/form-data; boundary=\"a b \"",
-    `multipart/form-data; boundary=${"a".repeat(71)}`,
-    "multipart/form-data; boundary=",
-    "multipart/form-data; boundary=a\n",
-    "multipart/form-data; boundary=\"unterminated",
-    "multipart/form-data; \u00a0boundary=a",
+  // Each case is a right media type with bad syntax; its message names either
+  // the trailing junk after the media type or the boundary parameter.
+  const invalidBodies: readonly { readonly header: string; readonly message: RegExp }[] = [
+    { header: "multipart/form-data\n", message: /trailing junk/ },
+    { header: "multipart/form-data ", message: /boundary parameter/ },
+    { header: "multipart/form-data x", message: /trailing junk/ },
+    { header: "multipart/form-data, charset=utf-8", message: /trailing junk/ },
+    { header: "multipart/form-data", message: /boundary parameter/ },
+    { header: "multipart/form-data; charset=utf-8", message: /boundary parameter/ },
+    { header: "multipart/form-data; boundary=x junk", message: /boundary parameter/ },
+    { header: "multipart/form-data; boundary=has*star", message: /boundary parameter/ },
+    { header: "multipart/form-data; boundary=x\njunk", message: /boundary parameter/ },
+    { header: "multipart/form-data; boundary=", message: /boundary parameter/ },
+    { header: "multipart/form-data; boundary=a; boundary=b", message: /boundary parameter/ },
+    { header: "multipart/form-data; boundary=\"a b \"", message: /boundary parameter/ },
+    { header: `multipart/form-data; boundary=${"a".repeat(71)}`, message: /boundary parameter/ },
+    { header: "multipart/form-data; boundary=a\n", message: /boundary parameter/ },
+    { header: "multipart/form-data; boundary=\"unterminated", message: /boundary parameter/ },
+    { header: "multipart/form-data; \u00a0boundary=a", message: /boundary parameter/ },
   ];
-  for (const header of invalidBodies) {
-    it(`refuses malformed boundary parameter in ${JSON.stringify(header)} with 400`, () => {
+  for (const testCase of invalidBodies) {
+    it(`refuses malformed Content-Type ${JSON.stringify(testCase.header)} with 400`, () => {
       const body = buildBody(BOUNDARY, [{ name: "a", value: "one" }]);
       refused(
-        decodeMultipart(body, header),
+        decodeMultipart(body, testCase.header),
         "invalid_multipart",
         400,
-        /boundary parameter/,
+        testCase.message,
         /multipart\/form-data/,
       );
     });

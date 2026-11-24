@@ -21,7 +21,10 @@
  *   a delimiter.
  * - The part delimiter ends with CRLF; header lines end with CRLF; the header
  *   block ends with CRLF CRLF before the payload. Bare LF, lone CR and folded
- *   header lines are refused, so mixed and LF-only framing is refused.
+ *   header lines are refused, so mixed and LF-only framing is refused. A
+ *   delimiter line met where a header line would start means the part's header
+ *   block never ended, so the part is incomplete and refused (a boundary may
+ *   itself contain a colon, which would otherwise read as an unknown header).
  * - The first real closing delimiter ends the body: the submission is complete
  *   there, and everything after it (the epilogue) is ignored. Apparent parts
  *   after the close are never read. A body that reaches its end without a
@@ -312,26 +315,40 @@ function hasAmbiguousParameter(params: readonly ParsedParameter[]): boolean {
 }
 
 /**
- * Parse the `Content-Type` header. The media type itself decides whether this is
- * a supported media type at all: after leading optional whitespace it must be
- * exactly `multipart/form-data` (optionally followed by `;`), or nothing else.
- * Returns the offset where the parameter list begins, or null for a wrong
- * media type (415). Invalid parameters after a right media type are 400.
+ * The result of reading the media type of a `Content-Type` header: either the
+ * offset where its parameter list begins, or the reason it is not supported.
+ * `wrong_media_type` means the media type is not `multipart/form-data` (415);
+ * `malformed` means it is `multipart/form-data` but the syntax around it is
+ * invalid, which is an invalid multipart header (400).
  */
-function parseContentType(header: string): number | null {
+type ContentTypeHead =
+  | { readonly kind: "parameters"; readonly start: number }
+  | { readonly kind: "wrong_media_type" }
+  | { readonly kind: "malformed" };
+
+/**
+ * Read the `Content-Type` header's media type. After leading optional
+ * whitespace the type and subtype must be `multipart/form-data`; a different or
+ * unreadable type is a wrong media type (415). Once the exact type and subtype
+ * are recognised, anything after them other than optional whitespace and the
+ * parameter list (a `;`) is malformed syntax (400), never a media mismatch.
+ */
+function parseContentType(header: string): ContentTypeHead {
   let index = 0;
   // Optional whitespace (SP / HTAB) before the media type; nothing else.
   while (index < header.length && (header[index] === " " || header[index] === "\t")) index += 1;
   const typeStart = index;
   while (index < header.length && isTokenChar(header[index]) && header[index] !== "/") index += 1;
-  if (header[index] !== "/") return null;
+  if (header[index] !== "/") return { kind: "wrong_media_type" };
   index += 1;
   while (index < header.length && isTokenChar(header[index])) index += 1;
-  if (header.slice(typeStart, index).toLowerCase() !== FORM_DATA_MEDIA_TYPE) return null;
-  // The type must be followed by optional whitespace, then `;` or the end.
+  if (header.slice(typeStart, index).toLowerCase() !== FORM_DATA_MEDIA_TYPE) {
+    return { kind: "wrong_media_type" };
+  }
+  // The right type and subtype: only optional whitespace and a `;` may follow.
   while (index < header.length && (header[index] === " " || header[index] === "\t")) index += 1;
-  if (index < header.length && header[index] !== ";") return null;
-  return index;
+  if (index < header.length && header[index] !== ";") return { kind: "malformed" };
+  return { kind: "parameters", start: index };
 }
 
 /**
@@ -530,15 +547,25 @@ interface ReadHeadersResult {
   readonly disposition: Disposition;
 }
 
-/** Read and validate a part's header block up to its terminating CRLF. */
+/**
+ * Read and validate a part's header block up to its terminating CRLF. A
+ * delimiter line that appears where a header line would start means the header
+ * block never ended: the part is incomplete and refused, so a boundary that
+ * contains a colon can never be mistaken for a stray header (the header grammar
+ * would otherwise accept `--a: b` as an unknown header).
+ */
 function readHeaders(
   body: Uint8Array,
   start: number,
+  boundary: Uint8Array,
   decoder: TextDecoder,
 ): ReadHeadersResult | MultipartRefusal {
   let cursor = start;
   let disposition: Disposition | null = null;
   while (true) {
+    if (delimiterKind(body, cursor, boundary) !== null) {
+      return invalidMultipart("the part has no complete header block before a boundary delimiter");
+    }
     const lineEnd = findHeaderLineEnd(body, cursor);
     if (lineEnd === -1) return invalidMultipart("the part headers are not terminated by CRLF CRLF");
     if (lineEnd === cursor) {
@@ -593,9 +620,12 @@ export function decodeMultipart(body: unknown, contentType: unknown): MultipartO
     throw new ValidationError("multipart content type must be a string");
   }
   const header = typeof contentType === "string" ? contentType : "";
-  const paramsStart = parseContentType(header);
-  if (paramsStart === null) return wrongMedia();
-  const media = parseBoundary(header, paramsStart);
+  const head = parseContentType(header);
+  if (head.kind === "wrong_media_type") return wrongMedia();
+  if (head.kind === "malformed") {
+    return invalidMultipart("the Content-Type header has trailing junk after the media type");
+  }
+  const media = parseBoundary(header, head.start);
   if (media === null) {
     return invalidMultipart("the Content-Type boundary parameter is missing or malformed");
   }
@@ -626,7 +656,7 @@ export function decodeMultipart(body: unknown, contentType: unknown): MultipartO
 
   let cursor = opening.after;
   while (true) {
-    const headers = readHeaders(body, cursor, headerDecoder);
+    const headers = readHeaders(body, cursor, boundary, headerDecoder);
     if (!("payloadStart" in headers)) return headers;
     const found = findDelimiter(body, boundary, headers.payloadStart, false);
     if (found === null) return invalidMultipart("the body has no closing boundary");
