@@ -1749,6 +1749,27 @@ class StoreImpl implements Store {
   }
 
   /**
+   * A mutable copy of the committed state, counters included, so an unexposed
+   * operation can plan against exactly the state the store would commit and, for
+   * a create, reserve the next id from the store's own allocation.
+   */
+  cloneState(): State {
+    return clone(this.state);
+  }
+
+  /**
+   * Run an unexposed operation inside the store's own mutation queue, with a
+   * draft of the committed state (counters included) the operation may build
+   * on. Unlike `runExclusive`, the operation commits nothing by itself; the
+   * store's serialized commit validates and persists the draft exactly as
+   * reopening would, and records no event of its own (the operation's one
+   * event, when it earns one, is carried by the mutation change).
+   */
+  runExclusiveDraft<T>(operation: (draft: State) => MutationChange<T>): Promise<T> {
+    return this.enqueue(() => this.commit(operation));
+  }
+
+  /**
    * Run an unexposed store operation inside this store's own mutation queue, so
    * it is serialized with every ordinary create, edit and save of the store: no
    * other mutation can interleave with the operation between reading the

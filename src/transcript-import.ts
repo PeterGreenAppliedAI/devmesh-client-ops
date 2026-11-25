@@ -54,6 +54,7 @@ import { MissingRecordError, ValidationError } from "./model.ts";
 import type { Engagement, Meeting, Project, Snapshot, Store } from "./store.ts";
 import {
   submissionOperation,
+  type SubmissionImportRequest,
   type TranscriptImportResult,
   type TranscriptInput,
   type TranscriptStore,
@@ -366,58 +367,78 @@ function createTarget(
  * built over the already-open workspace store (`transcriptService`), so the
  * import and any ordinary store write share one queue and one originals store.
  */
-export async function submitTranscript(
+export function submitTranscript(
   service: TranscriptStore,
   submission: TranscriptSubmission,
 ): Promise<TranscriptImportResult> {
-  if (typeof submission !== "object" || submission === null) {
-    throw new ValidationError("transcript submission must be an object");
+  // A refused submission resolves like any other failure: a rejected promise,
+  // never a synchronous throw, and nothing is written.
+  try {
+    return thisSubmission();
+  } catch (cause) {
+    return Promise.reject(cause);
   }
-  const kind = submission.kind;
-  if (kind !== "engagement" && kind !== "project" && kind !== "meeting") {
-    throw new ValidationError('transcript submission kind must be "engagement", "project" or "meeting"');
-  }
-  const fields = requireFields(submission.fields);
-  const file = submission.file ?? null;
-  const store: Store = service.store;
-  if (!isExclusive(store)) {
-    // Without the store's queue the checks below cannot use the records the
-    // import is applied to, so the submission is refused rather than guessed.
-    throw new ValidationError("the transcript service must share the workspace store's own queue");
-  }
-  // Everything is checked inside one admission to the store's own mutation
-  // queue: the URL record and its derived parents, the assertions against them,
-  // the input and the target are read from the committed state, and the import
-  // commits inside that same turn. A store write queued before this submission
-  // therefore finishes first, so an assertion that held for the old records
-  // cannot commit after a queued move to a new parent.
-  // The import operation belongs to the service: only a service built over the
-  // workspace store has one, and it commits inside the turn admitted below.
-  const operation = submissionOperation(service);
-  return store.runExclusive(async () => {
-    const snapshot = store.snapshot();
-    const scope = resolveScope(snapshot, kind, submission.rawId);
-    const create = kind !== "meeting";
-    requireAssertions(fields, scope, create);
-    const input = requireInput(fields, file);
-    let target: TranscriptTarget;
-    let engagementOnly = false;
-    if (create) {
-      const built = createTarget(snapshot, fields, scope);
-      target = built.target;
-      engagementOnly = built.engagementOnly;
-    } else {
-      target = { meetingId: scope.meeting!.id };
+
+  function thisSubmission(): Promise<TranscriptImportResult> {
+    if (typeof submission !== "object" || submission === null) {
+      throw new ValidationError("transcript submission must be an object");
     }
-    // The import commits inside the turn admitted above and never enqueues
-    // again, so its checks, its parent validation and its commit see exactly
-    // the committed records the assertions were checked against.
+    const kind = submission.kind;
+    if (kind !== "engagement" && kind !== "project" && kind !== "meeting") {
+      throw new ValidationError('transcript submission kind must be "engagement", "project" or "meeting"');
+    }
+    const fields = requireFields(submission.fields);
+    const file = submission.file ?? null;
+    const store: Store = service.store;
+    if (!isExclusive(store)) {
+      // Without the store's queue the checks below cannot use the records the
+      // import is applied to, so the submission is refused rather than guessed.
+      throw new ValidationError("the transcript service must share the workspace store's own queue");
+    }
+    // The import operation belongs to the service: only a service built over
+    // the workspace store has one, and it admits and commits the import in one
+    // store turn.
+    const operation = submissionOperation(service);
+    // The whole submission is resolved and checked inside one admission to the
+    // store's own mutation queue: the URL record and its derived parents, the
+    // assertions against them, the input and the target are read from the
+    // committed state, and the import commits inside that same turn. The check
+    // runs when admission is decided and again at the start of the turn (where
+    // it sees every write queued before this submission), so an assertion that
+    // held for the old records cannot commit after a queued move to a new
+    // parent; a store closed or blocked before admission is refused.
+    function resolve(): SubmissionImportRequest {
+      const snapshot = store.snapshot();
+      const scope = resolveScope(snapshot, kind, submission.rawId);
+      const create = kind !== "meeting";
+      requireAssertions(fields, scope, create);
+      const input = requireInput(fields, file);
+      let target: TranscriptTarget;
+      let engagementOnly = false;
+      if (create) {
+        const built = createTarget(snapshot, fields, scope);
+        target = built.target;
+        engagementOnly = built.engagementOnly;
+      } else {
+        target = { meetingId: scope.meeting!.id };
+      }
+      return {
+        input,
+        target,
+        ...(engagementOnly ? { engagementOnly } : {}),
+      };
+    }
+    const { input, target, engagementOnly } = resolve();
+    // The import runs inside the admission this call makes (one turn) and never
+    // enqueues again, so its checks, its parent validation and its commit see
+    // exactly the committed records the assertions were checked against.
     return operation.importSubmission({
       input,
       target,
-      ...(engagementOnly ? { engagementOnly } : {}),
+      ...(engagementOnly === undefined ? {} : { engagementOnly }),
+      check: resolve,
     });
-  });
+  }
 }
 
 /** Whether the store can admit one exclusive operation: its own mutation queue. */

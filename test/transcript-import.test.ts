@@ -746,6 +746,66 @@ describe("transcript submission handler: assertions inside the store's queue tur
   });
 });
 
+describe("transcript submission handler: admission with the store's queue", () => {
+  it("refuses a submission made while close drains the queue, so no import commits after close", async () => {
+    const fx = await fixture();
+    try {
+      // close() snapshots the queue and releases ownership once it drains. A
+      // submission made while close is running must be refused like any other
+      // call after close: it must not commit behind the close's own drain and
+      // then land on a workspace another owner already holds.
+      const closing = fx.store.close();
+      const [fields, file] = pasted(PASTED_TEXT, { title: "Too late", date: "2026-08-05" });
+      const submitted = submitTranscript(fx.service, submission("engagement", fx.engagementId, fields, file));
+      await closing;
+      await assert.rejects(submitted, PersistenceError);
+      assert.equal(fx.store.snapshot().meetings.length, 0, "nothing committed after close");
+      // Another owner opening the workspace sees no import that arrived after close.
+      const owner = await openStore(fx.dir);
+      try {
+        assert.equal(owner.snapshot().meetings.length, 0);
+        assert.equal(owner.snapshot().transcripts?.length ?? 0, 0);
+      } finally {
+        await owner.close();
+      }
+    } finally {
+      await fx.close();
+    }
+  });
+
+  it("admits a submission before a queued move and refuses its stale assertion without committing", async () => {
+    const fx = await fixture();
+    try {
+      const meeting = await fx.store.createMeeting({
+        clientId: fx.clientId,
+        engagementId: fx.engagementId,
+        projectId: fx.projectId,
+        title: "Moved before admission",
+        date: "2026-08-06",
+        notes: "",
+      });
+      // The move is admitted first, so it finishes before the submission's own
+      // turn. The submission asserts the project the meeting still shows in the
+      // committed state; at admission and inside its turn it sees the moved
+      // meeting, so the stale assertion is refused and nothing is written.
+      const move = fx.store.updateMeeting(meeting.id, { projectId: fx.secondProjectId });
+      const before = counts(fx.store);
+      const [fields, file] = pasted(PASTED_TEXT, { projectId: fx.projectId });
+      const submitted = submitTranscript(fx.service, submission("meeting", meeting.id, fields, file));
+      await move;
+      await assert.rejects(submitted, ValidationError);
+      assert.equal(fx.store.snapshot().meetings.find((m) => m.id === meeting.id)?.projectId, fx.secondProjectId);
+      const after = counts(fx.store);
+      assert.equal(after.transcripts, before.transcripts, "no transcript was attached");
+      assert.equal(after.sources, before.sources, "no original was recorded");
+      assert.equal(after.events, before.events + 1, "only the queued move's event");
+      assert.equal(existsSync(join(fx.dir, ORIGINALS_DIRECTORY)), false, "no original was published");
+    } finally {
+      await fx.close();
+    }
+  });
+});
+
 describe("transcript submission handler: borrowed service lifecycle", () => {
   it("leaves the borrowed store open after the service's close and refuses submissions to a closed store", async () => {
     const dir = tempDir();
