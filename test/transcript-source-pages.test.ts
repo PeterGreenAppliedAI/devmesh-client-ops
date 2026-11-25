@@ -387,10 +387,26 @@ describe("transcript source paths: exact fixed shapes", () => {
       const good = row.viewLinks.text;
       const parts = good.split("/");
       assert.equal(row.viewLinks.original.split("/").slice(2, 7).join("/"), parts.slice(2, 7).join("/"));
+      // The row's three links are followed over HTTP as well, so a misdirected
+      // or mislabeled link fails, while the direct handler checks below keep
+      // the distinct refusals for malformed and absent segments.
+      const served = await followRowLinks(server, row);
+      assert.deepEqual(new Uint8Array(served.original.bytes), encoder.encode("Encoded words."));
+      assert.equal(served.text.body, "Encoded words.");
+      assert.ok(served.passages.body.includes("Encoded words."));
+
       const resolved = await renderHref(server.store, row.viewLinks.original);
       assert.equal(resolved.ok, true, "the exact encoding of a stored source is accepted");
       assert.equal(resolved.ok && new TextDecoder().decode(resolved.bytes), "Encoded words.");
       assert.equal(imported.sourceId.length > 0, true);
+      // Each stored, nonempty id is encoded as the one lossless segment in its
+      // own position of the link, so an id encoded as a different (still valid)
+      // segment fails here.
+      assert.equal(good.split("/")[2], segment(meetingId));
+      assert.equal(good.split("/")[4], segment(imported.transcriptId));
+      assert.equal(good.split("/")[6], segment(imported.sourceId));
+      assert.equal(row.viewLinks.original.split("/")[6], segment(imported.sourceId));
+      assert.equal(row.viewLinks.passages.split("/")[6], segment(imported.sourceId));
 
       // A segment that is not the exact encoding names no record: the handler
       // refuses it before any lookup, so its message is the decoder's refusal
