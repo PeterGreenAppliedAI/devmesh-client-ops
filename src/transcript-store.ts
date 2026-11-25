@@ -977,23 +977,25 @@ class TranscriptStoreImpl implements TranscriptStore {
       if (engagementOnly && create.projectId !== undefined) {
         throw new ValidationError("transcript target.create cannot carry a project and an engagement-only selection");
       }
-      requireNonblank(create.clientId, "transcript target.create.clientId");
-      requireNonblank(create.engagementId, "transcript target.create.engagementId");
-      optionalNonblank(create.projectId, "transcript target.create.projectId");
-      requireNonblank(create.title, "transcript target.create.title");
-      requireNonblank(create.date, "transcript target.create.date");
-      optionalText(create.notes, "transcript target.create.notes");
-      // Capture the validated values now so the commit uses exactly them, even
-      // if the caller mutates its own object after validation.
+      // Read each field exactly once into a local constant, validate that
+      // constant, and build the captured copy from the validator results, so
+      // the commit uses exactly the validated values even if the caller mutates
+      // its own object after validation.
+      const clientId = requireNonblank(create.clientId, "transcript target.create.clientId");
+      const engagementId = requireNonblank(create.engagementId, "transcript target.create.engagementId");
+      const projectId = optionalNonblank(create.projectId, "transcript target.create.projectId");
+      const title = requireNonblank(create.title, "transcript target.create.title");
+      const date = requireNonblank(create.date, "transcript target.create.date");
+      const notes = optionalText(create.notes, "transcript target.create.notes");
       return {
-        create: {
-          clientId: create.clientId as string,
-          engagementId: create.engagementId as string,
-          ...(create.projectId === undefined ? {} : { projectId: create.projectId as string }),
-          title: create.title as string,
-          date: create.date as string,
-          ...(create.notes === undefined ? {} : { notes: create.notes as string }),
-        },
+        create: Object.freeze({
+          clientId,
+          engagementId,
+          ...(projectId === undefined ? {} : { projectId }),
+          title,
+          date,
+          ...(notes === undefined ? {} : { notes }),
+        }),
       };
     }
     const meetingId = requireNonblank(record.meetingId, "transcript target.meetingId");

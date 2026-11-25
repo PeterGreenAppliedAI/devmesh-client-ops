@@ -1023,9 +1023,11 @@ describe("transcript submission handler: the import's own commit", () => {
     const fx = await fixture();
     try {
       // The caller's own target object is validated when the import starts. Its
-      // `date` getter mutates the create on the read that follows validation,
-      // which happens after the original has been published and before the
-      // commit turn re-plans. The commit must use the validated values.
+      // `engagementId` accessor returns the real engagement on the validating
+      // read and a different, existing engagement on any later read, so an
+      // implementation that reads the field again to build the commit would
+      // commit the replacement. The commit must use the validated values.
+      const other = await fx.store.createEngagement({ clientId: fx.clientId, name: "Other engagement" });
       const create: { clientId: string; engagementId: string; title: string; date: string } = {
         clientId: fx.clientId,
         engagementId: fx.engagementId,
@@ -1033,14 +1035,11 @@ describe("transcript submission handler: the import's own commit", () => {
         date: "2026-09-02",
       };
       let reads = 0;
-      Object.defineProperty(create, "date", {
+      Object.defineProperty(create, "engagementId", {
         enumerable: true,
         get: () => {
           reads += 1;
-          // The first read is the validation; a later read means the validated
-          // values are used after publication, so mutate the caller's object.
-          if (reads > 1) create.engagementId = "engagement-999";
-          return "2026-09-02";
+          return reads === 1 ? fx.engagementId : other.id;
         },
       });
       const mutating = { create };
@@ -1052,8 +1051,7 @@ describe("transcript submission handler: the import's own commit", () => {
       );
       assert.equal(result.outcome, "created");
       assert.equal(result.meeting.date, "2026-09-02");
-      assert.equal(result.meeting.engagementId, fx.engagementId);
-      assert.ok(reads > 1, "the commit used the validated create's values");
+      assert.equal(result.meeting.engagementId, fx.engagementId, "the validated engagement was committed");
       const after = counts(fx.store);
       assert.equal(after.meetings, before.meetings + 1);
       assert.equal(after.transcripts, before.transcripts + 1);
