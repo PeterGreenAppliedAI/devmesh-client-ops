@@ -71,7 +71,8 @@ async function fixture(): Promise<Harness> {
   const routes: Routes = {
     home: { get: ok },
     health: { get: ok },
-    application: {
+    // Registered through the existing hierarchy extension interface.
+    hierarchy: {
       match: (path) => (path === "/import" ? "import" : path === "/plain" ? "plain" : null),
       route: (matched, method) => {
         if (matched === "import") return method === "POST" ? marked : ok;
@@ -307,6 +308,24 @@ describe("multipart import body policy", () => {
     }
   });
 
+  it("passes the decoder's prototype-less fields through unchanged", async () => {
+    const harness = await fixture();
+    try {
+      const body = multipartBody([{ name: "paste", body: "hello" }]);
+      const reply = await postBytes(harness.server.origin, "/import", MULTIPART_TYPE, body);
+      assert.equal(reply.status, 200);
+      const form = harness.seen[0]?.form;
+      assert.ok(form !== undefined);
+      // A control not submitted leaves no inherited value behind: the decoder's
+      // own field map is passed through, not a copy onto Object.prototype.
+      assert.equal((form as Record<string, unknown>).constructor, undefined);
+      assert.equal((form as Record<string, unknown>).toString, undefined);
+      assert.equal(Object.getPrototypeOf(form), null);
+    } finally {
+      await harness.close();
+    }
+  });
+
   it("accepts a chunked multipart body delivered across chunks", async () => {
     const harness = await fixture();
     try {
@@ -482,15 +501,34 @@ describe("multipart import body policy", () => {
     }
   });
 
-  it("rejects an import-looking unregistered URL with multipart as 404", async () => {
+  it("refuses an import-looking unregistered URL with multipart as 415 before any handler", async () => {
     const harness = await fixture();
     try {
       const body = multipartBody([{ name: "paste", body: "hello" }]);
       for (const path of ["/imports", "/import/now", "/transcript/import", "/importing"]) {
+        // An unregistered path is not a multipart route, so the ordinary POST
+        // guards run first: the multipart media type is not a url-encoded form.
         const reply = await postBytes(harness.server.origin, path, MULTIPART_TYPE, body);
-        assert.equal(reply.status, 404, path);
+        assert.equal(reply.status, 415, path);
         assert.equal(reply.headers["cache-control"], "no-store");
       }
+      assertNoHandlerRan(harness);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("answers an unregistered URL with an accepted url-encoded form as 404", async () => {
+    const harness = await fixture();
+    try {
+      const reply = await post(
+        harness.server.origin,
+        "/imports",
+        "application/x-www-form-urlencoded",
+        "name=Ada",
+      );
+      assert.equal(reply.status, 404);
+      assert.equal(reply.headers["cache-control"], "no-store");
       assertNoHandlerRan(harness);
     } finally {
       await harness.close();
@@ -507,7 +545,10 @@ describe("multipart import body policy", () => {
         `name=${"a".repeat(16 * 1024 + 1)}`,
       );
       assert.equal(reply.status, 413);
-      assert.match(reply.body, /too large/);
+      // An ordinary form keeps its existing 413 body, with no multipart
+      // guidance appended, and still closes the connection.
+      assert.equal(reply.body, "The request body is too large.\n");
+      assert.equal(reply.headers["connection"], "close");
       assertNoHandlerRan(harness);
     } finally {
       await harness.close();

@@ -170,29 +170,6 @@ async function newFixture(withPostHome = false): Promise<Fixture> {
   return fixtureWith((_store, base) => base, withPostHome);
 }
 
-/**
- * A fixture whose home POST is a plain url-encoded route. The shell matches a
- * route before reading the body and checks the matched route's body policy, so
- * the content-type and size checks need a route that accepts a POST body to run
- * against. The handler counts on `calls.post`, so a refused request that
- * reached it would be counted.
- */
-async function newPostFixture(): Promise<Fixture> {
-  return fixtureWith(
-    (_store, base) => ({
-      home: {
-        get: base.home.get,
-        post: {
-          method: "POST",
-          render: () => ({ status: 200, body: "accepted" }),
-        },
-      },
-      health: base.health,
-    }),
-    true,
-  );
-}
-
 async function closeFixture(fixture: Fixture): Promise<void> {
   await fixture.server.close();
   await fixture.store.close();
@@ -1135,9 +1112,9 @@ describe("method, path and content-type checks", () => {
   });
 
   it("rejects unsupported content types with 415", async () => {
-    const fixture = await newPostFixture();
+    const fixture = await newFixture();
     try {
-      for (const contentType of ["application/json", "text/plain", null]) {
+      for (const contentType of ["application/json", "text/plain", null, "multipart/form-data; boundary=x"]) {
         const reply = await send(fixture.server.origin, {
           method: "POST",
           origin: fixture.server.origin,
@@ -1198,7 +1175,7 @@ describe("method, path and content-type checks", () => {
   });
 
   it("rejects a form content type with an unsupported charset or parameter", async () => {
-    const fixture = await newPostFixture();
+    const fixture = await newFixture();
     try {
       for (const contentType of [
         "application/x-www-form-urlencoded; charset=iso-8859-1",
@@ -1213,22 +1190,6 @@ describe("method, path and content-type checks", () => {
         assert.equal(reply.status, 415, contentType);
         assertNoHandlerRan(fixture.calls);
       }
-    } finally {
-      await closeFixture(fixture);
-    }
-  });
-
-  it("refuses an unmarked POST multipart body with 415 before the route runs", async () => {
-    const fixture = await newPostFixture();
-    try {
-      const reply = await send(fixture.server.origin, {
-        method: "POST",
-        origin: fixture.server.origin,
-        contentType: "multipart/form-data; boundary=x",
-        body: "--x\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n--x--\r\n",
-      });
-      assert.equal(reply.status, 415);
-      assertNoHandlerRan(fixture.calls);
     } finally {
       await closeFixture(fixture);
     }
