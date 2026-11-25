@@ -27,7 +27,7 @@ export interface Reply {
   readonly body: string;
 }
 
-/** The origin of an application base URL. */
+/** The application base URL's origin, for the origin checks. */
 function originOf(base: string): URL {
   return new URL(base);
 }
@@ -57,7 +57,7 @@ interface SplitLink {
  * origin and a link naming another origin is refused, so a link that leaves the
  * application is never requested from the local pages instead.
  */
-function splitLink(base: string, fromPath: string, href: string): SplitLink {
+export function splitLink(base: string, fromPath: string, href: string): SplitLink {
   assert.ok(href !== "", `the link ${href || "(empty)"} is not empty`);
   const origin = new URL(base).origin;
   const resolved = new URL(href, new URL(fromPath, origin));
@@ -70,15 +70,19 @@ function splitLink(base: string, fromPath: string, href: string): SplitLink {
 }
 
 /**
- * Send one GET over loopback HTTP. `path` may be a request target with a query
- * or a link with a fragment; the fragment is resolved by the browser and never
- * sent, and the request target is the path and query. The Host header is the
- * origin's own authority; a plain GET carries no Origin and is accepted by the
- * shell.
+ * Send one GET over loopback HTTP. `path` is a root-relative request target
+ * (its query included) or an absolute URL naming the application's own origin;
+ * a target naming another origin, or a relative one resolved against `/`, is
+ * refused, so a misdirected link fails instead of being fetched locally. A
+ * fragment is resolved by the browser and never sent: the request target is
+ * the path and query. The Host header is the origin's own authority; a plain
+ * GET carries no Origin and is accepted by the shell.
  */
 export function get(base: string, path: string): Promise<Reply> {
   const url = originOf(base);
+  assert.ok(path.startsWith("/") || path.startsWith(`${url.origin}/`), `the request target ${path} is root-relative`);
   const resolved = new URL(path, url.origin);
+  assert.equal(resolved.origin, url.origin, `the request target ${path} names the application's own origin`);
   const target = `${resolved.pathname}${resolved.search}`;
   const headers: Record<string, string | number> = {
     host: url.host,
@@ -264,18 +268,33 @@ export function parseForm(document: string): ParsedForm {
   for (const match of inner.matchAll(/<select([^>]*)>([\s\S]*?)<\/select>/g)) {
     const name = /\sname="([^"]+)"/.exec(match[1]);
     assert.notEqual(name, null, "the select carries a name");
-    // A disabled option is unavailable to the operator even inside an enabled
-    // select, so it is not among the choices a supplied value may name.
-    const choices = [...match[2].matchAll(/<option([^>]*)>/g)]
-      .filter((option) => !isDisabled(option[1]))
-      .map((option) => {
-        const value = /\svalue="([^"]*)"/.exec(option[1]);
-        return unescapeHtml(value === null ? "" : value[1]);
+    const content = match[2];
+    // An option inside a disabled optgroup, like a disabled option itself, is
+    // unavailable to the operator, so the choices are only the enabled ones.
+    const groups = [...content.matchAll(/<optgroup([^>]*)>/g)];
+    const disabledGroups = groups
+      .filter((group) => isDisabled(group[1]))
+      .map((group) => {
+        const rest = content.slice(group.index!);
+        const close = rest.indexOf("</optgroup>");
+        return { start: group.index!, end: close < 0 ? content.length : group.index! + close };
       });
+    const offered = [...content.matchAll(/<option([^>]*)>/g)].filter(
+      (option) =>
+        !isDisabled(option[1]) &&
+        !disabledGroups.some((span) => option.index! >= span.start && option.index! < span.end),
+    );
+    const valueOf = (attributes: string): string => {
+      const value = /\svalue="([^"]*)"/.exec(attributes);
+      return unescapeHtml(value === null ? "" : value[1]);
+    };
+    const choices = offered.map((option) => valueOf(option[1]));
+    // The rendered default is the last enabled offered option marked selected,
+    // or the first enabled offered option, never a disabled option.
+    const selected = offered.filter((option) => /\sselected(?:[=\s]|>|$)/.test(option[1])).pop();
+    const value = selected === undefined ? (choices[0] ?? "") : valueOf(selected[1]);
     options.set(unescapeHtml(name![1]), choices);
     selects.add(unescapeHtml(name![1]));
-    const selected = /<option value="([^"]*)"[^>]*\sselected/.exec(match[2]);
-    const value = selected === null ? (choices[0] ?? "") : unescapeHtml(selected[1]);
     controls.set(unescapeHtml(name![1]), {
       name: unescapeHtml(name![1]),
       type: "select",
@@ -350,8 +369,11 @@ export function submit(
       assert.equal(part.control.type, "file", `a file part is sent only for a file control, not ${part.control.name}`);
     }
   }
+  // The action is the link the page rendered, resolved against the page it was
+  // rendered on; a form action naming another origin is refused.
+  const { path } = splitLink(base, "/", form.action);
   if (multipartBody) {
-    return postBytes(base, form.action, MULTIPART_TYPE, multipart(parts));
+    return postBytes(base, path, MULTIPART_TYPE, multipart(parts));
   }
   const fields = new URLSearchParams();
   for (const part of parts) {
@@ -359,7 +381,7 @@ export function submit(
     fields.set(part.control.name, part.value);
   }
   const body = Buffer.from(fields.toString(), "utf8");
-  return postBytes(base, form.action, "application/x-www-form-urlencoded", body);
+  return postBytes(base, path, "application/x-www-form-urlencoded", body);
 }
 
 /** One submitted control: its rendered control and the text or file it carries. */
@@ -504,14 +526,17 @@ export async function resolvePassageLink(
   base: string,
   fromPath: string,
   passage: RenderedPassage,
+  expectedText: string = passage.text,
 ): Promise<{ readonly path: string; readonly fragment: string }> {
   const { href, path, fragment } = splitLink(base, fromPath, passage.link);
   assert.notEqual(fragment, "", `the passage link ${passage.link} carries a fragment`);
+  // The browser decodes the fragment to find the anchor; the raw fragment is
+  // kept for the saved URL, and the decoded one is compared with the HTML id.
   const anchor = decodeURIComponent(fragment);
   const destination = await get(base, href);
   assert.equal(destination.status, 200, `the passage link destination ${href} is readable`);
   const targets = renderedPassages(destination.body).filter((row) => row.anchor === anchor);
   assert.equal(targets.length, 1, `the fragment ${anchor} targets exactly one passage row at ${href}`);
-  assert.equal(targets[0].text, passage.text, `the target row ${anchor} shows the passage's own quote`);
+  assert.equal(targets[0].text, expectedText, `the target row ${anchor} shows the passage's own quote`);
   return { path, fragment };
 }
