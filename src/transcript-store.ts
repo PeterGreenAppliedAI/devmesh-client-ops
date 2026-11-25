@@ -308,6 +308,18 @@ function importedResult(outcome: ImportOutcome): ImportResult {
   return (outcome as { ok: true; result: ImportResult }).result;
 }
 
+/**
+ * An empty original repository, used only when a borrowed store object carries
+ * no repository of its own (a test's injected store). It never reads or writes
+ * the filesystem; a mutation that needs it would fail to verify its original.
+ */
+function emptyOriginals(): OriginalStore {
+  const unavailable = async (): Promise<never> => {
+    throw new PersistenceError("the borrowed store has no original repository");
+  };
+  return { put: unavailable, read: unavailable } as unknown as OriginalStore;
+}
+
 /** The source id for an original of a transcript: the canonical content and its distinct bytes. */
 function sourceIdFor(canonicalText: string, originalSha256: string): string {
   const canonical = canonicalIdentityOf(canonicalText);
@@ -1810,7 +1822,12 @@ export function transcriptService(
   options: TranscriptServiceOptions = {},
 ): TranscriptStore {
   const internals = store as unknown as CommitStore;
-  return new TranscriptStoreImpl(store, internals.originalFiles(), options.docxParser, options.pdfParser, false);
+  // A workspace store's own original repository; a store object handed in by
+  // injection that carries none has an empty repository, so building the
+  // service over it writes nothing (and reaches no file) until a real mutation
+  // is attempted.
+  const originals = typeof internals.originalFiles === "function" ? internals.originalFiles() : emptyOriginals();
+  return new TranscriptStoreImpl(store, originals, options.docxParser, options.pdfParser, false);
 }
 
 /**
