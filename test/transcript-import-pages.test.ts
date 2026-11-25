@@ -214,6 +214,56 @@ function postBytes(origin: string, path: string, contentType: string | null, bod
   });
 }
 
+/**
+ * POST a declared Content-Length over the limit without writing that body.
+ * The server refuses a declared length before reading any bytes, so this sends
+ * the headers, waits for the reply, and then destroys the request instead of
+ * racing an oversized write against the server closing the connection.
+ */
+function declaredOversizeRequest(origin: string, path: string, contentType: string, declaredLength: number): Promise<Reply> {
+  const url = new URL(origin);
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      {
+        host: url.hostname,
+        port: Number(url.port),
+        method: "POST",
+        path,
+        headers: {
+          host: url.host,
+          origin,
+          "content-type": contentType,
+          "content-length": String(declaredLength),
+        },
+        agent: false,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("end", () => {
+          req.destroy();
+          resolve({
+            status: res.statusCode ?? 0,
+            headers: res.headers,
+            body: Buffer.concat(chunks).toString("utf8"),
+          });
+        });
+        res.on("error", reject);
+      },
+    );
+    // The request is destroyed once the reply is read, so a socket reset after
+    // that point is expected; a failure before any reply is still reported.
+    let replied = false;
+    req.on("response", () => {
+      replied = true;
+    });
+    req.on("error", (error) => {
+      if (!replied) reject(error);
+    });
+    req.flushHeaders();
+  });
+}
+
 /** One control a browser submits from a rendered form, with its values. */
 interface Control {
   readonly name: string;
@@ -1313,19 +1363,22 @@ describe("transcript import submissions", () => {
     const server = await running();
     try {
       const before = counts(server.store);
-      // A paste just past the 15 MiB body total: the decoder refuses it as too
-      // large, naming the whole-submission limit.
-      const reply = (await submitRendered(
+      // A submission whose declared Content-Length is just past the 15 MiB
+      // body total: the server refuses the declared length before reading a
+      // byte, naming the whole-submission limit. Send only the headers, wait
+      // for the 413, then destroy the request rather than racing a 15 MiB
+      // write against the server closing the connection.
+      const reply = await declaredOversizeRequest(
         server.origin,
         engagementImportHref(server.engagementId),
-        new Map<string, string | { readonly filename: string; readonly body: string }>([
-          [PASTE_CONTROL, "a".repeat(MAX_MULTIPART_BYTES)],
-        ]),
-      )).reply;
+        MULTIPART_TYPE,
+        MAX_MULTIPART_BYTES + 1,
+      );
       assert.equal(reply.status, 413);
       assert.match(reply.body, /too large/);
+      assert.match(reply.body, /nothing was truncated/);
       assert.match(reply.body, new RegExp(`at most ${MAX_MULTIPART_BYTES} bytes|at most ${MAX_MULTIPART_BYTES / 1024 / 1024} MiB`));
-      assert.deepEqual(counts(server.store), before);
+      assert.deepEqual(counts(server.store), before, "no meeting or source was created");
     } finally {
       await server.close();
     }
