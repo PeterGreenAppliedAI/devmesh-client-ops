@@ -185,7 +185,7 @@ function multipart(parts: readonly Part[]): Buffer {
 }
 
 /** POST a byte body to a path with a Content-Length and read the whole reply. */
-function postBytes(origin: string, path: string, contentType: string | null, body: Uint8Array): Promise<Reply> {
+function postBytes(origin: string, path: string, contentType: string | null, body: Uint8Array, method = "POST"): Promise<Reply> {
   const url = new URL(origin);
   const headers: Record<string, string> = {
     host: url.host,
@@ -195,7 +195,7 @@ function postBytes(origin: string, path: string, contentType: string | null, bod
   if (contentType !== null) headers["content-type"] = contentType;
   return new Promise((resolve, reject) => {
     const req = httpRequest(
-      { host: url.hostname, port: Number(url.port), method: "POST", path, headers, agent: false },
+      { host: url.hostname, port: Number(url.port), method, path, headers, agent: false },
       (res) => {
         const chunks: Buffer[] = [];
         res.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -220,46 +220,105 @@ interface Control {
   readonly kind: "input" | "textarea" | "select" | "file";
   readonly required: boolean;
   readonly options: readonly string[];
+  /** The value the browser submits when the control is left at its rendered state. */
+  readonly value: string;
+}
+
+/** The value attribute of a tag's attributes, unescaped, or an empty text. */
+function valueAttribute(attrs: string): string {
+  const value = /\svalue="([^"]*)"/.exec(attrs);
+  return value === null ? "" : unescapeHtml(value[1]);
+}
+
+/** The option a select shows as selected, or its first option when none is selected. */
+function selectedValue(inner: string): string {
+  const options = [...inner.matchAll(/<option value="([^"]*)"/g)].map((option) => unescapeHtml(option[1]));
+  const selected = /<option value="([^"]*)"[^>]*\sselected/.exec(inner);
+  if (selected !== null) return unescapeHtml(selected[1]);
+  return options[0] ?? "";
 }
 
 /** The controls of the one form on a rendered page, in order. */
 function controls(form: string): Control[] {
   const found: Control[] = [];
-  const pattern = /<(input|textarea|select)([^>]*)>/g;
-  for (const match of form.matchAll(pattern)) {
-    const tag = match[1];
-    const attrs = match[2];
+  // A textarea carries its value as its text, a select as the selected option;
+  // every other control carries a value attribute.
+  for (const match of form.matchAll(/<(input|textarea|select)([^>]*)>([\s\S]*?)<\/\1>|<(input)([^>]*)>/g)) {
+    const tag = match[1] ?? match[4];
+    const attrs = match[2] ?? match[5];
+    const inner = match[3] ?? "";
     const name = /\sname="([^"]+)"/.exec(attrs);
     assert.ok(name !== null, `every control has a name: ${match[0]}`);
     const type = /\stype="([^"]+)"/.exec(attrs);
+    const kind = tag === "textarea" ? "textarea" : tag === "select" ? "select" : type !== null && type[1] === "file" ? "file" : "input";
+    const value =
+      kind === "textarea" ? unescapeHtml(inner) : kind === "select" ? selectedValue(inner) : valueAttribute(attrs);
     found.push({
       name: unescapeHtml(name[1]),
-      kind: tag === "textarea" ? "textarea" : tag === "select" ? "select" : type !== null && type[1] === "file" ? "file" : "input",
+      kind,
       required: /\srequired(\s|>)/.test(attrs),
-      options: [...(match[0].matchAll(/<option value="([^"]*)"/g) ?? [])].map((option) => unescapeHtml(option[1])),
+      options: [...inner.matchAll(/<option value="([^"]*)"/g)].map((option) => unescapeHtml(option[1])),
+      value: kind === "file" ? "" : value,
     });
   }
   return found;
 }
 
 /**
- * Submit a rendered multipart form over HTTP exactly as a browser would: read
- * the discovery page, take the form's action, its encoding, the method and its
- * controls, then send one part per control. A text control carries the value
- * given (or its rendered initial value); a file control carries the selected
- * file, or the empty filename a browser sends when no file was chosen.
+ * Follow the import action a history or meeting page renders and return its
+ * href, so a submission starts from the discovery link rather than a URL the
+ * test builds itself. Exactly one import action is linked per page.
+ */
+async function importLinkFrom(origin: string, pagePath: string): Promise<string> {
+  const page = await get(origin, pagePath);
+  assert.equal(page.status, 200, pagePath);
+  const hrefs = new Set<string>();
+  for (const match of page.body.matchAll(/<a\b[^>]*\shref="([^"]*)"[^>]*>/g)) {
+    const href = unescapeHtml(match[1]);
+    if (href.includes("/transcripts/import")) hrefs.add(href);
+  }
+  assert.equal(hrefs.size, 1, `the page ${pagePath} links exactly one import action`);
+  return [...hrefs][0];
+}
+
+/**
+ * Follow the import action a history or meeting page renders, read the import
+ * form it links, and submit that rendered form over HTTP exactly as a browser
+ * would: take the form's action, method, encoding and controls, then send one
+ * part per control. A text control carries the value given (or its rendered
+ * initial value); a select carries its rendered selection; a file control
+ * carries the selected file, or the empty filename a browser sends when no file
+ * was chosen.
+ */
+async function submitFromDiscovery(
+  origin: string,
+  pagePath: string,
+  entries: ReadonlyMap<string, string | { readonly filename: string; readonly body: string | Uint8Array }>,
+): Promise<{ readonly reply: Reply; readonly form: string }> {
+  return submitRendered(origin, await importLinkFrom(origin, pagePath), entries);
+}
+
+/**
+ * Submit a rendered form over HTTP exactly as a browser would: read the page,
+ * take the form's action, method, encoding and controls, then send one part per
+ * control. A text control carries the value given (or its rendered initial
+ * value); a select carries its rendered selection; a file control carries the
+ * selected file, or the empty filename a browser sends when no file was chosen.
  */
 async function submitRendered(
   origin: string,
   path: string,
   entries: ReadonlyMap<string, string | { readonly filename: string; readonly body: string | Uint8Array }>,
-  options: { readonly unselectedFile?: boolean } = {},
 ): Promise<{ readonly reply: Reply; readonly form: string }> {
   const page = await get(origin, path);
   assert.equal(page.status, 200, path);
   const form = formOf(page.body);
-  assert.match(form, /method="post"/, path);
-  assert.match(form, /enctype="multipart\/form-data"/, path);
+  const method = /<form[^>]*\smethod="([^"]*)"/.exec(form);
+  assert.ok(method !== null, "the form has a method");
+  assert.equal(method[1].toLowerCase(), "post", "the import form posts");
+  const encoding = /<form[^>]*\senctype="([^"]*)"/.exec(form);
+  const enctype = encoding === null ? null : unescapeHtml(encoding[1]);
+  assert.equal(enctype, "multipart/form-data", "the import form is a multipart form");
   const action = /<form[^>]*\saction="([^"]*)"/.exec(form);
   assert.ok(action !== null, "the form has an action");
   assert.equal(unescapeHtml(action[1]), path, "the form posts back to the page it was read from");
@@ -268,7 +327,7 @@ async function submitRendered(
   for (const control of rendered) {
     const entry = entries.get(control.name);
     if (control.kind === "file") {
-      if (entry === undefined || (options.unselectedFile === true && entry === "")) {
+      if (entry === undefined || entry === "") {
         // The browser sends the file control as an empty file part when nothing
         // was chosen; the decoder reads that as no selected file.
         parts.push({ name: control.name, filename: "", body: "" });
@@ -279,17 +338,23 @@ async function submitRendered(
       }
       continue;
     }
-    if (entry === undefined) {
-      if (!control.required) continue;
-      assert.fail(`the required control ${control.name} must be submitted`);
+    // Every other control is submitted with its rendered default unless the
+    // caller overrides it, so a blank paste goes with the file workflow exactly
+    // as a browser would send it.
+    if (entry !== undefined && typeof entry !== "string") {
+      assert.fail(`the text control ${control.name} carries text`);
     }
-    assert.equal(typeof entry, "string", `the text control ${control.name} carries text`);
-    parts.push({ name: control.name, body: entry as string });
+    parts.push({ name: control.name, body: entry ?? control.value });
   }
   for (const name of entries.keys()) {
     assert.ok(rendered.some((control) => control.name === name), `the form carries ${name}`);
   }
-  return { reply: await postBytes(origin, unescapeHtml(action[1]), MULTIPART_TYPE, multipart(parts)), form };
+  // The browser appends the boundary the encoder chose to the stated encoding;
+  // the method comes from the form and the request follows it.
+  const contentType = enctype === "multipart/form-data" ? `${enctype}; boundary=${BOUNDARY}` : enctype;
+  const body = enctype === "multipart/form-data" ? multipart(parts) : Buffer.from(new URLSearchParams(parts.map((part) => [part.name, String(part.body ?? "")])).toString(), "utf8");
+  const reply = await postBytes(origin, unescapeHtml(action[1]), contentType, body, method[1].toUpperCase());
+  return { reply, form };
 }
 
 /** Submit a rendered form with the given text controls, pasted text only. */
@@ -298,7 +363,7 @@ function submitPaste(
   path: string,
   entries: ReadonlyMap<string, string>,
 ): Promise<{ readonly reply: Reply; readonly form: string }> {
-  return submitRendered(origin, path, entries, { unselectedFile: true });
+  return submitRendered(origin, path, entries);
 }
 
 /** The main content region of a rendered page, without the global shell. */
@@ -508,6 +573,33 @@ describe("transcript import paths", () => {
     } finally {
       await store.close();
     }
+  });
+
+  it("reports an unexpected submission failure unchanged, before any snapshot read", async () => {
+    // The route accepts the application's `Store` interface, so a store whose
+    // queue turn fails with an unexpected error is injected through it. Its
+    // snapshot also fails, but the route must report the submission's own
+    // failure unchanged: a later snapshot read can never replace it.
+    const submissionFailure = new Error("the queue turn failed");
+    const snapshotFailure = new Error("the snapshot read failed");
+    const store = {
+      snapshot: () => {
+        throw snapshotFailure;
+      },
+      originalFiles: () => ({}),
+      runExclusive: () => Promise.reject(submissionFailure),
+    } as unknown as Store;
+    const table = transcriptImportRoutes(store);
+    const request: TranscriptImportRequest = {
+      method: "POST",
+      path: "/engagements/engagement-1/transcripts/import",
+      form: { title: "T", date: "2026-01-01", [PASTE_CONTROL]: "Words." },
+      file: null,
+    };
+    await assert.rejects(
+      async () => table.engagementImport.post!.render(request),
+      (error: unknown) => error === submissionFailure,
+    );
   });
 
   it("leaves the url-encoded form behaviour on every non-import POST", async () => {
@@ -874,9 +966,9 @@ describe("transcript import submissions", () => {
     const server = await running();
     try {
       const before = counts(server.store);
-      const { reply, form } = await submitPaste(
+      const { reply, form } = await submitFromDiscovery(
         server.origin,
-        engagementImportHref(server.engagementId),
+        `/engagements/${encodeURIComponent(server.engagementId)}`,
         new Map([
           ["title", "Kickoff <notes>"],
           ["date", "2026-02-02"],
@@ -923,9 +1015,9 @@ describe("transcript import submissions", () => {
   it("creates a meeting in the URL project from a submitted file", async () => {
     const server = await running();
     try {
-      const { reply } = await submitRendered(
+      const { reply } = await submitFromDiscovery(
         server.origin,
-        projectImportHref(server.projectId),
+        `/projects/${encodeURIComponent(server.projectId)}`,
         new Map<string, string | { readonly filename: string; readonly body: string }>([
           ["title", "Project kickoff"],
           ["date", "2026-02-03"],
@@ -954,9 +1046,9 @@ describe("transcript import submissions", () => {
     const server = await running();
     try {
       const before = server.store.snapshot().meetings.find((meeting) => meeting.id === server.meetingId);
-      const { reply } = await submitPaste(
+      const { reply } = await submitFromDiscovery(
         server.origin,
-        meetingImportHref(server.meetingId),
+        `/meetings/${encodeURIComponent(server.meetingId)}`,
         new Map([[PASTE_CONTROL, "First attachment words."]]),
       );
       assert.equal(reply.status, 200);
@@ -1038,7 +1130,7 @@ describe("transcript import submissions", () => {
     try {
       const before = counts(server.store);
       const path = engagementImportHref(server.engagementId);
-      const cases: { readonly title: string; readonly entries: ReadonlyMap<string, string | { readonly filename: string; readonly body: string }>; readonly unselectedFile: boolean }[] = [
+      const cases: { readonly title: string; readonly entries: ReadonlyMap<string, string | { readonly filename: string; readonly body: string }> }[] = [
         // Both a nonempty paste and a selected file.
         {
           title: "Both",
@@ -1048,24 +1140,20 @@ describe("transcript import submissions", () => {
             [PASTE_CONTROL, "Pasted words."],
             [FILE_CONTROL, { filename: "also.txt", body: "File words." }],
           ]),
-          unselectedFile: false,
         },
-        // Neither: a blank paste and the file control left unselected.
+        // Neither: a blank paste and the file control left at its rendered,
+        // unselected state (the browser sends an empty file part).
         {
           title: "Neither",
           entries: new Map<string, string | { readonly filename: string; readonly body: string }>([
             ["title", "Neither"],
             ["date", "2026-04-02"],
             [PASTE_CONTROL, ""],
-            [FILE_CONTROL, ""],
           ]),
-          unselectedFile: true,
         },
       ];
       for (const attempt of cases) {
-        const { reply } = await submitRendered(server.origin, path, attempt.entries, {
-          unselectedFile: attempt.unselectedFile,
-        });
+        const { reply } = await submitRendered(server.origin, path, attempt.entries);
         assert.equal(reply.status, 400, attempt.title);
         const page = mainOf(reply.body);
         assert.match(page, /exactly one transcript/i);
@@ -1133,7 +1221,9 @@ describe("transcript import submissions", () => {
         ]),
       )).reply;
       assert.equal(noTitle.status, 400);
-      assert.match(mainOf(noTitle.body), /needs a title and a date/);
+      // A missing title is refused like a missing date: the rendered required
+      // title starts blank, and the browser submits that blank title.
+      assert.match(mainOf(noTitle.body), /title must be a nonblank string/);
       assert.deepEqual(counts(server.store), before);
     } finally {
       await server.close();

@@ -661,10 +661,13 @@ export function transcriptImportRoutes(store: Store): TranscriptImportRoutes {
       });
     } catch (error) {
       if (error instanceof MissingRecordError) throw error;
-      // Presentation data is resolved only now, for a correctable refusal on a
-      // record the store knows; a missing record keeps the handler's 404. An
-      // unexpected failure while resolving it (a store read that fails) is
-      // reported unchanged, never replaced by the submission's own error.
+      // Only a refusal of the submission's input (a `ValidationError`) names a
+      // correctable form, so only then is presentation data resolved. A missing
+      // record keeps the handler's 404. Every other failure (a persistence
+      // failure, a programming error) is reported unchanged before any snapshot
+      // read, so a later store read can never replace the failure that the
+      // submission raised.
+      if (!(error instanceof ValidationError)) throw error;
       const scope = resolvedScope(request, expected);
       if (scope === null) throw error;
       throw refuse(error, scope, request);
