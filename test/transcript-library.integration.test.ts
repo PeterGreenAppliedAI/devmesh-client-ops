@@ -31,8 +31,8 @@ import { after, describe, it } from "node:test";
 import { escapeHtml } from "../src/html.ts";
 import { startApplication, type Application } from "../src/index.ts";
 import {
-  fragmentOf,
   get,
+  meetingSourceRows,
   parseForm,
   renderedPassages,
   resolvePassageLink,
@@ -113,8 +113,15 @@ function pageMeetingLabel(document: string): string {
  */
 function profileProject(meetingPage: string): string {
   const section = sectionOf(meetingPage, "Identity and parents");
-  const match = /<p>Project: <a href="([^"]+)">/.exec(section);
-  return match === null ? "" : unescapeHtml(match[1]);
+  assert.notEqual(section, "", "a meeting page renders its Identity and parents section");
+  const match = /<p>Project: (.*?)<\/p>/.exec(section);
+  assert.notEqual(match, null, "the Identity and parents section shows the Project field");
+  const value = match![1];
+  const link = /^<a href="([^"]+)">/.exec(value);
+  if (link !== null) return unescapeHtml(link[1]);
+  // The no-project value is the renderer's escaped `(none)` placeholder.
+  assert.equal(value, "<em>(none)</em>", "the Project field shows a project link or the no-project placeholder");
+  return "";
 }
 
 /**
@@ -145,7 +152,7 @@ async function importThrough(
   assert.equal(form.action, actionPath, `the form at ${pagePath} posts to ${actionPath}`);
   assert.equal(form.method, "post", "the import form posts");
   assert.equal(form.enctype, "multipart/form-data", "the import form is a multipart form");
-  const reply = await submit(base, form, values);
+  const reply = await submit(base, pagePath, form, values);
   assert.equal(reply.status, 200, `the import submitted from ${pagePath} succeeds: ${reply.body.slice(0, 400)}`);
   assert.match(String(reply.headers["content-type"]), /^text\/html; charset=utf-8/, "a successful import answers HTML");
   return reply.body;
@@ -299,6 +306,9 @@ interface SourceView {
   readonly passages: ReturnType<typeof renderedPassages>;
   /** The resolved destinations (path and raw fragment) of each passage link. */
   readonly passageLinks: readonly { readonly path: string; readonly fragment: string }[];
+  /** Each passage row's link, resolved on its own passages page: its raw
+   * fragment, exactly as the href carried it. */
+  readonly passageFragments: readonly string[];
 }
 
 /**
@@ -309,9 +319,14 @@ interface SourceView {
  */
 async function readSource(
   base: string,
-  row: ReturnType<typeof sourceRows>[number],
+  meetingPath: string,
+  row: { readonly filename: string; readonly original: string; readonly text: string; readonly passages: string },
   expectedPassages: number,
 ): Promise<SourceView> {
+  // Each row is resolved from its meeting page, so its links name the
+  // application's own origin as a browser would follow them; the rows passed
+  // here are those resolved rows.
+  assert.ok(row.passages.startsWith("/meetings/"), `${row.filename}'s passages link is a root-relative meeting path`);
   const original = await get(base, row.original);
   assert.equal(original.status, 200, `${row.filename} original is served`);
   const text = await get(base, row.text);
@@ -326,11 +341,13 @@ async function readSource(
   // page (a same-page fragment included) and must reach a row with that anchor
   // and that quote, so a changed anchor or a misdirected fragment fails.
   const passageLinks: { readonly path: string; readonly fragment: string }[] = [];
+  const passageFragments: string[] = [];
   for (const passage of rendered) {
     // The row's links are resolved on the passages page that rendered them,
     // and each resolved destination is saved as its root-relative path.
     const passagePage = splitLink(base, row.passages, passage.link);
-    const resolved = await resolvePassageLink(base, row.passages, passage);
+    passageFragments.push(passagePage.fragment);
+    const resolved = await resolvePassageLink(base, row.passages, passage, passage.text);
     assert.deepEqual(
       [resolved.path, resolved.fragment],
       [passagePage.path, passage.anchor],
@@ -338,14 +355,19 @@ async function readSource(
     );
     passageLinks.push(resolved);
   }
-  return { originalBytes: original.bytes, text: text.body, passages: rendered, passageLinks };
+  return { originalBytes: original.bytes, text: text.body, passages: rendered, passageLinks, passageFragments };
 }
 
-/** The source rows a meeting page lists, read from its own markup. */
-async function meetingSources(base: string, meetingPath: string): Promise<ReturnType<typeof sourceRows>> {
+/**
+ * The source rows a meeting page lists, read from its own markup with every
+ * link resolved against the meeting page that rendered it, so a relative or
+ * absolute source link is followed where the browser would follow it and a
+ * link naming another origin is refused.
+ */
+async function meetingSources(base: string, meetingPath: string) {
   const page = await get(base, meetingPath);
   assert.equal(page.status, 200, `${meetingPath} is readable`);
-  return sourceRows(page.body);
+  return meetingSourceRows(base, meetingPath, page.body);
 }
 
 /** A source row read back as a row argument (for re-reads of saved links). */
@@ -380,7 +402,7 @@ describe("transcript library over loopback HTTP", () => {
       // -- Clients, engagements and projects through their rendered forms. ---
       const newClient = await get(base, "/clients/new");
       assert.equal(newClient.status, 200);
-      const clientId = await createRecord(base, parseForm(newClient.body), {
+      const clientId = await createRecord(base, "/clients/new", parseForm(newClient.body), {
         name: "Synthetic Client",
         background: "",
         contacts: "",
@@ -390,7 +412,7 @@ describe("transcript library over loopback HTTP", () => {
       });
       const anotherClientPage = await get(base, "/clients/new");
       assert.equal(anotherClientPage.status, 200);
-      const anotherClientId = await createRecord(base, parseForm(anotherClientPage.body), {
+      const anotherClientId = await createRecord(base, "/clients/new", parseForm(anotherClientPage.body), {
         name: "Other Client",
         background: "",
         contacts: "",
@@ -523,7 +545,7 @@ describe("transcript library over loopback HTTP", () => {
       // their text and passages, checked before it becomes a restart baseline.
       const txtRow = firstRows.find((row) => row.filename === "notes.txt");
       assert.ok(txtRow !== undefined, "the distinct original's TXT row is listed");
-      const txtView = await readSource(base, txtRow!, 2);
+      const txtView = await readSource(base, pasteMeeting, txtRow!, 2);
       assert.deepEqual(txtView.originalBytes, Buffer.from(encoder.encode(TEXT_FILE)), "the distinct original's bytes are the TXT file's bytes");
       assert.equal(txtView.text, TEXT_FILE, "the distinct original's text is the TXT file's text");
       assert.equal(txtView.passages[0].text, 'Alice:  "The budget is fixed," she said.', "the distinct original's first quote is its own text");
@@ -597,12 +619,12 @@ describe("transcript library over loopback HTTP", () => {
       const manualRows = await meetingSources(base, manualMeetingPath);
       assert.equal(manualRows.length, 1, "the manual meeting holds exactly one attached source");
       assert.equal(manualRows[0].format, "paste");
-      const manualView = await readSource(base, manualRows[0], 2);
+      const manualView = await readSource(base, manualMeetingPath, manualRows[0], 2);
       assert.equal(manualView.text, ATTACHED, "the attached source's text is the attached transcript");
 
       // An attachment is never replaced: a different content aimed at it is
       // refused, and the refusal keeps the attach form's own guidance.
-      const refusedAttach = await submit(base, parseForm((await get(base, attachAction)).body), {
+      const refusedAttach = await submit(base, attachAction, parseForm((await get(base, attachAction)).body), {
         paste: "Carol: A different transcript.",
         file: { filename: "", body: "" },
       });
@@ -614,7 +636,7 @@ describe("transcript library over loopback HTTP", () => {
       const manualAfterRefusal = await get(base, manualMeetingPath);
       assert.equal(profileValue(manualAfterRefusal.body, "Notes"), MANUAL_NOTES, "the refused replacement kept the notes");
       assert.deepEqual(sourceRows(manualAfterRefusal.body), manualRows, "the refused replacement added no source");
-      assert.equal((await readSource(base, manualRows[0], 2)).text, ATTACHED, "the saved source link still reads the attachment");
+      assert.equal((await readSource(base, manualMeetingPath, manualRows[0], 2)).text, ATTACHED, "the saved source link still reads the attachment");
 
       // -- Import 7: the DOCX and 8: the PDF, through the project's action. --
       const projectPage = await get(base, projectHref);
@@ -733,7 +755,7 @@ describe("transcript library over loopback HTTP", () => {
         for (const row of savedRows) {
           viewsBefore.set(`${meeting} ${row.filename}`, {
             row,
-            view: await readSource(base, row, row.filename === "blocks.docx" ? 3 : 2),
+            view: await readSource(base, meeting, row, row.filename === "blocks.docx" ? 3 : 2),
           });
         }
       }
@@ -754,7 +776,7 @@ describe("transcript library over loopback HTTP", () => {
       for (const refusal of refusals) {
         const form = parseForm((await get(base, pasteAction)).body);
         assert.equal(form.enctype, "multipart/form-data", "the corrected form stays a multipart form");
-        const reply = await submit(base, form, {
+        const reply = await submit(base, pasteAction, form, {
           title: `Refused ${refusal.name}`,
           date: "2026-01-20",
           notes: "",
@@ -785,7 +807,7 @@ describe("transcript library over loopback HTTP", () => {
           const stillListed = (await meetingSources(base, meeting)).find((candidate) => candidate.filename === row.filename);
           assert.ok(stillListed !== undefined, `${refusal.name} kept ${row.filename} listed on ${meeting}`);
           assert.deepEqual(stillListed, row, `${refusal.name} kept ${row.filename}'s links on ${meeting}`);
-          const saved = await readSource(base, row, baseline.view.passages.length);
+          const saved = await readSource(base, meeting, row, baseline.view.passages.length);
           compareView(`${refusal.name} and ${row.filename}`, saved, baseline.view);
         }
       }
@@ -923,7 +945,7 @@ describe("transcript library over loopback HTTP", () => {
       const docxSources = await meetingSources(base, docxMeeting);
       assert.equal(docxSources.length, 1);
       assert.equal(docxSources[0].filename, "blocks.docx");
-      const docxView = await readSource(base, docxSources[0], 3);
+      const docxView = await readSource(base, docxMeeting, docxSources[0], 3);
       assert.deepEqual(new Uint8Array(docxView.originalBytes), docxBytes(DOCX_PARAGRAPHS), "the DOCX bytes are preserved exactly");
       assert.equal(docxView.text, DOCX_PARAGRAPHS.join("\n\n"), "the DOCX text is the extracted blocks");
       assert.deepEqual(docxView.passages.map((p) => p.text), DOCX_PARAGRAPHS.join("\n\n").split("\n\n"));
@@ -932,25 +954,25 @@ describe("transcript library over loopback HTTP", () => {
       const pdfSources = await meetingSources(base, pdfMeeting);
       assert.equal(pdfSources.length, 1);
       assert.equal(pdfSources[0].filename, "report.pdf");
-      const pdfView = await readSource(base, pdfSources[0], 2);
+      const pdfView = await readSource(base, pdfMeeting, pdfSources[0], 2);
       assert.deepEqual(new Uint8Array(pdfView.originalBytes), pdfBytes(PDF_PAGES), "the PDF bytes are preserved exactly");
       assert.equal(pdfView.text, "Alice: The budget is fixed.\n\nBob: We can work within it.", "the blank page contributes no text");
       assert.deepEqual(pdfView.passages.map((p) => p.location), ["PDF page 1", "PDF page 3"], "the blank page is skipped, not renumbered");
 
       // The pasted source keeps its exact text and quoted passage.
       const pasteRows = await meetingSources(base, pasteMeeting);
-      const pastedView = await readSource(base, pasteRows[0], 2);
+      const pastedView = await readSource(base, pasteMeeting, pasteRows[0], 2);
       assert.equal(pastedView.text, PASTED, "a pasted original's text is exact");
       assert.equal(pastedView.passages[0].text, 'Alice: "The budget is fixed," she said.', "the quoted passage is exact");
       // The Markdown source keeps its case in the text it serves.
       const markdownRows = await meetingSources(base, markdownMeeting);
-      const markdownView = await readSource(base, markdownRows[0], 2);
+      const markdownView = await readSource(base, markdownMeeting, markdownRows[0], 2);
       assert.equal(markdownView.text, MARKDOWN, "the Markdown text is exact");
 
       // The beta meeting's own source is read and kept as a baseline.
       const betaRows = await meetingSources(base, betaMeeting);
       assert.equal(betaRows.length, 1, "the beta meeting holds its own source");
-      const betaView = await readSource(base, betaRows[0], 2);
+      const betaView = await readSource(base, betaMeeting, betaRows[0], 2);
       assert.equal(betaView.text, OTHER_ENGAGEMENT_TEXT, "the beta meeting's source is the text imported there");
 
       // -- Save what a restart must reproduce. -------------------------------
@@ -970,7 +992,6 @@ describe("transcript library over loopback HTTP", () => {
         alphaHref,
         clientPath,
         sourcesAll: [] as SavedSource[],
-        sources: [] as SavedSource[],
       };
       // Every meeting with its sources, in one common walk. The project
       // meetings are saved too, so the archive step has a baseline and the
@@ -983,7 +1004,6 @@ describe("transcript library over loopback HTTP", () => {
         [pdfLabel, pdfMeeting, pdfSources, 2],
         [betaLabel, betaMeeting, betaRows, 2],
       ] as const) {
-        const projectMeeting = meeting === docxMeeting || meeting === pdfMeeting;
         for (const row of rows) {
           const entry: SavedSource = {
             meetingLabel,
@@ -993,26 +1013,19 @@ describe("transcript library over loopback HTTP", () => {
             original: row.original,
             text: row.text,
             passages: row.passages,
-            view: await readSource(base, row, expectedPassages),
+            view: await readSource(base, meeting, row, expectedPassages),
           };
           saved.sourcesAll.push(entry);
-          if (!projectMeeting) saved.sources.push(entry);
         }
       }
-      // The saved baselines name a row count and every meeting's sources, the
-      // beta meeting's included.
+      // The saved baselines name every meeting's sources, the DOCX and PDF
+      // meetings' (archived later, and read through their own paths), the beta
+      // meeting's and the manual meeting's included.
       assert.deepEqual(
-        saved.sources.map((source) => source.meetingLabel).sort(),
-        [
-          pasteLabel,
-          pasteLabel,
-          manualLabel,
-          markdownLabel,
-          betaLabel,
-        ].sort(),
-        "the restart baselines cover each active meeting with its sources",
+        saved.sourcesAll.map((source) => source.meetingLabel).sort(),
+        [pasteLabel, pasteLabel, manualLabel, markdownLabel, docxLabel, pdfLabel, betaLabel].sort(),
+        "the restart baselines cover every meeting with its sources",
       );
-      // Each saved label is the label of a card rendered for that meeting.
 
       // -- Archive the project: its meetings leave the active histories. -----
       // The project page's own archive form is followed as the browser would,
@@ -1025,7 +1038,7 @@ describe("transcript library over loopback HTTP", () => {
         archiveForm.enctype === null || archiveForm.enctype === "application/x-www-form-urlencoded",
         `the archive form is a url-encoded form, not ${archiveForm.enctype}`,
       );
-      const archived = await submit(base, archiveForm);
+      const archived = await submit(base, projectHref, archiveForm);
       assert.equal(archived.status, 303, "archiving redirects to the project");
       assert.equal(String(archived.headers.location), projectHref);
 
@@ -1096,7 +1109,7 @@ describe("transcript library over loopback HTTP", () => {
         assert.equal(rows[0].filename, meeting === docxMeeting ? "blocks.docx" : "report.pdf");
       }
       for (const source of saved.sourcesAll.filter((candidate) => candidate.meeting === docxMeeting || candidate.meeting === pdfMeeting)) {
-        const view = await readSource(base, savedRow(source), source.view.passages.length || 1);
+        const view = await readSource(base, source.meeting, savedRow(source), source.view.passages.length || 1);
         assert.deepEqual(view.originalBytes, source.view.originalBytes, `${source.filename} original bytes still match after archiving`);
         assert.equal(view.text, source.view.text, `${source.filename} text still matches after archiving`);
       }
@@ -1176,21 +1189,26 @@ describe("transcript library over loopback HTTP", () => {
         await meetingSources(restarted, href);
       }
 
-      // Each saved source is rediscovered on its meeting page (found through
-      // the card carrying the meeting's label) and read over the new origin:
-      // original bytes, full text, quotes, locations and fragment targets
-      // (each resolved at its own destination page).
-      for (const source of saved.sources) {
-        const href =
+      // Each saved source is rediscovered on its meeting page and read over the
+      // new origin: original bytes, full text, quotes, locations and fragment
+      // targets (each resolved at its own destination page). An active
+      // meeting's page is found through the history card carrying its label;
+      // an archived meeting is no longer in an active history, so its own
+      // saved direct meeting path is resolved against the new origin.
+      for (const source of saved.sourcesAll) {
+        const active =
           restartedAlphaEntries.get(source.meetingLabel) ?? restartedClientEntries.get(source.meetingLabel) ?? "";
-        assert.equal(href, source.meeting, `${source.meetingLabel} is rediscovered in the history after the restart`);
+        const href = active === "" ? splitLink(restarted, "/", source.meeting).path : active;
+        if (active !== "") {
+          assert.equal(active, source.meeting, `${source.meetingLabel} is rediscovered in the history after the restart`);
+        }
         const rows = await meetingSources(restarted, href);
         // The rediscovered rows are the saved rows exactly, in order: a source
         // added or removed across the restart fails here, not only a missing
         // filename among extra ones.
         assert.deepEqual(
           rows.map((candidate) => savedRow(candidate)),
-          saved.sources.filter((saved) => saved.meeting === source.meeting).map((saved) => savedRow(saved)),
+          saved.sourcesAll.filter((candidate) => candidate.meeting === source.meeting).map((candidate) => savedRow(candidate)),
           `${source.meetingLabel}'s rediscovered rows are the saved rows`,
         );
         const row = rows.find((candidate) => candidate.filename === source.filename);
@@ -1198,25 +1216,25 @@ describe("transcript library over loopback HTTP", () => {
         assert.equal(row!.original, source.original, "the rediscovered original path is unchanged");
         assert.equal(row!.text, source.text, "the rediscovered text path is unchanged");
         assert.equal(row!.passages, source.passages, "the rediscovered passages path is unchanged");
-        const view = await readSource(restarted, row!, source.view.passages.length);
+        const view = await readSource(restarted, href, row!, source.view.passages.length);
         assert.deepEqual(view.originalBytes, source.view.originalBytes, `${source.filename} original bytes match across the restart`);
         assert.equal(view.text, source.view.text, `${source.filename} full text matches across the restart`);
         assert.deepEqual(
-          view.passages.map((passage) => ({
+          view.passages.map((passage, index) => ({
             anchor: passage.anchor,
             text: passage.text,
             offsets: passage.offsets,
             position: passage.position,
             location: passage.location,
-            fragment: fragmentOf(passage.link),
+            fragment: source.view.passageFragments[index],
           })),
-          source.view.passages.map((passage) => ({
+          source.view.passages.map((passage, index) => ({
             anchor: passage.anchor,
             text: passage.text,
             offsets: passage.offsets,
             position: passage.position,
             location: passage.location,
-            fragment: fragmentOf(passage.link),
+            fragment: source.view.passageFragments[index],
           })),
           `${source.filename} passages, quotes, locations and fragment targets match across the restart`,
         );
@@ -1238,19 +1256,46 @@ describe("transcript library over loopback HTTP", () => {
         const savedRendered = renderedPassages(savedPassages.body);
         assert.equal(savedRendered.length, source.view.passages.length, `${source.filename} saved passages page renders the same rows`);
         for (const [index, savedPassage] of savedRendered.entries()) {
+          const savedBaseline = source.view.passages[index];
+          // The row the saved page renders now must show the pre-restart quote
+          // and metadata, so a changed quote or location fails before the
+          // destination is even followed.
+          assert.deepEqual(
+            {
+              anchor: savedPassage.anchor,
+              text: savedPassage.text,
+              offsets: savedPassage.offsets,
+              position: savedPassage.position,
+              location: savedPassage.location,
+              fragment: splitLink(restarted, source.passages, savedPassage.link).fragment,
+            },
+            {
+              anchor: savedBaseline.anchor,
+              text: savedBaseline.text,
+              offsets: savedBaseline.offsets,
+              position: savedBaseline.position,
+              location: savedBaseline.location,
+              fragment: source.view.passageFragments[index],
+            },
+            `${source.filename} saved passage row ${index} still shows the pre-restart quote and location`,
+          );
           // The saved link is resolved against its rendering page and followed
           // to its own destination, which must be this application's and must
-          // show the pre-restart quote: the baseline quote is the expected
-          // value, so a quote changed between the two reads fails here.
+          // show the same pre-restart quote: the displayed row and its
+          // destination both carry the saved quote, so a quote changed on
+          // either side fails here.
           const followed = await resolvePassageLink(
             restarted,
             source.passages,
             savedPassage,
-            source.view.passages[index].text,
+            savedBaseline.text,
           );
           assert.deepEqual(
             { path: followed.path, fragment: followed.fragment },
-            { path: source.view.passageLinks[index].path, fragment: source.view.passageLinks[index].fragment },
+            {
+              path: splitLink(restarted, source.passages, savedBaseline.link).path,
+              fragment: source.view.passageLinks[index].fragment,
+            },
             `${source.filename} saved passage link ${index} still reaches the same destination and fragment`,
           );
         }
@@ -1271,10 +1316,11 @@ describe("transcript library over loopback HTTP", () => {
  */
 async function createRecord(
   base: string,
+  path: string,
   form: ReturnType<typeof parseForm>,
   values: Readonly<Record<string, string>>,
 ): Promise<string> {
-  const reply = await submit(base, form, values);
+  const reply = await submit(base, path, form, values);
   assert.equal(reply.status, 303, `${form.action} created the record: ${reply.body.slice(0, 200)}`);
   const location = String(reply.headers.location);
   return location.split("/").pop() as string;
@@ -1288,5 +1334,5 @@ async function createChild(
 ): Promise<string> {
   const page = await get(base, path);
   assert.equal(page.status, 200, `${path} is rendered`);
-  return createRecord(base, parseForm(page.body), values);
+  return createRecord(base, path, parseForm(page.body), values);
 }

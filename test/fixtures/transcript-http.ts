@@ -328,6 +328,7 @@ const CHOICE_CONTROLS: ReadonlySet<string> = new Set(["projectId"]);
  */
 export function submit(
   base: string,
+  pagePath: string,
   form: ParsedForm,
   values: Readonly<Record<string, string | { readonly filename: string; readonly body: string | Uint8Array }>> = {},
 ): Promise<Reply> {
@@ -370,8 +371,9 @@ export function submit(
     }
   }
   // The action is the link the page rendered, resolved against the page it was
-  // rendered on; a form action naming another origin is refused.
-  const { path } = splitLink(base, "/", form.action);
+  // rendered on (a page-relative action stays on that page's directory) and
+  // naming the application's own origin; a misdirected action is refused.
+  const { path } = splitLink(base, pagePath, form.action);
   if (multipartBody) {
     return postBytes(base, path, MULTIPART_TYPE, multipart(parts));
   }
@@ -460,6 +462,33 @@ export function sourceRows(document: string): SourceRow[] {
     });
   }
   return rows;
+}
+
+/** A source row with each of its three links resolved on the meeting page that
+ * rendered it: root-relative request targets on the application's own origin,
+ * as a browser would follow and as a restart baseline saves them. */
+export interface ResolvedSourceRow {
+  readonly filename: string;
+  readonly format: string;
+  readonly original: string;
+  readonly text: string;
+  readonly passages: string;
+}
+
+/**
+ * Resolve every link of every source row rendered on the meeting page at
+ * `meetingPath`, against that page. A relative href resolves against the
+ * meeting path's directory, a same-origin absolute href keeps its path and
+ * query, and a link naming another origin is refused.
+ */
+export function meetingSourceRows(base: string, meetingPath: string, document: string): ResolvedSourceRow[] {
+  return sourceRows(document).map((row) => ({
+    filename: row.filename,
+    format: row.format,
+    original: splitLink(base, meetingPath, row.original).path,
+    text: splitLink(base, meetingPath, row.text).path,
+    passages: splitLink(base, meetingPath, row.passages).path,
+  }));
 }
 
 /** One passage as the passages page renders it: its anchor, text, and metadata. */
