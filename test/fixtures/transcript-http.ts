@@ -38,20 +38,27 @@ function replyFrom(status: number, headers: Record<string, string | string[] | u
 }
 
 /**
- * Split a rendered link into its path and query (the request target a browser
- * fetches) and its fragment (the part the browser resolves locally). The
- * fragment is returned raw, exactly as it appears in the href.
+ * A resolved link: the request target a browser fetches (path and query) and
+ * the fragment it resolves locally. The fragment is returned raw, exactly as it
+ * appears in the href.
  */
-export interface SplitLink {
+interface SplitLink {
   readonly path: string;
   readonly fragment: string;
 }
 
-/** Split one rendered href into its request target and its raw fragment. */
-export function splitLink(href: string): SplitLink {
-  assert.match(href, /^\//, `the link ${href} is a root-relative path`);
-  const hash = href.indexOf("#");
-  return hash < 0 ? { path: href, fragment: "" } : { path: href.slice(0, hash), fragment: href.slice(hash + 1) };
+/**
+ * Resolve one rendered href against the page that rendered it: a root-relative
+ * href, a same-page `#fragment` href or a relative one becomes the request
+ * target a browser would fetch, and the fragment is kept raw.
+ */
+export function splitLink(fromPath: string, href: string): SplitLink {
+  assert.ok(href !== "", `the link ${href || "(empty)"} is not empty`);
+  const resolved = new URL(href, `http://loopback.invalid${fromPath}`);
+  return {
+    path: `${resolved.pathname}${resolved.search}`,
+    fragment: resolved.hash === "" ? "" : resolved.hash.slice(1),
+  };
 }
 
 /**
@@ -137,7 +144,7 @@ export function sectionOf(body: string, title: string): string {
 }
 
 /** One rendered form control, keeping the type it is rendered with. */
-export interface FormControl {
+interface FormControl {
   readonly name: string;
   /** The control's rendered type: `text`, `date`, `textarea`, `select`, `file`, `hidden`. */
   readonly type: string;
@@ -158,9 +165,32 @@ export interface ParsedForm {
   readonly options: Map<string, string[]>;
 }
 
-/** True for a control rendered with a `disabled` attribute. */
+/** True for an element rendered with a `disabled` attribute. */
 function isDisabled(attributes: string): boolean {
   return /\sdisabled(?:[=\s]|>|$)/.test(attributes);
+}
+
+/**
+ * The positions of the form's `<fieldset ... disabled>` elements (and of their
+ * closing tags), so a control rendered inside one is recognised as unavailable:
+ * a browser does not submit a control of a disabled fieldset even when the
+ * control itself carries no `disabled` attribute.
+ */
+function disabledFieldsets(inner: string): { readonly start: number; readonly end: number }[] {
+  const spans: { start: number; end: number }[] = [];
+  const open = [...inner.matchAll(/<fieldset([^>]*)>/g)];
+  for (const match of open) {
+    if (!isDisabled(match[1])) continue;
+    const start = match.index!;
+    const close = inner.indexOf("</fieldset>", start);
+    spans.push({ start, end: close < 0 ? inner.length : close });
+  }
+  return spans;
+}
+
+/** True when a control at `index` lies inside one of the disabled fieldsets. */
+function insideDisabledFieldset(spans: readonly { readonly start: number; readonly end: number }[], index: number): boolean {
+  return spans.some((span) => index > span.start && index < span.end);
 }
 
 /** Parse the one form of a rendered page, keeping each control's rendered type. */
@@ -177,6 +207,7 @@ export function parseForm(document: string): ParsedForm {
   const controls = new Map<string, FormControl>();
   const options = new Map<string, string[]>();
   const inner = form[1];
+  const disabledSpans = disabledFieldsets(inner);
   for (const match of inner.matchAll(/<textarea([^>]*)>([\s\S]*?)<\/textarea>/g)) {
     const name = /\sname="([^"]+)"/.exec(match[1]);
     if (name === null) continue;
@@ -184,7 +215,7 @@ export function parseForm(document: string): ParsedForm {
       name: unescapeHtml(name[1]),
       type: "textarea",
       value: unescapeHtml(match[2]),
-      enabled: !isDisabled(match[1]),
+      enabled: !isDisabled(match[1]) && !insideDisabledFieldset(disabledSpans, match.index!),
     });
   }
   for (const match of inner.matchAll(/<input([^>]*)>/g)) {
@@ -197,7 +228,7 @@ export function parseForm(document: string): ParsedForm {
       name: unescapeHtml(name[1]),
       type: unescapeHtml(type === null ? "text" : type[1]).toLowerCase(),
       value: value === null ? "" : unescapeHtml(value[1]),
-      enabled: !isDisabled(attrs),
+      enabled: !isDisabled(attrs) && !insideDisabledFieldset(disabledSpans, match.index!),
     });
   }
   for (const match of inner.matchAll(/<select([^>]*)>([\s\S]*?)<\/select>/g)) {
@@ -211,7 +242,7 @@ export function parseForm(document: string): ParsedForm {
       name: unescapeHtml(name![1]),
       type: "select",
       value,
-      enabled: !isDisabled(match[1]),
+      enabled: !isDisabled(match[1]) && !insideDisabledFieldset(disabledSpans, match.index!),
     });
   }
   return {
@@ -239,16 +270,26 @@ export function submit(
   form: ParsedForm,
   values: Readonly<Record<string, string | { readonly filename: string; readonly body: string | Uint8Array }>> = {},
 ): Promise<Reply> {
-  for (const name of Object.keys(values)) {
-    assert.ok(form.controls.has(name), `the form carries ${name}`);
+  // A submitted form is always a POST, as the pages render it; a creation or
+  // archive form that renders GET or omits its method is not followed here.
+  assert.equal(form.method, "post", `the form at ${form.action} posts`);
+  for (const [name, supplied] of Object.entries(values)) {
+    const control = form.controls.get(name);
+    assert.ok(control !== undefined, `the form carries ${name}`);
+    assert.ok(control!.enabled, `the supplied control ${name} is enabled`);
+    if (typeof supplied !== "string") {
+      assert.equal(control!.type, "file", `the form renders ${name} as a file control`);
+    } else if (control!.type === "select") {
+      const choices = form.options.get(name) ?? [];
+      assert.ok(choices.includes(supplied), `the select ${name} offers ${JSON.stringify(supplied)}`);
+    }
   }
+  // A browser does not submit a control rendered unavailable, so neither does
+  // the helper: a disabled control is left out of the request.
   const parts: Part[] = [];
   for (const [name, control] of form.controls) {
+    if (!control.enabled) continue;
     const supplied = values[name];
-    if (supplied !== undefined && typeof supplied !== "string") {
-      assert.equal(control.type, "file", `the form renders ${name} as a file control`);
-      assert.ok(control.enabled, `the file control ${name} is enabled`);
-    }
     parts.push({
       control,
       value: supplied === undefined ? control.value : supplied,
@@ -403,16 +444,18 @@ export function fragmentOf(link: string): string {
 }
 
 /**
- * Resolve one rendered passage link to the page a browser fetches and the
- * decoded anchor it scrolls to. The destination page is fetched and must be a
- * 200 carrying a row with that exact anchor whose quote is the passage's own
- * text; the resolved link's path and anchor are returned for comparison.
+ * Resolve one rendered passage link, rendered on the page at `fromPath`, to the
+ * page a browser fetches and the decoded anchor it scrolls to. The destination
+ * page is fetched and must be a 200 carrying a row with that exact anchor whose
+ * quote is the passage's own text; the resolved link's path and anchor are
+ * returned for comparison.
  */
 export async function resolvePassageLink(
   base: string,
+  fromPath: string,
   passage: RenderedPassage,
 ): Promise<{ readonly path: string; readonly fragment: string }> {
-  const { path, fragment } = splitLink(passage.link);
+  const { path, fragment } = splitLink(fromPath, passage.link);
   assert.notEqual(fragment, "", `the passage link ${passage.link} carries a fragment`);
   const anchor = decodeURIComponent(fragment);
   const destination = await get(base, path);
