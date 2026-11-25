@@ -974,20 +974,26 @@ class TranscriptStoreImpl implements TranscriptStore {
       // The public parser accepts only the supplied create keys; the handler's
       // private engagement-only marker is carried separately, never here.
       const create = requireRecord(record.create, "transcript target.create", CREATE_KEYS);
-      if (engagementOnly && create.projectId !== undefined) {
+      // Read each field exactly once into a local constant, then validate the
+      // constants and build the frozen copy from the validator results, so the
+      // commit uses exactly the validated values even if the caller mutates its
+      // own object after validation.
+      const rawClientId = create.clientId;
+      const rawEngagementId = create.engagementId;
+      const rawProjectId = create.projectId;
+      const rawTitle = create.title;
+      const rawDate = create.date;
+      const rawNotes = create.notes;
+      if (engagementOnly && rawProjectId !== undefined) {
         throw new ValidationError("transcript target.create cannot carry a project and an engagement-only selection");
       }
-      // Read each field exactly once into a local constant, validate that
-      // constant, and build the captured copy from the validator results, so
-      // the commit uses exactly the validated values even if the caller mutates
-      // its own object after validation.
-      const clientId = requireNonblank(create.clientId, "transcript target.create.clientId");
-      const engagementId = requireNonblank(create.engagementId, "transcript target.create.engagementId");
-      const projectId = optionalNonblank(create.projectId, "transcript target.create.projectId");
-      const title = requireNonblank(create.title, "transcript target.create.title");
-      const date = requireNonblank(create.date, "transcript target.create.date");
-      const notes = optionalText(create.notes, "transcript target.create.notes");
-      return {
+      const clientId = requireNonblank(rawClientId, "transcript target.create.clientId");
+      const engagementId = requireNonblank(rawEngagementId, "transcript target.create.engagementId");
+      const projectId = optionalNonblank(rawProjectId, "transcript target.create.projectId");
+      const title = requireNonblank(rawTitle, "transcript target.create.title");
+      const date = requireNonblank(rawDate, "transcript target.create.date");
+      const notes = optionalText(rawNotes, "transcript target.create.notes");
+      return Object.freeze({
         create: Object.freeze({
           clientId,
           engagementId,
@@ -996,10 +1002,10 @@ class TranscriptStoreImpl implements TranscriptStore {
           date,
           ...(notes === undefined ? {} : { notes }),
         }),
-      };
+      });
     }
     const meetingId = requireNonblank(record.meetingId, "transcript target.meetingId");
-    return { meetingId };
+    return Object.freeze({ meetingId });
   }
 
   /**

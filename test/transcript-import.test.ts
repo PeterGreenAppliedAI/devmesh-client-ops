@@ -1052,11 +1052,58 @@ describe("transcript submission handler: the import's own commit", () => {
       assert.equal(result.outcome, "created");
       assert.equal(result.meeting.date, "2026-09-02");
       assert.equal(result.meeting.engagementId, fx.engagementId, "the validated engagement was committed");
+      assert.equal(reads, 1, "engagementId is read exactly once from the caller");
       const after = counts(fx.store);
       assert.equal(after.meetings, before.meetings + 1);
       assert.equal(after.transcripts, before.transcripts + 1);
       assert.equal(after.sources, before.sources + 1);
       assert.equal(after.events, before.events + 1, "one create event");
+    } finally {
+      await fx.close();
+    }
+  });
+
+  it("reads each create field from the caller exactly once, including the project", async () => {
+    const fx = await fixture();
+    try {
+      // Every create field is an accessor that counts its reads and returns a
+      // stable value, including an explicitly supplied project of the URL
+      // engagement. The parser must capture each field once, use the captured
+      // value for its engagement-only guard and validators, and build the
+      // frozen target from it, so a commit never reads a caller field again.
+      const project = await fx.store.createProject({ engagementId: fx.engagementId, name: "Captured project" });
+      const values: Record<string, unknown> = {
+        clientId: fx.clientId,
+        engagementId: fx.engagementId,
+        projectId: project.id,
+        title: "Read once",
+        date: "2026-09-03",
+        notes: "Captured notes",
+      };
+      const reads: Record<string, number> = {};
+      const create: Record<string, unknown> = {};
+      for (const key of Object.keys(values)) {
+        reads[key] = 0;
+        Object.defineProperty(create, key, {
+          enumerable: true,
+          get: () => {
+            reads[key] += 1;
+            return values[key];
+          },
+        });
+      }
+      const result = await fx.service.importTranscript(
+        { kind: "paste", text: `Read once words. ${PASTED_TEXT}` },
+        { create } as unknown as Parameters<TranscriptStore["importTranscript"]>[1],
+      );
+      assert.equal(result.outcome, "created");
+      assert.equal(result.meeting.title, "Read once");
+      assert.equal(result.meeting.projectId, project.id, "the supplied project was committed");
+      // The parser reads each field once; the parent validation reads the
+      // captured target (clientId and projectId again), never the caller.
+      for (const key of Object.keys(values)) {
+        assert.equal(reads[key], 1, `${key} is read exactly once from the caller`);
+      }
     } finally {
       await fx.close();
     }
