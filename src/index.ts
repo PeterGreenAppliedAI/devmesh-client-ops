@@ -36,7 +36,6 @@ import {
   type TranscriptImportRoutes,
 } from "./transcript-import-pages.ts";
 import { openStore, type Store } from "./store.ts";
-import { transcriptService, type TranscriptStore } from "./transcript-store.ts";
 
 export function health(): { status: "ok" } {
   return { status: "ok" };
@@ -147,14 +146,13 @@ export interface HierarchyPathMatch {
  * every list, tally and history does.
  */
 export function registerRoutes(store: Store): Routes {
-  // The transcript service borrows the same store the routes are built over, so
-  // an import and every ordinary store write share the store's one mutation
-  // queue and originals; the application displays and commits one workspace.
-  // The service is resolved only when an import POST first needs it, so
-  // registering the routes (and a startup that never imports) needs nothing
-  // beyond what every existing page already reads.
-  let service: TranscriptStore | null = null;
-  const transcripts = (): TranscriptStore => (service ??= transcriptService(store));
+  // The transcript import routes are built over the same owned store, and their
+  // transcript service borrows that store, so an import and every ordinary
+  // store write share the store's one mutation queue and originals; the
+  // application displays and commits one workspace. The service is built only
+  // when an import POST first needs it, so registering the routes (and a
+  // startup that never imports) needs nothing beyond what every existing page
+  // already reads.
   const base: Routes = appRoutes(store);
   const hierarchy = hierarchyRoutes(store);
   const work = workRoutes(store);
@@ -162,7 +160,7 @@ export function registerRoutes(store: Store): Routes {
   const archive = archiveRoutes(store);
   const archived = archivedRoutes(store).archived;
   const kanban = kanbanRoutes(store);
-  const imports = transcriptImportRoutes(store, transcripts);
+  const imports = transcriptImportRoutes(store);
   const table: PathRouteTable<HierarchyPathMatch> = {
     match: (path: string) => {
       // The archive endpoints and the archived discovery page are matched

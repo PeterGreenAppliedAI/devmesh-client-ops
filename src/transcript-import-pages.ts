@@ -41,7 +41,7 @@ import {
 import { engagementImportHref, meetingImportHref, projectImportHref } from "./meeting-pages.ts";
 import { MissingRecordError, ValidationError } from "./model.ts";
 import type { Client, Engagement, Meeting, Project, Snapshot, Store } from "./store.ts";
-import type { TranscriptImportResult, TranscriptStore } from "./transcript-store.ts";
+import { transcriptService as buildTranscriptService, type TranscriptImportResult, type TranscriptStore } from "./transcript-store.ts";
 import { submitTranscript } from "./transcript-import.ts";
 import {
   FILE_CONTROL,
@@ -521,7 +521,9 @@ function resultPage(result: TranscriptImportResult, snapshot: Snapshot, scope: I
  * URL project and a blank select stays blank. The refusal's message names the
  * problem in the summary and, for a visible control it names, beside that
  * control. The notice is the URL scope's archive notice, so a refusal on an
- * archived scope stays marked.
+ * archived scope stays marked. The same guidance the initial form states (the
+ * supported formats and the size limits) is kept above the corrected form, so
+ * a user correcting a refused submission still sees what the import accepts.
  */
 function formFailure(
   error: unknown,
@@ -536,8 +538,9 @@ function formFailure(
     if (!field.hidden && Object.hasOwn(values, field.name)) filled[field.name] = values[field.name];
   }
   const errors = fieldErrorsFor(error.message, filled, fields);
+  const shownNotice = notice === "" ? importGuidance() : `${notice}\n${importGuidance()}`;
   return new FormError(error.message, filled, errors, fields, action)
-    .withNotice(notice)
+    .withNotice(shownNotice)
     .withEnctype(MULTIPART_FORM_ENCTYPE);
 }
 
@@ -556,19 +559,22 @@ function selectedFile(file: MultipartFile | null): { filename: string; bytes: Ui
 
 /**
  * Build the transcript import routes over the application's single owned store.
- * `transcriptService` resolves the borrowed service bound to that store; it is
- * called only when an import POST first needs it, so a page read and a startup
- * that never imports need nothing beyond the store every page already reads.
- * The GET forms render from the snapshot; the POSTs hand the matched kind and
- * raw id to `submitTranscript` first, so the URL record is resolved inside the
- * store's own queue turn, and answer with the transient result page. A refusal
- * writes nothing and is shown as a correctable form.
+ * The borrowed transcript service is built inside this factory over that same
+ * store (`transcriptService(store)`) and only when an import POST first needs
+ * it, so a page read and a startup that never imports need nothing beyond the
+ * store every page already reads; a GET and a POST can never read one workspace
+ * and write another. The GET forms render from the snapshot; the POSTs hand the
+ * matched kind and raw id to `submitTranscript` first, so the URL record is
+ * resolved inside the store's own queue turn, and answer with the transient
+ * result page. A refusal writes nothing and is shown as a correctable form.
  */
-export function transcriptImportRoutes(
-  store: Store,
-  transcriptService: () => TranscriptStore,
-): TranscriptImportRoutes {
+export function transcriptImportRoutes(store: Store): TranscriptImportRoutes {
   const snapshot = (): Snapshot => store.snapshot();
+
+  // The service borrows the one store this factory was given, so displaying and
+  // committing always name the same workspace. It is built on first use.
+  let service: TranscriptStore | null = null;
+  const transcriptService = (): TranscriptStore => (service ??= buildTranscriptService(store));
 
   /** The scope the request path names, or null when it is missing or malformed. */
   function resolvedScope(request: TranscriptImportRequest, expected: TranscriptImportKind): ImportScope | null {
@@ -656,13 +662,10 @@ export function transcriptImportRoutes(
     } catch (error) {
       if (error instanceof MissingRecordError) throw error;
       // Presentation data is resolved only now, for a correctable refusal on a
-      // record the store knows; a missing record keeps the handler's 404.
-      let scope: ImportScope | null;
-      try {
-        scope = resolvedScope(request, expected);
-      } catch {
-        scope = null;
-      }
+      // record the store knows; a missing record keeps the handler's 404. An
+      // unexpected failure while resolving it (a store read that fails) is
+      // reported unchanged, never replaced by the submission's own error.
+      const scope = resolvedScope(request, expected);
       if (scope === null) throw error;
       throw refuse(error, scope, request);
     }

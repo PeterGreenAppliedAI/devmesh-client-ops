@@ -5,8 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { escapeHtml, FormError } from "../src/html.ts";
+import { PersistenceError } from "../src/model.ts";
 import { registerRoutes, startApplication } from "../src/index.ts";
-import { ValidationError } from "../src/model.ts";
 import {
   engagementImportHref,
   matchMeetingPath,
@@ -16,7 +16,6 @@ import {
 } from "../src/meeting-pages.ts";
 import { startServer, type Routes } from "../src/server.ts";
 import { openStore, type Store } from "../src/store.ts";
-import { transcriptService, type TranscriptStore } from "../src/transcript-store.ts";
 import {
   engagementImportHref as importEngagementHref,
   importLimitsText,
@@ -254,7 +253,7 @@ async function submitRendered(
   origin: string,
   path: string,
   entries: ReadonlyMap<string, string | { readonly filename: string; readonly body: string | Uint8Array }>,
-  options: { readonly unselectedFile?: boolean; readonly contentTypeOverride?: string | null } = {},
+  options: { readonly unselectedFile?: boolean } = {},
 ): Promise<{ readonly reply: Reply; readonly form: string }> {
   const page = await get(origin, path);
   assert.equal(page.status, 200, path);
@@ -290,8 +289,7 @@ async function submitRendered(
   for (const name of entries.keys()) {
     assert.ok(rendered.some((control) => control.name === name), `the form carries ${name}`);
   }
-  const contentType = options.contentTypeOverride === undefined ? MULTIPART_TYPE : options.contentTypeOverride;
-  return { reply: await postBytes(origin, unescapeHtml(action[1]), contentType, multipart(parts)), form };
+  return { reply: await postBytes(origin, unescapeHtml(action[1]), MULTIPART_TYPE, multipart(parts)), form };
 }
 
 /** Submit a rendered form with the given text controls, pasted text only. */
@@ -434,22 +432,8 @@ describe("transcript import paths", () => {
         transcripts: [],
       }),
     } as unknown as Store;
-    const service = {
-      store,
-      submitTranscript: async () => {
-        throw new Error("must not run for a GET");
-      },
-      importTranscript: async () => {
-        throw new Error("must not run");
-      },
-      readSource: async () => {
-        throw new Error("must not run");
-      },
-      transcripts: () => [],
-      close: async () => {},
-    } as unknown as TranscriptStore;
-    // The service is resolved lazily, only when an import POST needs it.
-    const table = transcriptImportRoutes(store, () => service);
+    // The factory is bound to its one store; registration builds no service.
+    const table = transcriptImportRoutes(store);
     for (const pattern of [
       "/engagements/:id/transcripts/import",
       "/projects/:id/transcripts/import",
@@ -463,48 +447,67 @@ describe("transcript import paths", () => {
     }
   });
 
-  it("shows a refused submission as a correctable form and never swallows another failure", async () => {
-    const store = {
-      snapshot: () => ({
-        clients: [{ id: "client-1", name: "C", background: "", contacts: "", stakeholders: "", requirements: "", objectives: "" }],
-        engagements: [{ id: "engagement-1", clientId: "client-1", name: "E", objectives: "", status: "active" }],
-        projects: [],
-        meetings: [],
-        tasks: [],
-        items: [],
-        transcripts: [],
-      }),
-    } as unknown as Store;
-    // The service is injected through the interface the routes accept: a
-    // validation refusal and an unexpected failure are each raised there.
-    const makeService = (failure: unknown) => () =>
-      ({
-        submitTranscript: async () => {
-          throw failure;
+  it("shows a refused submission as a correctable form with its guidance and never swallows another failure", async () => {
+    // A real store over a failing originals filesystem: a paste publishes no
+    // original, so it commits; a refused date writes nothing. The originals
+    // failure is injected through the interface the store accepts.
+    const store = await openStore(tempDir(), {
+      originalsFs: { renameSync: () => {
+        throw Object.assign(new Error("the originals store is unavailable"), { code: "EIO" });
+      } },
+    });
+    try {
+      const client = await store.createClient({ name: "C" });
+      const engagement = await store.createEngagement({ clientId: client.id, name: "E" });
+      const request: TranscriptImportRequest = {
+        method: "POST",
+        path: `/engagements/${engagement.id}/transcripts/import`,
+        form: { title: "T", date: "2026-01-01", paste: "Words." },
+        file: null,
+      };
+      const table = transcriptImportRoutes(store);
+      const refusals: FormError[] = [];
+      await assert.rejects(
+        async () => table.engagementImport.post!.render({ ...request, form: { ...request.form, date: "2026-02-30" } }),
+        (error: unknown) => {
+          if (!(error instanceof FormError) || !error.message.includes("real calendar date")) return false;
+          refusals.push(error);
+          return true;
         },
-      }) as unknown as TranscriptStore;
-    const request: TranscriptImportRequest = {
-      method: "POST",
-      path: "/engagements/engagement-1/transcripts/import",
-      form: { title: "T", date: "2026-01-01", paste: "Words." },
-      file: null,
-    };
-    const refusal = transcriptImportRoutes(store, makeService(new ValidationError("meeting.date is invalid")));
-    await assert.rejects(
-      async () => refusal.engagementImport.post!.render(request),
-      (error: unknown) => error instanceof FormError && error.message === "meeting.date is invalid",
-    );
-    // A failure that is not a refusal is reported unchanged, never rendered as
-    // a form problem.
-    const unexpected = new Error("the store is unavailable");
-    const broken = transcriptImportRoutes(store, makeService(unexpected));
-    await assert.rejects(async () => broken.engagementImport.post!.render(request), (error: unknown) => error === unexpected);
-    // An import POST resolved under the wrong URL shape is refused as missing,
-    // not rendered.
-    await assert.rejects(
-      async () =>
-        refusal.engagementImport.get!.render({ ...request, method: "GET", path: "/projects/project-1/transcripts/import" }),
-    );
+      );
+      // The corrected form keeps the same formats and size guidance as the
+      // initial form, so a user correcting a refused submission still sees it.
+      const refusalNotice = refusals[0]!.notice;
+      assert.ok(refusalNotice.includes(escapeHtml(supportedFormatsText())));
+      assert.ok(refusalNotice.includes(escapeHtml(importLimitsText())));
+      // A refused submission wrote nothing.
+      assert.equal(store.snapshot().meetings.length, 0);
+      // A failure that is not a refusal (here, the originals store failing on a
+      // file import whose content is otherwise acceptable) is reported unchanged,
+      // never rendered as a form problem and never replaced by the submission's
+      // own error.
+      const fileRequest = {
+        ...request,
+        form: { ...request.form, [PASTE_CONTROL]: "", [FILE_CONTROL]: "words.txt" },
+        file: { filename: "words.txt", bytes: new TextEncoder().encode("Words.") },
+      };
+      await assert.rejects(
+        async () => table.engagementImport.post!.render(fileRequest),
+        (error: unknown) =>
+          !(error instanceof FormError) &&
+          error instanceof PersistenceError &&
+          String(((error.cause as Error | undefined)?.cause as Error | undefined)?.message).includes("originals store is unavailable"),
+      );
+      assert.equal(store.snapshot().meetings.length, 0, "a failed import writes nothing");
+      // An import POST resolved under the wrong URL shape is refused as missing,
+      // not rendered.
+      await assert.rejects(
+        async () =>
+          table.engagementImport.get!.render({ ...request, method: "GET", path: "/projects/project-1/transcripts/import" }),
+      );
+    } finally {
+      await store.close();
+    }
   });
 
   it("leaves the url-encoded form behaviour on every non-import POST", async () => {
@@ -1058,18 +1061,9 @@ describe("transcript import submissions", () => {
           ]),
           unselectedFile: true,
         },
-        // Neither at all: the source controls were not submitted.
-        {
-          title: "Nothing",
-          entries: new Map<string, string | { readonly filename: string; readonly body: string }>([
-            ["title", "Nothing"],
-            ["date", "2026-04-03"],
-          ]),
-          unselectedFile: false,
-        },
       ];
       for (const attempt of cases) {
-        const { reply, form } = await submitRendered(server.origin, path, attempt.entries, {
+        const { reply } = await submitRendered(server.origin, path, attempt.entries, {
           unselectedFile: attempt.unselectedFile,
         });
         assert.equal(reply.status, 400, attempt.title);
@@ -1080,7 +1074,29 @@ describe("transcript import submissions", () => {
         // title is kept.
         assert.match(formOf(reply.body), /enctype="multipart\/form-data"/);
         assert.ok(page.includes(`value="${escapeHtml(attempt.title)}"`));
+        // The corrected form keeps the formats and size guidance.
+        assert.ok(page.includes(escapeHtml(supportedFormatsText())), attempt.title);
+        assert.ok(page.includes(escapeHtml(importLimitsText())), attempt.title);
       }
+      // Neither at all, sent as a raw HTTP body: the source controls are absent
+      // from the multipart body entirely (no paste part, no file part), which a
+      // browser never sends, so the handler's own neither check refuses it.
+      const rawNeither = await postBytes(
+        server.origin,
+        path,
+        MULTIPART_TYPE,
+        multipart([
+          { name: "title", body: "Nothing" },
+          { name: "date", body: "2026-04-03" },
+        ]),
+      );
+      assert.equal(rawNeither.status, 400, "neither source control was submitted");
+      const rawPage = mainOf(rawNeither.body);
+      assert.match(rawPage, /exactly one transcript/i);
+      assert.match(rawPage, /never both and never neither/);
+      assert.match(formOf(rawNeither.body), /enctype="multipart\/form-data"/);
+      assert.ok(rawPage.includes('value="Nothing"'));
+      assert.ok(rawPage.includes(escapeHtml(supportedFormatsText())));
       assert.deepEqual(counts(server.store), before, "no meeting or source was created");
     } finally {
       await server.close();
@@ -1238,19 +1254,21 @@ describe("transcript import submissions", () => {
     const server = await running();
     try {
       const before = counts(server.store);
-      // The rendered form is multipart; a body sent with the wrong encoding to a
-      // marked slot is refused by the shell's media check.
-      const reply = (await submitRendered(
+      // The rendered form is multipart; a well-formed URL-encoded body sent to a
+      // marked slot is refused by the shell's media check before any handler
+      // runs, and nothing is written.
+      const form = new URLSearchParams();
+      form.set("title", "x");
+      form.set("date", "2026-01-01");
+      form.set(PASTE_CONTROL, "Words");
+      const reply = await postBytes(
         server.origin,
         engagementImportHref(server.engagementId),
-        new Map<string, string | { readonly filename: string; readonly body: string }>([
-          ["title", "x"],
-          ["date", "2026-01-01"],
-          [PASTE_CONTROL, "Words"],
-        ]),
-        { contentTypeOverride: "application/x-www-form-urlencoded" },
-      )).reply;
+        "application/x-www-form-urlencoded",
+        Buffer.from(form.toString(), "utf8"),
+      );
       assert.equal(reply.status, 415);
+      assert.match(reply.body, /not a multipart\/form-data body/);
       assert.deepEqual(counts(server.store), before);
     } finally {
       await server.close();
