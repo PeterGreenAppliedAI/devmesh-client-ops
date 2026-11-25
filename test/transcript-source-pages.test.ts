@@ -25,6 +25,7 @@ import { registerRoutes } from "../src/index.ts";
 import { matchMeetingPath, meetingRoutes, routeForMeetingPattern } from "../src/meeting-pages.ts";
 import { startServer } from "../src/server.ts";
 import { openStore, type Snapshot, type Store, type TranscriptSource } from "../src/store.ts";
+import { MissingRecordError } from "../src/model.ts";
 import { transcriptService, type TranscriptSourceRead } from "../src/transcript-store.ts";
 import type { OriginalFileSystem } from "../src/transcript-files.ts";
 import { importPdf } from "../src/transcript-pdf.ts";
@@ -36,9 +37,6 @@ import {
   resolveSourceTarget,
   sourceHref,
   transcriptSourceRoutes,
-  encodeSegment,
-  decodeSegment,
-  recordSegment,
 } from "../src/transcript-source-pages.ts";
 import { extractBlocks, importDocx } from "../src/transcript-docx.ts";
 import type { Passage } from "../src/transcript.ts";
@@ -173,17 +171,56 @@ async function notesMeeting(
   return meeting.id;
 }
 
-/** The three view paths of one source, from the production helper. */
-function views(
-  meetingId: string,
-  transcriptId: string,
-  sourceId: string,
-): { original: string; text: string; passages: string } {
-  return {
-    original: sourceHref(meetingId, transcriptId, sourceId, "original"),
-    text: sourceHref(meetingId, transcriptId, sourceId, "text"),
-    passages: sourceHref(meetingId, transcriptId, sourceId, "passages"),
-  };
+/**
+ * One path segment of a link, rebuilt in the test so hand-built paths can name
+ * a record: the same lossless spelling the production links carry (a fixed
+ * prefix and the base64url of the id's code-unit hex), never imported from the
+ * module under test.
+ */
+function segment(id: string): string {
+  let hex = "";
+  for (let index = 0; index < id.length; index += 1) hex += id.charCodeAt(index).toString(16).padStart(4, "0");
+  return `~${Buffer.from(hex, "utf8").toString("base64url")}`;
+}
+
+/**
+ * The decoded ids of one source link, read back through the production
+ * interfaces only: one view link is split into its raw segments, the route
+ * handler decodes each exactly once, and the read's own source id names the
+ * third. A segment the handler refuses is reported as such.
+ */
+async function decodeHref(store: Store, href: string, view: "text" | "original" | "passages" = "text"): Promise<{
+  meetingId: string;
+  transcriptId: string;
+  sourceId: string;
+}> {
+  const parts = href.split("?")[0].split("/");
+  assert.equal(parts.length, 8, href);
+  const routes = transcriptSourceRoutes(store);
+  const read = await routes[view].get.render({
+    method: "GET",
+    meetingId: parts[2],
+    transcriptId: parts[4],
+    sourceId: parts[6],
+  });
+  return { meetingId: parts[2], transcriptId: parts[4], sourceId: (read as unknown as TranscriptSourceRead).sourceId };
+}
+
+/** True when a source link is refused as no record, before any record read. */
+async function segmentRefused(store: Store, href: string): Promise<boolean> {
+  const parts = href.split("?")[0].split("/");
+  try {
+    await transcriptSourceRoutes(store).text.get.render({
+      method: "GET",
+      meetingId: parts[2],
+      transcriptId: parts[4],
+      sourceId: parts[6],
+    });
+    return false;
+  } catch (error) {
+    assert.equal(error instanceof MissingRecordError, true, String(error));
+    return true;
+  }
 }
 
 /**
@@ -261,18 +298,18 @@ async function onlyRow(server: Running, meetingId: string): Promise<DetailRow> {
 describe("transcript source paths: exact fixed shapes", () => {
   it("matches only the three exact source views and keeps the meeting paths", () => {
     const base =
-      `/meetings/${encodeSegment("meeting-1")}` +
-      `/transcripts/${encodeSegment("sha256:abc")}` +
-      `/sources/${encodeSegment("src-1")}`;
+      `/meetings/${segment("meeting-1")}` +
+      `/transcripts/${segment("sha256:abc")}` +
+      `/sources/${segment("src-1")}`;
     for (const view of ["original", "text", "passages"] as const) {
       const matched = matchTranscriptSourcePath(`${base}/${view}`);
       assert.notEqual(matched, null);
       assert.equal(matched?.view, view);
       // The matcher keeps the raw, still-encoded segments; only a handler
       // decodes them.
-      assert.equal(matched?.meetingId, encodeSegment("meeting-1"));
-      assert.equal(matched?.transcriptId, encodeSegment("sha256:abc"));
-      assert.equal(matched?.sourceId, encodeSegment("src-1"));
+      assert.equal(matched?.meetingId, segment("meeting-1"));
+      assert.equal(matched?.transcriptId, segment("sha256:abc"));
+      assert.equal(matched?.sourceId, segment("src-1"));
       assert.equal(matched?.pattern, `/meetings/:id/transcripts/:transcriptId/sources/:sourceId/${view}`);
     }
     // Another view, a missing segment, an extra segment and a query keep it a
@@ -281,7 +318,7 @@ describe("transcript source paths: exact fixed shapes", () => {
       `${base}/raw`,
       `${base}`,
       `${base}/original/extra`,
-      `/meetings/${encodeSegment("meeting-1")}/transcripts/${encodeSegment("sha256:abc")}/sources/original`,
+      `/meetings/${segment("meeting-1")}/transcripts/${segment("sha256:abc")}/sources/original`,
       "/engagements/engagement-1/transcripts/import",
       // An inherited property name of an ordinary object names no view.
       `${base}/constructor`,
@@ -291,7 +328,7 @@ describe("transcript source paths: exact fixed shapes", () => {
       // A path without its leading separator does not match, and no empty
       // segment is accepted, so no leading component is silently discarded.
       base.slice(1) + "/text",
-      `/meetings//transcripts/${encodeSegment("sha256:abc")}/sources/${encodeSegment("src-1")}/text`,
+      `/meetings//transcripts/${segment("sha256:abc")}/sources/${segment("src-1")}/text`,
       `${base}//text`,
     ]) {
       assert.equal(matchTranscriptSourcePath(path), null, path);
@@ -299,47 +336,76 @@ describe("transcript source paths: exact fixed shapes", () => {
     assert.notEqual(matchTranscriptSourcePath(`${base}/text?x=1`), null);
     // The ordinary meeting paths are still matched by the meeting table.
     assert.equal(matchMeetingPath(`${base}/text`), null);
-    assert.notEqual(matchMeetingPath(`/meetings/${encodeSegment("meeting-1")}`), null);
-    assert.notEqual(matchMeetingPath(`/meetings/${encodeSegment("meeting-1")}/edit`), null);
+    assert.notEqual(matchMeetingPath(`/meetings/${segment("meeting-1")}`), null);
+    assert.notEqual(matchMeetingPath(`/meetings/${segment("meeting-1")}/edit`), null);
   });
 
-  it("encodes each id as one reversible, collision-free segment that survives URL resolution", () => {
+  it("encodes each id as one reversible, collision-free segment that survives URL resolution", async () => {
     // The encoding is one segment for any stored id, including a stored `.`,
-    // `..`, a slash, a query or a fragment character, a dot and supplementary
-    // characters. A browser's URL resolution against the canonical origin keeps
-    // the segment exactly as written.
-    const ids = [".", "..", "a/b", "a?b", "a#b", "p.1", "p_1", "p😀", "p😁", "\u0000", "", "sha256:abc"];
-    // `recordSegment` refuses the empty id (a stored id is never blank) and
-    // otherwise equals the reversible encoding.
-    ids.filter((id) => id !== "").forEach((id) => assert.equal(recordSegment(id), encodeSegment(id), id));
-    assert.throws(() => recordSegment(""), /No record/);
-    for (const id of ids) {
-      const encoded = encodeSegment(id);
-      assert.match(encoded, /^~[A-Za-z0-9_-]*$/);
-      assert.equal(encoded.includes("/"), false, id);
-      // Every nonempty id round-trips; the blank encoding names no record.
-      if (id === "") assert.throws(() => decodeSegment(encoded), /No record/);
-      else assert.equal(decodeSegment(encoded), id, id);
+    // `..`, a slash, a query or a fragment character, a dot, supplementary
+    // characters, an unpaired surrogate and an initial U+FEFF (which a UTF-8
+    // decoder would strip). Every id is exercised through the production
+    // interfaces: a generated link, browser URL resolution, and the route
+    // handler that decodes it exactly once.
+    const store = await openStore(tempDir());
+    try {
+      const ids = [".", "..", "a/b", "a?b", "a#b", "p.1", "p_1", "p😀", "p😁", "\u0000", "\uFEFFx", "\uD800", "\uDC00", "sha256:abc"];
+      const hrefs = ids.map((id) => sourceHref(id, "..", "p.", "text"));
+      // No link carries a bare path separator from its ids: every segment of
+      // the link is the encoded single segment, and the link stays root-relative.
+      for (const href of hrefs) {
+        assert.match(href, /^\/meetings\/~[A-Za-z0-9_-]+\/transcripts\/~[A-Za-z0-9_-]+\/sources\/~[A-Za-z0-9_-]+\/text$/, href);
+      }
+      // Distinct ids never share a link.
+      assert.equal(new Set(hrefs).size, hrefs.length, "no two ids collide");
+      // A generated href survives the browser's own URL resolution: the segment
+      // keeps its exact spelling, and the handler decodes it back to the id.
+      for (const [index, id] of ids.entries()) {
+        const resolved = new URL(hrefs[index], "http://127.0.0.1:3000");
+        assert.equal(resolved.pathname, hrefs[index], `${JSON.stringify(id)} is never normalised away`);
+        const resolvedParts = resolved.pathname.split("/");
+        assert.equal(resolvedParts.length, 8);
+        // The handler decodes each segment exactly once. In a blank store the
+        // decoded meeting is absent, and the handler's refusal carries the
+        // decoded id, so this is the exact stored id the link was built from.
+        const message = await transcriptSourceRoutes(store)
+          .text.get.render({ method: "GET", meetingId: resolvedParts[2], transcriptId: resolvedParts[4], sourceId: resolvedParts[6] })
+          .then(() => assert.fail("a blank store has no such meeting"), (error: unknown) => {
+            assert.equal(error instanceof MissingRecordError, true, String(error));
+            return (error as Error).message;
+          });
+        assert.equal(message, `No meeting with id ${JSON.stringify(id)}`, JSON.stringify(id));
+      }
+    } finally {
+      await store.close();
     }
-    // Distinct ids never share an encoding.
-    const encodings = ids.map((id) => encodeSegment(id));
-    assert.equal(new Set(encodings).size, encodings.length, "no two ids collide");
-    // A generated href survives the browser's own URL resolution: the segment
-    // keeps its exact spelling and the ids decode back to the stored ones.
-    const href = sourceHref(".", "..", "p.", "text");
-    const resolved = new URL(href, "http://127.0.0.1:3000");
-    assert.equal(resolved.pathname, href, "a dot id is never normalised away");
-    const parts = resolved.pathname.split("/");
-    assert.equal(parts.length, 8);
-    assert.equal(decodeSegment(parts[2]), ".");
-    assert.equal(decodeSegment(parts[4]), "..");
-    assert.equal(decodeSegment(parts[6]), "p.");
-    // Anything but the exact encoding is refused, decoded no further.
-    // The bare prefix `~` is refused: a record id is never blank, so the empty
-    // encoding names no record.
-    assert.throws(() => decodeSegment("~"), /No record/);
-    for (const raw of ["meeting-1", "", "~", "%7E", "~!!!!", encodeSegment("a") + "=", "~YQB", "~a"]) {
-      assert.throws(() => decodeSegment(raw), /No record/, raw);
+  });
+
+  it("refuses any segment that is not the exact encoding", async () => {
+    const store = await openStore(tempDir());
+    try {
+      const good = sourceHref("meeting-1", "transcript-1", "source-1", "text");
+      const parts = good.split("/");
+      // The exact spelling is accepted (it resolves no record in a blank store,
+      // so the handler then reports the missing meeting, not a bad segment).
+      assert.equal(await decodeHref(store, good).then(() => "decoded", () => "refused"), "refused");
+      // A bare id, a percent-escaped prefix, a padded tail, a trailing-bit
+      // variant, an invalid hex spelling and the blank encoding are refused as
+      // no record before any read.
+      const badSegments = [
+        parts[2].slice(1),
+        "%7E" + parts[2].slice(1),
+        parts[2] + "=",
+        parts[2] + "YQ",
+        "~!!!!",
+        "~",
+      ];
+      for (const bad of badSegments) {
+        const path = `/meetings/${bad}/transcripts/${parts[4]}/sources/${parts[6]}/text`;
+        assert.equal(await segmentRefused(store, path), true, bad);
+      }
+    } finally {
+      await store.close();
     }
   });
 
@@ -630,12 +696,11 @@ describe("transcript source views: original, text and passages", () => {
         assert.equal(row!.format, source.format, source.id);
         assert.equal(row!.viewLinks.original, sourceHref(meetingId, transcript.id, source.id, "original"));
         assert.equal(row!.viewLinks.passages, sourceHref(meetingId, transcript.id, source.id, "passages"));
-        for (const view of ["original", "text", "passages"] as const) {
-          assert.equal((await send(server.origin, row!.viewLinks[view])).status, 200, `${source.id} ${view}`);
-        }
-        // Each source's extracted text is its own, served from its own links.
-        const text = await send(server.origin, row!.viewLinks.text);
-        assert.equal(text.body, source.extractedText);
+        // Every one of the row's three links answers, and the text is that
+        // source's own.
+        const replies = await followRowLinks(server, row!);
+        assert.equal(replies.text.body, source.extractedText);
+        assert.match(String(replies.passages.headers["content-type"]), /^text\/html/);
       }
     } finally {
       await server.close();
@@ -650,13 +715,15 @@ describe("transcript source views: original, text and passages", () => {
       const detail = await send(server.origin, `/meetings/${meetingId}`);
       assert.equal(detail.status, 200);
       assert.ok(detail.body.includes("No transcript sources recorded yet."));
-      // The meeting detail still offers its one import action, encoded.
-      assert.match(detail.body, /href="[^"]*\/transcripts\/import"/);
-      assert.equal((detail.body.match(/href="[^"]*\/transcripts\/import"/g) ?? []).length, 1);
+      // The meeting detail still offers its import action at this meeting's
+      // own encoded destination.
+      const importHref = `/meetings/${encodeURIComponent(meetingId)}/transcripts/import`;
+      assert.ok(detail.body.includes(`href="${importHref}"`), "the import action names this meeting");
+      assert.ok(detail.body.includes("Import transcript"));
       // A source path of an absent transcript is a 404, never a page or a read.
       const missing = await send(
         server.origin,
-        `/meetings/${encodeSegment(meetingId)}/transcripts/${encodeSegment("sha256:" + "0".repeat(64))}/sources/${encodeSegment("source-1")}/text`,
+        `/meetings/${segment(meetingId)}/transcripts/${segment("sha256:" + "0".repeat(64))}/sources/${segment("source-1")}/text`,
       );
       assert.equal(missing.status, 404);
     } finally {
@@ -711,23 +778,47 @@ describe("transcript source views: escaped text and quotes", () => {
     assert.ok(section.body.includes("line 1, column 1"));
     // The second passage follows one blank line, so it is at line 3, column 1;
     // its half-open offsets index the very text it sits in, and its row shows
-    // that stored position (never the row number).
+    // that stored position (never the row number). The metadata is checked
+    // inside the row that carries `Second`, so swapped locations between the
+    // rows would fail.
     assert.ok(section.body.includes("offsets 7–13 (UTF-16, start inclusive, end exclusive)"));
     assert.ok(section.body.includes("line 3, column 1"));
     assert.equal(section.body.includes("line 2, column 1"), false, "no row is given its row number as a line");
-    // A passage starting mid-line shows its exact 1-based column.
-    // A passage starting after two spaces on its line is at column 3.
+    const secondRow = section.body.split('<li class="passage"').slice(1).find((row) =>
+      row.includes(`<p class="passage-text">${escapeHtml("Second")}</p>`),
+    );
+    assert.notEqual(secondRow, undefined, "the second row is rendered");
+    assert.ok(secondRow!.includes("offsets 7–13"), "the second row owns its offsets");
+    assert.ok(secondRow!.includes("line 3, column 1"), "the second row owns its position");
+    const firstRow = section.body.split('<li class="passage"').slice(1).find((row) =>
+      row.includes(`<p class="passage-text">${escapeHtml("First")}</p>`),
+    );
+    assert.notEqual(firstRow, undefined, "the first row is rendered");
+    assert.ok(firstRow!.includes("offsets 0–5"), "the first row owns its offsets");
+    assert.ok(firstRow!.includes("line 1, column 1"), "the first row owns its position");
+    // A passage starting mid-line shows its exact 1-based column: its text
+    // starts at offset 2 of `  Second`, after two leading spaces, so its stored
+    // range starts at 2 and its line 1 column is 3.
     const inlineSource = markedSourceRead([{ id: "p1", text: "  Second" }]);
     const inline = {
       ...inlineSource,
-      passages: [{ ...inlineSource.passages[0], location: { ...inlineSource.passages[0].location, column: 3 } }],
+      passages: [
+        {
+          ...inlineSource.passages[0],
+          text: "Second",
+          range: { start: 2, end: 2 + "Second".length },
+          location: { ...inlineSource.passages[0].location, start: 2, end: 2 + "Second".length, column: 3 },
+        },
+      ],
     };
     const inlineBody = passagesSection(inline, inline.meetingId).body;
+    assert.ok(inlineBody.includes("offsets 2–8 (UTF-16, start inclusive, end exclusive)"));
     assert.ok(inlineBody.includes("line 1, column 3"), "a passage starting mid-line keeps its column");
     // In stored order, the second row follows the first.
     assert.ok(section.body.indexOf("First") < section.body.indexOf("Second"));
-    // The anchors name the source, so a link never points into another source.
-    assert.ok(anchorIdForText(read, "First").includes("src-a"));
+    // The anchors name the source, so a link never points into another source:
+    // the source id is carried losslessly as its code-unit hex spelling.
+    assert.ok(anchorIdForText(read, "First").includes("passage-007300720063002d0061-"));
     // The passages page carries links back to this source's text and original.
     const hrefs = [...section.body.matchAll(/href="([^"]+)"/g)].map((match) => match[1]);
     assert.ok(hrefs.includes(sourceHref(read.meetingId, read.transcriptId, "src-a", "text")));
@@ -808,8 +899,13 @@ describe("transcript source views: resolved references", () => {
       // Each source is served under its own meeting.
       const firstRow = await onlyRow(server, firstMeeting);
       const secondRow = await onlyRow(server, secondMeeting);
-      assert.equal((await send(server.origin, firstRow.viewLinks.text)).body, "First words.");
-      assert.equal((await send(server.origin, secondRow.viewLinks.text)).body, "Second words.");
+      // Each detail row's own three links are followed and answer their source.
+      const firstReplies = await followRowLinks(server, firstRow);
+      const secondReplies = await followRowLinks(server, secondRow);
+      assert.equal(firstReplies.text.body, "First words.");
+      assert.equal(secondReplies.text.body, "Second words.");
+      assert.ok(firstReplies.passages.body.includes("First words."));
+      assert.ok(secondReplies.passages.body.includes("Second words."));
 
       // Swapping the meeting (or the transcript) makes the reference mismatched.
       for (const path of [
@@ -826,9 +922,9 @@ describe("transcript source views: resolved references", () => {
       // before any read: a malformed escape, a bare stored id, a percent-escaped
       // encoding and a padded or trailing-bit variant of a valid one.
       const good = sourceHref(firstMeeting, first.transcriptId, first.sourceId, "text");
-      const encodedSource = encodeSegment(first.sourceId);
-      const encodedMeeting = encodeSegment(firstMeeting);
-      const encodedTranscript = encodeSegment(first.transcriptId);
+      const encodedSource = segment(first.sourceId);
+      const encodedMeeting = segment(firstMeeting);
+      const encodedTranscript = segment(first.transcriptId);
       for (const path of [
         `/meetings/${encodedMeeting}/transcripts/%E0%A4%A/sources/${encodedSource}/text`,
         `/meetings/${encodedMeeting}/transcripts/${encodedTranscript}/sources/%ZZ/text`,
@@ -876,9 +972,9 @@ describe("transcript source views: resolved references", () => {
       assert.throws(
         () => resolveSourceTarget(
           detached,
-          encodeSegment(meetingId),
-          encodeSegment(transcript.id),
-          encodeSegment(source.id),
+          segment(meetingId),
+          segment(transcript.id),
+          segment(source.id),
         ),
         /No meeting/,
         "a transcript whose meeting is absent names no source",
@@ -889,38 +985,77 @@ describe("transcript source views: resolved references", () => {
       assert.equal(detached.meetings.some((candidate) => candidate.id === meetingId), false);
       assert.equal(detached.transcripts!.length, 1);
 
-      // A detached snapshot where a retained original is no longer named by any
-      // committed source (in the same workspace state, the store's own snapshot
-      // is read through the resolver here): its hash is not reachable through any
-      // source route, and the committed source is still listed and read.
+      // One workspace state in which the retained original is no longer named by
+      // any committed source: every read of the open store delegates to it, but
+      // its snapshot omits this source, so the listing and every source route see
+      // the unreferenced state together. The store is not mutated.
       const withoutSource = {
         ...snapshot,
         transcripts: snapshot.transcripts!.map((candidate) => ({
           ...candidate,
           sources: candidate.sources.filter((each) => each.id !== source.id),
-        })).filter((candidate) => candidate.sources.length > 0),
+        })),
       } as Snapshot;
-      assert.throws(
-        () => resolveSourceTarget(
-          withoutSource,
-          encodeSegment(meetingId),
-          encodeSegment(transcript.id),
-          encodeSegment(source.id),
-        ),
-        /No transcript|No source/,
-        "a retained original with no committed source names no source",
+      assert.equal(
+        withoutSource.transcripts!.some((candidate) => candidate.sources.some((each) => each.id === source.id)),
+        false,
+        "the retained original is named by no source",
       );
-      // The same workspace state as the open store: the committed source is
-      // listed once in the section built from the store's own snapshot.
-      const listed = server.store.snapshot().transcripts!.find((candidate) => candidate.id === transcript.id)!;
-      assert.equal(listed.sources.some((each) => each.id === source.id), true);
-      const section = meetingSourceSection(server.store.snapshot(), meetingId);
-      assert.ok(section.includes(`<li class="card">`));
-      assert.equal((section.match(/<li class="card">/g) ?? []).length, listed.sources.length);
-      const row = await onlyRow(server, meetingId);
-      assert.equal((await send(server.origin, row.viewLinks.text)).body, "Orphan original words.");
-      const hashPath = `/meetings/${encodeSegment(meetingId)}/transcripts/${encodeSegment(transcript.id)}/sources/${encodeSegment(source.originalSha256!)}/text`;
-      assert.equal((await send(server.origin, hashPath)).status, 404, "no source id equals the hash");
+      const orphaned: Store = new Proxy(server.store, {
+        get(target, property, receiver) {
+          if (property !== "snapshot") return Reflect.get(target, property, receiver);
+          return () => withoutSource;
+        },
+      });
+      // The listing built from that same state omits the unreferenced source.
+      const section = meetingSourceSection(withoutSource, meetingId);
+      assert.ok(section.includes("No transcript sources recorded yet."), "the empty source list says so");
+      assert.equal((section.match(/<li class="card">/g) ?? []).length, 0, "the unreferenced source is not listed");
+      assert.equal(section.includes("orphan.txt"), false, "the unreferenced filename is not listed");
+      const routes = registerRoutes(orphaned);
+      // The meeting detail route reads a percent-encoded path id, so the
+      // detail page is requested with the meeting's id encoded that way.
+      const detail = routes.hierarchy!.route(
+        routes.hierarchy!.match(`/meetings/${encodeURIComponent(meetingId)}`),
+        "GET",
+      );
+      assert.notEqual(detail, undefined);
+      const detailPage = await detail!.render({
+        method: "GET",
+        path: `/meetings/${encodeURIComponent(meetingId)}`,
+        origin: "",
+        form: {},
+        file: null,
+      });
+      assert.equal(JSON.stringify(detailPage).includes("Orphan original words."), false, "the orphan text is never shown");
+      // Every source route for the unreferenced source refuses it as a 404 in
+      // that same state, before any original is read.
+      for (const view of ["original", "text", "passages"] as const) {
+        const path = `/meetings/${segment(meetingId)}/transcripts/${segment(transcript.id)}/sources/${segment(source.id)}/${view}`;
+        const route = routes.hierarchy!.route(routes.hierarchy!.match(path), "GET");
+        assert.notEqual(route, undefined, view);
+        await assert.rejects(
+          async () => route!.render({ method: "GET", path: "", origin: "", form: {}, file: null }),
+          (error: unknown) => error instanceof MissingRecordError,
+          view,
+        );
+      }
+      // Through HTTP over the same workspace state, the unreadable orphan is a
+      // 404 for every view; no route reaches the retained original's hash.
+      const orphanServer = await startServer({ store: orphaned, port: 0, routes: registerRoutes(orphaned) });
+      try {
+        for (const view of ["original", "text", "passages"] as const) {
+          const reply = await send(
+            orphanServer.origin,
+            `/meetings/${segment(meetingId)}/transcripts/${segment(transcript.id)}/sources/${segment(source.id)}/${view}`,
+          );
+          assert.equal(reply.status, 404, view);
+        }
+        const hashPath = `/meetings/${segment(meetingId)}/transcripts/${segment(transcript.id)}/sources/${segment(source.originalSha256!)}/text`;
+        assert.equal((await send(orphanServer.origin, hashPath)).status, 404, "no source id equals the hash");
+      } finally {
+        await orphanServer.close();
+      }
     } finally {
       await server.close();
     }
@@ -948,8 +1083,14 @@ describe("transcript source views: resolved references", () => {
 
       const acmeRow = await onlyRow(server, acmeMeeting);
       const otherRow = await onlyRow(server, otherMeeting);
-      const acmeText = await send(server.origin, acmeRow.viewLinks.text);
-      const otherText = await send(server.origin, otherRow.viewLinks.text);
+      // Both sources' three links are followed; equal canonical text still
+      // serves each engagement's own original.
+      const acmeReplies = await followRowLinks(server, acmeRow);
+      const otherReplies = await followRowLinks(server, otherRow);
+      const acmeText = acmeReplies.text;
+      const otherText = otherReplies.text;
+      assert.deepEqual(new Uint8Array(acmeReplies.original.bytes), encoder.encode("Shared words."));
+      assert.deepEqual(new Uint8Array(otherReplies.original.bytes), encoder.encode(" Shared words.\r\n"));
       assert.equal(acmeText.body, "Shared words.");
       assert.equal(otherText.body, " Shared words.\r\n");
       assert.deepEqual(new Uint8Array(acmeText.bytes), encoder.encode("Shared words."));
@@ -972,12 +1113,10 @@ describe("transcript source views: resolved references", () => {
       const meetingId = await notesMeeting(server.store, parents);
       const imported = await importFor(server.store, meetingId, { kind: "paste", text: "Read only." });
       const before = JSON.stringify(server.store.snapshot());
-      const reply = await send(
-        server.origin,
-        views(imported.meetingId, imported.transcriptId, imported.sourceId).text,
-        "POST",
-        server.origin,
-      );
+      // A POST to the detail page's own text link is refused by the shell.
+      const row = await onlyRow(server, meetingId);
+      assert.equal(imported.sourceId, imported.sourceIds[0]);
+      const reply = await send(server.origin, row.viewLinks.text, "POST", server.origin);
       assert.equal(reply.status, 405);
       assert.equal(JSON.stringify(server.store.snapshot()), before, "a source request writes nothing");
     } finally {
@@ -1052,8 +1191,11 @@ describe("transcript source views: an unreadable referenced original", () => {
           "2026-07-08",
         );
         await importFor(server.store, unaffectedMeeting, { kind: "paste", text: "Still readable." });
+        // The unaffected source opens through all three of its own links.
         const unaffectedRow = await onlyRow(server, unaffectedMeeting);
-        assert.equal((await send(server.origin, unaffectedRow.viewLinks.text)).body, "Still readable.");
+        const unaffected = await followRowLinks(server, unaffectedRow);
+        assert.equal(unaffected.text.body, "Still readable.");
+        assert.ok(unaffected.passages.body.includes("Still readable."));
       } finally {
         await server.close();
       }
@@ -1118,10 +1260,11 @@ describe("transcript source pages: snapshot-built listing and route table", () =
     // The empty section repeats no second import action; the meeting's own
     // header already offers it once.
     assert.equal(section.includes("/transcripts/import"), false);
-    // Every nonempty id encodes as one segment; a blank record id names no
-    // record at all and is refused before any href is built.
-    assert.equal(recordSegment("meeting-1"), encodeSegment("meeting-1"));
-    assert.throws(() => recordSegment(""), /No record/);
+    // A source link for an id is one prefixed segment; the handler decodes it
+    // back to the exact stored id (a blank record id names no record at all,
+    // and a link for it is refused before any read).
+    assert.equal(sourceHref("meeting-1", "t", "s", "text").split("/")[2], segment("meeting-1"));
+    assert.equal(sourceHref("meeting-1", "t", "s", "text").split("/")[6], segment("s"));
     // No transcript collection at all is still an empty list, never a failure.
     assert.equal(section.includes("card-list"), false);
   });
@@ -1133,40 +1276,71 @@ describe("transcript source pages: snapshot-built listing and route table", () =
       const meetingId = await notesMeeting(server.store, parents);
       const imported = await importFor(server.store, meetingId, { kind: "paste", text: "Borrowed words." });
 
-      // The application's routes are registered over its own store. Showing a
-      // meeting needs no original read, and a valid source read returns the
-      // store's own committed text through the borrowed service; both requests
-      // reach the registered table, so a service borrowed during them would be
-      // the application's own.
-      type SourceMatch = { readonly pattern: string; readonly source?: { readonly meetingId: string } };
-      const registered = registerRoutes(server.store).hierarchy!;
-      const detailMatch = registered.match(`/meetings/${encodeSegment(meetingId)}`) as SourceMatch | null;
-      assert.equal(detailMatch?.pattern, "/meetings/:id");
-      const sourceMatch = registered.match(
-        `/meetings/${encodeSegment(meetingId)}/transcripts/${encodeSegment(imported.transcriptId)}/sources/${encodeSegment(imported.sourceId)}/text`,
-      ) as SourceMatch | null;
-      // The match keeps the route's own encoded spelling; its handler decodes it.
-      assert.equal(sourceMatch?.source?.meetingId, encodeSegment(meetingId));
-      // The registered table's source route borrows a service whose read names
-      // the same snapshot the open store serves, and the store stays open after.
-      const table = meetingRoutes(server.store);
-      // The handler receives the matched, still-encoded segments and decodes
-      // them exactly once to reach the store's committed source.
-      const read = await table.sources.text.get.render({
-        method: "GET",
-        meetingId: encodeSegment(meetingId),
-        transcriptId: encodeSegment(imported.transcriptId),
-        sourceId: encodeSegment(imported.sourceId),
+      // An observable store that delegates every read to the open store and
+      // counts how often the transcript service asks it for its original-file
+      // store (`originalFiles()`). That call happens when the service is built,
+      // so the count says exactly when the service was borrowed. Every other
+      // operation is delegated unchanged, so the workspace stays one store.
+      interface CommitStore { originalFiles(): unknown }
+      let originalFilesCalls = 0;
+      const inner = server.store as unknown as CommitStore & Store;
+      const observed: Store = new Proxy(server.store, {
+        get(target, property, receiver) {
+          if (property !== "originalFiles") return Reflect.get(target, property, receiver);
+          return () => {
+            originalFilesCalls += 1;
+            return inner.originalFiles();
+          };
+        },
       });
+
+      // Registering the application's own route table borrows nothing.
+      const registered = registerRoutes(observed);
+      assert.equal(originalFilesCalls, 0, "registration borrows no service");
+      const table = registered.hierarchy!;
+      const detailMatch = table.match(`/meetings/${encodeURIComponent(meetingId)}`);
+      assert.notEqual(detailMatch, null);
+      const detailRoute = table.route(detailMatch, "GET");
+      assert.notEqual(detailRoute, undefined, "the meeting detail slot is registered");
+
+      // Showing a meeting needs no original read and borrows nothing.
+      const detail = await detailRoute!.render({
+        method: "GET",
+        path: `/meetings/${encodeURIComponent(meetingId)}`,
+        origin: "",
+        form: {},
+        file: null,
+      });
+      assert.equal(originalFilesCalls, 0, "showing a meeting borrows no service");
+      assert.equal(JSON.stringify(detail).includes("Borrowed words."), false);
+
+      // The first valid source read borrows the service exactly once, from the
+      // very store the routes were registered over, and returns its text.
+      const sourceMatch = table.match(
+        `/meetings/${segment(meetingId)}/transcripts/${segment(imported.transcriptId)}/sources/${segment(imported.sourceId)}/text`,
+      );
+      assert.notEqual(sourceMatch, null);
+      const sourceRoute = table.route(sourceMatch, "GET");
+      assert.notEqual(sourceRoute, undefined, "the source text slot is registered");
+      const read = await sourceRoute!.render({ method: "GET", path: "", origin: "", form: {}, file: null });
+      assert.equal(originalFilesCalls, 1, "the first read borrows the service once");
       assert.equal((read as { body: string }).body, "Borrowed words.");
+
+      // A second read reuses the one borrowed service; an HTTP read over the
+      // real server still serves the store's own committed text.
+      await sourceRoute!.render({ method: "GET", path: "", origin: "", form: {}, file: null });
+      assert.equal(originalFilesCalls, 1, "later reads reuse the borrowed service");
+      assert.equal(sourceRoute!.method, "GET");
       assert.equal(server.store.snapshot().transcripts![0].sources.length, 1);
       const row = await onlyRow(server, meetingId);
       assert.equal((await send(server.origin, row.viewLinks.text)).body, "Borrowed words.");
+
       // The table's meeting slot is still a GET, and the source slots are GET-only.
-      assert.equal(routeForMeetingPattern(table, "/meetings/:id", "GET")?.method, "GET");
-      assert.equal(table.sources.original.get.method, "GET");
-      assert.equal(table.sources.text.get.method, "GET");
-      assert.equal(table.sources.passages.get.method, "GET");
+      const meetingTable = meetingRoutes(server.store);
+      assert.equal(routeForMeetingPattern(meetingTable, "/meetings/:id", "GET")?.method, "GET");
+      assert.equal(meetingTable.sources.original.get.method, "GET");
+      assert.equal(meetingTable.sources.text.get.method, "GET");
+      assert.equal(meetingTable.sources.passages.get.method, "GET");
     } finally {
       await server.close();
     }

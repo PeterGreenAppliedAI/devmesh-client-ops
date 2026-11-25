@@ -927,10 +927,15 @@ export function meetingRoutes(store: Store): MeetingRoutes {
           body: displayList(displayValues(MEETING_PROFILE_FIELDS, profile)),
         },
         {
+          // The transcript actions of this meeting: the import form the header
+          // also offers. This place in the page body is kept beside the source
+          // list, exactly as before sources gained their own section.
+          title: "Transcript",
+          body: link(meetingImportHref(meeting.id), "Import transcript"),
+        },
+        {
           // Every committed source of this meeting, from the snapshot metadata
-          // alone, so a missing original cannot break the page. The import
-          // action is offered once in the header nav, so the page keeps exactly
-          // one import action even when this list renders its own fallback.
+          // alone, so a missing original cannot break the page.
           title: "Sources",
           body: meetingSourceSection(snap, meeting.id),
         },

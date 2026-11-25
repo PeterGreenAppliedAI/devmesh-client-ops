@@ -34,11 +34,12 @@
  *
  * Every displayed value is escaped. Every id in a link is encoded as one path
  * segment through `encodeSegment`: a fixed prefix plus the base64url of the
- * id's UTF-8 bytes. The encoding is reversible and collision-free, contains
- * only URL, path and HTML-safe characters, and never reads as `.` or `..`, so
- * no browser URL resolution can drop or re-split a segment. The handler decodes
- * it exactly once, and a segment that is not exactly that encoding is refused
- * as a missing record.
+ * id's code-unit hex spelling. The encoding is lossless and collision-free for
+ * every stored string (lone surrogates and an initial U+FEFF included),
+ * contains only URL, path and HTML-safe characters, and never reads as `.` or
+ * `..`, so no browser URL resolution can drop or re-split a segment. The
+ * handler decodes it exactly once, and a segment that is not exactly that
+ * encoding is refused as a missing record.
  */
 import { escapeHtml, renderPage, type Page } from "./html.ts";
 import { MissingRecordError } from "./model.ts";
@@ -99,15 +100,45 @@ export function matchTranscriptSourcePath(
   };
 }
 
+/** The fixed prefix of every encoded segment: never part of base64url. */
+const SEGMENT_PREFIX = "~";
+
+/**
+ * The code-unit hex spelling of a JavaScript string: every UTF-16 code unit of
+ * the string as exactly four lowercase hex digits. It is lossless for every
+ * string JavaScript can hold, including lone surrogate halves (which UTF-8
+ * cannot round-trip) and an initial U+FEFF (which a UTF-8 decoder otherwise
+ * strips), and it is collision-free because each string has exactly one
+ * spelling.
+ */
+function unitHex(value: string): string {
+  let out = "";
+  for (let index = 0; index < value.length; index += 1) {
+    out += value.charCodeAt(index).toString(16).padStart(4, "0");
+  }
+  return out;
+}
+
+/** Decode a code-unit hex spelling exactly; anything else names no record. */
+function fromUnitHex(hex: string): string {
+  if (hex.length % 4 !== 0 || !/^[0-9a-f]*$/.test(hex)) throw new MissingRecordError("No record for that path");
+  let out = "";
+  for (let index = 0; index < hex.length; index += 4) {
+    out += String.fromCharCode(parseInt(hex.slice(index, index + 4), 16));
+  }
+  return out;
+}
+
 /**
  * The single-segment encoding of one record id: the fixed prefix `~` and the
- * base64url of the id's UTF-8 bytes. It is reversible and collision-free, and
- * its alphabet (letters, digits, `-`, `_`) is safe in a path segment, a query
- * and an HTML attribute, so a link never needs a second escape. No value starts
- * with a dot, so a browser's URL resolution never drops or re-reads it.
+ * base64url of the code-unit hex spelling above. It is reversible and
+ * collision-free for every stored string, its alphabet (letters, digits, `-`,
+ * `_`) is safe in a path segment, a query and an HTML attribute, and no value
+ * starts with a dot, so a browser's URL resolution never drops or re-reads it.
  */
 export function encodeSegment(value: string): string {
-  return `~${Buffer.from(value, "utf8").toString("base64url")}`;
+  const hex = unitHex(value);
+  return `${SEGMENT_PREFIX}${hex === "" ? "" : Buffer.from(hex, "utf8").toString("base64url")}`;
 }
 
 /**
@@ -124,29 +155,26 @@ export function recordSegment(value: string): string {
 }
 
 /**
- * Decode exactly one segment id, once. Only the exact encoding `encodeSegment`
- * produces is accepted; anything else (a bare id, a percent-escaped spelling,
- * a padded base64, a non-canonical tail, or an invalid UTF-8 tail) names no
- * record and is a `MissingRecordError`. Decoding the canonical form yields the
- * id's exact UTF-8 bytes, so ids differing in one byte never decode alike.
+ * Decode exactly one segment id, once. Only the exact spelling `encodeSegment`
+ * produces is accepted; anything else (a bare id, a percent-escaped spelling, a
+ * padded base64, a non-canonical tail, an invalid code-unit spelling or the
+ * blank encoding) names no record and is a `MissingRecordError`. The result is
+ * the exact stored string, so two ids differing in one code unit never decode
+ * alike.
  */
 export function decodeSegment(raw: string): string {
-  if (!raw.startsWith("~")) {
-    throw new MissingRecordError("No record for that path");
-  }
-  const body = raw.slice(1);
-  if (!/^[A-Za-z0-9_-]+$/.test(body)) throw new MissingRecordError("No record for that path");
-  let bytes: Uint8Array;
-  let decoded: string;
+  if (!raw.startsWith(SEGMENT_PREFIX)) throw new MissingRecordError("No record for that path");
+  const body = raw.slice(SEGMENT_PREFIX.length);
+  if (body === "" || !/^[A-Za-z0-9_-]+$/.test(body)) throw new MissingRecordError("No record for that path");
+  let hex: string;
   try {
-    bytes = new Uint8Array(Buffer.from(body, "base64url"));
-    decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    hex = Buffer.from(body, "base64url").toString("utf8");
   } catch {
     throw new MissingRecordError("No record for that path");
   }
+  const decoded = fromUnitHex(hex);
   // Re-encoding is the canonical-form check: it rejects padding, unused tail
-  // bits (whose bits spill into the decoded bytes) and any spelling other than
-  // the one `encodeSegment` produces.
+  // bits (whose bits spill into the decoded bytes) and any other spelling.
   if (encodeSegment(decoded) !== raw) throw new MissingRecordError("No record for that path");
   return decoded;
 }
@@ -350,28 +378,14 @@ export function passagesSection(
 /**
  * The fragment anchor of one passage. It is built from the source and passage
  * ids only, so an anchor is scoped to its source and two sources of one
- * transcript cannot collide. The mapping is lossless: every character other
- * than an ASCII letter, digit or `_`/`-` is written as `_` and two lowercase
- * hex digits of its UTF-16 code unit, and a literal `_` is written as `_5f`,
- * so distinct stored passage ids such as `p.1` and `p_1` never share an anchor
- * and every character round-trips. The result is a safe HTML `id` value.
+ * transcript cannot collide. Each id's exact code units are written as four
+ * lowercase hex digits each (`unitHex`), which is lossless and collision-free:
+ * no two distinct stored passage ids, including `p.1`/`p_1` and supplementary
+ * characters, share an anchor, and every character round-trips. The result is
+ * a safe HTML `id` value.
  */
 export function passageAnchorId(sourceId: string, passageId: string): string {
-  // Iterate UTF-16 code units (not code points) so a supplementary character
-  // keeps both surrogate halves; every reserved code unit is written as `_`
-  // plus four lowercase hex digits, and a literal `_` escapes as `_5f`, so no
-  // two distinct strings share an encoding and every character round-trips.
-  const encode = (value: string): string => {
-    let out = "";
-    for (let index = 0; index < value.length; index += 1) {
-      const char = value[index];
-      if (/[A-Za-z0-9-]/.test(char)) out += char;
-      else if (char === "_") out += "_5f";
-      else out += `_${char.charCodeAt(0).toString(16).padStart(4, "0")}`;
-    }
-    return out;
-  };
-  return `passage-${encode(sourceId)}-${encode(passageId)}`;
+  return `passage-${unitHex(sourceId)}-${unitHex(passageId)}`;
 }
 
 /**
