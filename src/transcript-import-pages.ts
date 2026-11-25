@@ -11,12 +11,12 @@
  * - `/meetings/:id/transcripts/import` attaches a transcript to an existing
  *   manual meeting; its only input is the transcript source.
  *
- * The URL record is authoritative. Every record is resolved from the snapshot
- * here, so a missing record is a `MissingRecordError` (404) like every other
- * detail page; every other decision (the submitted title, date, notes, project
- * and source) is validated by the transcript service inside one store turn. The
- * pages only render; the POSTs hand the decoded submission to
- * `submitTranscript` over the application's one owned store.
+ * The URL record is authoritative. The POST hands the matched kind and raw id
+ * to `submitTranscript` first, so the record is resolved inside the store's own
+ * queue turn (a missing record is a `MissingRecordError`, a 404 for the shell).
+ * The GET forms resolve the record from the snapshot for presentation. Every
+ * other decision (the submitted title, date, notes, project and source) is
+ * validated by the transcript service inside that same store turn.
  *
  * The import form is a native `multipart/form-data` form (the shell accepts that
  * body only on the three opted-in POST slots). Pasted text and a file are two
@@ -34,6 +34,7 @@ import {
   FormError,
   renderForm,
   renderPage,
+  type FieldError,
   type FieldSpec,
   type Page,
 } from "./html.ts";
@@ -43,6 +44,7 @@ import type { Client, Engagement, Meeting, Project, Snapshot, Store } from "./st
 import type { TranscriptImportResult, TranscriptStore } from "./transcript-store.ts";
 import { submitTranscript } from "./transcript-import.ts";
 import {
+  FILE_CONTROL,
   MAX_FILE_BYTES,
   MAX_MULTIPART_BYTES,
   MAX_PASTE_BYTES,
@@ -151,6 +153,9 @@ export { engagementImportHref, meetingImportHref, projectImportHref } from "./me
 /** The inclusive limit in MiB (a decimal count of bytes, as a form states it). */
 const MIB = 1024 * 1024;
 
+/** The encoding every import form states: the marked multipart body. */
+const MULTIPART_FORM_ENCTYPE = "multipart/form-data";
+
 /** The formats the import accepts, named for the user. */
 const SUPPORTED_FORMATS = "pasted plain text; UTF-8 .txt and .md files; .docx documents; text-based .pdf files";
 
@@ -189,7 +194,7 @@ const SOURCE_FIELDS: readonly FieldSpec[] = [
     label: "Paste transcript text (an alternative to the file below)",
     type: "textarea",
   },
-  { name: "file", label: "Or choose a transcript file (an alternative to the text above)" },
+  { name: FILE_CONTROL, label: "Or choose a transcript file (an alternative to the text above)", type: "file" },
 ];
 
 const CREATE_FIELDS: readonly FieldSpec[] = [
@@ -241,36 +246,58 @@ function createValues(urlProject?: Project): Record<string, string> {
     notes: "",
     projectId: urlProject === undefined ? "" : urlProject.id,
     [PASTE_CONTROL]: "",
+    [FILE_CONTROL]: "",
   };
 }
 
 /**
- * The multipart form around the given controls, posting to a fixed internal
- * action. `renderForm` sets `method="post"`; the browser submits a form with a
- * file control as `multipart/form-data` without a script, which is the marked
- * body the shell accepts on these routes.
+ * The controls a browser submits for a form: a text control carries its text,
+ * a file control carries the selected file's name (or the empty name a browser
+ * sends when nothing was chosen). These are the values a corrected form shows.
  */
-function importForm(
-  action: string,
-  fields: readonly FieldSpec[],
-  values: Readonly<Record<string, string>>,
-  submitLabel: string,
-): string {
-  return renderForm({ action, fields, values, submitLabel });
+function submittedControls(form: Readonly<Record<string, string>>, file: MultipartFile | null): Record<string, string> {
+  const controls: Record<string, string> = {};
+  for (const name of ["title", "date", "notes", "projectId", PASTE_CONTROL]) {
+    if (Object.hasOwn(form, name)) controls[name] = form[name];
+  }
+  controls[FILE_CONTROL] = file === null ? "" : file.filename;
+  return controls;
 }
 
-/** The page body of an import form: the guidance, then the form. */
+/**
+ * The page body of an import form: the guidance, then the native multipart
+ * form. A form with a file control is submitted by the browser as
+ * `multipart/form-data` without a script, which is the marked body the shell
+ * accepts on these routes; the encoding is stated on both the initial and the
+ * corrected form.
+ */
 function formPageBody(
   action: string,
   fields: readonly FieldSpec[],
   values: Readonly<Record<string, string>>,
   submitLabel: string,
   notice: string,
+  errors: readonly FieldError[] = [],
+  summary?: string,
   extraAbove = "",
   extraBelow = "",
 ): string {
-  return [notice, extraAbove, importGuidance(), importForm(action, fields, values, submitLabel), extraBelow]
-    .filter((part) => part !== "")
+  return [
+    notice,
+    extraAbove,
+    importGuidance(),
+    renderForm({
+      action,
+      fields,
+      values,
+      errors,
+      ...(summary === undefined ? {} : { summary }),
+      submitLabel,
+      enctype: MULTIPART_FORM_ENCTYPE,
+    }),
+    extraBelow,
+  ]
+    .filter((part) => part !== "" && part !== undefined)
     .join("\n");
 }
 
@@ -294,13 +321,13 @@ function findRecord<T extends { readonly id: string }>(items: readonly T[], id: 
 }
 
 /** The raw id in a transcript import path: the second segment. */
-function idFromPath(path: string): string {
+function rawIdFromPath(path: string): string {
   const parts = path.split("?")[0].split("/").slice(1);
   if (parts.length < 2) throw new MissingRecordError("No record for that path");
   return parts[1];
 }
 
-/** The client, engagement and optional project a transcript import path names. */
+/** The client, engagement and optional project or meeting an import path names. */
 interface ImportScope {
   readonly kind: TranscriptImportKind;
   readonly client: Client;
@@ -329,30 +356,34 @@ function meetingScope(snapshot: Snapshot, id: string): ImportScope {
   return { kind: "meeting", client, engagement, meeting };
 }
 
-/** The scope the raw path id names, resolved from the snapshot. */
-function scopeFromPath(snapshot: Snapshot, path: string): ImportScope {
-  const parts = path.split("?")[0].split("/").slice(1);
-  const rawId = idFromPath(path);
-  if (parts[0] === "engagements") return engagementScope(snapshot, decodeId(rawId, "engagement"));
-  if (parts[0] === "projects") return projectScope(snapshot, decodeId(rawId, "project"));
-  return meetingScope(snapshot, decodeId(rawId, "meeting"));
+/** The scope the raw path id and its matched kind name, resolved from the snapshot. */
+function scopeFromPath(snapshot: Snapshot, kind: TranscriptImportKind, rawId: string): ImportScope {
+  const id = decodeId(rawId, kind);
+  if (kind === "engagement") return engagementScope(snapshot, id);
+  if (kind === "project") return projectScope(snapshot, id);
+  return meetingScope(snapshot, id);
 }
 
 /**
- * The archive notice of the scope, so an archived engagement, project or
- * meeting keeps a usable import page with its notice. A create under a blank
- * project select belongs to the engagement, so that is the notice; a project
- * selection that is a project of the engagement is that project's notice.
+ * The archive notice shown on an import page, so an archived engagement,
+ * project or meeting keeps a usable import page with its notice. The URL scope
+ * is always noticed; on a create form a selected project of the engagement adds
+ * that project's notice. The URL scope's notice never depends on the submitted
+ * selection: on an archived project's URL, selecting an active sibling still
+ * shows the archived URL project's notice, and an invalid selection (a foreign
+ * or unknown project) notices the URL scope too.
  */
-function scopeNotice(snapshot: Snapshot, scope: ImportScope, selectedId: string): string {
+function scopeNotice(snapshot: Snapshot, scope: ImportScope, fields: readonly FieldSpec[]): string {
   const direct = scope.project !== undefined ? scope.project : scope.meeting !== undefined ? scope.meeting : scope.engagement;
-  if (scope.kind !== "meeting" && selectedId !== "") {
-    const selected = snapshot.projects.find((candidate) => candidate.id === selectedId);
-    if (selected !== undefined && selected.engagementId === scope.engagement.id) {
-      return archiveNotice(snapshot, selected);
+  const notices = [archiveNotice(snapshot, direct)];
+  if (scope.kind !== "meeting") {
+    const selected = fields.find((field) => field.name === "projectId")?.value ?? "";
+    const project = snapshot.projects.find((candidate) => candidate.id === selected);
+    if (project !== undefined && project.engagementId === scope.engagement.id && project.id !== direct.id) {
+      notices.push(archiveNotice(snapshot, project));
     }
   }
-  return archiveNotice(snapshot, direct);
+  return notices.filter((notice) => notice !== "").join("\n");
 }
 
 /** The breadcrumb links for a transcript import page. */
@@ -396,13 +427,31 @@ function fieldsForScope(scope: ImportScope, snapshot: Snapshot): readonly FieldS
   return createFields(projectChoices(snapshot, scope.engagement.id), snapshot);
 }
 
+/**
+ * The project select of a form as it is shown: the same choices, with the
+ * value a (possibly refused) submission holds marked as selected. The initial
+ * values put the URL project or a blank choice in `values.projectId`.
+ */
+function fieldsWithValues(
+  fields: readonly FieldSpec[],
+  values: Readonly<Record<string, string>>,
+): readonly FieldSpec[] {
+  return fields.map((field) =>
+    Object.hasOwn(values, field.name) ? { ...field, value: values[field.name] } : field,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // The transient result page
 // ---------------------------------------------------------------------------
 
-/** The stored record a result names, resolved from the snapshot for display. */
+/**
+ * The stored records a result names, resolved for display from the returned
+ * result (never from a snapshot read before the commit's turn): the meeting
+ * the commit names, and the project stored on it.
+ */
 function resultLines(result: TranscriptImportResult, snapshot: Snapshot): string[] {
-  const meeting = findRecord(snapshot.meetings, result.meeting.id, "meeting");
+  const meeting = result.meeting;
   const lines: string[] = [];
   lines.push(
     `<p>Meeting: ${link(`/meetings/${encodeURIComponent(meeting.id)}`, `${meeting.date} — ${meeting.title}`)}</p>`,
@@ -431,22 +480,31 @@ function resultLines(result: TranscriptImportResult, snapshot: Snapshot): string
   return lines;
 }
 
+/** The breadcrumbs of a result page, from the scope's stored records. */
+function resultBreadcrumbs(scope: ImportScope | null): readonly { readonly label: string; readonly href: string }[] {
+  if (scope === null) return [{ label: "Home", href: "/" }];
+  return [
+    { label: "Home", href: "/" },
+    { label: scope.client.name, href: `/clients/${encodeURIComponent(scope.client.id)}` },
+    { label: scope.engagement.name, href: `/engagements/${encodeURIComponent(scope.engagement.id)}` },
+  ];
+}
+
 /**
  * The result page shown after an import commits. It is transient: it is built
  * from the commit's own result, so a repeat can explain itself and name the
  * canonical meeting without a stored receipt, a session or a query parameter.
  */
-function resultPage(result: TranscriptImportResult, snapshot: Snapshot, scope: ImportScope): Page {
+function resultPage(result: TranscriptImportResult, snapshot: Snapshot, scope: ImportScope | null): Page {
   const title = "Transcript imported";
   const lines = resultLines(result, snapshot);
-  const back =
-    scope.kind === "meeting"
-      ? `<p>${link(`/meetings/${encodeURIComponent(result.meeting.id)}`, "Open the meeting")}</p>`
-      : `<p>${link(`/meetings/${encodeURIComponent(result.meeting.id)}`, "Open the meeting")}</p>\n<p>${link(
-          `/engagements/${encodeURIComponent(scope.engagement.id)}`,
-          "Return to the engagement",
-        )}</p>`;
-  return pageWith(title, breadcrumbs(scope), [
+  const back = [
+    `<p>${link(`/meetings/${encodeURIComponent(result.meeting.id)}`, "Open the meeting")}</p>`,
+    ...(scope === null
+      ? []
+      : [`<p>${link(`/engagements/${encodeURIComponent(scope.engagement.id)}`, "Return to the engagement")}</p>`]),
+  ].join("\n");
+  return pageWith(title, resultBreadcrumbs(scope), [
     { title: "Result", body: lines.join("\n") },
     { title: "Where to go next", body: back },
   ]);
@@ -457,20 +515,30 @@ function resultPage(result: TranscriptImportResult, snapshot: Snapshot, scope: I
 // ---------------------------------------------------------------------------
 
 /**
- * The refusal a submission produced, shown as a correctable form. The submitted
- * controls are kept as posted; every control the submission omitted is filled
- * from the initial values, so a corrected form carries the URL project and a
- * blank select stays blank. The refusal's message names the problem in the
- * summary and, for a visible control it names, beside that control.
+ * The refusal a submission produced, shown as a correctable multipart form.
+ * The submitted controls are kept as posted; every control the submission
+ * omitted is filled from the initial values, so a corrected form carries the
+ * URL project and a blank select stays blank. The refusal's message names the
+ * problem in the summary and, for a visible control it names, beside that
+ * control. The notice is the URL scope's archive notice, so a refusal on an
+ * archived scope stays marked.
  */
-function formFailure(error: unknown, values: Readonly<Record<string, string>>, fields: readonly FieldSpec[], action: string, notice: string): FormError | null {
+function formFailure(
+  error: unknown,
+  values: Readonly<Record<string, string>>,
+  fields: readonly FieldSpec[],
+  action: string,
+  notice: string,
+): FormError | null {
   if (!(error instanceof ValidationError) && !(error instanceof MissingRecordError)) return null;
   const filled: Record<string, string> = {};
   for (const field of fields) {
     if (!field.hidden && Object.hasOwn(values, field.name)) filled[field.name] = values[field.name];
   }
   const errors = fieldErrorsFor(error.message, filled, fields);
-  return new FormError(error.message, filled, errors, fields, action).withNotice(notice);
+  return new FormError(error.message, filled, errors, fields, action)
+    .withNotice(notice)
+    .withEnctype(MULTIPART_FORM_ENCTYPE);
 }
 
 /**
@@ -482,48 +550,73 @@ function selectedFile(file: MultipartFile | null): { filename: string; bytes: Ui
   return file === null ? null : { filename: file.filename, bytes: new Uint8Array(file.bytes) };
 }
 
-/** The source controls a submission actually supplied, as a multipart body would. */
-function submittedControls(form: Readonly<Record<string, string>>): Record<string, string> {
-  const controls: Record<string, string> = {};
-  for (const name of [PASTE_CONTROL, "title", "date", "notes", "projectId"]) {
-    if (Object.hasOwn(form, name)) controls[name] = form[name];
-  }
-  return controls;
-}
-
 // ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
 
 /**
- * Build the transcript import routes over one transcript service: a borrowed
- * service over the application's single owned store. The GET forms render from
- * the snapshot; the POSTs hand the decoded submission to `submitTranscript`,
- * which resolves the URL record and commits inside the store's own queue turn,
- * and answer with the transient result page. A refusal writes nothing and is
- * shown as a correctable form.
+ * Build the transcript import routes over the application's single owned store.
+ * `transcriptService` resolves the borrowed service bound to that store; it is
+ * called only when an import POST first needs it, so a page read and a startup
+ * that never imports need nothing beyond the store every page already reads.
+ * The GET forms render from the snapshot; the POSTs hand the matched kind and
+ * raw id to `submitTranscript` first, so the URL record is resolved inside the
+ * store's own queue turn, and answer with the transient result page. A refusal
+ * writes nothing and is shown as a correctable form.
  */
-export function transcriptImportRoutes(store: Store, service: TranscriptStore): TranscriptImportRoutes {
+export function transcriptImportRoutes(
+  store: Store,
+  transcriptService: () => TranscriptStore,
+): TranscriptImportRoutes {
   const snapshot = (): Snapshot => store.snapshot();
+
+  /** The scope the request path names, or null when it is missing or malformed. */
+  function resolvedScope(request: TranscriptImportRequest, expected: TranscriptImportKind): ImportScope | null {
+    const rawId = rawIdFromPath(request.path);
+    try {
+      const scope = scopeFromPath(snapshot(), expected, rawId);
+      return scope.kind === expected ? scope : null;
+    } catch (error) {
+      if (error instanceof MissingRecordError) return null;
+      throw error;
+    }
+  }
+
+  /**
+   * The refusal a submission produced on a scope that exists, shown as a
+   * correctable multipart form. A failure that is not a refusal of the
+   * submission's input (a persistence failure, a programming error) is reported
+   * unchanged, never as a form.
+   */
+  function refuse(error: unknown, scope: ImportScope, request: TranscriptImportRequest): FormError {
+    const snap = snapshot();
+    const fields = fieldsForScope(scope, snap);
+    const values = { ...createValues(scope.project), ...submittedControls(request.form, request.file) };
+    const shown = fieldsWithValues(fields, values);
+    const failure = formFailure(error, values, shown, importAction(scope), scopeNotice(snap, scope, shown));
+    if (failure === null) throw error;
+    return failure;
+  }
 
   function createForm(scope: ImportScope): Page {
     const snap = snapshot();
     const fields = fieldsForScope(scope, snap);
     const values = createValues(scope.project);
-    const notice = scopeNotice(snap, scope, values.projectId);
+    const shown = fieldsWithValues(fields, values);
+    const notice = scopeNotice(snap, scope, shown);
     return renderPage(
       "Import transcript",
       [
         `<nav>${link("/", "Home")}${link(cancelHref(scope), "Cancel")}</nav>`,
-        formPageBody(importAction(scope), fields, values, "Import transcript", notice),
+        formPageBody(importAction(scope), shown, values, "Import transcript", notice),
       ].join("\n"),
     );
   }
 
   function attachForm(scope: ImportScope): Page {
     const snap = snapshot();
-    const fields = SOURCE_FIELDS;
-    const values: Record<string, string> = { [PASTE_CONTROL]: "" };
+    const values: Record<string, string> = { [PASTE_CONTROL]: "", [FILE_CONTROL]: "" };
+    const shown = fieldsWithValues(SOURCE_FIELDS, values);
     const notice = archiveNotice(snap, scope.meeting!);
     return renderPage(
       "Import transcript",
@@ -531,46 +624,57 @@ export function transcriptImportRoutes(store: Store, service: TranscriptStore): 
         `<nav>${link("/", "Home")}${link(cancelHref(scope), "Cancel")}</nav>`,
         formPageBody(
           importAction(scope),
-          fields,
+          shown,
           values,
           "Attach transcript",
           notice,
+          [],
+          undefined,
           `<p>This attaches one transcript to the meeting ${link(cancelHref(scope), `${scope.meeting!.date} — ${scope.meeting!.title}`)}. Its title, date, notes and project are kept.</p>`,
         ),
       ].join("\n"),
     );
   }
 
+  /** The GET form of the scope an import path names: attachment or create. */
+  function renderGet(scope: ImportScope): Page {
+    return scope.kind === "meeting" ? attachForm(scope) : createForm(scope);
+  }
+
   async function handlePost(request: TranscriptImportRequest, expected: TranscriptImportKind): Promise<Page> {
-    const snap = snapshot();
-    // The URL record is resolved first and stays a 404 when it is missing, so an
-    // import never guesses a scope.
-    const scope = scopeFromPath(snap, request.path);
-    if (scope.kind !== expected) throw new MissingRecordError("No record for that path");
-    const fields = fieldsForScope(scope, snap);
-    const values = { ...createValues(scope.project), ...submittedControls(request.form) };
-    const action = importAction(scope);
-    const notice = scopeNotice(snap, scope, values.projectId ?? "");
+    // The matched kind and raw id are handed to the scoped handler first: it
+    // resolves the URL record, validates the submission and commits inside one
+    // store queue turn, so the page never decides a scope from an older snapshot.
+    let result: TranscriptImportResult;
     try {
-      const result = await submitTranscript(service, {
-        kind: scope.kind,
-        rawId: idFromPath(request.path),
+      result = await submitTranscript(transcriptService(), {
+        kind: expected,
+        rawId: rawIdFromPath(request.path),
         fields: request.form,
         file: selectedFile(request.file),
       });
-      return resultPage(result, snapshot(), scope);
     } catch (error) {
-      const failure = formFailure(error, values, fields, action, notice);
-      if (failure !== null) throw failure;
-      throw error;
+      if (error instanceof MissingRecordError) throw error;
+      // Presentation data is resolved only now, for a correctable refusal on a
+      // record the store knows; a missing record keeps the handler's 404.
+      let scope: ImportScope | null;
+      try {
+        scope = resolvedScope(request, expected);
+      } catch {
+        scope = null;
+      }
+      if (scope === null) throw error;
+      throw refuse(error, scope, request);
     }
+    return resultPage(result, snapshot(), resolvedScope(request, expected));
   }
 
   const get: TranscriptImportRoute = {
     method: "GET",
     render(request) {
-      const scope = scopeFromPath(snapshot(), request.path);
-      return scope.kind === "meeting" ? attachForm(scope) : createForm(scope);
+      const matched = matchTranscriptImportPath(request.path);
+      if (matched === null) throw new MissingRecordError("No record for that path");
+      return renderGet(scopeFromPath(snapshot(), matched.kind, matched.id));
     },
   };
 
@@ -587,4 +691,3 @@ export function transcriptImportRoutes(store: Store, service: TranscriptStore): 
     meetingImport: { get, post: post("meeting") },
   };
 }
-

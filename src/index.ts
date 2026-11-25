@@ -147,17 +147,14 @@ export interface HierarchyPathMatch {
  * every list, tally and history does.
  */
 export function registerRoutes(store: Store): Routes {
-  return registerRoutesWith(store, transcriptService(store));
-}
-
-/**
- * Build the full route table over the given transcript service: the service
- * borrows the same store `registerRoutes` is given, so an import and every
- * ordinary store write share the store's one mutation queue and originals. The
- * three transcript import POST slots are the only routes that opt into the
- * multipart body policy.
- */
-export function registerRoutesWith(store: Store, service: TranscriptStore): Routes {
+  // The transcript service borrows the same store the routes are built over, so
+  // an import and every ordinary store write share the store's one mutation
+  // queue and originals; the application displays and commits one workspace.
+  // The service is resolved only when an import POST first needs it, so
+  // registering the routes (and a startup that never imports) needs nothing
+  // beyond what every existing page already reads.
+  let service: TranscriptStore | null = null;
+  const transcripts = (): TranscriptStore => (service ??= transcriptService(store));
   const base: Routes = appRoutes(store);
   const hierarchy = hierarchyRoutes(store);
   const work = workRoutes(store);
@@ -165,7 +162,7 @@ export function registerRoutesWith(store: Store, service: TranscriptStore): Rout
   const archive = archiveRoutes(store);
   const archived = archivedRoutes(store).archived;
   const kanban = kanbanRoutes(store);
-  const imports = transcriptImportRoutes(store, service);
+  const imports = transcriptImportRoutes(store, transcripts);
   const table: PathRouteTable<HierarchyPathMatch> = {
     match: (path: string) => {
       // The archive endpoints and the archived discovery page are matched
@@ -347,12 +344,13 @@ export async function startApplication(
 
   let server: StartedServer;
   try {
-    // One transcript service borrows the one owned store, so the registerRoutes
-    // it wires shares the store's own queue and originals with every page.
+    // The existing registration entry point wires the one owned store: its
+    // transcript service borrows that same store (built on the first import),
+    // so every import shares the store's own queue and originals with every page.
     const serverOptions: ServerOptions = {
       store,
       port: options.port,
-      routes: registerRoutesWith(store, transcriptService(store)),
+      routes: registerRoutes(store),
     };
     server = await dependencies.start(serverOptions);
   } catch (error) {

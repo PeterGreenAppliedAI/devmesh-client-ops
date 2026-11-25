@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { escapeHtml, FormError } from "../src/html.ts";
-import { registerRoutes, registerRoutesWith, startApplication } from "../src/index.ts";
+import { registerRoutes, startApplication } from "../src/index.ts";
 import { ValidationError } from "../src/model.ts";
 import {
   engagementImportHref,
@@ -16,7 +16,7 @@ import {
 } from "../src/meeting-pages.ts";
 import { startServer, type Routes } from "../src/server.ts";
 import { openStore, type Store } from "../src/store.ts";
-import { transcriptService } from "../src/transcript-store.ts";
+import { transcriptService, type TranscriptStore } from "../src/transcript-store.ts";
 import {
   engagementImportHref as importEngagementHref,
   importLimitsText,
@@ -28,7 +28,7 @@ import {
   transcriptImportRoutes,
   type TranscriptImportRequest,
 } from "../src/transcript-import-pages.ts";
-import { MAX_MULTIPART_BYTES, PASTE_CONTROL } from "../src/transcript-multipart.ts";
+import { FILE_CONTROL, MAX_FILE_BYTES, MAX_MULTIPART_BYTES, MAX_PASTE_BYTES, PASTE_CONTROL } from "../src/transcript-multipart.ts";
 
 // ---------------------------------------------------------------------------
 // Fixtures and HTTP helpers
@@ -215,14 +215,92 @@ function postBytes(origin: string, path: string, contentType: string | null, bod
   });
 }
 
-/** Submit the rendered multipart form: the given controls, as a browser would. */
-function submit(
+/** One control a browser submits from a rendered form, with its values. */
+interface Control {
+  readonly name: string;
+  readonly kind: "input" | "textarea" | "select" | "file";
+  readonly required: boolean;
+  readonly options: readonly string[];
+}
+
+/** The controls of the one form on a rendered page, in order. */
+function controls(form: string): Control[] {
+  const found: Control[] = [];
+  const pattern = /<(input|textarea|select)([^>]*)>/g;
+  for (const match of form.matchAll(pattern)) {
+    const tag = match[1];
+    const attrs = match[2];
+    const name = /\sname="([^"]+)"/.exec(attrs);
+    assert.ok(name !== null, `every control has a name: ${match[0]}`);
+    const type = /\stype="([^"]+)"/.exec(attrs);
+    found.push({
+      name: unescapeHtml(name[1]),
+      kind: tag === "textarea" ? "textarea" : tag === "select" ? "select" : type !== null && type[1] === "file" ? "file" : "input",
+      required: /\srequired(\s|>)/.test(attrs),
+      options: [...(match[0].matchAll(/<option value="([^"]*)"/g) ?? [])].map((option) => unescapeHtml(option[1])),
+    });
+  }
+  return found;
+}
+
+/**
+ * Submit a rendered multipart form over HTTP exactly as a browser would: read
+ * the discovery page, take the form's action, its encoding, the method and its
+ * controls, then send one part per control. A text control carries the value
+ * given (or its rendered initial value); a file control carries the selected
+ * file, or the empty filename a browser sends when no file was chosen.
+ */
+async function submitRendered(
   origin: string,
   path: string,
-  parts: readonly Part[],
-  contentType: string | null = MULTIPART_TYPE,
-): Promise<Reply> {
-  return postBytes(origin, path, contentType, multipart(parts));
+  entries: ReadonlyMap<string, string | { readonly filename: string; readonly body: string | Uint8Array }>,
+  options: { readonly unselectedFile?: boolean; readonly contentTypeOverride?: string | null } = {},
+): Promise<{ readonly reply: Reply; readonly form: string }> {
+  const page = await get(origin, path);
+  assert.equal(page.status, 200, path);
+  const form = formOf(page.body);
+  assert.match(form, /method="post"/, path);
+  assert.match(form, /enctype="multipart\/form-data"/, path);
+  const action = /<form[^>]*\saction="([^"]*)"/.exec(form);
+  assert.ok(action !== null, "the form has an action");
+  assert.equal(unescapeHtml(action[1]), path, "the form posts back to the page it was read from");
+  const rendered = controls(form);
+  const parts: Part[] = [];
+  for (const control of rendered) {
+    const entry = entries.get(control.name);
+    if (control.kind === "file") {
+      if (entry === undefined || (options.unselectedFile === true && entry === "")) {
+        // The browser sends the file control as an empty file part when nothing
+        // was chosen; the decoder reads that as no selected file.
+        parts.push({ name: control.name, filename: "", body: "" });
+      } else if (typeof entry === "string") {
+        assert.fail(`a file control carries a file, not ${JSON.stringify(entry)}`);
+      } else {
+        parts.push({ name: control.name, filename: entry.filename, body: entry.body });
+      }
+      continue;
+    }
+    if (entry === undefined) {
+      if (!control.required) continue;
+      assert.fail(`the required control ${control.name} must be submitted`);
+    }
+    assert.equal(typeof entry, "string", `the text control ${control.name} carries text`);
+    parts.push({ name: control.name, body: entry as string });
+  }
+  for (const name of entries.keys()) {
+    assert.ok(rendered.some((control) => control.name === name), `the form carries ${name}`);
+  }
+  const contentType = options.contentTypeOverride === undefined ? MULTIPART_TYPE : options.contentTypeOverride;
+  return { reply: await postBytes(origin, unescapeHtml(action[1]), contentType, multipart(parts)), form };
+}
+
+/** Submit a rendered form with the given text controls, pasted text only. */
+function submitPaste(
+  origin: string,
+  path: string,
+  entries: ReadonlyMap<string, string>,
+): Promise<{ readonly reply: Reply; readonly form: string }> {
+  return submitRendered(origin, path, entries, { unselectedFile: true });
 }
 
 /** The main content region of a rendered page, without the global shell. */
@@ -369,8 +447,9 @@ describe("transcript import paths", () => {
       },
       transcripts: () => [],
       close: async () => {},
-    } as unknown as Parameters<typeof transcriptImportRoutes>[1];
-    const table = transcriptImportRoutes(store, service);
+    } as unknown as TranscriptStore;
+    // The service is resolved lazily, only when an import POST needs it.
+    const table = transcriptImportRoutes(store, () => service);
     for (const pattern of [
       "/engagements/:id/transcripts/import",
       "/projects/:id/transcripts/import",
@@ -398,12 +477,12 @@ describe("transcript import paths", () => {
     } as unknown as Store;
     // The service is injected through the interface the routes accept: a
     // validation refusal and an unexpected failure are each raised there.
-    const makeService = (failure: unknown) =>
+    const makeService = (failure: unknown) => () =>
       ({
         submitTranscript: async () => {
           throw failure;
         },
-      }) as unknown as Parameters<typeof transcriptImportRoutes>[1];
+      }) as unknown as TranscriptStore;
     const request: TranscriptImportRequest = {
       method: "POST",
       path: "/engagements/engagement-1/transcripts/import",
@@ -448,7 +527,10 @@ describe("transcript import paths", () => {
     }
   });
 
-  it("opts in only the three import POST slots and leaves meeting routes otherwise unchanged", () => {
+  it("opts in only the three import POST slots and leaves meeting routes otherwise unchanged", async () => {
+    // Registration itself needs nothing beyond what every page reads: a store
+    // object with no original repository still registers, and a real import
+    // over it is refused rather than silently writing against another store.
     const store = {
       snapshot: () => ({
         clients: [],
@@ -487,6 +569,11 @@ describe("transcript import paths", () => {
     const meetingTable = meetingRoutes(store);
     assert.equal(meetingTable.meetingsNew.get?.method, "GET");
     assert.equal(meetingTable.meetingsNew.post?.method, "POST");
+    // The import POST over this store refuses at the service it builds, not at
+    // registration: the failure is reported, and nothing pretends to write.
+    const importRoute = table.route(table.match("/engagements/e/transcripts/import"), "POST");
+    assert.ok(importRoute !== undefined);
+    await assert.rejects(async () => importRoute.render({ method: "POST", path: "/engagements/e/transcripts/import", origin: "http://127.0.0.1", form: {}, file: null }));
   });
 
   it("shares one spelling of the encoded import links", () => {
@@ -577,6 +664,11 @@ describe("transcript import forms", () => {
       assert.match(formOf(reply.body), /<input type="date"[^>]*name="date"[^>]*required>/);
       assert.match(formOf(reply.body), /<textarea[^>]*name="notes"/);
       assert.match(formOf(reply.body), /<textarea[^>]*name="paste"/);
+      // The source file is a native file input, so a browser sends it as its
+      // own multipart part, and the form states the multipart encoding.
+      assert.match(formOf(reply.body), /<input type="file"[^>]*\sname="file"[^>]*>/);
+      assert.ok(!/<input type="text"[^>]*\sname="file"/.test(formOf(reply.body)));
+      assert.match(formOf(reply.body), /enctype="multipart\/form-data"/);
       // The engagement-scoped form starts with a blank project selection.
       assert.equal(selectedOption(reply.body, "projectId"), "");
       // The engagement's own projects are offered, escaped, labelled as archived
@@ -609,8 +701,9 @@ describe("transcript import forms", () => {
         // Both source controls are present and labelled as alternatives.
         assert.match(form, /<label for="field-paste">[^<]*alternative[^<]*<\/label>/, path);
         assert.match(form, /<label for="field-file">[^<]*alternative[^<]*<\/label>/, path);
-        assert.match(form, /name="paste"/, path);
-        assert.match(form, /name="file"/, path);
+        assert.match(form, /<textarea[^>]*name="paste"/, path);
+        assert.match(form, /<input type="file"[^>]*\sname="file"/, path);
+        assert.match(form, /enctype="multipart\/form-data"/, path);
         // The supported formats and the total, per-paste and per-file limits.
         const page = mainOf(reply.body);
         assert.ok(page.includes(escapeHtml(supportedFormatsText())), path);
@@ -622,6 +715,9 @@ describe("transcript import forms", () => {
         assert.match(page, /\.pdf/, path);
         assert.match(page, /extracted text/, path);
         assert.equal(MAX_MULTIPART_BYTES, 15 * 1024 * 1024);
+        assert.equal(MAX_PASTE_BYTES, 10 * 1024 * 1024);
+        assert.equal(MAX_FILE_BYTES, 10 * 1024 * 1024);
+        assert.match(page, new RegExp(`extracted text[^<]*${MAX_PASTE_BYTES} bytes|at most ${MAX_PASTE_BYTES / 1024 / 1024} MiB`), path);
       }
     } finally {
       await server.close();
@@ -686,6 +782,37 @@ describe("transcript import forms", () => {
     }
   });
 
+  it("keeps an archived URL project's notice on a refused submission that selected an active sibling", async () => {
+    const server = await running();
+    try {
+      // The URL names the archived project; the submitted project select names an
+      // active sibling of the same engagement, and the date is invalid. The
+      // refusal is a correctable form, and it keeps the archived URL project's
+      // notice, not the silently selected sibling's empty one.
+      await server.store.setArchived("project", server.projectId, true);
+      const before = counts(server.store);
+      const reply = (await submitPaste(
+        server.origin,
+        projectImportHref(server.projectId),
+        new Map([
+          ["title", "Archived project"],
+          ["date", "2026-02-30"],
+          ["projectId", server.secondProjectId],
+          [PASTE_CONTROL, "Words."],
+        ]),
+      )).reply;
+      assert.equal(reply.status, 400);
+      const page = mainOf(reply.body);
+      assert.match(page, /class="archive-notice"/);
+      assert.match(page, /real calendar date/);
+      // The rejected selection is shown as it was submitted, marked selected.
+      assert.ok(page.includes(`<option value="${escapeHtml(server.secondProjectId)}" selected>`));
+      assert.deepEqual(counts(server.store), before);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("escapes every displayed stored value and encodes the id in the URL", async () => {
     const store = await openStore(tempDir());
     const server = await startServer({ store, port: 0, routes: registerRoutes(store) });
@@ -744,13 +871,20 @@ describe("transcript import submissions", () => {
     const server = await running();
     try {
       const before = counts(server.store);
-      const reply = await submit(server.origin, engagementImportHref(server.engagementId), [
-        { name: "title", body: "Kickoff <notes>" },
-        { name: "date", body: "2026-02-02" },
-        { name: "notes", body: "Agenda" },
-        { name: "projectId", body: "" },
-        { name: PASTE_CONTROL, body: "Alice: Hello there.\n\nBob: Hi." },
-      ]);
+      const { reply, form } = await submitPaste(
+        server.origin,
+        engagementImportHref(server.engagementId),
+        new Map([
+          ["title", "Kickoff <notes>"],
+          ["date", "2026-02-02"],
+          ["notes", "Agenda"],
+          ["projectId", ""],
+          [PASTE_CONTROL, "Alice: Hello there.\n\nBob: Hi."],
+        ]),
+      );
+      // The browser sent the file control unselected, and no file was stored.
+      assert.match(form, /<input type="file"[^>]*name="file"/);
+      assert.equal(counts(server.store).sources, before.sources + 1);
       assert.equal(reply.status, 200);
       assert.equal(reply.headers["cache-control"], "no-store");
       const page = mainOf(reply.body);
@@ -786,13 +920,17 @@ describe("transcript import submissions", () => {
   it("creates a meeting in the URL project from a submitted file", async () => {
     const server = await running();
     try {
-      const reply = await submit(server.origin, projectImportHref(server.projectId), [
-        { name: "title", body: "Project kickoff" },
-        { name: "date", body: "2026-02-03" },
-        { name: "notes", body: "" },
-        { name: "projectId", body: server.projectId },
-        { name: "file", filename: "transcript.txt", body: "File words here." },
-      ]);
+      const { reply } = await submitRendered(
+        server.origin,
+        projectImportHref(server.projectId),
+        new Map<string, string | { readonly filename: string; readonly body: string }>([
+          ["title", "Project kickoff"],
+          ["date", "2026-02-03"],
+          ["notes", ""],
+          ["projectId", server.projectId],
+          [FILE_CONTROL, { filename: "transcript.txt", body: "File words here." }],
+        ]),
+      );
       assert.equal(reply.status, 200);
       const snapshot = server.store.snapshot();
       const created = snapshot.meetings.find((meeting) => meeting.title === "Project kickoff");
@@ -813,9 +951,11 @@ describe("transcript import submissions", () => {
     const server = await running();
     try {
       const before = server.store.snapshot().meetings.find((meeting) => meeting.id === server.meetingId);
-      const reply = await submit(server.origin, meetingImportHref(server.meetingId), [
-        { name: PASTE_CONTROL, body: "First attachment words." },
-      ]);
+      const { reply } = await submitPaste(
+        server.origin,
+        meetingImportHref(server.meetingId),
+        new Map([[PASTE_CONTROL, "First attachment words."]]),
+      );
       assert.equal(reply.status, 200);
       const after = server.store.snapshot().meetings.find((meeting) => meeting.id === server.meetingId);
       assert.deepEqual(after, before, "the meeting's own metadata is kept");
@@ -831,21 +971,25 @@ describe("transcript import submissions", () => {
   it("explains an exact repeat on a transient result page", async () => {
     const server = await running();
     try {
-      const parts = [{ name: "title", body: "Repeat" }, { name: "date", body: "2026-03-01" }, { name: PASTE_CONTROL, body: "Same words." }];
-      const first = await submit(server.origin, engagementImportHref(server.engagementId), parts);
-      assert.equal(first.status, 200);
+      const entries = new Map([
+        ["title", "Repeat"],
+        ["date", "2026-03-01"],
+        [PASTE_CONTROL, "Same words."],
+      ]);
+      const first = await submitPaste(server.origin, engagementImportHref(server.engagementId), entries);
+      assert.equal(first.reply.status, 200);
       const created = server.store.snapshot().meetings.find((meeting) => meeting.title === "Repeat");
       assert.ok(created !== undefined);
       const before = counts(server.store);
-      const repeat = await submit(server.origin, engagementImportHref(server.engagementId), parts);
-      assert.equal(repeat.status, 200);
+      const repeat = await submitPaste(server.origin, engagementImportHref(server.engagementId), entries);
+      assert.equal(repeat.reply.status, 200);
       assert.deepEqual(counts(server.store), before, "a repeat writes nothing");
-      const page = mainOf(repeat.body);
+      const page = mainOf(repeat.reply.body);
       assert.match(page, /canonical meeting is reused/);
       assert.match(page, /exact original is already stored and was reused/);
       assert.match(page, new RegExp(`href="/meetings/${created.id}"`));
       // No redirect carries the result: the page is the response itself.
-      assert.equal(repeat.headers.location, undefined);
+      assert.equal(repeat.reply.headers.location, undefined);
     } finally {
       await server.close();
     }
@@ -854,21 +998,27 @@ describe("transcript import submissions", () => {
   it("repeats an attachment aimed at another meeting and links the canonical meeting", async () => {
     const server = await running();
     try {
-      const first = await submit(server.origin, engagementImportHref(server.engagementId), [
-        { name: "title", body: "Canonical" },
-        { name: "date", body: "2026-03-02" },
-        { name: PASTE_CONTROL, body: "Canonical words." },
-      ]);
-      assert.equal(first.status, 200);
+      const first = await submitPaste(
+        server.origin,
+        engagementImportHref(server.engagementId),
+        new Map([
+          ["title", "Canonical"],
+          ["date", "2026-03-02"],
+          [PASTE_CONTROL, "Canonical words."],
+        ]),
+      );
+      assert.equal(first.reply.status, 200);
       const canonical = server.store.snapshot().meetings.find((meeting) => meeting.title === "Canonical");
       assert.ok(canonical !== undefined);
       const otherBefore = server.store.snapshot().meetings.find((meeting) => meeting.id === server.otherMeetingId);
       const before = counts(server.store);
-      const repeat = await submit(server.origin, meetingImportHref(server.otherMeetingId), [
-        { name: PASTE_CONTROL, body: "Canonical words." },
-      ]);
-      assert.equal(repeat.status, 200);
-      const page = mainOf(repeat.body);
+      const repeat = await submitPaste(
+        server.origin,
+        meetingImportHref(server.otherMeetingId),
+        new Map([[PASTE_CONTROL, "Canonical words."]]),
+      );
+      assert.equal(repeat.reply.status, 200);
+      const page = mainOf(repeat.reply.body);
       // The target stayed unchanged, and the canonical meeting is explained and linked.
       assert.deepEqual(server.store.snapshot().meetings.find((meeting) => meeting.id === server.otherMeetingId), otherBefore);
       assert.deepEqual(counts(server.store), before);
@@ -884,33 +1034,52 @@ describe("transcript import submissions", () => {
     const server = await running();
     try {
       const before = counts(server.store);
-      for (const parts of [
+      const path = engagementImportHref(server.engagementId);
+      const cases: { readonly title: string; readonly entries: ReadonlyMap<string, string | { readonly filename: string; readonly body: string }>; readonly unselectedFile: boolean }[] = [
         // Both a nonempty paste and a selected file.
-        [
-          { name: "title", body: "Both" },
-          { name: "date", body: "2026-04-01" },
-          { name: PASTE_CONTROL, body: "Pasted words." },
-          { name: "file", filename: "also.txt", body: "File words." },
-        ],
-        // Neither: a blank paste and no file.
-        [
-          { name: "title", body: "Neither" },
-          { name: "date", body: "2026-04-02" },
-          { name: PASTE_CONTROL, body: "" },
-        ],
-        // Neither at all: no source controls were submitted.
-        [
-          { name: "title", body: "Nothing" },
-          { name: "date", body: "2026-04-03" },
-        ],
-      ] as const) {
-        const reply = await submit(server.origin, engagementImportHref(server.engagementId), parts);
-        assert.equal(reply.status, 400);
+        {
+          title: "Both",
+          entries: new Map<string, string | { readonly filename: string; readonly body: string }>([
+            ["title", "Both"],
+            ["date", "2026-04-01"],
+            [PASTE_CONTROL, "Pasted words."],
+            [FILE_CONTROL, { filename: "also.txt", body: "File words." }],
+          ]),
+          unselectedFile: false,
+        },
+        // Neither: a blank paste and the file control left unselected.
+        {
+          title: "Neither",
+          entries: new Map<string, string | { readonly filename: string; readonly body: string }>([
+            ["title", "Neither"],
+            ["date", "2026-04-02"],
+            [PASTE_CONTROL, ""],
+            [FILE_CONTROL, ""],
+          ]),
+          unselectedFile: true,
+        },
+        // Neither at all: the source controls were not submitted.
+        {
+          title: "Nothing",
+          entries: new Map<string, string | { readonly filename: string; readonly body: string }>([
+            ["title", "Nothing"],
+            ["date", "2026-04-03"],
+          ]),
+          unselectedFile: false,
+        },
+      ];
+      for (const attempt of cases) {
+        const { reply, form } = await submitRendered(server.origin, path, attempt.entries, {
+          unselectedFile: attempt.unselectedFile,
+        });
+        assert.equal(reply.status, 400, attempt.title);
         const page = mainOf(reply.body);
         assert.match(page, /exactly one transcript/i);
         assert.match(page, /never both and never neither/);
-        // The refused form is shown again with its submitted values kept.
-        assert.ok(page.includes(`value="${escapeHtml(parts[0].body as string)}"`));
+        // The corrected form is a native multipart form again, and its submitted
+        // title is kept.
+        assert.match(formOf(reply.body), /enctype="multipart\/form-data"/);
+        assert.ok(page.includes(`value="${escapeHtml(attempt.title)}"`));
       }
       assert.deepEqual(counts(server.store), before, "no meeting or source was created");
     } finally {
@@ -922,11 +1091,15 @@ describe("transcript import submissions", () => {
     const server = await running();
     try {
       const before = counts(server.store);
-      const reply = await submit(server.origin, engagementImportHref(server.engagementId), [
-        { name: "title", body: "Bad date" },
-        { name: "date", body: "2026-02-30" },
-        { name: PASTE_CONTROL, body: "Words." },
-      ]);
+      const reply = (await submitPaste(
+        server.origin,
+        engagementImportHref(server.engagementId),
+        new Map([
+          ["title", "Bad date"],
+          ["date", "2026-02-30"],
+          [PASTE_CONTROL, "Words."],
+        ]),
+      )).reply;
       assert.equal(reply.status, 400);
       const page = mainOf(reply.body);
       assert.match(page, /real calendar date/);
@@ -935,10 +1108,14 @@ describe("transcript import submissions", () => {
       assert.match(page, /<textarea[^>]*name="paste"[^>]*>Words\.<\/textarea>/);
       assert.deepEqual(counts(server.store), before);
       // A missing title is refused like a missing date.
-      const noTitle = await submit(server.origin, engagementImportHref(server.engagementId), [
-        { name: "date", body: "2026-05-01" },
-        { name: PASTE_CONTROL, body: "Words." },
-      ]);
+      const noTitle = (await submitPaste(
+        server.origin,
+        engagementImportHref(server.engagementId),
+        new Map([
+          ["date", "2026-05-01"],
+          [PASTE_CONTROL, "Words."],
+        ]),
+      )).reply;
       assert.equal(noTitle.status, 400);
       assert.match(mainOf(noTitle.body), /needs a title and a date/);
       assert.deepEqual(counts(server.store), before);
@@ -952,12 +1129,16 @@ describe("transcript import submissions", () => {
     try {
       const before = counts(server.store);
       for (const projectId of [server.foreignProjectId, "project-999"]) {
-        const reply = await submit(server.origin, engagementImportHref(server.engagementId), [
-          { name: "title", body: "Foreign" },
-          { name: "date", body: "2026-06-01" },
-          { name: "projectId", body: projectId },
-          { name: PASTE_CONTROL, body: "Fresh words." },
-        ]);
+        const reply = (await submitPaste(
+          server.origin,
+          engagementImportHref(server.engagementId),
+          new Map([
+            ["title", "Foreign"],
+            ["date", "2026-06-01"],
+            ["projectId", projectId],
+            [PASTE_CONTROL, "Fresh words."],
+          ]),
+        )).reply;
         assert.equal(reply.status, 400, projectId);
         const page = mainOf(reply.body);
         assert.match(page, /projectId/);
@@ -975,11 +1156,15 @@ describe("transcript import submissions", () => {
     const server = await running();
     try {
       const before = counts(server.store);
-      const unsupported = await submit(server.origin, engagementImportHref(server.engagementId), [
-        { name: "title", body: "Unsupported" },
-        { name: "date", body: "2026-06-02" },
-        { name: "file", filename: "notes.exe", body: "Some bytes." },
-      ]);
+      const unsupported = (await submitRendered(
+        server.origin,
+        engagementImportHref(server.engagementId),
+        new Map<string, string | { readonly filename: string; readonly body: string }>([
+          ["title", "Unsupported"],
+          ["date", "2026-06-02"],
+          [FILE_CONTROL, { filename: "notes.exe", body: "Some bytes." }],
+        ]),
+      )).reply;
       assert.equal(unsupported.status, 400);
       const page = mainOf(unsupported.body);
       assert.match(page, /not a supported format/);
@@ -988,14 +1173,15 @@ describe("transcript import submissions", () => {
 
       // An oversize file part is refused by the multipart decoder with its own
       // guidance, before any handler ran.
-      const oversized = await postBytes(
+      const oversized = (await submitRendered(
         server.origin,
         projectImportHref(server.projectId),
-        MULTIPART_TYPE,
-        multipart([{ name: "file", filename: "big.txt", body: "a".repeat(10 * 1024 * 1024 + 1) }]),
-      );
+        new Map<string, string | { readonly filename: string; readonly body: string }>([
+          [FILE_CONTROL, { filename: "big.txt", body: "a".repeat(MAX_FILE_BYTES + 1) }],
+        ]),
+      )).reply;
       assert.equal(oversized.status, 413);
-      assert.match(oversized.body, /at most 10(4?85760| MiB| bytes)/);
+      assert.match(oversized.body, /at most 10485760 bytes/);
       assert.match(oversized.body, /nothing was truncated/i);
       assert.deepEqual(counts(server.store), before, "no meeting or source was created");
     } finally {
@@ -1009,12 +1195,13 @@ describe("transcript import submissions", () => {
       const before = counts(server.store);
       // A paste just past the 15 MiB body total: the decoder refuses it as too
       // large, naming the whole-submission limit.
-      const reply = await postBytes(
+      const reply = (await submitRendered(
         server.origin,
         engagementImportHref(server.engagementId),
-        MULTIPART_TYPE,
-        multipart([{ name: PASTE_CONTROL, body: "a".repeat(MAX_MULTIPART_BYTES) }]),
-      );
+        new Map<string, string | { readonly filename: string; readonly body: string }>([
+          [PASTE_CONTROL, "a".repeat(MAX_MULTIPART_BYTES)],
+        ]),
+      )).reply;
       assert.equal(reply.status, 413);
       assert.match(reply.body, /too large/);
       assert.match(reply.body, new RegExp(`at most ${MAX_MULTIPART_BYTES} bytes|at most ${MAX_MULTIPART_BYTES / 1024 / 1024} MiB`));
@@ -1027,14 +1214,18 @@ describe("transcript import submissions", () => {
   it("refuses an attachment of different content to a meeting that already holds one", async () => {
     const server = await running();
     try {
-      const first = await submit(server.origin, meetingImportHref(server.meetingId), [
-        { name: PASTE_CONTROL, body: "First words." },
-      ]);
+      const first = (await submitPaste(
+        server.origin,
+        meetingImportHref(server.meetingId),
+        new Map([[PASTE_CONTROL, "First words."]]),
+      )).reply;
       assert.equal(first.status, 200);
       const before = counts(server.store);
-      const second = await submit(server.origin, meetingImportHref(server.meetingId), [
-        { name: PASTE_CONTROL, body: "Different words." },
-      ]);
+      const second = (await submitPaste(
+        server.origin,
+        meetingImportHref(server.meetingId),
+        new Map([[PASTE_CONTROL, "Different words."]]),
+      )).reply;
       assert.equal(second.status, 400);
       assert.match(mainOf(second.body), /an attachment is never replaced/);
       assert.deepEqual(counts(server.store), before);
@@ -1047,12 +1238,18 @@ describe("transcript import submissions", () => {
     const server = await running();
     try {
       const before = counts(server.store);
-      const reply = await postBytes(
+      // The rendered form is multipart; a body sent with the wrong encoding to a
+      // marked slot is refused by the shell's media check.
+      const reply = (await submitRendered(
         server.origin,
         engagementImportHref(server.engagementId),
-        "application/x-www-form-urlencoded",
-        Buffer.from("title=x&date=2026-01-01&paste=Words"),
-      );
+        new Map<string, string | { readonly filename: string; readonly body: string }>([
+          ["title", "x"],
+          ["date", "2026-01-01"],
+          [PASTE_CONTROL, "Words"],
+        ]),
+        { contentTypeOverride: "application/x-www-form-urlencoded" },
+      )).reply;
       assert.equal(reply.status, 415);
       assert.deepEqual(counts(server.store), before);
     } finally {
@@ -1060,18 +1257,52 @@ describe("transcript import submissions", () => {
     }
   });
 
+  it("resolves the URL record through the scoped handler before rendering the refusal form", async () => {
+    // The URL names a record that does not exist when the page's snapshot is
+    // read: the scoped handler resolves it inside the store's own queue turn,
+    // after an earlier queued write created it. The POST is handed the kind and
+    // raw id first, so it commits instead of answering 404 from the stale page.
+    const store = await openStore(tempDir());
+    const server = await startServer({ store, port: 0, routes: registerRoutes(store) });
+    try {
+      const fixture = await seed(store);
+      // A queued write creates an engagement; the import's URL is resolved
+      // against the draft that write commits, not the snapshot read before it.
+      const creating = store.createEngagement({ clientId: fixture.clientId, name: "Queued" });
+      const engagement = await creating;
+      const reply = (await submitPaste(
+        server.origin,
+        engagementImportHref(engagement.id),
+        new Map([
+          ["title", "Queued import"],
+          ["date", "2026-07-02"],
+          [PASTE_CONTROL, "Queued words."],
+        ]),
+      )).reply;
+      assert.equal(reply.status, 200);
+      assert.ok(store.snapshot().meetings.some((meeting) => meeting.title === "Queued import"));
+    } finally {
+      await server.close();
+      await store.close();
+    }
+  });
+
   it("commits through the registered route table built over one borrowed service", async () => {
     // The application wires the routes over one transcript service that
     // borrows the same open store, so an import shares the store's own queue.
     const store = await openStore(tempDir());
-    const server = await startServer({ store, port: 0, routes: registerRoutesWith(store, transcriptService(store)) });
+    const server = await startServer({ store, port: 0, routes: registerRoutes(store) });
     try {
       const fixture = await seed(store);
-      const reply = await submit(server.origin, engagementImportHref(fixture.engagementId), [
-        { name: "title", body: "Through the table" },
-        { name: "date", body: "2026-07-01" },
-        { name: PASTE_CONTROL, body: "Table words." },
-      ]);
+      const reply = (await submitPaste(
+        server.origin,
+        engagementImportHref(fixture.engagementId),
+        new Map([
+          ["title", "Through the table"],
+          ["date", "2026-07-01"],
+          [PASTE_CONTROL, "Table words."],
+        ]),
+      )).reply;
       assert.equal(reply.status, 200);
       assert.ok(store.snapshot().meetings.some((meeting) => meeting.title === "Through the table"));
       assert.ok((store.snapshot().transcripts ?? []).length > 0);
@@ -1105,11 +1336,15 @@ describe("transcript import submissions", () => {
       );
       const form = await get(app.url, engagementImportHref(engagementId));
       assert.equal(form.status, 200);
-      const reply = await submit(app.url, engagementImportHref(engagementId), [
-        { name: "title", body: "Owned import" },
-        { name: "date", body: "2026-08-01" },
-        { name: PASTE_CONTROL, body: "Owned words." },
-      ]);
+      const reply = (await submitPaste(
+        app.url,
+        engagementImportHref(engagementId),
+        new Map([
+          ["title", "Owned import"],
+          ["date", "2026-08-01"],
+          [PASTE_CONTROL, "Owned words."],
+        ]),
+      )).reply;
       assert.equal(reply.status, 200);
       assert.match(mainOf(reply.body), /Transcript imported/);
       assert.match(mainOf(reply.body), new RegExp(`href="/meetings/meeting-`));
