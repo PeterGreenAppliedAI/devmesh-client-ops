@@ -16,8 +16,9 @@
  *   that meeting's metadata (its notes included when it has any).
  * - A content the engagement already holds reuses its canonical meeting,
  *   archived matches included, and preserves the stored metadata and project;
- *   every supplied difference (title, date, project or explicitly supplied
- *   notes) is reported as a conflict and is never written.
+ *   every supplied difference (title, date, project — an explicit blank
+ *   engagement-only selection included — or explicitly supplied notes) is
+ *   reported as a conflict and is never written.
  * - A repeat aimed at another meeting leaves that target unchanged and returns
  *   the canonical meeting with an explanation.
  * - Different content aimed at a meeting that already holds an attachment is
@@ -39,7 +40,10 @@
  *   its turn it commits directly and never enqueues again, and a meeting id is
  *   allocated from the draft that is actually persisted. An import accepted
  *   before `close` finishes and commits while close waits for the queue, exactly
- *   like an ordinary mutation close drains; a call after close is refused.
+ *   like an ordinary mutation close drains; a call after close is refused. A
+ *   caller that already holds the store's queue turn (the submission handler
+ *   admits the whole submission once) commits the import inside that turn and
+ *   never enqueues again.
  * - The complete proposed metadata is validated before any blob is published,
  *   so a validation failure writes nothing at all, blobs included.
  * - Original files are published and verified before the JSON that names them
@@ -78,6 +82,7 @@ import {
 } from "./transcript.ts";
 import { importDocx, type DocxParser } from "./transcript-docx.ts";
 import { importPdf, type PdfParser } from "./transcript-pdf.ts";
+import { isEffectivelyArchived } from "./archive.ts";
 import {
   clone,
   deepFreeze,
@@ -207,7 +212,14 @@ export type TranscriptTarget =
   | { readonly meetingId: unknown; readonly create?: undefined };
 
 /** Options accepted by `openTranscriptStore`; only tests pass them. */
-export interface TranscriptStoreOptions extends StoreOptions {
+export interface TranscriptStoreOptions extends StoreOptions, TranscriptServiceOptions {}
+
+/**
+ * Options accepted by `transcriptService`: only the adapters that a borrowed
+ * service needs, since the workspace store it borrows is already open and its
+ * filesystem, clock, originals and lock are the open store's own.
+ */
+export interface TranscriptServiceOptions {
   /** Overrides the DOCX parser, so a parser refusal can be injected. */
   docxParser?: DocxParser;
   /** Overrides the PDF parser, so a parser refusal can be injected. */
@@ -231,12 +243,19 @@ export interface TranscriptStore {
   ): Promise<TranscriptSourceRead>;
   /** Detached, read-only committed transcript metadata. */
   transcripts(): readonly Transcript[];
-  /** Release ownership of the workspace. */
+  /**
+   * Release this service's ownership of the workspace. A service built by
+   * `openTranscriptStore` owns the store it opened and closes it; a service
+   * built by `transcriptService` borrows an already-open store and leaves it
+   * open, so the caller keeps the store and closes it (`close` is then a no-op).
+   */
   close(): Promise<void>;
 }
 
 const INPUT_KEYS = ["kind", "text", "bytes", "filename"] as const;
 const CREATE_KEYS = ["clientId", "engagementId", "projectId", "title", "date", "notes"] as const;
+/** The create keys plus the handler's internal marker for an explicitly blank project. */
+const SUPPLIED_CREATE_KEYS = [...CREATE_KEYS, "engagementOnly"] as const;
 const TARGET_KEYS = ["create", "meetingId"] as const;
 
 function requireRecord(value: unknown, what: string, keys: readonly string[]): Record<string, unknown> {
@@ -318,6 +337,12 @@ interface CommitStore {
   writeBlock(): PersistenceError | null;
 }
 
+/** A meeting create together with the project control that was explicitly blank. */
+interface SuppliedCreate extends TranscriptMeetingCreate {
+  /** True when the submission explicitly left the project blank (engagement only). */
+  readonly engagementOnly?: boolean;
+}
+
 /** The supplied meeting create, normalized after validation. */
 interface NormalizedCreate {
   readonly clientId: string;
@@ -355,17 +380,21 @@ class TranscriptStoreImpl implements TranscriptStore {
   private readonly originals: OriginalStore;
   private readonly docxParser: DocxParser | undefined;
   private readonly pdfParser: PdfParser | undefined;
+  /** Whether this service owns the store it was built over and closes it. */
+  private readonly ownsStore: boolean;
 
   constructor(
     store: Store,
     originals: OriginalStore,
     docxParser: DocxParser | undefined,
     pdfParser: PdfParser | undefined,
+    ownsStore: boolean,
   ) {
     this.store = store;
     this.originals = originals;
     this.docxParser = docxParser;
     this.pdfParser = pdfParser;
+    this.ownsStore = ownsStore;
   }
 
   transcripts(): readonly Transcript[] {
@@ -397,7 +426,17 @@ class TranscriptStoreImpl implements TranscriptStore {
    * malformed call, a parser refusal or an invalid parent writes nothing.
    */
   importTranscript(input: TranscriptInput, target: TranscriptTarget): Promise<TranscriptImportResult> {
-    return this.exclusive(async () => {
+    return this.exclusive(() => this.importInTurn(input, target));
+  }
+
+  /**
+   * The import itself, run inside a workspace store's queue turn that the caller
+   * already holds (see `importTranscriptInTurn`). It commits inside that turn and
+   * never enqueues again, since a turn awaiting its own admission would leave
+   * the queue unsettled; admission was decided by the caller's turn.
+   */
+  importInTurn(input: TranscriptInput, target: TranscriptTarget): Promise<TranscriptImportResult> {
+    return (async () => {
       // Admission was decided when this import entered the store's queue: an
       // import accepted before close keeps running while close drains the queue.
       // A store that became blocked may not build on uncommitted state.
@@ -413,7 +452,7 @@ class TranscriptStoreImpl implements TranscriptStore {
           ? this.planCreate(prepared, parsed.create, snapshot)
           : this.planTarget(prepared, parsed.meetingId!, snapshot);
       return this.commit(prepared, committed);
-    });
+    })();
   }
 
   /**
@@ -506,8 +545,14 @@ class TranscriptStoreImpl implements TranscriptStore {
       const create = requireRecord(
         record.create,
         "transcript target.create",
-        CREATE_KEYS,
-      ) as unknown as TranscriptMeetingCreate;
+        SUPPLIED_CREATE_KEYS,
+      ) as unknown as SuppliedCreate;
+      if (create.engagementOnly !== undefined && create.engagementOnly !== true) {
+        throw new ValidationError("transcript target.create.engagementOnly must be true when present");
+      }
+      if (create.engagementOnly === true && create.projectId !== undefined) {
+        throw new ValidationError("transcript target.create cannot carry a project and an engagement-only selection");
+      }
       requireNonblank(create.clientId, "transcript target.create.clientId");
       requireNonblank(create.engagementId, "transcript target.create.engagementId");
       optionalNonblank(create.projectId, "transcript target.create.projectId");
@@ -612,13 +657,12 @@ class TranscriptStoreImpl implements TranscriptStore {
   }
 
   /**
-   * Whether the canonical meeting's engagement or client is archived. Archived
-   * canonical meetings are reused like active ones, and the result says so.
+   * Whether the canonical meeting is effectively archived: its client, its
+   * engagement or its own project carries the flag. Archived canonical meetings
+   * are reused like active ones, and the result says so.
    */
   private isArchived(snapshot: Snapshot, meeting: Meeting): boolean {
-    const engagement = snapshot.engagements.find((e) => e.id === meeting.engagementId);
-    const client = snapshot.clients.find((c) => c.id === meeting.clientId);
-    return engagement?.archived === true || client?.archived === true;
+    return isEffectivelyArchived(snapshot, meeting);
   }
 
   /**
@@ -708,10 +752,17 @@ class TranscriptStoreImpl implements TranscriptStore {
     }
     // An omitted project is not a supplied one: only a project the caller
     // actually supplied and that differs from the preserved project is a
-    // difference.
+    // difference. An explicitly blank project selects the engagement only
+    // (supplied as "") and differs from a preserved project like any other
+    // selection; the canonical holder's project is still preserved.
     const projectId = create.projectId as string | undefined;
-    if (projectId !== undefined && projectId !== meeting.projectId) {
-      conflicts.push({ field: "projectId", supplied: projectId, preserved: meeting.projectId ?? "" });
+    const suppliedProject = (create as SuppliedCreate).engagementOnly === true ? "" : projectId;
+    if (suppliedProject !== undefined && suppliedProject !== (meeting.projectId ?? "")) {
+      conflicts.push({
+        field: "projectId",
+        supplied: suppliedProject,
+        preserved: meeting.projectId ?? "",
+      });
     }
     if (create.notes !== undefined && create.notes !== meeting.notes) {
       conflicts.push({ field: "notes", supplied: create.notes as string, preserved: meeting.notes });
@@ -1149,6 +1200,8 @@ class TranscriptStoreImpl implements TranscriptStore {
   }
 
   async close(): Promise<void> {
+    // A borrowed store stays open: the caller that opened it closes it.
+    if (!this.ownsStore) return;
     await this.store.close();
   }
 }
@@ -1230,6 +1283,44 @@ function requireWellFormed(result: ImportResult): void {
 }
 
 /**
+ * Build a transcript service over an already-open workspace store. The service
+ * shares that store's own mutation queue and original-file store, so an import
+ * and an ordinary store write are serialized together and name originals in the
+ * same repository the workspace keeps. The service does not own the store: the
+ * caller keeps it open and closes it, and closing the borrowed service is a
+ * no-op. Only the adapters a borrowed service needs can be overridden; the
+ * workspace's filesystem, clock, originals and lock stay the open store's own.
+ */
+export function transcriptService(
+  store: Store,
+  options: TranscriptServiceOptions = {},
+): TranscriptStore {
+  const internals = store as unknown as CommitStore;
+  return new TranscriptStoreImpl(store, internals.originalFiles(), options.docxParser, options.pdfParser, false);
+}
+
+/**
+ * Perform one import inside the workspace store's queue turn that the caller
+ * already holds. The submission handler admits the whole submission once with
+ * `store.runExclusive`, checks the URL record and the submitted assertions
+ * inside that turn, and then commits the import here: it must not enqueue again,
+ * because a turn awaiting its own admission would leave the queue unsettled. A
+ * service built by `openTranscriptStore` or `transcriptService` has this
+ * turn-aware import; any other `TranscriptStore` is refused.
+ */
+export function importTranscriptInTurn(
+  service: TranscriptStore,
+  input: TranscriptInput,
+  target: TranscriptTarget,
+): Promise<TranscriptImportResult> {
+  const importer = service as unknown as { importInTurn?: TranscriptStoreImpl["importInTurn"] };
+  if (typeof importer.importInTurn !== "function") {
+    throw new ValidationError("the transcript service must share the workspace store's own queue");
+  }
+  return importer.importInTurn(input, target);
+}
+
+/**
  * Open the workspace store and a transcript store over it. The original-file
  * store is the workspace's own, so the metadata the transcript store commits
  * names originals in the same repository the workspace keeps.
@@ -1241,7 +1332,14 @@ export async function openTranscriptStore(
   const store = await openStore(directory, options);
   try {
     const internals = store as unknown as CommitStore;
-    return new TranscriptStoreImpl(store, internals.originalFiles(), options.docxParser, options.pdfParser);
+    // An opened store is owned by its service: closing the service closes it.
+    return new TranscriptStoreImpl(
+      store,
+      internals.originalFiles(),
+      options.docxParser,
+      options.pdfParser,
+      true,
+    );
   } catch (cause) {
     await store.close();
     throw cause;
