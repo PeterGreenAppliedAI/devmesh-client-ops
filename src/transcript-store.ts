@@ -41,10 +41,11 @@
  *   allocated from the draft that is actually persisted. An import accepted
  *   before `close` finishes and commits while close waits for the queue, exactly
  *   like an ordinary mutation close drains; a call admitted after close is
- *   refused. The submission handler resolves and checks the URL and the
- *   submitted assertions, then hands its import to the service, which admits the
- *   whole import as one queue turn; the import commits inside that turn and never
- *   enqueues again.
+ *   refused. The submission handler hands the service one resolver that reads
+ *   the URL record and checks the submitted assertions; the service admits the
+ *   whole submission as one queue turn, runs the resolver against the committed
+ *   state at admission and again at the start of the turn, and commits the
+ *   import inside that turn without enqueuing again.
  * - The complete proposed metadata is validated before any blob is published,
  *   so a validation failure writes nothing at all, blobs included.
  * - Original files are published and verified before the JSON that names them
@@ -236,6 +237,12 @@ export interface TranscriptStore {
    * commit its transcript metadata. See the module comment for the rules.
    */
   importTranscript(input: TranscriptInput, target: TranscriptTarget): Promise<TranscriptImportResult>;
+  /**
+   * Handle one submission (see `transcript-import.ts`) as one admission to the
+   * workspace store's own queue: the resolver reads the URL record and checks
+   * the submitted assertions inside that turn, and the import commits there.
+   */
+  submitImport(resolve: SubmissionResolver): Promise<TranscriptImportResult>;
   /** Read one committed source with its verified original and detached values. */
   readSource(
     transcriptId: unknown,
@@ -315,30 +322,29 @@ interface PreparedImport {
   readonly originalBytes: Uint8Array;
 }
 
-/** The mutable transcript draft a commit is applied to. */
-interface DraftState {
+/** The mutable workspace draft a commit is applied to: the committed state. */
+interface DraftState extends Snapshot {
   meetings: Meeting[];
   transcripts: Transcript[];
-  [key: string]: unknown;
 }
 
 /** The store's internal transcript commit, over the committed state. */
 interface CommitStore {
+  /** Allocate the next id of a collection from the draft that is persisted. */
   nextId(draft: DraftState, key: "meetings"): string;
-  /** A detached copy of the committed state with the store's id counters. */
-  cloneState(): DraftState;
   /**
-   * Run one draft mutation inside the store's queue: the draft is the committed
-   * state with its counters, the store validates it exactly as reopening would,
-   * persists it and records the mutation's one event, if any. Nothing else is
-   * enqueued, so this is used inside the turn `runExclusive` admitted.
+   * Apply one mutation to a draft of the committed state, validate the
+   * resulting transcripts exactly as reopening would, persist the draft and
+   * record the mutation's one event, if any. This never enqueues: it is called
+   * inside the turn `runExclusive` admitted, so the whole import commits with
+   * that one admission and no further turn waits behind it.
    */
-  runExclusiveDraft<T>(
+  commitTranscripts(
     mutate: (draft: DraftState) => {
-      value: T;
+      value: unknown;
       event?: { action: "create" | "edit"; targetKind: "meeting"; targetId: string };
     },
-  ): Promise<T>;
+  ): Promise<unknown>;
   originalFiles(): OriginalStore;
   /** The failure that refuses a write on a store whose state is not committed. */
   writeBlock(): PersistenceError | null;
@@ -352,33 +358,52 @@ interface CommitStore {
 }
 
 /**
- * The handler's request for one submission import. The service admits it as one
- * queue turn of the workspace store. The explicitly blank project selection
- * travels privately in `engagementOnly`, never through the public
- * `TranscriptTarget` parser. An optional `check` is the submission's own
- * resolution and assertion check: it runs when admission is decided and again at
- * the start of the turn, so both see the committed records the import is applied
- * to.
+ * The submission handler's resolution of one submission against the committed
+ * state: it reads the URL record and the submitted assertions from the
+ * snapshot it is given and returns the one raw import and validated target the
+ * import commits. It is run inside the service's queue turn, once with the
+ * committed state at admission and again at the start of the turn, so the
+ * assertions and the import are checked against the records the import is
+ * applied to.
  */
-export interface SubmissionImportRequest {
+export type SubmissionResolver = (snapshot: Snapshot) => SubmissionImport;
+
+/** What a submission resolver returns: one raw import, its target, and the private blank selection. */
+export interface SubmissionImport {
   readonly input: TranscriptInput;
   readonly target: TranscriptTarget;
   /** True when the submission explicitly left the project blank (engagement only). */
   readonly engagementOnly?: boolean;
-  /** The submission's own URL resolution and assertion check. */
-  readonly check?: () => void;
 }
 
 /**
- * The import a service exposes to the submission handler: it admits the import
- * to the workspace store's own queue as one turn, so the store decides
- * acceptance, and it commits inside that turn without enqueuing again (a turn
- * awaiting its own admission would leave the queue unsettled). It is reachable
- * only through the service's own operation, never as a bare function that skips
- * the store's admission.
+ * The shape-checked import request an import operation runs: the submission
+ * resolver's result, validated before any read or write. The explicit blank
+ * selection travels privately here, never through the public `TranscriptTarget`
+ * parser.
  */
-interface SubmissionImportOperation {
-  importSubmission(request: SubmissionImportRequest): Promise<TranscriptImportResult>;
+interface SubmissionImportRequest {
+  readonly input: TranscriptInput;
+  readonly target: TranscriptTarget;
+  readonly engagementOnly?: boolean;
+}
+
+/**
+ * Shape-check a resolver's result for the import operation: exactly one input
+ * and one target, and the private blank marker only when it is true. Only the
+ * submission's own resolver produces these, so the marker is never a
+ * caller-supplied control.
+ */
+function importRequest(submission: SubmissionImport): SubmissionImportRequest {
+  const shape = requireRecord(submission, "transcript submission import", [
+    "input",
+    "target",
+    "engagementOnly",
+  ] as const);
+  if (shape.engagementOnly !== undefined && shape.engagementOnly !== true) {
+    throw new ValidationError("transcript submission import.engagementOnly must be true when present");
+  }
+  return submission as SubmissionImportRequest;
 }
 
 /** The supplied meeting create, normalized after validation. */
@@ -448,34 +473,6 @@ class TranscriptStoreImpl implements TranscriptStore {
     return this.store as unknown as CommitStore;
   }
 
-  /**
-   * The id the store's own serialized commit allocates to the next meeting: a
-   * create plans it from the store's allocation on a detached copy of the
-   * committed state, so the result names the id that is persisted. The store's
-   * serialized commit then rebuilds its draft from the committed state and
-   * allocates that same next id.
-   */
-  private reserveMeetingId(): string {
-    return this.internals().nextId(this.internals().cloneState(), "meetings");
-  }
-
-  /**
-   * The committed state a plan is made against: detached copies of the
-   * hierarchy, meetings and transcripts the plan reads. The store's own
-   * serialized commit then rebuilds its draft from the committed state inside
-   * its turn, where the plan is applied and re-checked.
-   */
-  private planState(): DraftState {
-    const snapshot = this.store.snapshot();
-    return {
-      clients: clone(snapshot.clients),
-      engagements: clone(snapshot.engagements),
-      projects: clone(snapshot.projects),
-      meetings: clone(snapshot.meetings),
-      transcripts: clone(snapshot.transcripts ?? []),
-    } as unknown as DraftState;
-  }
-
   /** The failure that refuses an accepted import's write when it is blocked. */
   private writeBlock(): PersistenceError | null {
     return this.internals().writeBlock();
@@ -492,81 +489,66 @@ class TranscriptStoreImpl implements TranscriptStore {
    * malformed call, a parser refusal or an invalid parent writes nothing.
    */
   importTranscript(input: TranscriptInput, target: TranscriptTarget): Promise<TranscriptImportResult> {
-    return this.exclusive(() => this.importInTurn({ input, target }));
+    // The public target parser accepts only the supplied create keys; a direct
+    // import therefore never carries the handler's private blank marker.
+    return this.exclusive(() => this.importResolved(() => ({ input, target })));
   }
 
   /**
-   * Run the submission handler's import as one admission to the store's own
-   * mutation queue. The handler resolves the URL, checks the assertions and
-   * hands its request here, all before this promise is created; this call then
-   * decides admission and runs the import inside its own turn, so the whole
-   * submission (URL validation, parent checks and commit together) is admitted
-   * by the store and a store closed or blocked before admission is refused.
-   * Inside the turn the import commits directly and never enqueues again, since
-   * a turn awaiting its own admission would leave the queue unsettled.
+   * Handle one submission as one admission to the store's own mutation queue.
+   * The service's resolver reads the URL record and checks the submitted
+   * assertions against the committed state, so URL resolution, assertion
+   * checks and the import's commit are all admitted together by the store: a
+   * store closed or blocked before admission is refused, and an assertion that
+   * held at admission is re-checked at the start of the turn against every
+   * write queued before it. The import commits inside that turn and never
+   * enqueues again, since a turn awaiting its own admission would leave the
+   * queue unsettled. A malformed resolver writes nothing and enters no queue.
    */
-  importSubmission(request: SubmissionImportRequest): Promise<TranscriptImportResult> {
-    // The request shape is checked before the queue admission, so a malformed
-    // request writes nothing and never enters the queue.
-    const shape = requireRecord(request, "transcript submission import", [
-      "input",
-      "target",
-      "engagementOnly",
-      "check",
-    ] as const);
-    if (shape.engagementOnly !== undefined && shape.engagementOnly !== true) {
-      throw new ValidationError("transcript submission import.engagementOnly must be true when present");
+  submitImport(resolve: SubmissionResolver): Promise<TranscriptImportResult> {
+    if (typeof resolve !== "function") {
+      throw new ValidationError("a transcript submission needs a resolver function");
     }
-    if (shape.check !== undefined && typeof shape.check !== "function") {
-      throw new ValidationError("transcript submission import.check must be a function");
-    }
-    // The submission's own resolution and assertion check is applied to the
-    // committed state when admission is decided, and again at the start of the
-    // turn (where it sees every write queued before it), so a refused submission
-    // never enters the queue and a stale assertion never commits.
-    const check = shape.check as (() => void) | undefined;
-    check?.();
-    return this.exclusive(() => {
-      check?.();
-      return this.importInTurn(request);
-    });
+    // The submission is resolved against the committed state when admission is
+    // decided, so a refused submission never enters the queue; the resolver is
+    // run again inside the turn, where it sees every write queued before it.
+    return this.exclusive(() => this.importResolved(resolve));
   }
 
   /**
    * The import itself, run inside the workspace store's queue turn this call was
-   * admitted to (the submission operation or this service's own
-   * `importTranscript` both admit it with the store's `runExclusive`). It commits
-   * inside that turn and never enqueues again, since a turn awaiting its own
-   * admission would leave the queue unsettled.
+   * admitted to (both `importTranscript` and `submitImport` admit it with the
+   * store's own queue). The resolver is applied to the committed state at the
+   * start of the turn, so a submission's URL record and assertion checks see
+   * every write queued before it; this method then prepares, plans and commits
+   * inside that turn and never enqueues again.
    */
-  private importInTurn(request: SubmissionImportRequest): Promise<TranscriptImportResult> {
+  private importResolved(resolve: SubmissionResolver): Promise<TranscriptImportResult> {
     return (async () => {
       // Admission was decided when this import entered the store's queue: an
       // import accepted before close keeps running while close drains the queue.
       // A store that became blocked may not build on uncommitted state.
       const blocked = this.writeBlock();
       if (blocked !== null) throw blocked;
-      // The arguments are checked before any read or write, so a malformed
-      // call writes nothing at all.
+      // The resolver runs here against the committed state every queued write
+      // has already updated, so the URL record and the submitted assertions are
+      // checked against the records the import is applied to. A stale assertion
+      // is refused before anything is read or written.
+      const request = importRequest(resolve(this.store.snapshot()));
       const parsed = this.parseTarget(request.target, request.engagementOnly === true);
       const prepared = await this.prepare(request.input);
-      // The plan is made from the committed state after the input was read, and
-      // validates its complete proposal before anything is published.
-      const state = this.planState();
+      // The complete proposal is validated against the committed state before
+      // any blob is published, and the blob is published before the JSON that
+      // names it. The plan is then applied to the store's own draft inside this
+      // turn's single commit, which re-checks the proposal against the records
+      // actually persisted and allocates the meeting id from them.
       const plan =
         parsed.create !== undefined
-          ? this.planCreate(prepared, parsed.create, state, request.engagementOnly === true)
-          : this.planTarget(prepared, parsed.meetingId!, state);
-      // A file original is published and verified before the JSON that names it
-      // is committed, and only once the proposal it joins has been validated.
+          ? this.planCreate(prepared, parsed.create, request.engagementOnly === true)
+          : this.planTarget(prepared, parsed.meetingId!);
       if (plan.write !== "noop") await this.publish(prepared);
-      // The store's serialized commit rebuilds its draft from the committed
-      // state; the plan is applied to that draft, where its re-check sees the
-      // records that are actually persisted.
-      const committed = await this.internals().runExclusiveDraft((draft) =>
-        this.commitChange(prepared, plan, draft),
-      );
-      return this.result(committed);
+      await this.internals().commitTranscripts((draft) => this.commitChange(prepared, plan, draft));
+      return this.result(plan);
     })();
   }
 
@@ -755,21 +737,15 @@ class TranscriptStoreImpl implements TranscriptStore {
     snapshot: Snapshot,
     engagementId: string,
     canonicalText: string,
-    heldMeetingId?: string,
   ): CanonicalMatch | undefined {
-    // A transcript held by the submitted target is that target's own holder;
-    // any other stored transcript of the content in the engagement is the
-    // canonical one, so a repeat is never taken as an attachment to itself.
-    const matches = (snapshot.transcripts ?? []).flatMap((transcript) => {
-      if (transcript.canonicalText !== canonicalText) return [];
+    for (const transcript of snapshot.transcripts ?? []) {
+      if (transcript.canonicalText !== canonicalText) continue;
       const holder = snapshot.meetings.find((m) => m.id === transcript.meetingId);
-      if (holder === undefined || holder.engagementId !== engagementId) return [];
-      return [{ meeting: holder, transcript }];
-    });
-    for (const match of matches) {
-      if (match.meeting.id !== heldMeetingId) return match;
+      if (holder !== undefined && holder.engagementId === engagementId) {
+        return { meeting: holder, transcript };
+      }
     }
-    return matches[0];
+    return undefined;
   }
 
   /** The transcript held by exactly this meeting, or undefined. */
@@ -905,10 +881,9 @@ class TranscriptStoreImpl implements TranscriptStore {
   private planCreate(
     prepared: PreparedImport,
     create: TranscriptMeetingCreate,
-    draft: DraftState,
     engagementOnly = false,
   ): CommitPlan {
-    const snapshot = draft as unknown as Snapshot;
+    const snapshot = this.store.snapshot();
     const normalized = this.requireCreateParents(snapshot, create);
     const canonical = this.canonicalFor(snapshot, normalized.engagementId, prepared.result.canonicalText);
     if (canonical !== undefined) {
@@ -931,12 +906,11 @@ class TranscriptStoreImpl implements TranscriptStore {
       meetingId: meeting.id,
       sources: [this.newSource(prepared)],
     };
-    // The meeting id is the next the store's own serialized commit allocates,
-    // so the meeting, its transcript's association and its event all name it.
-    const planned = this.reserveMeetingId();
-    (globalThis as any).__res = { planned, meetings: (snapshot as any).meetings.map((m: any) => m.id), nextIds: (this.internals().cloneState() as any).nextIds };
-    const created = parseMeeting({ ...meeting, id: planned });
-    this.validateProposal(snapshot, created, { ...transcript, meetingId: planned });
+    // The proposed metadata, transcript and source are validated as if the
+    // meeting already existed; its id is allocated from the draft the store
+    // actually persists, so the meeting, its transcript's association and its
+    // event all name that id.
+    this.validateProposal(snapshot, meeting, transcript);
     return {
       outcome: "created",
       engagementId: normalized.engagementId,
@@ -944,7 +918,7 @@ class TranscriptStoreImpl implements TranscriptStore {
       createdMeeting: true,
       write: "create",
       canonicalText: prepared.result.canonicalText,
-      meeting: { ...created, id: "" },
+      meeting: { ...meeting, id: "" },
       transcript: { ...transcript, meetingId: "" },
       event: { action: "create", targetKind: "meeting", targetId: "" },
       conflicts: [],
@@ -961,10 +935,10 @@ class TranscriptStoreImpl implements TranscriptStore {
    * already is refused before anything is written, because an attachment is
    * never replaced and different content never becomes a second transcript.
    */
-  private planTarget(prepared: PreparedImport, meetingId: string, draft: DraftState): CommitPlan {
-    const snapshot = draft as unknown as Snapshot;
+  private planTarget(prepared: PreparedImport, meetingId: string): CommitPlan {
+    const snapshot = this.store.snapshot();
     const target = this.findMeeting(snapshot, meetingId);
-    const canonical = this.canonicalFor(snapshot, target.engagementId, prepared.result.canonicalText, target.id);
+    const canonical = this.canonicalFor(snapshot, target.engagementId, prepared.result.canonicalText);
     if (canonical !== undefined) {
       return this.planReuse(prepared, canonical, [], target.id);
     }
@@ -1059,6 +1033,8 @@ class TranscriptStoreImpl implements TranscriptStore {
     value: CommitPlan;
     event?: { action: "create" | "edit"; targetKind: "meeting"; targetId: string };
   } {
+    const meetings = draft.meetings as Meeting[];
+    const transcripts = draft.transcripts as Transcript[];
     if (plan.write === "create") {
       // The meeting id is allocated from the draft that is actually persisted,
       // so the meeting, its transcript's association and its event all name it.
@@ -1067,22 +1043,24 @@ class TranscriptStoreImpl implements TranscriptStore {
       const created = parseMeeting({ ...plan.meeting!, id });
       plan.meetingId = id;
       if (plan.event !== undefined) plan.event.targetId = id;
-      draft.meetings.push(created);
-      draft.transcripts.push({ ...plan.transcript!, meetingId: id });
+      meetings.push(created);
+      transcripts.push({ ...plan.transcript!, meetingId: id });
     } else if (plan.write === "attach") {
       this.recheckNewContent(draft, plan);
-      draft.transcripts.push(plan.transcript!);
+      transcripts.push(plan.transcript!);
     } else if (plan.write === "edit") {
       // The draft must still hold the canonical transcript this original joins.
-      const transcript = draft.transcripts.find((t) => t.id === plan.planTranscriptId);
+      const index = transcripts.findIndex(
+        (t) => t.id === plan.planTranscriptId && t.meetingId === plan.meetingId,
+      );
+      const transcript = index < 0 ? undefined : transcripts[index];
       if (transcript === undefined) {
         throw new ValidationError(`transcript ${JSON.stringify(plan.planTranscriptId)} is no longer stored`);
       }
-      const proposed = {
+      transcripts[index] = {
         ...transcript,
         sources: this.proposedSources(transcript, this.newSource({ ...prepared, ...planOriginals(plan) })),
       };
-      draft.transcripts[draft.transcripts.indexOf(transcript)] = proposed;
     }
     return plan.event === undefined ? { value: plan } : { value: plan, event: plan.event };
   }
@@ -1094,18 +1072,18 @@ class TranscriptStoreImpl implements TranscriptStore {
    * new, so this only guards an attachment).
    */
   private recheckNewContent(draft: DraftState, plan: CommitPlan): void {
-    const snapshot = draft as unknown as Snapshot;
     const meeting = draft.meetings.find((m) => m.id === plan.meetingId);
     if (plan.write !== "create" && meeting === undefined) {
       throw new MissingRecordError(`No meeting with id ${JSON.stringify(plan.meetingId)}`);
     }
-    if (plan.write === "attach" && meeting !== undefined && this.transcriptOf(snapshot, meeting.id) !== undefined) {
+    if (plan.write === "attach" && meeting !== undefined && this.transcriptOf(draft, meeting.id) !== undefined) {
       throw new ValidationError(
-        `meeting ${JSON.stringify(meeting.id)} still holds no transcript`,
+        `meeting ${JSON.stringify(meeting.id)} already holds a transcript of different content; ` +
+          "an attachment is never replaced",
       );
     }
     const engagementId = meeting?.engagementId ?? plan.engagementId;
-    const clash = draft.transcripts.some(
+    const clash = (draft.transcripts ?? []).some(
       (t) =>
         t.canonicalText === plan.canonicalText &&
         draft.meetings.some((m) => m.id === t.meetingId && m.engagementId === engagementId),
@@ -1442,27 +1420,6 @@ export function transcriptService(
 ): TranscriptStore {
   const internals = store as unknown as CommitStore;
   return new TranscriptStoreImpl(store, internals.originalFiles(), options.docxParser, options.pdfParser, false);
-}
-
-/**
- * The submission operation of a transcript service: the handler admits the
- * whole submission once with `store.runExclusive`, checks the URL record and the
- * submitted assertions inside that turn, and then hands its request here. The
- * returned operation imports inside that turn and never enqueues again. A
- * service built by `openTranscriptStore` or `transcriptService` has it; any
- * other `TranscriptStore` is refused.
- */
-export function submissionOperation(service: TranscriptStore): SubmissionImportOperation {
-  const importer = service as unknown as Partial<SubmissionImportOperation>;
-  if (typeof importer.importSubmission !== "function") {
-    throw new ValidationError("the transcript service must share the workspace store's own queue");
-  }
-  // Bind the method to the service: it uses the service's own store and
-  // originals, and an unbound call would have no `this`.
-  const importSubmission = importer.importSubmission!.bind(service);
-  return {
-    importSubmission: (request) => importSubmission(request),
-  };
 }
 
 /**

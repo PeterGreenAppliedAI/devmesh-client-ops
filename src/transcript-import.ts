@@ -51,10 +51,9 @@
  * refused submission writes nothing, including blobs.
  */
 import { MissingRecordError, ValidationError } from "./model.ts";
-import type { Engagement, Meeting, Project, Snapshot, Store } from "./store.ts";
+import type { Engagement, Meeting, Project, Snapshot } from "./store.ts";
 import {
-  submissionOperation,
-  type SubmissionImportRequest,
+  type SubmissionImport,
   type TranscriptImportResult,
   type TranscriptInput,
   type TranscriptStore,
@@ -389,26 +388,16 @@ export function submitTranscript(
     }
     const fields = requireFields(submission.fields);
     const file = submission.file ?? null;
-    const store: Store = service.store;
-    if (!isExclusive(store)) {
-      // Without the store's queue the checks below cannot use the records the
-      // import is applied to, so the submission is refused rather than guessed.
-      throw new ValidationError("the transcript service must share the workspace store's own queue");
-    }
-    // The import operation belongs to the service: only a service built over
-    // the workspace store has one, and it admits and commits the import in one
-    // store turn.
-    const operation = submissionOperation(service);
     // The whole submission is resolved and checked inside one admission to the
-    // store's own mutation queue: the URL record and its derived parents, the
+    // service's own store queue: the URL record and its derived parents, the
     // assertions against them, the input and the target are read from the
-    // committed state, and the import commits inside that same turn. The check
-    // runs when admission is decided and again at the start of the turn (where
-    // it sees every write queued before this submission), so an assertion that
-    // held for the old records cannot commit after a queued move to a new
-    // parent; a store closed or blocked before admission is refused.
-    function resolve(): SubmissionImportRequest {
-      const snapshot = store.snapshot();
+    // committed state the resolver is given, and the import commits inside that
+    // same turn. The resolver runs when admission is decided and again at the
+    // start of the turn (where it sees every write queued before this
+    // submission), so an assertion that held for the old records cannot commit
+    // after a queued move to a new parent; a store closed or blocked before
+    // admission is refused.
+    function resolve(snapshot: Snapshot): SubmissionImport {
       const scope = resolveScope(snapshot, kind, submission.rawId);
       const create = kind !== "meeting";
       requireAssertions(fields, scope, create);
@@ -428,23 +417,6 @@ export function submitTranscript(
         ...(engagementOnly ? { engagementOnly } : {}),
       };
     }
-    const { input, target, engagementOnly } = resolve();
-    // The import runs inside the admission this call makes (one turn) and never
-    // enqueues again, so its checks, its parent validation and its commit see
-    // exactly the committed records the assertions were checked against.
-    return operation.importSubmission({
-      input,
-      target,
-      ...(engagementOnly === undefined ? {} : { engagementOnly }),
-      check: resolve,
-    });
+    return service.submitImport(resolve);
   }
-}
-
-/** Whether the store can admit one exclusive operation: its own mutation queue. */
-function isExclusive(store: Store): store is Store & {
-  runExclusive<T>(operation: () => Promise<T>): Promise<T>;
-} {
-  const candidate = store as unknown as { runExclusive?: unknown };
-  return typeof candidate.runExclusive === "function";
 }
