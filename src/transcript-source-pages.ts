@@ -13,8 +13,9 @@
  * Each source is read at `/meetings/:id/transcripts/:transcriptId/sources/:sourceId/{original,text,passages}`,
  * a fixed, exact route shape whose three ids are single path segments. A read
  * first resolves the decoded meeting, the transcript and the source together:
- * a malformed escape, a missing record or a reference that does not belong to
- * the resolved meeting is a 404 and no read is attempted. The original bytes
+ * a segment that is not the exact encoding, a missing record or a reference
+ * that does not belong to the resolved meeting is a 404 and no read is
+ * attempted. The original bytes
  * are read only then, through the borrowed transcript service's `readSource`,
  * scoped to the meeting's engagement. A referenced original that cannot be
  * read or verified is a `PersistenceError`, which the shell answers with its
@@ -31,10 +32,15 @@
  * column. A recorded PDF page is shown as such; a DOCX passage names an
  * extracted block, because a DOCX has no recorded page.
  *
- * Every displayed value is escaped; every link is built from a stored record
- * id through `encodeURIComponent`.
+ * Every displayed value is escaped. Every id in a link is encoded as one path
+ * segment through `encodeSegment`: a fixed prefix plus the base64url of the
+ * id's UTF-8 bytes. The encoding is reversible and collision-free, contains
+ * only URL, path and HTML-safe characters, and never reads as `.` or `..`, so
+ * no browser URL resolution can drop or re-split a segment. The handler decodes
+ * it exactly once, and a segment that is not exactly that encoding is refused
+ * as a missing record.
  */
-import { escapeHtml, PAGE_HEADERS, renderPage, type Page } from "./html.ts";
+import { escapeHtml, renderPage, type Page } from "./html.ts";
 import { MissingRecordError } from "./model.ts";
 import type { Snapshot, Store, Transcript, TranscriptSource } from "./store.ts";
 import { transcriptService, type TranscriptSourceRead, type TranscriptStore } from "./transcript-store.ts";
@@ -58,8 +64,9 @@ const SOURCE_VIEWS: readonly SourceView[] = Object.freeze(["original", "text", "
  * other path so an unregistered path is refused before any handler runs. Only
  * the three exact view literals match (an ordinary object's inherited
  * property names such as `constructor` name no view), and the path must be
- * root-relative with no empty segment. The ids are not decoded here: a
- * malformed escape names no record, which the handler answers as a 404.
+ * root-relative with no empty segment. The ids are not decoded here: a segment
+ * that is not the exact encoding names no record, which the handler answers as
+ * a 404.
  */
 export function matchTranscriptSourcePath(
   path: string,
@@ -93,12 +100,55 @@ export function matchTranscriptSourcePath(
 }
 
 /**
- * The transcript import path of one meeting, the fixed route the listing links
- * to. Declared here as well so the listing and the import pages share one
- * spelling; it equals `meetingImportHref` in `meeting-pages.ts`.
+ * The single-segment encoding of one record id: the fixed prefix `~` and the
+ * base64url of the id's UTF-8 bytes. It is reversible and collision-free, and
+ * its alphabet (letters, digits, `-`, `_`) is safe in a path segment, a query
+ * and an HTML attribute, so a link never needs a second escape. No value starts
+ * with a dot, so a browser's URL resolution never drops or re-reads it.
  */
-export function meetingImportPath(meetingId: string): string {
-  return `/meetings/${encodeURIComponent(meetingId)}/transcripts/import`;
+export function encodeSegment(value: string): string {
+  return `~${Buffer.from(value, "utf8").toString("base64url")}`;
+}
+
+/**
+ * The single-segment encoding of a stored record id for a link. A record id is
+ * never empty (the store refuses a blank one), so a blank value names no record
+ * and is refused here rather than encoded into a link; every other value is the
+ * reversible encoding above.
+ */
+export function recordSegment(value: string): string {
+  if (value === "") {
+    throw new MissingRecordError("No record for that path");
+  }
+  return encodeSegment(value);
+}
+
+/**
+ * Decode exactly one segment id, once. Only the exact encoding `encodeSegment`
+ * produces is accepted; anything else (a bare id, a percent-escaped spelling,
+ * a padded base64, a non-canonical tail, or an invalid UTF-8 tail) names no
+ * record and is a `MissingRecordError`. Decoding the canonical form yields the
+ * id's exact UTF-8 bytes, so ids differing in one byte never decode alike.
+ */
+export function decodeSegment(raw: string): string {
+  if (!raw.startsWith("~")) {
+    throw new MissingRecordError("No record for that path");
+  }
+  const body = raw.slice(1);
+  if (!/^[A-Za-z0-9_-]+$/.test(body)) throw new MissingRecordError("No record for that path");
+  let bytes: Uint8Array;
+  let decoded: string;
+  try {
+    bytes = new Uint8Array(Buffer.from(body, "base64url"));
+    decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new MissingRecordError("No record for that path");
+  }
+  // Re-encoding is the canonical-form check: it rejects padding, unused tail
+  // bits (whose bits spill into the decoded bytes) and any spelling other than
+  // the one `encodeSegment` produces.
+  if (encodeSegment(decoded) !== raw) throw new MissingRecordError("No record for that path");
+  return decoded;
 }
 
 /** The path of one source's view, from the stored ids of its records. */
@@ -109,9 +159,9 @@ export function sourceHref(
   view: SourceView,
 ): string {
   return (
-    `/meetings/${encodeURIComponent(meetingId)}` +
-    `/transcripts/${encodeURIComponent(transcriptId)}` +
-    `/sources/${encodeURIComponent(sourceId)}/${view}`
+    `/meetings/${recordSegment(meetingId)}` +
+    `/transcripts/${recordSegment(transcriptId)}` +
+    `/sources/${recordSegment(sourceId)}/${view}`
   );
 }
 
@@ -129,8 +179,9 @@ export function meetingTranscripts(snapshot: Snapshot, meetingId: string): reado
 /**
  * The source list of a meeting's detail page: one entry for each committed
  * source of each of the meeting's transcripts, in stored order, with its stored
- * filename and format and the three read-only links. An empty list says so and
- * offers the meeting's import form; it never claims a source that is missing.
+ * filename and format and the three read-only links. An empty list says so; the
+ * meeting's own import action is already offered on the page, so the section
+ * adds no second one. It never claims a source that is missing.
  */
 export function meetingSourceSection(snapshot: Snapshot, meetingId: string): string {
   const transcripts = meetingTranscripts(snapshot, meetingId);
@@ -141,10 +192,11 @@ export function meetingSourceSection(snapshot: Snapshot, meetingId: string): str
     }
   }
   if (items.length === 0) {
+    // An empty list says so; the meeting detail already offers the import form
+    // in its header, so the section repeats no second import action.
     return [
       `<p>No transcript sources recorded yet.</p>`,
       `<p>${escapeHtml("A source appears here once a transcript is imported for this meeting.")}</p>`,
-      `<p><a href="${escapeHtml(meetingImportPath(meetingId))}">Import transcript</a></p>`,
     ].join("\n");
   }
   return `<ul class="card-list">${items.join("")}</ul>`;
@@ -172,15 +224,6 @@ interface SourceTarget {
   readonly sourceId: string;
   /** The meeting's engagement, which scopes the source read. */
   readonly engagementId: string;
-}
-
-/** Decode a raw path segment; a malformed escape names no record. */
-function decodeSegment(raw: string): string {
-  try {
-    return decodeURIComponent(raw);
-  } catch {
-    throw new MissingRecordError("No record for that path");
-  }
 }
 
 function findRecord<T extends { readonly id: string }>(
@@ -314,9 +357,14 @@ export function passagesSection(
  * and every character round-trips. The result is a safe HTML `id` value.
  */
 export function passageAnchorId(sourceId: string, passageId: string): string {
+  // Iterate UTF-16 code units (not code points) so a supplementary character
+  // keeps both surrogate halves; every reserved code unit is written as `_`
+  // plus four lowercase hex digits, and a literal `_` escapes as `_5f`, so no
+  // two distinct strings share an encoding and every character round-trips.
   const encode = (value: string): string => {
     let out = "";
-    for (const char of value) {
+    for (let index = 0; index < value.length; index += 1) {
+      const char = value[index];
       if (/[A-Za-z0-9-]/.test(char)) out += char;
       else if (char === "_") out += "_5f";
       else out += `_${char.charCodeAt(0).toString(16).padStart(4, "0")}`;
@@ -415,10 +463,11 @@ export function transcriptSourceRoutes(store: Store): TranscriptSourceRoutes {
         return { status: 200, body: read.extractedText };
       }
       const section = passagesSection(read, read.meetingId);
-      // The existing `renderPage` helper's page with its own headers, so the
-      // passages page carries the shell's CSP and no sniffing, exactly like
-      // every other page.
-      return { ...renderPage(section.title, section.body), headers: PAGE_HEADERS };
+      // The existing `renderPage` helper's page and its own headers, with
+      // `nosniff` added on this page only; the shell forwards page headers and
+      // sets Content-Type and no-store itself.
+      const page = renderPage(section.title, section.body);
+      return { ...page, headers: { ...page.headers, "X-Content-Type-Options": "nosniff" } };
     },
   });
 

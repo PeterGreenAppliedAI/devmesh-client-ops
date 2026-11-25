@@ -217,9 +217,12 @@ export function registerRoutes(store: Store): Routes {
         return route === undefined ? undefined : adaptRoute(route);
       }
       if (matched.source !== undefined) {
+        // The matched raw segments are already single-segment encoded ids; the
+        // route decodes each exactly once, so it receives the request's own
+        // spelling and refuses anything that is not the canonical encoding.
         const sourceRoute = routeForMeetingRequest(
           meetings,
-          pathFor(matched.source.view, matched.source.meetingId, matched.source.transcriptId, matched.source.sourceId),
+          "",
           method,
           { view: matched.source.view },
         );
@@ -258,23 +261,6 @@ const KANBAN_PATTERNS: readonly KanbanPath[] = Object.freeze([
   "/projects/:id/kanban",
   "/tasks/:id/move",
 ]);
-
-/**
- * The fixed source path for a matched source view and its raw segment ids.
- * Every id is encoded as one segment: `encodeURIComponent` cannot re-encode a
- * reserved character, so each of `/`, `?` and `#` is escaped again, keeping the
- * id a single path segment exactly as the request spelled it. The route decodes
- * each segment once, so the decoded ids are the request's own.
- */
-function pathFor(view: SourceView, meetingId: string, transcriptId: string, sourceId: string): string {
-  const segment = (raw: string): string =>
-    encodeURIComponent(raw).replace(/[?#]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
-  return (
-    `/meetings/${segment(meetingId)}` +
-    `/transcripts/${segment(transcriptId)}` +
-    `/sources/${segment(sourceId)}/${view}`
-  );
-}
 
 function isKanbanPath(pattern: string): pattern is KanbanPath {
   return (KANBAN_PATTERNS as readonly string[]).includes(pattern);

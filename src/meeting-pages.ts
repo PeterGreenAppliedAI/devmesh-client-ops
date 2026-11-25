@@ -927,12 +927,10 @@ export function meetingRoutes(store: Store): MeetingRoutes {
           body: displayList(displayValues(MEETING_PROFILE_FIELDS, profile)),
         },
         {
-          title: "Transcript",
-          body: `<p>${link(meetingImportHref(meeting.id), "Import transcript")}</p>`,
-        },
-        {
           // Every committed source of this meeting, from the snapshot metadata
-          // alone, so a missing original cannot break the page.
+          // alone, so a missing original cannot break the page. The import
+          // action is offered once in the header nav, so the page keeps exactly
+          // one import action even when this list renders its own fallback.
           title: "Sources",
           body: meetingSourceSection(snap, meeting.id),
         },
