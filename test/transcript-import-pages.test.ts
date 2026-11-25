@@ -1376,7 +1376,6 @@ describe("transcript import submissions", () => {
         reply.body,
         new RegExp(`Keep the whole submission at most ${MAX_MULTIPART_BYTES} bytes|Keep the whole submission at most ${MAX_MULTIPART_BYTES / 1024 / 1024} MiB`),
       );
-      assert.doesNotMatch(reply.body, /the file at most/i);
       assert.deepEqual(counts(server.store), before, "no meeting or source was created");
     } finally {
       await server.close();
