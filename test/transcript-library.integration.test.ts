@@ -149,7 +149,11 @@ async function importThrough(
   const page = await get(base, pagePath);
   assert.equal(page.status, 200, `${pagePath} is rendered`);
   const form = parseForm(page.body);
-  assert.equal(splitLink(base, pagePath, form.action).path, actionPath, `the form at ${pagePath} posts to ${actionPath}`);
+  assert.equal(
+    splitLink(base, pagePath, form.action).path,
+    splitLink(base, pagePath, actionPath).path,
+    `the form at ${pagePath} posts to ${actionPath}`,
+  );
   assert.equal(form.method, "post", "the import form posts");
   assert.equal(form.enctype, "multipart/form-data", "the import form is a multipart form");
   const reply = await submit(base, pagePath, form, values);
@@ -1043,7 +1047,11 @@ describe("transcript library over loopback HTTP", () => {
       const projectArchivePage = await get(base, projectHref);
       assert.equal(projectArchivePage.status, 200, "the project page is readable");
       const archiveForm = parseForm(projectArchivePage.body);
-      assert.equal(splitLink(base, projectHref, archiveForm.action).path, `${projectHref}/archive`, "the project page offers its archive action");
+      assert.equal(
+        splitLink(base, projectHref, archiveForm.action).path,
+        splitLink(base, projectHref, `${projectHref}/archive`).path,
+        "the project page offers its archive action",
+      );
       assert.ok(
         archiveForm.enctype === null || archiveForm.enctype === "application/x-www-form-urlencoded",
         `the archive form is a url-encoded form, not ${archiveForm.enctype}`,
