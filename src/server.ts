@@ -29,6 +29,14 @@ import {
   type LayoutContext,
 } from "./layout.ts";
 import { MissingRecordError, ValidationError, type Store } from "./store.ts";
+import {
+  decodeMultipart,
+  FILE_CONTROL,
+  MAX_MULTIPART_BYTES,
+  PASTE_CONTROL,
+  type MultipartFile,
+  type MultipartOutcome,
+} from "./transcript-multipart.ts";
 
 export { escapeHtml, FormError, redirect, renderForm, renderFormError, renderPage } from "./html.ts";
 export type { FieldError, FieldSpec, Page, Redirect } from "./html.ts";
@@ -66,7 +74,21 @@ export interface RouteRequest {
   readonly origin: string;
   /** Form fields of an accepted POST; empty for a GET. */
   readonly form: Readonly<Record<string, string>>;
+  /**
+   * The decoded file for a multipart POST route, or null when none was
+   * selected. It is always null for a UrlEncoded route and for a GET.
+   */
+  readonly file: MultipartFile | null;
 }
+
+/**
+ * A route's opt-in multipart POST policy. A route that declares it accepts a
+ * complete `multipart/form-data` body instead of a url-encoded form: the shell
+ * bounds the body, decodes it with `decodeMultipart` and passes the decoded
+ * controls as `form` and the file separately as `file`, only on success. A
+ * POST route that declares no policy keeps the url-encoded form behaviour.
+ */
+export type RouteBodyPolicy = "UrlEncoded" | "Multipart";
 
 /**
  * A guarded route. Its `render` runs only after the request checks pass. A
@@ -75,6 +97,8 @@ export interface RouteRequest {
  */
 export interface Route {
   readonly method: "GET" | "POST";
+  /** The body policy a POST route opts into; absent means `UrlEncoded`. */
+  readonly bodyPolicy?: RouteBodyPolicy;
   render(request: RouteRequest): Promise<RouteResult> | RouteResult;
 }
 
@@ -101,6 +125,14 @@ export interface Routes {
   readonly home: { readonly get: Route; readonly post?: Route };
   readonly health: { readonly get: Route; readonly post?: Route };
   readonly hierarchy?: PathRouteTable<unknown>;
+  /**
+   * Application routes such as a transcript import: a path matcher and its
+   * route lookup, looked up like `hierarchy` after the fixed routes. The shell
+   * keeps the matched value opaque, so no route name ever comes from a
+   * request. A multipart POST route registered here opts into the multipart
+   * body policy; every other POST keeps the url-encoded form checks.
+   */
+  readonly application?: PathRouteTable<unknown>;
 }
 
 export interface ServerOptions {
@@ -405,6 +437,70 @@ function readForm(message: IncomingMessage, limit: number): Promise<Record<strin
   });
 }
 
+/**
+ * Read a size-bounded complete multipart body. The declared length is checked
+ * before any byte is buffered, and arriving bytes are counted so a chunked body
+ * that crosses the limit is refused as soon as it does, before it finishes.
+ *
+ * The reader never tears the request stream down: like `readForm`, the
+ * listeners stay in place and keep draining, the promise settles at the moment
+ * the limit is crossed, and the caller answers 413 and closes the connection.
+ */
+function readMultipartBody(message: IncomingMessage, limit: number): Promise<Buffer> {
+  const declaredHeader = message.headers["content-length"];
+  const declared = typeof declaredHeader === "string" && /^\d+$/.test(declaredHeader) ? Number(declaredHeader) : null;
+  if (declared !== null && declared > limit) return Promise.reject(new Rejection(413));
+  return new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let settled = false;
+    function onData(chunk: Buffer | string): void {
+      if (settled) return;
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      size += buffer.byteLength;
+      if (size > limit) {
+        settled = true;
+        reject(new Rejection(413));
+        return;
+      }
+      chunks.push(buffer);
+    }
+    function onEnd(): void {
+      cleanup();
+      if (settled) return;
+      settled = true;
+      if (declared !== null && declared !== size) {
+        reject(new Rejection(400));
+        return;
+      }
+      resolve(Buffer.concat(chunks));
+    }
+    function onError(): void {
+      cleanup();
+      if (settled) return;
+      settled = true;
+      reject(new Rejection(400));
+    }
+    function cleanup(): void {
+      message.off("end", onEnd);
+      message.off("error", onError);
+    }
+    message.on("data", onData);
+    message.on("end", onEnd);
+    message.on("error", onError);
+  });
+}
+
+/**
+ * The plain-text answer to a multipart refusal: the decoder's own message and
+ * guidance, under the decoder's status (415 wrong media, 400 malformed or
+ * duplicate, 413 excess).
+ */
+function multipartRefusalResult(outcome: MultipartOutcome & { readonly ok: false }): RouteResult {
+  const refusal = outcome.refusal;
+  return response(refusal.status, `${refusal.message}\n\n${refusal.guidance}`);
+}
+
 /** Decode a parsed urlencoded body into fields; the last of a repeated key wins. */
 function parseForm(text: string): Record<string, string> {
   const fields: Record<string, string> = {};
@@ -483,18 +579,11 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
       return;
     }
 
-    // The form checks run before dispatch so an unsupported type or an
-    // oversized body is answered as such, whatever the destination.
+    let multipart = false;
     try {
-      let form: Record<string, string> = {};
-      if (isPost) {
-        if (!isFormContentType(singleHeader(req, "content-type"))) {
-          throw new Rejection(415);
-        }
-        form = await readForm(req, DEFAULT_MAX_BODY_BYTES);
-      }
-
-      // Dispatch only on the fixed route table; an unknown path is 404.
+      // Match the route once, before reading the body: the matched route's
+      // opt-in multipart policy selects the body checks, while an unregistered
+      // path or a wrong method is refused before any body is read.
       const route = dispatch(routes, path, method);
       if (route === UNREGISTERED) {
         send(res, 404, "Not found.\n", "text/plain; charset=utf-8");
@@ -504,14 +593,45 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
         send(res, 405, "Method not allowed.\n", "text/plain; charset=utf-8", { Allow: "GET, POST" });
         return;
       }
+      multipart = isPost && route.bodyPolicy === "Multipart";
 
-      const result = await route.render({ method, path, origin: canonical, form });
+      // The form checks run before invocation so an unsupported type or an
+      // oversized body is answered as such, and a refusal never reaches the
+      // handler.
+      let form: Record<string, string> = {};
+      let file: MultipartFile | null = null;
+      if (multipart) {
+        // The complete multipart body is bounded inclusively before buffering
+        // and while arriving; the decoder gets the complete bytes and header.
+        const body = await readMultipartBody(req, MAX_MULTIPART_BYTES);
+        const outcome = decodeMultipart(body, singleHeader(req, "content-type"));
+        if (!outcome.ok) {
+          sendRouteResult(res, multipartRefusalResult(outcome), path, options.store);
+          return;
+        }
+        form = { ...outcome.fields };
+        file = outcome.file;
+      } else if (isPost) {
+        if (!isFormContentType(singleHeader(req, "content-type"))) {
+          throw new Rejection(415);
+        }
+        form = await readForm(req, DEFAULT_MAX_BODY_BYTES);
+      }
+
+      const result = await route.render({ method, path, origin: canonical, form, file });
       sendRouteResult(res, result, path, options.store);
     } catch (error) {
       if (error instanceof Rejection && error.status === 413) {
-        // The body was refused before it was fully read; answer, then close the
-        // connection instead of trying to reuse it for another request.
-        res.setHeader("Connection", "close");
+        // The body was refused before it was fully read; answer with the limit
+        // guidance, then close the connection instead of trying to reuse it.
+        // The guidance names the limit that applied to this body.
+        const limit = multipart
+          ? `Keep the whole submission at most ${MAX_MULTIPART_BYTES} bytes; nothing was truncated.`
+          : `Keep the form body at most ${DEFAULT_MAX_BODY_BYTES} bytes; nothing was truncated.`;
+        send(res, 413, `The request body is too large.\n\n${limit}\n`, "text/plain; charset=utf-8", {
+          Connection: "close",
+        });
+        return;
       }
       const status = errorStatus(error);
       if (error instanceof FormError) {
@@ -572,16 +692,20 @@ const UNREGISTERED = Symbol("unregistered");
 
 /**
  * Find the guarded route for a path: the fixed `/` and `/health` routes, else
- * the extension's route for a matched hierarchy path. An unmatched path is
- * reported separately so the caller answers it as unregistered.
+ * the application table's route for a matched path, else the extension's route
+ * for a matched hierarchy path. An unmatched path is reported separately so
+ * the caller answers it as unregistered. The path is matched at most once by
+ * each table, and the matched value names the route.
  */
 function dispatch(routes: Routes, path: string, method: "GET" | "POST"): Route | undefined | typeof UNREGISTERED {
   const page = path === "/" ? routes.home : path === "/health" ? routes.health : undefined;
   if (page !== undefined) return method === "POST" ? page.post : page.get;
-  if (routes.hierarchy === undefined) return UNREGISTERED;
-  const matched = routes.hierarchy.match(path);
-  if (matched === null) return UNREGISTERED;
-  return routes.hierarchy.route(matched, method);
+  for (const table of [routes.application, routes.hierarchy]) {
+    if (table === undefined) continue;
+    const matched = table.match(path);
+    if (matched !== null) return table.route(matched, method);
+  }
+  return UNREGISTERED;
 }
 
 function errorResponse(error: unknown): RouteResult {
