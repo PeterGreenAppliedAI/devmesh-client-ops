@@ -379,9 +379,21 @@ export interface SubmissionFile {
  */
 export interface TranscriptSubmission {
   readonly kind: SubmissionRouteKind;
-  readonly rawId: string;
+  /** The raw (still encoded) id path segment; absent or non-string names no record. */
+  readonly rawId?: string;
   readonly fields: Readonly<Record<string, string>>;
   readonly file: SubmissionFile | null;
+}
+
+/**
+ * The validated target: either a meeting create captured as an immutable copy
+ * of the fields that were validated, or a meeting id. Capturing the copy means
+ * a caller that mutates its own target object while a plan or publication is
+ * pending cannot change what is committed: the validated values are used.
+ */
+interface ValidatedTarget {
+  readonly create?: TranscriptMeetingCreate;
+  readonly meetingId?: string;
 }
 
 const SUBMISSION_KEYS = ["kind", "rawId", "fields", "file"] as const;
@@ -433,9 +445,9 @@ function requireSubmission(value: TranscriptSubmission): TranscriptSubmission {
   if (kind !== "engagement" && kind !== "project" && kind !== "meeting") {
     throw new ValidationError('transcript submission kind must be "engagement", "project" or "meeting"');
   }
-  if (typeof record.rawId !== "string") {
-    throw new ValidationError("transcript submission rawId must be a string");
-  }
+  // A raw id that is absent or not a string names no URL record: it is carried
+  // through so decoding it reports a missing record (404), never a 400.
+  const rawId = typeof record.rawId === "string" ? record.rawId : "";
   if (typeof record.fields !== "object" || record.fields === null || Array.isArray(record.fields)) {
     throw new ValidationError("transcript submission fields must be an object");
   }
@@ -455,15 +467,15 @@ function requireSubmission(value: TranscriptSubmission): TranscriptSubmission {
   }
   return {
     kind,
-    rawId: record.rawId,
+    rawId,
     fields: record.fields as Readonly<Record<string, string>>,
     file,
   };
 }
 
-/** Decode a raw path id; a malformed escape names no record. */
-function decodeId(rawId: string, kind: SubmissionRouteKind): string {
-  if (rawId === "") throw new MissingRecordError(`No ${kind} for that path`);
+/** Decode a raw path id; an empty or malformed escape names no record. */
+function decodeId(rawId: string | undefined, kind: SubmissionRouteKind): string {
+  if (rawId === undefined || rawId === "") throw new MissingRecordError(`No ${kind} for that path`);
   try {
     return decodeURIComponent(rawId);
   } catch {
@@ -477,7 +489,7 @@ function missingRecord(kind: string, id: string): MissingRecordError {
 }
 
 /** Resolve the URL record and derive its authoritative client and engagement. */
-function resolveScope(snapshot: Snapshot, kind: SubmissionRouteKind, rawId: string): ResolvedScope {
+function resolveScope(snapshot: Snapshot, kind: SubmissionRouteKind, rawId: string | undefined): ResolvedScope {
   if (kind === "engagement") {
     const id = decodeId(rawId, kind);
     const engagement = snapshot.engagements.find((e) => e.id === id);
@@ -485,7 +497,13 @@ function resolveScope(snapshot: Snapshot, kind: SubmissionRouteKind, rawId: stri
     if (!snapshot.clients.some((c) => c.id === engagement.clientId)) {
       throw new ValidationError(`engagement ${JSON.stringify(engagement.id)} references a missing client`);
     }
-    return { kind, rawId, recordId: engagement.id, clientId: engagement.clientId, engagementId: engagement.id };
+    return {
+      kind,
+      rawId: rawId ?? "",
+      recordId: engagement.id,
+      clientId: engagement.clientId,
+      engagementId: engagement.id,
+    };
   }
   if (kind === "project") {
     const id = decodeId(rawId, kind);
@@ -500,7 +518,7 @@ function resolveScope(snapshot: Snapshot, kind: SubmissionRouteKind, rawId: stri
     }
     return {
       kind,
-      rawId,
+      rawId: rawId ?? "",
       recordId: project.id,
       clientId: engagement.clientId,
       engagementId: engagement.id,
@@ -528,7 +546,7 @@ function resolveScope(snapshot: Snapshot, kind: SubmissionRouteKind, rawId: stri
   }
   return {
     kind,
-    rawId,
+    rawId: rawId ?? "",
     recordId: meeting.id,
     clientId: meeting.clientId,
     engagementId: meeting.engagementId,
@@ -842,7 +860,7 @@ class TranscriptStoreImpl implements TranscriptStore {
   /** Plan one prepared import for its parsed target against a snapshot. */
   private planImport(
     prepared: PreparedImport,
-    parsed: { create?: TranscriptMeetingCreate; meetingId?: string },
+    parsed: ValidatedTarget,
     engagementOnly: boolean,
     snapshot: Snapshot = this.store.snapshot(),
   ): CommitPlan {
@@ -945,7 +963,7 @@ class TranscriptStoreImpl implements TranscriptStore {
   private parseTarget(
     target: TranscriptTarget,
     engagementOnly = false,
-  ): { create?: TranscriptMeetingCreate; meetingId?: string } {
+  ): ValidatedTarget {
     const record = requireRecord(target, "transcript target", TARGET_KEYS);
     const hasCreate = record.create !== undefined;
     const hasMeeting = record.meetingId !== undefined;
@@ -965,7 +983,18 @@ class TranscriptStoreImpl implements TranscriptStore {
       requireNonblank(create.title, "transcript target.create.title");
       requireNonblank(create.date, "transcript target.create.date");
       optionalText(create.notes, "transcript target.create.notes");
-      return { create: create as unknown as TranscriptMeetingCreate };
+      // Capture the validated values now so the commit uses exactly them, even
+      // if the caller mutates its own object after validation.
+      return {
+        create: {
+          clientId: create.clientId as string,
+          engagementId: create.engagementId as string,
+          ...(create.projectId === undefined ? {} : { projectId: create.projectId as string }),
+          title: create.title as string,
+          date: create.date as string,
+          ...(create.notes === undefined ? {} : { notes: create.notes as string }),
+        },
+      };
     }
     const meetingId = requireNonblank(record.meetingId, "transcript target.meetingId");
     return { meetingId };

@@ -560,6 +560,33 @@ describe("transcript submission handler: URL resolution", () => {
     }
   });
 
+  it("answers an omitted or non-string raw id as a missing record (404)", async () => {
+    const fx = await fixture();
+    try {
+      const before = counts(fx.store);
+      for (const kind of ["engagement", "project", "meeting"] as const) {
+        // The raw id is absent: the submission names no URL record.
+        await assert.rejects(
+          submitTranscript(fx.service, { kind, fields: { paste: "x", title: "T", date: "2026-06-01" }, file: null }),
+          MissingRecordError,
+        );
+        // The raw id is not a string: it still names no URL record.
+        await assert.rejects(
+          submitTranscript(fx.service, {
+            kind,
+            rawId: 42 as unknown as string,
+            fields: { paste: "x", title: "T", date: "2026-06-01" },
+            file: null,
+          }),
+          MissingRecordError,
+        );
+      }
+      assert.deepEqual(counts(fx.store), before, "a submission without a raw id writes nothing");
+    } finally {
+      await fx.close();
+    }
+  });
+
   it("shares the workspace store with a manual write", async () => {
     const fx = await fixture();
     try {
@@ -989,6 +1016,51 @@ describe("transcript submission handler: the import's own commit", () => {
       assert.equal(result.meeting.title, "Uncommitted");
     } finally {
       await reopened.close();
+    }
+  });
+
+  it("commits the validated create it planned even when its caller mutates it after publication begins", async () => {
+    const fx = await fixture();
+    try {
+      // The caller's own target object is validated when the import starts. Its
+      // `date` getter mutates the create on the read that follows validation,
+      // which happens after the original has been published and before the
+      // commit turn re-plans. The commit must use the validated values.
+      const create: { clientId: string; engagementId: string; title: string; date: string } = {
+        clientId: fx.clientId,
+        engagementId: fx.engagementId,
+        title: "Captured",
+        date: "2026-09-02",
+      };
+      let reads = 0;
+      Object.defineProperty(create, "date", {
+        enumerable: true,
+        get: () => {
+          reads += 1;
+          // The first read is the validation; a later read means the validated
+          // values are used after publication, so mutate the caller's object.
+          if (reads > 1) create.engagementId = "engagement-999";
+          return "2026-09-02";
+        },
+      });
+      const mutating = { create };
+      const before = counts(fx.store);
+      const bytes = encoder(`Captured words. ${PASTED_TEXT}`);
+      const result = await fx.service.importTranscript(
+        { kind: "file", bytes, filename: "captured.txt" },
+        mutating as unknown as Parameters<TranscriptStore["importTranscript"]>[1],
+      );
+      assert.equal(result.outcome, "created");
+      assert.equal(result.meeting.date, "2026-09-02");
+      assert.equal(result.meeting.engagementId, fx.engagementId);
+      assert.ok(reads > 1, "the commit used the validated create's values");
+      const after = counts(fx.store);
+      assert.equal(after.meetings, before.meetings + 1);
+      assert.equal(after.transcripts, before.transcripts + 1);
+      assert.equal(after.sources, before.sources + 1);
+      assert.equal(after.events, before.events + 1, "one create event");
+    } finally {
+      await fx.close();
     }
   });
 });
