@@ -34,7 +34,7 @@
  * Every displayed value is escaped; every link is built from a stored record
  * id through `encodeURIComponent`.
  */
-import { escapeHtml } from "./html.ts";
+import { escapeHtml, PAGE_HEADERS, renderPage, type Page } from "./html.ts";
 import { MissingRecordError } from "./model.ts";
 import type { Snapshot, Store, Transcript, TranscriptSource } from "./store.ts";
 import { transcriptService, type TranscriptSourceRead, type TranscriptStore } from "./transcript-store.ts";
@@ -49,19 +49,17 @@ export type TranscriptSourcePath =
   | "/meetings/:id/transcripts/:transcriptId/sources/:sourceId/text"
   | "/meetings/:id/transcripts/:transcriptId/sources/:sourceId/passages";
 
-/** The view a matched source path names. */
-const VIEW_FOR_SEGMENT: Readonly<Record<string, SourceView>> = Object.freeze({
-  original: "original",
-  text: "text",
-  passages: "passages",
-});
+/** The three exact view literals a source path may end with. */
+const SOURCE_VIEWS: readonly SourceView[] = Object.freeze(["original", "text", "passages"]);
 
 /**
  * Match a request path against the fixed source patterns and return the
  * matched shape, the view and the still-encoded segment ids, or null for any
- * other path so an unregistered path is refused before any handler runs. The
- * ids are not decoded here: a malformed escape names no record, which the
- * handler answers as a 404.
+ * other path so an unregistered path is refused before any handler runs. Only
+ * the three exact view literals match (an ordinary object's inherited
+ * property names such as `constructor` name no view), and the path must be
+ * root-relative with no empty segment. The ids are not decoded here: a
+ * malformed escape names no record, which the handler answers as a 404.
  */
 export function matchTranscriptSourcePath(
   path: string,
@@ -73,19 +71,24 @@ export function matchTranscriptSourcePath(
   readonly sourceId: string;
 } | null {
   const pathname = path.split("?")[0];
-  const parts = pathname.split("/").slice(1);
-  if (parts.some((part) => part === "")) return null;
+  // A path must start with the separator; `split` then yields an empty first
+  // element, so every segment after it is checked and no leading component is
+  // silently discarded.
+  if (!pathname.startsWith("/")) return null;
+  const parts = pathname.split("/");
+  if (parts[0] !== "" || parts.length !== 8) return null;
+  if (parts.slice(1).some((part) => part === "")) return null;
   // `/meetings/:id/transcripts/:transcriptId/sources/:sourceId/:view`
-  if (parts.length !== 7 || parts[0] !== "meetings") return null;
-  if (parts[2] !== "transcripts" || parts[4] !== "sources") return null;
-  const view = VIEW_FOR_SEGMENT[parts[6]];
-  if (view === undefined) return null;
+  if (parts[1] !== "meetings" || parts[3] !== "transcripts" || parts[5] !== "sources") return null;
+  const last = parts[7];
+  if (!(SOURCE_VIEWS as readonly string[]).includes(last)) return null;
+  const view = last as SourceView;
   return {
     pattern: `/meetings/:id/transcripts/:transcriptId/sources/:sourceId/${view}`,
     view,
-    meetingId: parts[1],
-    transcriptId: parts[3],
-    sourceId: parts[5],
+    meetingId: parts[2],
+    transcriptId: parts[4],
+    sourceId: parts[6],
   };
 }
 
@@ -249,9 +252,14 @@ export function originalBytesResult(read: TranscriptSourceRead): OriginalBytesRe
   };
 }
 
-/** The source list link labels a passage row shows; kept in stored order. */
+/**
+ * The location label a passage row shows, chosen by the source format, never by
+ * the presence of a recorded page alone: a PDF names the page it recorded, and
+ * a DOCX names the extracted block it came from (it has no page). A pasted or
+ * plain-text source records no page, so it names none.
+ */
 function passageLocationText(passage: Passage, format: TranscriptSource["format"]): string {
-  if (passage.page !== undefined) return `PDF page ${passage.page}`;
+  if (format === "pdf") return passage.page === undefined ? "" : `PDF page ${passage.page}`;
   if (format === "docx") return "Extracted block";
   return "";
 }
@@ -299,12 +307,23 @@ export function passagesSection(
 /**
  * The fragment anchor of one passage. It is built from the source and passage
  * ids only, so an anchor is scoped to its source and two sources of one
- * transcript cannot collide; a non-identifier character is replaced, so the id
- * is a safe HTML `id` value.
+ * transcript cannot collide. The mapping is lossless: every character other
+ * than an ASCII letter, digit or `_`/`-` is written as `_` and two lowercase
+ * hex digits of its UTF-16 code unit, and a literal `_` is written as `_5f`,
+ * so distinct stored passage ids such as `p.1` and `p_1` never share an anchor
+ * and every character round-trips. The result is a safe HTML `id` value.
  */
 export function passageAnchorId(sourceId: string, passageId: string): string {
-  const safe = (value: string): string => value.replace(/[^A-Za-z0-9_-]/g, "_");
-  return `passage-${safe(sourceId)}-${safe(passageId)}`;
+  const encode = (value: string): string => {
+    let out = "";
+    for (const char of value) {
+      if (/[A-Za-z0-9-]/.test(char)) out += char;
+      else if (char === "_") out += "_5f";
+      else out += `_${char.charCodeAt(0).toString(16).padStart(4, "0")}`;
+    }
+    return out;
+  };
+  return `passage-${encode(sourceId)}-${encode(passageId)}`;
 }
 
 /**
@@ -345,8 +364,11 @@ export interface TranscriptSourceRoute {
   readonly method: "GET";
   render(
     request: TranscriptSourceRequest,
-  ): Promise<OriginalBytesResponse | { readonly status: number; readonly body: string; readonly headers: Readonly<Record<string, string>> }
-    | { readonly html: string; readonly headers: Readonly<Record<string, string>>; readonly title: string; readonly body: string }>;
+  ): Promise<
+    | OriginalBytesResponse
+    | { readonly status: number; readonly body: string; readonly headers?: Readonly<Record<string, string>> }
+    | Page
+  >;
 }
 
 /**
@@ -359,15 +381,16 @@ export interface TranscriptSourceRoute {
  * a referenced original that cannot be read or verified leaves the handler as
  * the service's `PersistenceError`, which the shell answers with its generic
  * 500 for the original, the text and the passages alike.
+ *
+ * The text answer and the passages page are the shell's own shapes: a plain
+ * text result keeps the shell's text Content-Type and no-store policy, and the
+ * passages page is the existing `renderPage` helper's result, which the shell
+ * wraps in its shared layout exactly like every other page.
  */
-export function transcriptSourceRoutes(
-  store: Store,
-  options: { readonly transcriptService?: (store: Store) => TranscriptStore } = {},
-): TranscriptSourceRoutes {
+export function transcriptSourceRoutes(store: Store): TranscriptSourceRoutes {
   const snapshot = (): Snapshot => store.snapshot();
-  const buildService = options.transcriptService ?? ((target: Store) => transcriptService(target));
   let service: TranscriptStore | null = null;
-  const borrow = (): TranscriptStore => (service ??= buildService(store));
+  const borrow = (): TranscriptStore => (service ??= transcriptService(store));
 
   /**
    * The resolved reference and its verified read, or a 404 before any read. The
@@ -387,25 +410,15 @@ export function transcriptSourceRoutes(
       const read = await readFor(request);
       if (view === "original") return originalBytesResult(read);
       if (view === "text") {
-        // The exact extracted text as UTF-8, with no added newline.
-        return {
-          status: 200,
-          body: read.extractedText,
-          headers: {
-            "Content-Type": "text/plain; charset=utf-8",
-            "Content-Length": String(new TextEncoder().encode(read.extractedText).byteLength),
-            "X-Content-Type-Options": "nosniff",
-            "Cache-Control": "no-store",
-          },
-        };
+        // The exact extracted text as UTF-8, with no added newline; the shell
+        // sends it as plain text with its own Content-Type and no-store policy.
+        return { status: 200, body: read.extractedText };
       }
       const section = passagesSection(read, read.meetingId);
-      return {
-        html: renderPassagesDocument(section.title, section.body),
-        title: section.title,
-        body: section.body,
-        headers: PASSAGES_HEADERS,
-      };
+      // The existing `renderPage` helper's page with its own headers, so the
+      // passages page carries the shell's CSP and no sniffing, exactly like
+      // every other page.
+      return { ...renderPage(section.title, section.body), headers: PAGE_HEADERS };
     },
   });
 
@@ -414,32 +427,4 @@ export function transcriptSourceRoutes(
     text: { get: get("text") },
     passages: { get: get("passages") },
   };
-}
-
-/** The headers a passages page carries: HTML, no scripts, no caching. */
-const PASSAGES_HEADERS: Readonly<Record<string, string>> = Object.freeze({
-  "Content-Type": "text/html; charset=utf-8",
-  "Cache-Control": "no-store",
-  "X-Content-Type-Options": "nosniff",
-  "Content-Security-Policy":
-    "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
-});
-
-/** The passages page as a complete document: no raw document HTML, only text. */
-function renderPassagesDocument(title: string, body: string): string {
-  return [
-    "<!doctype html>",
-    '<html lang="en">',
-    "<head>",
-    '<meta charset="utf-8">',
-    '<meta name="viewport" content="width=device-width, initial-scale=1">',
-    `<title>${escapeHtml(title)}</title>`,
-    "<style>body{font-family:system-ui,sans-serif;margin:2rem;line-height:1.5}ol.passage-list{list-style:none;padding:0}.passage{margin:1rem 0;border-bottom:1px solid #b8b8b8;padding-bottom:1rem}</style>",
-    "</head>",
-    "<body>",
-    `<h1>${escapeHtml(title)}</h1>`,
-    body,
-    "</body>",
-    "</html>",
-  ].join("\n");
 }

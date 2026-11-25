@@ -25,7 +25,7 @@ import { matchWorkPath, routeForWorkPattern, workRoutes, type WorkPath } from ".
 import type { WorkRoute } from "./work-pages.ts";
 import { matchMeetingPath, meetingRoutes, routeForMeetingPattern, routeForMeetingRequest, type MeetingPath } from "./meeting-pages.ts";
 import type { MeetingRoute } from "./meeting-pages.ts";
-import { matchTranscriptSourcePath, sourceHref, type SourceView, type TranscriptSourceRoute } from "./transcript-source-pages.ts";
+import { matchTranscriptSourcePath, type SourceView, type TranscriptSourceRoute } from "./transcript-source-pages.ts";
 import { archivedRoutes, archiveRoutes, matchArchivePath, type ArchivePath, type ArchiveRoute } from "./archive-pages.ts";
 import { kanbanRoutes, matchKanbanPath, routeForKanbanPattern, type KanbanPath, type KanbanRoute } from "./kanban-pages.ts";
 import {
@@ -259,9 +259,21 @@ const KANBAN_PATTERNS: readonly KanbanPath[] = Object.freeze([
   "/tasks/:id/move",
 ]);
 
-/** The fixed source path for a matched source view and its raw segment ids. */
+/**
+ * The fixed source path for a matched source view and its raw segment ids.
+ * Every id is encoded as one segment: `encodeURIComponent` cannot re-encode a
+ * reserved character, so each of `/`, `?` and `#` is escaped again, keeping the
+ * id a single path segment exactly as the request spelled it. The route decodes
+ * each segment once, so the decoded ids are the request's own.
+ */
 function pathFor(view: SourceView, meetingId: string, transcriptId: string, sourceId: string): string {
-  return sourceHref(meetingId, transcriptId, sourceId, view);
+  const segment = (raw: string): string =>
+    encodeURIComponent(raw).replace(/[?#]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+  return (
+    `/meetings/${segment(meetingId)}` +
+    `/transcripts/${segment(transcriptId)}` +
+    `/sources/${segment(sourceId)}/${view}`
+  );
 }
 
 function isKanbanPath(pattern: string): pattern is KanbanPath {

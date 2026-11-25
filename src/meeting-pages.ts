@@ -165,12 +165,33 @@ export function routeForMeetingRequest(
   source?: { readonly view: SourceView },
 ): MeetingRoute | TranscriptSourceRoute | undefined {
   if (source !== undefined) {
-    const slot = routes.sources[source.view];
+    const slot = sourceSlot(routes.sources, source.view);
+    if (slot === null) return undefined;
     return method === "GET" ? slot.get : undefined;
   }
   const matched = matchMeetingPath(path);
   if (matched === null) return undefined;
   return routeForMeetingPattern(routes, matched.pattern, method);
+}
+
+/**
+ * The GET slot of one source view, chosen by the three exact view literals. Only
+ * a GET is served (a POST finds no slot and the shell answers 405), and no
+ * other view name can reach the table, so an inherited property name is never
+ * read as a slot.
+ */
+function sourceSlot(
+  sources: TranscriptSourceRoutes,
+  view: SourceView,
+): { readonly get: TranscriptSourceRoute } | null {
+  switch (view) {
+    case "original":
+      return sources.original;
+    case "text":
+      return sources.text;
+    case "passages":
+      return sources.passages;
+  }
 }
 
 /** Pick the registered route for a matched pattern from the table. */
