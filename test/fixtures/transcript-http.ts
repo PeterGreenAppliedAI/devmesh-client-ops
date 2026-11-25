@@ -27,6 +27,7 @@ export interface Reply {
   readonly body: string;
 }
 
+/** The origin of an application base URL. */
 function originOf(base: string): URL {
   return new URL(base);
 }
@@ -34,6 +35,23 @@ function originOf(base: string): URL {
 /** A reply body decoded as a string; text is UTF-8 in this application. */
 function replyFrom(status: number, headers: Record<string, string | string[] | undefined>, bytes: Buffer): Reply {
   return { status, headers, bytes, body: bytes.toString("utf8") };
+}
+
+/**
+ * Split a rendered link into its path and query (the request target a browser
+ * fetches) and its fragment (the part the browser resolves locally). The
+ * fragment is returned raw, exactly as it appears in the href.
+ */
+export interface SplitLink {
+  readonly path: string;
+  readonly fragment: string;
+}
+
+/** Split one rendered href into its request target and its raw fragment. */
+export function splitLink(href: string): SplitLink {
+  assert.match(href, /^\//, `the link ${href} is a root-relative path`);
+  const hash = href.indexOf("#");
+  return hash < 0 ? { path: href, fragment: "" } : { path: href.slice(0, hash), fragment: href.slice(hash + 1) };
 }
 
 /**
@@ -64,26 +82,24 @@ export function get(base: string, path: string): Promise<Reply> {
 /**
  * Send one POST over loopback HTTP with an exact byte body. The Origin header
  * is the request's own origin, as a browser would send it for a same-origin
- * form submission; it can be overridden only to build a deliberately foreign
- * request.
+ * form submission.
  */
 export function postBytes(
   base: string,
   path: string,
   contentType: string,
   body: Uint8Array,
-  options: { readonly method?: string; readonly origin?: string } = {},
 ): Promise<Reply> {
   const url = originOf(base);
   const headers: Record<string, string> = {
     host: url.host,
-    origin: options.origin ?? url.origin,
+    origin: url.origin,
     "content-length": String(body.byteLength),
     "content-type": contentType,
   };
   return new Promise((resolve, reject) => {
     const req = httpRequest(
-      { host: url.hostname, port: Number(url.port), method: options.method ?? "POST", path, headers, agent: false },
+      { host: url.hostname, port: Number(url.port), method: "POST", path, headers, agent: false },
       (res) => {
         const chunks: Buffer[] = [];
         res.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -110,15 +126,6 @@ export function unescapeHtml(value: string): string {
     .replace(/&amp;/g, "&");
 }
 
-/** The main content region of a page, without the shared shell. */
-export function mainOf(body: string): string {
-  const start = body.indexOf('<main id="main">');
-  assert.ok(start >= 0, "the page carries a main landmark");
-  const end = body.indexOf("</main>", start);
-  assert.ok(end >= 0, "the main landmark is closed");
-  return body.slice(start, end);
-}
-
 /** One section of a page: from its own `<h2>` to the next one. */
 export function sectionOf(body: string, title: string): string {
   const heading = `<h2>${unescapeHtml(title).replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char] ?? char)}</h2>`;
@@ -129,18 +136,34 @@ export function sectionOf(body: string, title: string): string {
   return next < 0 ? rest : rest.slice(0, next);
 }
 
+/** One rendered form control, keeping the type it is rendered with. */
+export interface FormControl {
+  readonly name: string;
+  /** The control's rendered type: `text`, `date`, `textarea`, `select`, `file`, `hidden`. */
+  readonly type: string;
+  /** The rendered value; a file control has none. */
+  readonly value: string;
+  /** True for a control a browser would submit (never a disabled one). */
+  readonly enabled: boolean;
+}
+
 /** The single `<form>` of a page: its action, encoding, method and controls. */
 export interface ParsedForm {
   readonly action: string;
   readonly method: string;
   readonly enctype: string | null;
-  /** Text, select, textarea and hidden controls: name to rendered value. */
-  readonly controls: Map<string, string>;
+  /** Every named control with its rendered type, value and enabled state. */
+  readonly controls: Map<string, FormControl>;
   /** Select controls: name to the option values it offers. */
   readonly options: Map<string, string[]>;
 }
 
-/** Parse the one form of a rendered page, keeping each control's value. */
+/** True for a control rendered with a `disabled` attribute. */
+function isDisabled(attributes: string): boolean {
+  return /\sdisabled(?:[=\s]|>|$)/.test(attributes);
+}
+
+/** Parse the one form of a rendered page, keeping each control's rendered type. */
 export function parseForm(document: string): ParsedForm {
   const form = /<form[^>]*>([\s\S]*?)<\/form>/.exec(document);
   assert.ok(form !== null, "the page carries a form");
@@ -151,18 +174,31 @@ export function parseForm(document: string): ParsedForm {
   };
   const action = attribute("action");
   assert.notEqual(action, null, "the form carries an action");
-  const controls = new Map<string, string>();
+  const controls = new Map<string, FormControl>();
   const options = new Map<string, string[]>();
   const inner = form[1];
-  for (const match of inner.matchAll(/<textarea[^>]*\sname="([^"]+)"[^>]*>([\s\S]*?)<\/textarea>/g)) {
-    controls.set(unescapeHtml(match[1]), unescapeHtml(match[2]));
+  for (const match of inner.matchAll(/<textarea([^>]*)>([\s\S]*?)<\/textarea>/g)) {
+    const name = /\sname="([^"]+)"/.exec(match[1]);
+    if (name === null) continue;
+    controls.set(unescapeHtml(name[1]), {
+      name: unescapeHtml(name[1]),
+      type: "textarea",
+      value: unescapeHtml(match[2]),
+      enabled: !isDisabled(match[1]),
+    });
   }
   for (const match of inner.matchAll(/<input([^>]*)>/g)) {
     const attrs = match[1];
     const name = /\sname="([^"]+)"/.exec(attrs);
     if (name === null) continue;
+    const type = /\stype="([^"]*)"/.exec(attrs);
     const value = /\svalue="([^"]*)"/.exec(attrs);
-    controls.set(unescapeHtml(name[1]), value === null ? "" : unescapeHtml(value[1]));
+    controls.set(unescapeHtml(name[1]), {
+      name: unescapeHtml(name[1]),
+      type: unescapeHtml(type === null ? "text" : type[1]).toLowerCase(),
+      value: value === null ? "" : unescapeHtml(value[1]),
+      enabled: !isDisabled(attrs),
+    });
   }
   for (const match of inner.matchAll(/<select([^>]*)>([\s\S]*?)<\/select>/g)) {
     const name = /\sname="([^"]+)"/.exec(match[1]);
@@ -170,7 +206,13 @@ export function parseForm(document: string): ParsedForm {
     const choices = [...match[2].matchAll(/<option value="([^"]*)"/g)].map((option) => unescapeHtml(option[1]));
     options.set(unescapeHtml(name![1]), choices);
     const selected = /<option value="([^"]*)"[^>]*\sselected/.exec(match[2]);
-    controls.set(unescapeHtml(name![1]), selected === null ? (choices[0] ?? "") : unescapeHtml(selected[1]));
+    const value = selected === null ? (choices[0] ?? "") : unescapeHtml(selected[1]);
+    controls.set(unescapeHtml(name![1]), {
+      name: unescapeHtml(name![1]),
+      type: "select",
+      value,
+      enabled: !isDisabled(match[1]),
+    });
   }
   return {
     action: action!,
@@ -187,6 +229,10 @@ export function parseForm(document: string): ParsedForm {
  * empty filename a browser sends when no file was chosen); every other control
  * is sent as a text part carrying the value the caller supplied or the value
  * the form rendered. For a url-encoded form, every control is one field.
+ *
+ * A fixture file may be supplied only for a control the page actually renders
+ * as an enabled file input, so a replaced picker cannot silently carry an
+ * upload.
  */
 export function submit(
   base: string,
@@ -197,26 +243,38 @@ export function submit(
     assert.ok(form.controls.has(name), `the form carries ${name}`);
   }
   const parts: Part[] = [];
-  for (const [name, rendered] of form.controls) {
+  for (const [name, control] of form.controls) {
     const supplied = values[name];
-    parts.push({ name, value: supplied === undefined ? rendered : supplied });
+    if (supplied !== undefined && typeof supplied !== "string") {
+      assert.equal(control.type, "file", `the form renders ${name} as a file control`);
+      assert.ok(control.enabled, `the file control ${name} is enabled`);
+    }
+    parts.push({
+      control,
+      value: supplied === undefined ? control.value : supplied,
+    });
   }
-  if (form.enctype === "multipart/form-data") {
-    const body = multipart(parts);
-    return postBytes(base, form.action, MULTIPART_TYPE, body, { method: form.method.toUpperCase() });
+  const multipartBody = form.enctype === "multipart/form-data";
+  for (const part of parts) {
+    if (multipartBody && typeof part.value !== "string") {
+      assert.equal(part.control.type, "file", `a file part is sent only for a file control, not ${part.control.name}`);
+    }
+  }
+  if (multipartBody) {
+    return postBytes(base, form.action, MULTIPART_TYPE, multipart(parts));
   }
   const fields = new URLSearchParams();
   for (const part of parts) {
-    if (typeof part.value !== "string") assert.fail(`the url-encoded form carries text for ${part.name}`);
-    fields.set(part.name, part.value);
+    if (typeof part.value !== "string") assert.fail(`the url-encoded form carries text for ${part.control.name}`);
+    fields.set(part.control.name, part.value);
   }
   const body = Buffer.from(fields.toString(), "utf8");
-  return postBytes(base, form.action, "application/x-www-form-urlencoded", body, { method: form.method.toUpperCase() });
+  return postBytes(base, form.action, "application/x-www-form-urlencoded", body);
 }
 
-/** One submitted control: a text value or a file part. */
+/** One submitted control: its rendered control and the text or file it carries. */
 interface Part {
-  readonly name: string;
+  readonly control: FormControl;
   readonly value: string | { readonly filename: string; readonly body: string | Uint8Array };
 }
 
@@ -224,7 +282,7 @@ interface Part {
 function multipart(parts: readonly Part[]): Buffer {
   const pieces = parts.map((part) => {
     const isFile = typeof part.value !== "string";
-    const disposition = [`name="${part.name}"`];
+    const disposition = [`name="${part.control.name}"`];
     if (isFile) disposition.push(`filename="${part.value.filename}"`);
     const lines = [
       `--${BOUNDARY}`,
@@ -341,6 +399,26 @@ export function renderedPassages(document: string): RenderedPassage[] {
 export function fragmentOf(link: string): string {
   const at = link.indexOf("#");
   assert.ok(at >= 0, `the link ${link} carries a fragment`);
-  const raw = link.slice(at + 1);
-  return decodeURIComponent(raw);
+  return decodeURIComponent(link.slice(at + 1));
+}
+
+/**
+ * Resolve one rendered passage link to the page a browser fetches and the
+ * decoded anchor it scrolls to. The destination page is fetched and must be a
+ * 200 carrying a row with that exact anchor whose quote is the passage's own
+ * text; the resolved link's path and anchor are returned for comparison.
+ */
+export async function resolvePassageLink(
+  base: string,
+  passage: RenderedPassage,
+): Promise<{ readonly path: string; readonly fragment: string }> {
+  const { path, fragment } = splitLink(passage.link);
+  assert.notEqual(fragment, "", `the passage link ${passage.link} carries a fragment`);
+  const anchor = decodeURIComponent(fragment);
+  const destination = await get(base, path);
+  assert.equal(destination.status, 200, `the passage link destination ${path} is readable`);
+  const targets = renderedPassages(destination.body).filter((row) => row.anchor === anchor);
+  assert.equal(targets.length, 1, `the fragment ${anchor} targets exactly one passage row on ${path}`);
+  assert.equal(targets[0].text, passage.text, `the target row ${anchor} shows the passage's own quote`);
+  return { path, fragment };
 }

@@ -23,21 +23,21 @@
  */
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
-import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { escapeHtml } from "../src/html.ts";
 import { startApplication, type Application } from "../src/index.ts";
-import { OCR_UNAVAILABLE_GUIDANCE, RE_EXPORT_GUIDANCE } from "../src/transcript-pdf.ts";
 import {
   fragmentOf,
   get,
   parseForm,
   postBytes,
   renderedPassages,
+  resolvePassageLink,
   sectionOf,
   sourceRows,
+  splitLink,
   submit,
   unescapeHtml,
 } from "./fixtures/transcript-http.ts";
@@ -65,14 +65,14 @@ const encoder = new TextEncoder();
 // Fixture text
 // ---------------------------------------------------------------------------
 
-/** The pasted original: two paragraphs, one quoted. */
-const PASTED = 'Alice: "The budget is fixed," she said.\n\nBob: We can work within it.';
+/** The pasted original: two paragraphs, one quoted, with multibyte text. */
+const PASTED = 'Alice: "The budget is fixed," she said.\n\nBob: We can work within it — café.';
 /** A .txt original: the pasted words with different whitespace, its own file. */
-const TEXT_FILE = ' Alice:  "The budget is fixed," she said.\r\n\r\nBob: We can work within it.\n';
+const TEXT_FILE = ' Alice:  "The budget is fixed," she said.\r\n\r\nBob: We can work within it — café.\n';
 /** A .md original whose canonical text differs by case. */
 const MARKDOWN = 'Alice: "The budget is fixed," she said.\n\nbob: we can work within it.';
 /** An original imported in a second engagement, with the same canonical text. */
-const OTHER_ENGAGEMENT_TEXT = 'Alice: "The budget is fixed," she said.\n\nBob: We can work within it.';
+const OTHER_ENGAGEMENT_TEXT = 'Alice: "The budget is fixed," she said.\n\nBob: We can work within it — café.';
 /** The DOCX paragraphs: several blocks, one quoted. */
 const DOCX_PARAGRAPHS = ['Alice: "The budget is fixed," she said.', "Bob: We can work within it.", "Carol: Agreed."];
 /** The text PDF's pages: text on page one, a blank page, text on page three. */
@@ -119,30 +119,32 @@ function resultMeetingLink(resultPage: string): string {
   return href;
 }
 
-/** The explanation a result page shows, or null when it shows none. */
-function resultExplanation(resultPage: string): string | null {
-  const match = /<p role="status">([\s\S]*?)<\/p>/.exec(sectionOf(resultPage, "Result"));
-  return match === null ? null : unescapeHtml(match[1]);
-}
-
-/** The preserved-metadata conflicts a result page reports, as `field: supplied -> preserved`. */
-function resultConflicts(resultPage: string): string[] {
-  const section = sectionOf(resultPage, "Result");
-  return [...section.matchAll(/<li>([\s\S]*?)<\/li>/g)].map((match) => unescapeHtml(match[1]));
-}
-
 /**
- * The ids of the meetings a scope's meeting history lists, in rendered order,
- * read from the history's own cards. A meeting appears once per card, so a
- * duplicate link shows up as a duplicate id.
+ * The meeting link card a history section renders for one meeting path, or ""
+ * when the history carries no card for that path. The card is the whole
+ * `<li class="card">`, so its destination link is read from the entry, not
+ * inferred from the set of links the history happens to hold.
  */
+function historyCardFor(historySection: string, meetingPath: string): string {
+  const link = `<a href="${escapeHtml(meetingPath)}">`;
+  for (const match of historySection.matchAll(/<li class="card">([\s\S]*?)<\/li>/g)) {
+    if (match[1].includes(link)) return match[0];
+  }
+  return "";
+}
+
+/** The meeting paths a history section lists, in rendered order. */
 function historyMeetingIds(historySection: string): string[] {
-  return [...historySection.matchAll(/<li class="card"><a href="(\/meetings\/[^"]+)">/g)].map((match) => unescapeHtml(match[1]));
+  return [...historySection.matchAll(/<li class="card"><a href="(\/meetings\/[^"]+)">/g)].map((match) =>
+    unescapeHtml(match[1]),
+  );
 }
 
 /** The single import link a history section offers, or "" when it offers none. */
 function historyImportLink(historySection: string): string {
-  const links = [...historySection.matchAll(/<a href="([^"]+)">Import transcript<\/a>/g)].map((match) => unescapeHtml(match[1]));
+  const links = [...historySection.matchAll(/<a href="([^"]+)">Import transcript<\/a>/g)].map((match) =>
+    unescapeHtml(match[1]),
+  );
   assert.ok(links.length <= 1, "a history offers at most one import action");
   return links[0] ?? "";
 }
@@ -170,14 +172,31 @@ function profileValue(meetingPage: string, label: string): string | null {
   return match === null ? null : unescapeHtml(match[1]);
 }
 
-/**
- * One source's three views read over HTTP, plus what they show: the original
- * bytes, the extracted text and the rendered passages.
- */
+/** The explanation a result page shows, or null when it shows none. */
+function resultExplanation(resultPage: string): string | null {
+  const match = /<p role="status">([\s\S]*?)<\/p>/.exec(sectionOf(resultPage, "Result"));
+  return match === null ? null : unescapeHtml(match[1]);
+}
+
+/** The preserved-metadata conflicts a result page reports, as `field: supplied -> preserved`. */
+function resultConflicts(resultPage: string): string[] {
+  const section = sectionOf(resultPage, "Result");
+  return [...section.matchAll(/<li>([\s\S]*?)<\/li>/g)].map((match) => unescapeHtml(match[1]));
+}
+
+/** The project a result page names, as a path, or "". */
+function resultPageProject(resultPage: string): string {
+  const match = /<p>Project: <a href="([^"]+)">/.exec(sectionOf(resultPage, "Result"));
+  return match === null ? "" : unescapeHtml(match[1]);
+}
+
+/** One source's three views read over HTTP, plus what they show. */
 interface SourceView {
   readonly originalBytes: Buffer;
   readonly text: string;
   readonly passages: ReturnType<typeof renderedPassages>;
+  /** The resolved destinations (path and raw fragment) of each passage link. */
+  readonly passageLinks: readonly { readonly path: string; readonly fragment: string }[];
 }
 
 /** Read one source row's three views over HTTP and require each to be a 200. */
@@ -191,12 +210,17 @@ async function readSource(base: string, row: ReturnType<typeof sourceRows>[numbe
   assert.equal(passages.status, 200, `${row.filename} passages are served`);
   assert.match(String(passages.headers["content-type"]), /^text\/html; charset=utf-8/, "the passages are a page");
   const rendered = renderedPassages(passages.body);
-  // Every passage row's fragment link names that same row's anchor, so a
+  // Every passage row's fragment link resolves to a readable page (its own
+  // passages page) carrying a row with that anchor and that quote, so a
   // changed anchor or a misdirected fragment fails.
+  const passageLinks: { readonly path: string; readonly fragment: string }[] = [];
   for (const passage of rendered) {
-    assert.equal(fragmentOf(passage.link), passage.anchor, `${row.filename} passage fragment targets its own anchor`);
+    const resolved = await resolvePassageLink(base, passage);
+    assert.equal(resolved.path, splitLink(row.passages).path, `${row.filename} passage link stays on its passages page`);
+    assert.equal(decodeURIComponent(resolved.fragment), passage.anchor, `${row.filename} passage fragment targets its own anchor`);
+    passageLinks.push(resolved);
   }
-  return { originalBytes: original.bytes, text: text.body, passages: rendered };
+  return { originalBytes: original.bytes, text: text.body, passages: rendered, passageLinks };
 }
 
 /** The source rows a meeting page lists, read from its own markup. */
@@ -204,6 +228,23 @@ async function meetingSources(base: string, meetingPath: string): Promise<Return
   const page = await get(base, meetingPath);
   assert.equal(page.status, 200, `${meetingPath} is readable`);
   return sourceRows(page.body);
+}
+
+/** A source row read back as a row argument (for re-reads of saved links). */
+function savedRow(source: {
+  readonly filename: string;
+  readonly format: string;
+  readonly original: string;
+  readonly text: string;
+  readonly passages: string;
+}): ReturnType<typeof sourceRows>[number] {
+  return {
+    filename: source.filename,
+    format: source.format,
+    original: source.original,
+    text: source.text,
+    passages: source.passages,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -216,11 +257,9 @@ describe("transcript library over loopback HTTP", () => {
     let app: Application | undefined;
     try {
       app = await startApplication({ dataDirectory: dir, port: 0 });
-      let base = app.url;
+      const base = app.url;
 
-      // -- Clients and two engagements through their rendered forms. ---------
-      const clientsPage = await get(base, "/clients");
-      assert.equal(clientsPage.status, 200);
+      // -- Clients, engagements and projects through their rendered forms. ---
       const newClient = await get(base, "/clients/new");
       assert.equal(newClient.status, 200);
       const clientId = await createRecord(base, parseForm(newClient.body), {
@@ -258,21 +297,43 @@ describe("transcript library over loopback HTTP", () => {
         { name: "Foreign engagement", objectives: "Test", status: "active" },
       );
       // An archiveable project of the alpha engagement; the DOCX and PDF
-      // imports create their meetings in it.
+      // imports create their meetings in it. A sibling project holds one more
+      // meeting, so the project history's selection is observable.
       const projectId = await createChild(
         base,
         `/engagements/${encodeURIComponent(alphaEngagementId)}/projects/new`,
         { name: "Alpha project", objectives: "Imported meetings", status: "active" },
       );
       const projectHref = `/projects/${encodeURIComponent(projectId)}`;
+      const siblingProjectId = await createChild(
+        base,
+        `/engagements/${encodeURIComponent(alphaEngagementId)}/projects/new`,
+        { name: "Sibling project", objectives: "Another project", status: "active" },
+      );
 
-      // A manual meeting in the alpha engagement, created through its form.
+      // Meetings created through the engagement meeting forms: a manual
+      // meeting whose notes an attachment keeps, and a project-assigned
+      // sibling meeting that only the sibling project may list.
       const manualMeetingId = await createChild(
         base,
         `/engagements/${encodeURIComponent(alphaEngagementId)}/meetings/new`,
         { title: "Manual kickoff", date: "2026-01-05", notes: MANUAL_NOTES, projectId: "" },
       );
       const manualMeetingPath = `/meetings/${encodeURIComponent(manualMeetingId)}`;
+      const siblingMeetingId = await createChild(
+        base,
+        `/engagements/${encodeURIComponent(alphaEngagementId)}/meetings/new`,
+        { title: "Sibling meeting", date: "2026-01-06", notes: "", projectId: siblingProjectId },
+      );
+      const siblingMeetingPath = `/meetings/${encodeURIComponent(siblingMeetingId)}`;
+      // A beta-engagement meeting, so the client history must select across
+      // engagements by its own client and a client selector cannot merely
+      // return the alpha engagement.
+      const betaManualId = await createChild(
+        base,
+        `/engagements/${encodeURIComponent(betaEngagementId)}/meetings/new`,
+        { title: "Beta manual", date: "2026-01-04", notes: "", projectId: "" },
+      );
 
       // -- Import 1: paste, through the alpha engagement's history action. ---
       const alphaHref = `/engagements/${encodeURIComponent(alphaEngagementId)}`;
@@ -291,22 +352,43 @@ describe("transcript library over loopback HTTP", () => {
       });
       const pasteMeeting = resultMeetingLink(pasteResult);
 
-      // -- Import 2: a whitespace-equivalent distinct original, same meeting.
+      // -- Import 2: a whitespace-equivalent distinct original to the same
+      // meeting, with conflicting metadata the explanation must report. -----
       const distinctResult = await importThrough(base, pasteAction, pasteAction, {
-        title: "Paste meeting",
+        title: "A different title",
         date: "2026-01-10",
         notes: "Imported notes",
+        projectId: siblingProjectId,
         paste: "",
         file: { filename: "notes.txt", body: encoder.encode(TEXT_FILE) },
       });
       assert.equal(resultMeetingLink(distinctResult), pasteMeeting, "a whitespace-equivalent original reuses the meeting");
       const explanation = resultExplanation(distinctResult) ?? "";
       assert.match(explanation, /distinct original was retained/i, "the result explains the distinct original");
-      assert.deepEqual(resultConflicts(distinctResult), [], "the supplied metadata matches the preserved meeting");
+      assert.match(explanation, /canonical meeting is reused/i);
+      // The conflicting title and the different project selection are
+      // reported and never written; the meeting keeps the first metadata.
+      assert.deepEqual(
+        resultConflicts(distinctResult).sort(),
+        [
+          `projectId: submitted ${siblingProjectId}, kept `,
+          "title: submitted A different title, kept Paste meeting",
+        ].sort(),
+        "the distinct original's conflicting metadata is reported",
+      );
+      assert.equal(resultPageProject(distinctResult), "", "the result keeps no project, the preserved value");
 
       const firstRows = await meetingSources(base, pasteMeeting);
       assert.deepEqual(firstRows.map((row) => row.filename), ["Pasted text", "notes.txt"], "the distinct original added a readable source");
       assert.deepEqual(firstRows.map((row) => row.format), ["paste", "txt"]);
+      // The distinct original's readable source is the exact TXT bytes and
+      // their text and passages, checked before it becomes a restart baseline.
+      const txtRow = firstRows.find((row) => row.filename === "notes.txt");
+      assert.ok(txtRow !== undefined, "the distinct original's TXT row is listed");
+      const txtView = await readSource(base, txtRow!);
+      assert.deepEqual(txtView.originalBytes, Buffer.from(encoder.encode(TEXT_FILE)), "the distinct original's bytes are the TXT fixt");
+      assert.equal(txtView.text, TEXT_FILE, "the distinct original's text is the TXT file's text");
+      assert.equal(txtView.passages[0].text, 'Alice:  "The budget is fixed," she said.', "the distinct original's first quote is its own text");
 
       // -- Import 3: an exact repeat of one stored file under a new name. ----
       const repeatResult = await importThrough(base, pasteAction, pasteAction, {
@@ -371,6 +453,12 @@ describe("transcript library over loopback HTTP", () => {
       assert.equal(profileValue(manualAfterAttach.body, "Title"), "Manual kickoff", "the meeting title is kept");
       assert.equal(profileValue(manualAfterAttach.body, "Date"), "2026-01-05", "the meeting date is kept");
       assert.equal(profileValue(manualAfterAttach.body, "Notes"), MANUAL_NOTES, "the meeting notes are kept");
+      // Exactly one source was attached, and its text reads back as ATTACHED.
+      const manualRows = await meetingSources(base, manualMeetingPath);
+      assert.equal(manualRows.length, 1, "the manual meeting holds exactly one attached source");
+      assert.equal(manualRows[0].format, "paste");
+      const manualView = await readSource(base, manualRows[0]);
+      assert.equal(manualView.text, ATTACHED, "the attached source's text is the attached transcript");
 
       // An attachment is never replaced: a different content aimed at it is
       // refused, and the refusal keeps the attach form's own guidance.
@@ -381,6 +469,12 @@ describe("transcript library over loopback HTTP", () => {
       assert.equal(refusedAttach.status, 400, "a second, different attachment is refused");
       assert.match(refusedAttach.body, /already holds a transcript of different content/);
       assert.match(refusedAttach.body, /Supported formats:/, "the refused form still states the formats");
+      // The refused replacement left the manual meeting's single source and
+      // its notes untouched, and the saved source link still reads back.
+      const manualAfterRefusal = await get(base, manualMeetingPath);
+      assert.equal(profileValue(manualAfterRefusal.body, "Notes"), MANUAL_NOTES, "the refused replacement kept the notes");
+      assert.deepEqual(sourceRows(manualAfterRefusal.body), manualRows, "the refused replacement added no source");
+      assert.equal((await readSource(base, manualRows[0])).text, ATTACHED, "the saved source link still reads the attachment");
 
       // -- Import 7: the DOCX and 8: the PDF, through the project's action. --
       const projectPage = await get(base, projectHref);
@@ -388,7 +482,7 @@ describe("transcript library over loopback HTTP", () => {
       const docxAction = historyImportLink(projectHistory);
       assert.match(docxAction, /^\/projects\/[^/]+\/transcripts\/import$/, "the project history links the project import");
       const docxForm = parseForm((await get(base, docxAction)).body);
-      assert.equal(docxForm.controls.get("projectId"), projectId, "the project import preselects the URL project");
+      assert.equal(docxForm.controls.get("projectId")?.value, projectId, "the project import preselects the URL project");
       const docxResult = await importThrough(base, docxAction, docxAction, {
         title: "DOCX meeting",
         date: "2026-01-13",
@@ -417,6 +511,7 @@ describe("transcript library over loopback HTTP", () => {
         title: "A different title",
         date: "2026-02-01",
         notes: "A different note",
+        projectId: projectId,
         paste: PASTED,
         file: { filename: "", body: "" },
       });
@@ -426,6 +521,7 @@ describe("transcript library over loopback HTTP", () => {
         resultConflicts(conflictResult).sort(),
         [
           "date: submitted 2026-02-01, kept 2026-01-10",
+          `projectId: submitted ${projectId}, kept `,
           "notes: submitted A different note, kept Imported notes",
           "title: submitted A different title, kept Paste meeting",
         ].sort(),
@@ -438,15 +534,51 @@ describe("transcript library over loopback HTTP", () => {
       assert.equal(profileValue(preservedPage.body, "Notes"), "Imported notes");
 
       // -- Refusals: invalid UTF-8, corrupt DOCX/PDF and a scan. --------------
-      const refusals: { readonly name: string; readonly filename: string; readonly body: Uint8Array; readonly guidance: RegExp }[] = [
-        { name: "invalid UTF-8", filename: "broken.txt", body: INVALID_UTF8, guidance: /not valid UTF-8/ },
-        { name: "corrupt DOCX", filename: "broken.docx", body: encoder.encode("This is not a DOCX archive."), guidance: /DOCX|document/i },
-        { name: "corrupt PDF", filename: "broken.pdf", body: corruptBytes(), guidance: new RegExp(escapeRegExp(RE_EXPORT_GUIDANCE)) },
-        { name: "image-only PDF", filename: "scan.pdf", body: pdfBytes(["image-only"]), guidance: new RegExp(escapeRegExp(OCR_UNAVAILABLE_GUIDANCE)) },
+      // Each refusal names the format it could not read and the concrete
+      // recovery action, and the scan case names selectable-text export.
+      const refusals: readonly {
+        readonly name: string;
+        readonly filename: string;
+        readonly body: Uint8Array;
+        readonly diagnosis: RegExp;
+        readonly recovery: RegExp;
+      }[] = [
+        {
+          name: "invalid UTF-8",
+          filename: "broken.txt",
+          body: INVALID_UTF8,
+          diagnosis: /is not valid UTF-8/,
+          recovery: /import pasted text, or a UTF-8 \.txt or \.md file/,
+        },
+        {
+          name: "corrupt DOCX",
+          filename: "broken.docx",
+          body: encoder.encode("This is not a DOCX archive."),
+          diagnosis: /could not be read as a DOCX document/,
+          recovery: /Re-export the document as DOCX \(Word, \.docx\) or as UTF-8 text \(\.txt\)/,
+        },
+        {
+          name: "corrupt PDF",
+          filename: "broken.pdf",
+          body: corruptBytes(),
+          diagnosis: /could not be read as a PDF document/,
+          recovery: /Re-export the document as a text-based PDF with selectable text, or as UTF-8 text \(\.txt\)/,
+        },
+        {
+          name: "image-only PDF",
+          filename: "scan.pdf",
+          body: pdfBytes(["image-only"]),
+          diagnosis: /carries no extractable text/,
+          recovery: /export a text-based copy of the document with selectable text/,
+        },
       ];
+      // The engagement's meetings before any refusal, captured from the page,
+      // so a refusal that changed the list is visible.
+      const meetingsBeforeRefusals = historyMeetingIds(sectionOf((await get(base, alphaHref)).body, "Meeting history"));
+      const meetingCountBefore = meetingsBeforeRefusals.length;
+      const rowsBefore = await meetingSources(base, pasteMeeting);
+      const pastedViewBefore = await readSource(base, rowsBefore[0]);
       for (const refusal of refusals) {
-        // The refused form shows the guidance and the recovery sentence; a
-        // refused submission is answered with 400 and the multipart form again.
         const form = parseForm((await get(base, pasteAction)).body);
         assert.equal(form.enctype, "multipart/form-data", "the corrected form stays a multipart form");
         const reply = await submit(base, form, {
@@ -457,16 +589,25 @@ describe("transcript library over loopback HTTP", () => {
           file: { filename: refusal.filename, body: refusal.body },
         });
         assert.equal(reply.status, 400, `${refusal.name} is refused with 400`);
-        assert.match(reply.body, refusal.guidance, `${refusal.name} carries its recovery guidance`);
-        assert.match(reply.body, /Supported formats:/, `${refusal.name} keeps the import guidance`);
-        // A refusal adds no meeting to the engagement history.
+        assert.match(String(reply.headers["content-type"]), /^text\/html; charset=utf-8/, `${refusal.name} answers HTML`);
+        assert.match(reply.body, refusal.diagnosis, `${refusal.name} names the problem`);
+        assert.match(reply.body, refusal.recovery, `${refusal.name} states the recovery action`);
+        assert.match(reply.body, /Supported formats: pasted plain text; UTF-8 \.txt and \.md files; \.docx documents; text-based \.pdf files/);
+        // A refusal adds no meeting to the engagement history, and adds no
+        // source to the canonical meeting it was aimed past.
         const refusedHistory = historyMeetingIds(sectionOf((await get(base, alphaHref)).body, "Meeting history"));
-        assert.ok(!refusedHistory.some((path) => path.length === 0), "a refused import adds no meeting");
-        assert.equal(refusedHistory.length, 5, `${refusal.name} left the engagement's five meetings as they were`);
+        assert.equal(refusedHistory.length, meetingCountBefore, `${refusal.name} left the engagement's meetings as they were`);
+        assert.deepEqual(
+          [...refusedHistory].sort(),
+          [...meetingsBeforeRefusals].sort(),
+          `${refusal.name} kept the meetings the engagement already had`,
+        );
+        assert.deepEqual(await meetingSources(base, pasteMeeting), rowsBefore, `${refusal.name} added no source to the paste meeting`);
+        assert.deepEqual((await readSource(base, rowsBefore[0])).originalBytes, pastedViewBefore.originalBytes, `${refusal.name} kept the prior original bytes`);
       }
       // The prior source links still work after the refusals.
       const afterRefusalsRows = await meetingSources(base, pasteMeeting);
-      assert.equal(afterRefusalsRows.length, 2, "the earlier sources are unchanged by refusals");
+      assert.deepEqual(afterRefusalsRows, rowsBefore, "the earlier sources are unchanged by refusals");
       await readSource(base, afterRefusalsRows[0]);
 
       // -- The client history across engagements. ----------------------------
@@ -476,26 +617,55 @@ describe("transcript library over loopback HTTP", () => {
       assert.equal(historyImportLink(clientHistory), "", "the client history offers no single import action");
       assert.deepEqual(
         [...historyMeetingIds(clientHistory)].sort(),
-        [pasteMeeting, markdownMeeting, betaMeeting, manualMeetingPath, docxMeeting, pdfMeeting].sort(),
-        "the client history holds every meeting of both engagements",
+        [
+          pasteMeeting,
+          markdownMeeting,
+          betaMeeting,
+          manualMeetingPath,
+          docxMeeting,
+          pdfMeeting,
+          siblingMeetingPath,
+          `/meetings/${encodeURIComponent(betaManualId)}`,
+        ].sort(),
+        "the client history holds its client's every meeting across engagements, and no other client's",
       );
-      // The other client's engagement holds none of these meetings.
+      // The other client's engagement and client hold none of these meetings.
       const foreignPage = await get(base, `/engagements/${encodeURIComponent(foreignEngagementId)}`);
       assert.deepEqual(historyMeetingIds(sectionOf(foreignPage.body, "Meeting history")), []);
+      const foreignClientPage = await get(base, `/clients/${encodeURIComponent(anotherClientId)}`);
+      assert.deepEqual(historyMeetingIds(sectionOf(foreignClientPage.body, "Meeting history")), [], "the other client's history is empty");
 
       // -- The engagement history, including project meetings once. ----------
-      const engagementHistory = historyMeetingIds(sectionOf((await get(base, alphaHref)).body, "Meeting history"));
+      const alphaHistoryNow = sectionOf((await get(base, alphaHref)).body, "Meeting history");
+      const engagementHistory = historyMeetingIds(alphaHistoryNow);
       assert.equal(engagementHistory.length, new Set(engagementHistory).size, "a project meeting appears once");
       assert.deepEqual(
         [...engagementHistory].sort(),
-        [pasteMeeting, markdownMeeting, manualMeetingPath, docxMeeting, pdfMeeting].sort(),
+        [pasteMeeting, markdownMeeting, manualMeetingPath, docxMeeting, pdfMeeting, siblingMeetingPath].sort(),
         "the engagement history holds its own meetings, project meetings included, once",
       );
+      assert.ok(!engagementHistory.includes(betaMeeting), "the alpha engagement does not list the beta meeting");
+      // Each expected meeting's card links to its own page and lists its
+      // sources there, so a card that swapped destinations would fail.
+      for (const meeting of [pasteMeeting, markdownMeeting, manualMeetingPath, docxMeeting, pdfMeeting, siblingMeetingPath]) {
+        const card = historyCardFor(alphaHistoryNow, meeting);
+        assert.notEqual(card, "", `the engagement history lists ${meeting} as its own card`);
+        const destination = /<a href="([^"]+)">/.exec(card);
+        assert.equal(unescapeHtml(destination![1]), meeting, `${meeting}'s history card links its own page`);
+        const page = await get(base, meeting);
+        assert.equal(page.status, 200, `${meeting}'s card destination is readable`);
+        assert.ok(page.body.includes('<main id="main">'), `${meeting}'s card destination is a meeting page`);
+      }
 
       // -- The project history, only its assigned meetings. ------------------
       const projectHistoryIds = historyMeetingIds(sectionOf((await get(base, projectHref)).body, "Meeting history"));
       assert.deepEqual(projectHistoryIds, [docxMeeting, pdfMeeting], "the project history holds its assigned meetings by date");
       assert.ok(!projectHistoryIds.includes(pasteMeeting), "an engagement-only meeting is not in the project history");
+      assert.ok(!projectHistoryIds.includes(siblingMeetingPath), "a sibling project's meeting is not in the project history");
+      const siblingHistoryIds = historyMeetingIds(
+        sectionOf((await get(base, `/projects/${encodeURIComponent(siblingProjectId)}`)).body, "Meeting history"),
+      );
+      assert.deepEqual(siblingHistoryIds, [siblingMeetingPath], "the sibling project lists only its own meeting");
 
       // -- The DOCX and PDF sources, read over HTTP. -------------------------
       const docxSources = await meetingSources(base, docxMeeting);
@@ -526,6 +696,15 @@ describe("transcript library over loopback HTTP", () => {
       assert.equal(markdownView.text, MARKDOWN, "the Markdown text is exact");
 
       // -- Save what a restart must reproduce. -------------------------------
+      interface SavedSource {
+        readonly meeting: string;
+        readonly filename: string;
+        readonly format: string;
+        readonly original: string;
+        readonly text: string;
+        readonly passages: string;
+        readonly view: SourceView;
+      }
       const saved = {
         pasteMeeting,
         markdownMeeting,
@@ -535,18 +714,11 @@ describe("transcript library over loopback HTTP", () => {
         projectHref,
         alphaHref,
         clientPath,
-        sources: [] as {
-          readonly meeting: string;
-          readonly filename: string;
-          readonly original: string;
-          readonly text: string;
-          readonly passages: string;
-          readonly view: SourceView;
-        }[],
+        sources: [] as SavedSource[],
       };
       for (const [meeting, rows] of [
         [pasteMeeting, pasteRows],
-        [manualMeetingPath, await meetingSources(base, manualMeetingPath)],
+        [manualMeetingPath, manualRows],
         [markdownMeeting, markdownRows],
         [docxMeeting, docxSources],
         [pdfMeeting, pdfSources],
@@ -555,6 +727,7 @@ describe("transcript library over loopback HTTP", () => {
           saved.sources.push({
             meeting,
             filename: row.filename,
+            format: row.format,
             original: row.original,
             text: row.text,
             passages: row.passages,
@@ -562,9 +735,19 @@ describe("transcript library over loopback HTTP", () => {
           });
         }
       }
+      // The restart baselines hold every meeting's sources, the beta meeting's
+      // included, so every expected history entry is opened after the restart.
+      assert.deepEqual(
+        saved.sources.map((source) => source.meeting).sort(),
+        [pasteMeeting, pasteMeeting, manualMeetingPath, markdownMeeting, docxMeeting, pdfMeeting].sort(),
+        "the baselines cover each meeting with its sources",
+      );
+      const betaRows = await meetingSources(base, betaMeeting);
+      assert.equal(betaRows.length, 1, "the beta meeting holds its own source");
+      const betaView = await readSource(base, betaRows[0]);
+      assert.equal(betaView.text, OTHER_ENGAGEMENT_TEXT, "the beta meeting's source is the text imported there");
 
       // -- Archive the project: its meetings leave the active histories. -----
-      const beforeArchiveRows = saved.sources.length;
       const projectArchivePage = await get(base, projectHref);
       const archiveForm = parseForm(projectArchivePage.body);
       assert.equal(archiveForm.action, `${projectHref}/archive`, "the project page offers its archive action");
@@ -572,13 +755,14 @@ describe("transcript library over loopback HTTP", () => {
       assert.equal(archived.status, 303, "archiving redirects to the project");
       assert.equal(String(archived.headers.location), projectHref);
 
-      // Neither project meeting is in the engagement or client histories.
+      // Neither project meeting is in the engagement or client histories, and
+      // none of the project's sources were added or removed by archiving.
       const archivedEngagementHistory = historyMeetingIds(sectionOf((await get(base, alphaHref)).body, "Meeting history"));
       assert.ok(!archivedEngagementHistory.includes(docxMeeting), "the archived project's DOCX meeting left the engagement history");
       assert.ok(!archivedEngagementHistory.includes(pdfMeeting), "the archived project's PDF meeting left the engagement history");
       assert.deepEqual(
         [...archivedEngagementHistory].sort(),
-        [pasteMeeting, markdownMeeting, manualMeetingPath].sort(),
+        [pasteMeeting, markdownMeeting, manualMeetingPath, siblingMeetingPath].sort(),
         "the engagement history keeps only its active meetings",
       );
       const archivedClientHistory = historyMeetingIds(sectionOf((await get(base, clientPath)).body, "Meeting history"));
@@ -586,18 +770,37 @@ describe("transcript library over loopback HTTP", () => {
       assert.ok(!archivedClientHistory.includes(pdfMeeting));
       assert.deepEqual(
         [...archivedClientHistory].sort(),
-        [pasteMeeting, markdownMeeting, manualMeetingPath, betaMeeting].sort(),
+        [
+          pasteMeeting,
+          markdownMeeting,
+          manualMeetingPath,
+          betaMeeting,
+          siblingMeetingPath,
+          `/meetings/${encodeURIComponent(betaManualId)}`,
+        ].sort(),
         "the client history keeps only its active meetings",
       );
       // The project's own history is empty while it is archived, and the
-      // project page stays readable with its archive notice.
+      // project page stays readable with its archive notice and history.
       const archivedProjectPage = await get(base, projectHref);
-      assert.equal(archivedProjectPage.status, 200);
+      assert.equal(archivedProjectPage.status, 200, "the archived project page is readable");
       assert.match(archivedProjectPage.body, /This record is archived/);
-      assert.deepEqual(historyMeetingIds(sectionOf(archivedProjectPage.body, "Meeting history")), [], "the archived project lists no active meeting");
+      const archivedProjectSection = sectionOf(archivedProjectPage.body, "Meeting history");
+      assert.notEqual(archivedProjectSection, "", "the archived project page renders its meeting history section");
+      assert.deepEqual(historyMeetingIds(archivedProjectSection), [], "the archived project lists no active meeting");
+
+      // Freshly fetched source rows for the project's meetings equal the rows
+      // saved before archiving: archiving added or removed no source.
+      for (const meeting of [docxMeeting, pdfMeeting]) {
+        const savedRows = saved.sources
+          .filter((candidate) => candidate.meeting === meeting)
+          .map((candidate) => savedRow(candidate));
+        assert.deepEqual(await meetingSources(base, meeting), savedRows, `${meeting} lists the same sources after archiving`);
+      }
 
       // Direct meeting and source links still work for the archived meetings,
-      // whose own pages keep their source rows with all three links.
+      // whose own pages keep their source rows with all three links, and whose
+      // rows and bytes still match the saved baselines.
       for (const meeting of [docxMeeting, pdfMeeting]) {
         const page = await get(base, meeting);
         assert.equal(page.status, 200, `${meeting} stays directly readable`);
@@ -607,50 +810,77 @@ describe("transcript library over loopback HTTP", () => {
         assert.equal(rows[0].filename, meeting === docxMeeting ? "blocks.docx" : "report.pdf");
       }
       for (const source of saved.sources.filter((candidate) => candidate.meeting === docxMeeting || candidate.meeting === pdfMeeting)) {
-        const view = await readSource(base, {
-          filename: source.filename,
-          format: "",
-          original: source.original,
-          text: source.text,
-          passages: source.passages,
-        });
+        const view = await readSource(base, savedRow(source));
         assert.deepEqual(view.originalBytes, source.view.originalBytes, `${source.filename} original bytes still match after archiving`);
         assert.equal(view.text, source.view.text, `${source.filename} text still matches after archiving`);
       }
-      assert.equal(saved.sources.length, beforeArchiveRows, "archiving added no source");
 
       // -- Restart over the same directory, on a new origin. -----------------
+      // The second instance's own URL is the origin for every restarted
+      // request; no assumption is made about how the OS allocates ports.
       await app.close();
       app = await startApplication({ dataDirectory: dir, port: 0 });
       const restarted = app.url;
-      assert.notEqual(restarted, base, "the restarted application listens on its own origin");
 
       // The saved paths are resolved against the new origin, and the same
       // pages are rediscovered from the histories, not from the saved paths.
       const restartedAlpha = await get(restarted, alphaHref);
-      const restartedAlphaHistory = historyMeetingIds(sectionOf(restartedAlpha.body, "Meeting history"));
+      assert.equal(restartedAlpha.status, 200);
+      const restartedAlphaHistorySection = sectionOf(restartedAlpha.body, "Meeting history");
       assert.deepEqual(
-        [...restartedAlphaHistory].sort(),
-        [pasteMeeting, markdownMeeting, manualMeetingPath].sort(),
+        [...historyMeetingIds(restartedAlphaHistorySection)].sort(),
+        [pasteMeeting, markdownMeeting, manualMeetingPath, siblingMeetingPath].sort(),
         "the restarted engagement history is the same active history",
       );
+      const restartedClientHistorySection = sectionOf((await get(restarted, clientPath)).body, "Meeting history");
       assert.deepEqual(
-        [...historyMeetingIds(sectionOf((await get(restarted, clientPath)).body, "Meeting history"))].sort(),
-        [pasteMeeting, markdownMeeting, manualMeetingPath, betaMeeting].sort(),
+        [...historyMeetingIds(restartedClientHistorySection)].sort(),
+        [
+          pasteMeeting,
+          markdownMeeting,
+          manualMeetingPath,
+          betaMeeting,
+          siblingMeetingPath,
+          `/meetings/${encodeURIComponent(betaManualId)}`,
+        ].sort(),
         "the restarted client history is the same active history",
       );
-      assert.deepEqual(
-        historyMeetingIds(sectionOf((await get(restarted, projectHref)).body, "Meeting history")),
-        [],
-        "the archived project still lists no active meeting after the restart",
-      );
+      const restartedProjectSection = sectionOf((await get(restarted, projectHref)).body, "Meeting history");
+      assert.notEqual(restartedProjectSection, "", "the archived project still renders its history section");
+      assert.deepEqual(historyMeetingIds(restartedProjectSection), [], "the archived project still lists no active meeting after the restart");
       // The archived meetings are still directly readable after the restart.
       for (const meeting of [docxMeeting, pdfMeeting]) {
         assert.equal((await get(restarted, meeting)).status, 200, `${meeting} is readable after the restart`);
       }
+      // Every active history entry is opened at its own href after the restart,
+      // so each card still reaches its own meeting page.
+      const activeAfterRestart = new Set([
+        ...historyMeetingIds(restartedAlphaHistorySection),
+        ...historyMeetingIds(restartedClientHistorySection),
+      ]);
+      for (const meeting of activeAfterRestart) {
+        const historySection = historyMeetingIds(restartedAlphaHistorySection).includes(meeting)
+          ? restartedAlphaHistorySection
+          : restartedClientHistorySection;
+        const card = historyCardFor(historySection, meeting);
+        assert.notEqual(card, "", `${meeting}'s history card is rendered after the restart`);
+        const destination = /<a href="([^"]+)">/.exec(card);
+        assert.equal(unescapeHtml(destination![1]), meeting, `${meeting}'s history card still links its own page after the restart`);
+        const page = await get(restarted, meeting);
+        assert.equal(page.status, 200, `${meeting}'s card destination is readable after the restart`);
+        assert.ok(page.body.includes('<main id="main">'), `${meeting}'s card destination is a page after the restart`);
+      }
+      assert.ok(activeAfterRestart.has(betaMeeting), "the beta meeting is rediscovered from the restarted client history");
+      assert.deepEqual(
+        (await meetingSources(restarted, betaMeeting)).map((row) => row.filename),
+        betaRows.map((row) => row.filename),
+        "the beta meeting's sources are rediscovered after the restart",
+      );
+      assert.equal((await readSource(restarted, (await meetingSources(restarted, betaMeeting))[0])).text, betaView.text, "the beta meeting's text matches across the restart");
 
       // Each saved source is rediscovered on its meeting page and read over the
-      // new origin: original bytes, full text, quotes, locations and fragments.
+      // new origin: original bytes, full text, quotes, locations and fragment
+      // targets (each resolved at its own destination page).
       for (const source of saved.sources) {
         const rows = await meetingSources(restarted, source.meeting);
         const row = rows.find((candidate) => candidate.filename === source.filename);
@@ -680,11 +910,27 @@ describe("transcript library over loopback HTTP", () => {
           })),
           `${source.filename} passages, quotes, locations and fragment targets match across the restart`,
         );
-        // Each saved fragment link resolves to the saved anchor on the new
-        // origin: the fragment target the passage renders still exists there.
-        const fragments = await get(restarted, source.passages);
+        assert.deepEqual(
+          view.passageLinks.map((link) => ({ path: link.path, fragment: link.fragment })),
+          source.view.passageLinks.map((link) => ({ path: link.path, fragment: link.fragment })),
+          `${source.filename} passage-link destinations match across the restart`,
+        );
+        // The saved paths, resolved against the new origin, still serve the
+        // same bytes, text and fragment targets.
+        const savedOriginal = await get(restarted, source.original);
+        assert.deepEqual(savedOriginal.bytes, source.view.originalBytes, `${source.filename} saved original path serves the same bytes`);
+        const savedText = await get(restarted, source.text);
+        assert.equal(savedText.body, source.view.text, `${source.filename} saved text path serves the same text`);
+        const savedPassages = await get(restarted, source.passages);
+        assert.equal(savedPassages.status, 200);
         for (const passage of source.view.passages) {
-          assert.ok(fragments.body.includes(`id="${escapeHtml(passage.anchor)}"`), `the saved fragment ${passage.anchor} targets a row`);
+          assert.ok(savedPassages.body.includes(`id="${escapeHtml(passage.anchor)}"`), `the saved fragment ${passage.anchor} targets a row`);
+        }
+        for (const link of source.view.passageLinks) {
+          assert.ok(link.fragment !== "", "a saved passage link carries a fragment");
+          const destination = await get(restarted, link.path);
+          assert.equal(destination.status, 200, `the saved passage destination ${link.path} is readable after the restart`);
+          assert.ok(destination.body.includes(`id="${escapeHtml(decodeURIComponent(link.fragment))}"`), "the saved fragment targets a row at its destination");
         }
       }
     } finally {
@@ -696,17 +942,6 @@ describe("transcript library over loopback HTTP", () => {
 // ---------------------------------------------------------------------------
 // Small helpers for the rendered forms
 // ---------------------------------------------------------------------------
-
-/** Escape text for a regular expression, so a literal is matched literally. */
-function escapeRegExp(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-/** The project a result page names, as a path, or "". */
-function resultPageProject(resultPage: string): string {
-  const match = /<p>Project: <a href="([^"]+)">/.exec(sectionOf(resultPage, "Result"));
-  return match === null ? "" : unescapeHtml(match[1]);
-}
 
 /**
  * Submit a rendered creation form and follow its 303 redirect, returning the
