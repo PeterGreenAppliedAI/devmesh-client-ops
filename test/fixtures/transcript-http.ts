@@ -38,42 +38,55 @@ function replyFrom(status: number, headers: Record<string, string | string[] | u
 }
 
 /**
- * A resolved link: the request target a browser fetches (path and query) and
- * the fragment it resolves locally. The fragment is returned raw, exactly as it
- * appears in the href.
+ * A resolved link: the absolute href a browser follows (origin, path and query)
+ * and the fragment it resolves locally. The fragment is returned raw, exactly
+ * as it appears in the href, and the href keeps its origin, so a link pointing
+ * at another origin is visible instead of being reduced to the local path.
  */
 interface SplitLink {
+  readonly href: string;
   readonly path: string;
   readonly fragment: string;
 }
 
 /**
- * Resolve one rendered href against the page that rendered it: a root-relative
- * href, a same-page `#fragment` href or a relative one becomes the request
- * target a browser would fetch, and the fragment is kept raw.
+ * Resolve one rendered href against the page that rendered it on the running
+ * application: a root-relative href, a same-page `#fragment` href, a relative
+ * or an absolute href becomes the absolute URL a browser would follow, and the
+ * fragment is kept raw. The page is resolved against the application's own
+ * origin and a link naming another origin is refused, so a link that leaves the
+ * application is never requested from the local pages instead.
  */
-export function splitLink(fromPath: string, href: string): SplitLink {
+function splitLink(base: string, fromPath: string, href: string): SplitLink {
   assert.ok(href !== "", `the link ${href || "(empty)"} is not empty`);
-  const resolved = new URL(href, `http://loopback.invalid${fromPath}`);
+  const origin = new URL(base).origin;
+  const resolved = new URL(href, new URL(fromPath, origin));
+  assert.equal(resolved.origin, origin, `the link ${href} on ${fromPath} names the application's own origin`);
   return {
+    href: resolved.href,
     path: `${resolved.pathname}${resolved.search}`,
     fragment: resolved.hash === "" ? "" : resolved.hash.slice(1),
   };
 }
 
 /**
- * Send one GET over loopback HTTP. The Host header is the origin's own
- * authority; a plain GET carries no Origin and is accepted by the shell.
+ * Send one GET over loopback HTTP. `path` may be a request target with a query
+ * or a link with a fragment; the fragment is resolved by the browser and never
+ * sent, and the request target is the path and query. The Host header is the
+ * origin's own authority; a plain GET carries no Origin and is accepted by the
+ * shell.
  */
 export function get(base: string, path: string): Promise<Reply> {
   const url = originOf(base);
+  const resolved = new URL(path, url.origin);
+  const target = `${resolved.pathname}${resolved.search}`;
   const headers: Record<string, string | number> = {
     host: url.host,
     "content-length": 0,
   };
   return new Promise((resolve, reject) => {
     const req = httpRequest(
-      { host: url.hostname, port: Number(url.port), method: "GET", path, headers, agent: false },
+      { host: url.hostname, port: Number(url.port), method: "GET", path: target, headers, agent: false },
       (res) => {
         const chunks: Buffer[] = [];
         res.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -91,7 +104,7 @@ export function get(base: string, path: string): Promise<Reply> {
  * is the request's own origin, as a browser would send it for a same-origin
  * form submission.
  */
-export function postBytes(
+function postBytes(
   base: string,
   path: string,
   contentType: string,
@@ -161,8 +174,10 @@ export interface ParsedForm {
   readonly enctype: string | null;
   /** Every named control with its rendered type, value and enabled state. */
   readonly controls: Map<string, FormControl>;
-  /** Select controls: name to the option values it offers. */
+  /** Select controls: name to the option values an operator can select. */
   readonly options: Map<string, string[]>;
+  /** Names the page renders as a select, whether or not it offers an option. */
+  readonly selects: ReadonlySet<string>;
 }
 
 /** True for an element rendered with a `disabled` attribute. */
@@ -178,12 +193,26 @@ function isDisabled(attributes: string): boolean {
  */
 function disabledFieldsets(inner: string): { readonly start: number; readonly end: number }[] {
   const spans: { start: number; end: number }[] = [];
-  const open = [...inner.matchAll(/<fieldset([^>]*)>/g)];
-  for (const match of open) {
+  const tags = [...inner.matchAll(/<fieldset([^>]*)>|<\/fieldset>/g)];
+  for (const [index, match] of tags.entries()) {
+    if (match[0] === "</fieldset>") continue;
     if (!isDisabled(match[1])) continue;
-    const start = match.index!;
-    const close = inner.indexOf("</fieldset>", start);
-    spans.push({ start, end: close < 0 ? inner.length : close });
+    // The fieldset's own close is the first closing tag with no further open
+    // fieldset between them, so a nested fieldset's close does not end it.
+    let depth = 0;
+    let end = inner.length;
+    for (const nested of tags.slice(index + 1)) {
+      if (nested[0] === "</fieldset>") {
+        if (depth === 0) {
+          end = nested.index!;
+          break;
+        }
+        depth -= 1;
+      } else {
+        depth += 1;
+      }
+    }
+    spans.push({ start: match.index!, end });
   }
   return spans;
 }
@@ -206,6 +235,7 @@ export function parseForm(document: string): ParsedForm {
   assert.notEqual(action, null, "the form carries an action");
   const controls = new Map<string, FormControl>();
   const options = new Map<string, string[]>();
+  const selects = new Set<string>();
   const inner = form[1];
   const disabledSpans = disabledFieldsets(inner);
   for (const match of inner.matchAll(/<textarea([^>]*)>([\s\S]*?)<\/textarea>/g)) {
@@ -234,8 +264,16 @@ export function parseForm(document: string): ParsedForm {
   for (const match of inner.matchAll(/<select([^>]*)>([\s\S]*?)<\/select>/g)) {
     const name = /\sname="([^"]+)"/.exec(match[1]);
     assert.notEqual(name, null, "the select carries a name");
-    const choices = [...match[2].matchAll(/<option value="([^"]*)"/g)].map((option) => unescapeHtml(option[1]));
+    // A disabled option is unavailable to the operator even inside an enabled
+    // select, so it is not among the choices a supplied value may name.
+    const choices = [...match[2].matchAll(/<option([^>]*)>/g)]
+      .filter((option) => !isDisabled(option[1]))
+      .map((option) => {
+        const value = /\svalue="([^"]*)"/.exec(option[1]);
+        return unescapeHtml(value === null ? "" : value[1]);
+      });
     options.set(unescapeHtml(name![1]), choices);
+    selects.add(unescapeHtml(name![1]));
     const selected = /<option value="([^"]*)"[^>]*\sselected/.exec(match[2]);
     const value = selected === null ? (choices[0] ?? "") : unescapeHtml(selected[1]);
     controls.set(unescapeHtml(name![1]), {
@@ -251,8 +289,12 @@ export function parseForm(document: string): ParsedForm {
     enctype: attribute("enctype"),
     controls,
     options,
+    selects,
   };
 }
+
+/** The form controls whose submitted value is a choice from a list. */
+const CHOICE_CONTROLS: ReadonlySet<string> = new Set(["projectId"]);
 
 /**
  * Submit a rendered form over HTTP exactly as a browser would. For a
@@ -279,9 +321,16 @@ export function submit(
     assert.ok(control!.enabled, `the supplied control ${name} is enabled`);
     if (typeof supplied !== "string") {
       assert.equal(control!.type, "file", `the form renders ${name} as a file control`);
-    } else if (control!.type === "select") {
+    } else if (CHOICE_CONTROLS.has(name) || form.selects.has(name)) {
+      // The import forms' choice controls are projects. A supplied choice must
+      // come from the rendered, enabled select and be one of its enabled
+      // options; a hidden or ordinary input standing in for the select, or a
+      // value the operator cannot pick, is refused.
+      assert.equal(control!.type, "select", `the form renders the choice ${name} as a select, not ${control!.type}`);
       const choices = form.options.get(name) ?? [];
       assert.ok(choices.includes(supplied), `the select ${name} offers ${JSON.stringify(supplied)}`);
+    } else {
+      assert.notEqual(control!.type, "select", `the select ${name} is rendered with its options`);
     }
   }
   // A browser does not submit a control rendered unavailable, so neither does
@@ -444,24 +493,25 @@ export function fragmentOf(link: string): string {
 }
 
 /**
- * Resolve one rendered passage link, rendered on the page at `fromPath`, to the
- * page a browser fetches and the decoded anchor it scrolls to. The destination
- * page is fetched and must be a 200 carrying a row with that exact anchor whose
- * quote is the passage's own text; the resolved link's path and anchor are
- * returned for comparison.
+ * Resolve one rendered passage link, rendered on the page at `fromPath` on the
+ * running application, against the page that rendered it. The destination must
+ * be the application's own, carry exactly one row with the decoded fragment's
+ * anchor, and that row must show the passage's own quote. A fragment link is a
+ * same-page anchor: the fragment names a row on the page, and the page is
+ * fetched, so the resolved request target and raw fragment are returned.
  */
 export async function resolvePassageLink(
   base: string,
   fromPath: string,
   passage: RenderedPassage,
 ): Promise<{ readonly path: string; readonly fragment: string }> {
-  const { path, fragment } = splitLink(fromPath, passage.link);
+  const { href, path, fragment } = splitLink(base, fromPath, passage.link);
   assert.notEqual(fragment, "", `the passage link ${passage.link} carries a fragment`);
   const anchor = decodeURIComponent(fragment);
-  const destination = await get(base, path);
-  assert.equal(destination.status, 200, `the passage link destination ${path} is readable`);
+  const destination = await get(base, href);
+  assert.equal(destination.status, 200, `the passage link destination ${href} is readable`);
   const targets = renderedPassages(destination.body).filter((row) => row.anchor === anchor);
-  assert.equal(targets.length, 1, `the fragment ${anchor} targets exactly one passage row on ${path}`);
+  assert.equal(targets.length, 1, `the fragment ${anchor} targets exactly one passage row at ${href}`);
   assert.equal(targets[0].text, passage.text, `the target row ${anchor} shows the passage's own quote`);
   return { path, fragment };
 }
