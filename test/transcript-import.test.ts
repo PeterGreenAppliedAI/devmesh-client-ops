@@ -394,6 +394,53 @@ describe("transcript submission handler: conflicting assertions and input", () =
     }
   });
 
+  it("accepts a matching id assertion on a create and an attachment, refusing a mismatched one", async () => {
+    const fx = await fixture();
+    try {
+      const [fields, file] = pasted("Matching id words.", {
+        title: "Matching id",
+        date: "2026-05-10",
+        id: fx.engagementId,
+      });
+      const created = await submitTranscript(fx.service, submission("engagement", fx.engagementId, fields, file));
+      assert.equal(created.outcome, "created");
+      assert.equal(created.meeting.engagementId, fx.engagementId);
+
+      const [projectFields, projectFile] = pasted("Matching project id words.", {
+        title: "Matching project id",
+        date: "2026-05-11",
+        id: fx.projectId,
+      });
+      const byProject = await submitTranscript(fx.service, submission("project", fx.projectId, projectFields, projectFile));
+      assert.equal(byProject.outcome, "created");
+      assert.equal(byProject.meeting.projectId, fx.projectId);
+
+      // A meeting URL's matching id assertion is also accepted: a manual,
+      // empty meeting receives its first attachment.
+      const target = await fx.store.createMeeting({
+        clientId: fx.clientId,
+        engagementId: fx.engagementId,
+        title: "Attachment target",
+        date: "2026-05-12",
+        notes: "",
+      });
+      const [meetingFields, meetingFile] = pasted("Fresh attachment words.", { id: target.id });
+      const viaMeeting = await submitTranscript(fx.service, submission("meeting", target.id, meetingFields, meetingFile));
+      assert.equal(viaMeeting.outcome, "attached");
+      assert.equal(viaMeeting.meeting.id, target.id);
+
+      const before = counts(fx.store);
+      const [mismatch, mismatchFile] = pasted("Words.", { title: "T", date: "2026-05-13", id: fx.secondProjectId });
+      await assert.rejects(
+        submitTranscript(fx.service, submission("project", fx.projectId, mismatch, mismatchFile)),
+        ValidationError,
+      );
+      assert.deepEqual(counts(fx.store), before, "a mismatched id writes nothing");
+    } finally {
+      await fx.close();
+    }
+  });
+
   it("rejects a conflicting project assertion on an attachment", async () => {
     const fx = await fixture();
     try {
@@ -735,6 +782,40 @@ describe("transcript submission handler: borrowed service lifecycle", () => {
     }
   });
 
+  it("keeps the public target parser closed to the handler's private blank-project marker", async () => {
+    const dir = tempDir();
+    const store = await openStore(dir);
+    try {
+      const service = transcriptService(store);
+      const client = await store.createClient({ name: "Acme" });
+      const engagement = await store.createEngagement({ clientId: client.id, name: "Eng" });
+      // A direct import names its engagement-only selection by omitting the
+      // project; the parser refuses the handler's internal marker as an
+      // unsupported field, so no caller can change conflict reporting with it.
+      await assert.rejects(
+        service.importTranscript(
+          { kind: "paste", text: "Marker words." },
+          {
+            create: {
+              clientId: client.id,
+              engagementId: engagement.id,
+              engagementOnly: true,
+              title: "Marker",
+              date: "2026-08-10",
+            },
+          } as unknown as Parameters<TranscriptStore["importTranscript"]>[1],
+        ),
+        (error: unknown) =>
+          error instanceof ValidationError &&
+          error.message.includes("unsupported field") &&
+          error.message.includes("engagementOnly"),
+      );
+      assert.equal(store.snapshot().meetings.length, 0, "the refused target writes nothing");
+    } finally {
+      await store.close();
+    }
+  });
+
   it("accepts only adapter options on the borrowed service, not workspace opening options", async () => {
     const dir = tempDir();
     const store = await openStore(dir);
@@ -812,3 +893,34 @@ describe("transcript submission handler: the import's own commit", () => {
     }
   });
 });
+
+describe("transcript submission handler: one shared originals store", () => {
+  it("shares the originals store with a manual write and an import", async () => {
+    const fx = await fixture();
+    try {
+      const manual = await fx.store.createMeeting({
+        clientId: fx.clientId,
+        engagementId: fx.engagementId,
+        projectId: fx.projectId,
+        title: "Manual",
+        date: "2026-08-11",
+        notes: "kept",
+      });
+      const [fields, file] = pasted("Original words.");
+      const imported = await submitTranscript(fx.service, submission("meeting", manual.id, fields, file));
+      assert.equal(imported.outcome, "attached");
+      assert.equal(imported.meeting.notes, "kept", "an attachment preserves the meeting's fields");
+      const source = imported.transcript.sources[0];
+      assert.equal(source.format, "paste");
+      assert.equal(source.originalText, "Original words.");
+      // The manual write's meeting and the import's transcript name the same
+      // committed document the workspace keeps.
+      const saved = JSON.parse(readFileSync(storePath(fx.dir), "utf8"));
+      assert.ok(saved.meetings.some((m: { id: string }) => m.id === manual.id));
+      assert.ok(saved.transcripts.some((t: { meetingId: string }) => t.meetingId === manual.id));
+    } finally {
+      await fx.close();
+    }
+  });
+});
+

@@ -53,7 +53,7 @@
 import { MissingRecordError, ValidationError } from "./model.ts";
 import type { Engagement, Meeting, Project, Snapshot, Store } from "./store.ts";
 import {
-  importTranscriptInTurn,
+  submissionOperation,
   type TranscriptImportResult,
   type TranscriptInput,
   type TranscriptStore,
@@ -239,10 +239,11 @@ function requireFields(value: unknown): Readonly<Record<string, string>> {
  * the committed records the import will be applied to. An omitted control
  * asserts nothing; a present value, including a blank one, must name exactly
  * the derived value (the archive pages' rule: an empty clientId is a conflict).
- * An `id` or `meetingId` control on a create has nothing to assert against, so
- * any such value is conflicting. On a create the project control is an ordinary
- * selection (blank
- * means the engagement only) and is validated by `createTarget`; on an
+ * An `id` control names the record of the URL, so on both routes it must equal
+ * the record the URL names. A `meetingId` control names the attachment target
+ * and asserts nothing on a create, which names no meeting, so any such value
+ * conflicts there. On a create the project control is an ordinary selection
+ * (blank means the engagement only) and is validated by `createTarget`; on an
  * attachment it is a parent assertion against the preserved meeting.
  */
 function requireAssertions(
@@ -273,15 +274,7 @@ function requireAssertions(
   if (!create && Object.hasOwn(fields, "projectId")) {
     assert("projectId", scope.meeting?.projectId ?? "");
   }
-  if (Object.hasOwn(fields, "id")) {
-    const supplied = fields.id;
-    if (create || supplied !== scope.recordId) {
-      throw new ValidationError(
-        `Submitted id ${JSON.stringify(supplied)} conflicts with the record of the URL` +
-          (create ? "" : ` ${JSON.stringify(scope.recordId)}`),
-      );
-    }
-  }
+  assert("id", scope.recordId);
 }
 
 /** The one raw import a submission carries: exactly one paste or one file. */
@@ -318,8 +311,9 @@ function requireInput(
  * The meeting create a submission asks for, with the URL-derived parents, the
  * required title and date, the notes only when supplied, and the project chosen
  * by the control or defaulted to the URL project. An explicit blank project
- * selects the engagement only and is marked as such, so a reuse of the canonical
- * meeting reports it as a supplied difference. Any other selected project must
+ * selects the engagement only and is marked as such privately, so a reuse of the
+ * canonical meeting reports it as a supplied difference without the marker
+ * reaching the public target parser. Any other selected project must
  * be a project of the URL engagement: a selection that is not (an unknown id, a
  * project of another engagement, or a malformed value) is invalid input refused
  * with `ValidationError` (400), never a missing record, before anything is
@@ -329,7 +323,7 @@ function createTarget(
   snapshot: Snapshot,
   fields: Readonly<Record<string, string>>,
   scope: ResolvedScope,
-): TranscriptTarget {
+): { target: TranscriptTarget; engagementOnly: boolean } {
   if (!Object.hasOwn(fields, "title") || !Object.hasOwn(fields, "date")) {
     throw new ValidationError("creating a meeting needs a title and a date");
   }
@@ -352,15 +346,17 @@ function createTarget(
     projectId = scope.urlProjectId;
   }
   return {
-    create: {
-      clientId: scope.clientId,
-      engagementId: scope.engagementId,
-      ...(projectId === undefined ? {} : { projectId }),
-      ...(engagementOnly ? { engagementOnly } : {}),
-      title: fields.title,
-      date: fields.date,
-      ...(Object.hasOwn(fields, "notes") ? { notes: fields.notes } : {}),
+    target: {
+      create: {
+        clientId: scope.clientId,
+        engagementId: scope.engagementId,
+        ...(projectId === undefined ? {} : { projectId }),
+        title: fields.title,
+        date: fields.date,
+        ...(Object.hasOwn(fields, "notes") ? { notes: fields.notes } : {}),
+      },
     },
+    engagementOnly,
   };
 }
 
@@ -395,17 +391,32 @@ export async function submitTranscript(
   // commits inside that same turn. A store write queued before this submission
   // therefore finishes first, so an assertion that held for the old records
   // cannot commit after a queued move to a new parent.
+  // The import operation belongs to the service: only a service built over the
+  // workspace store has one, and it commits inside the turn admitted below.
+  const operation = submissionOperation(service);
   return store.runExclusive(async () => {
     const snapshot = store.snapshot();
     const scope = resolveScope(snapshot, kind, submission.rawId);
     const create = kind !== "meeting";
     requireAssertions(fields, scope, create);
     const input = requireInput(fields, file);
-    const target = create ? createTarget(snapshot, fields, scope) : { meetingId: scope.meeting!.id };
+    let target: TranscriptTarget;
+    let engagementOnly = false;
+    if (create) {
+      const built = createTarget(snapshot, fields, scope);
+      target = built.target;
+      engagementOnly = built.engagementOnly;
+    } else {
+      target = { meetingId: scope.meeting!.id };
+    }
     // The import commits inside the turn admitted above and never enqueues
     // again, so its checks, its parent validation and its commit see exactly
     // the committed records the assertions were checked against.
-    return importTranscriptInTurn(service, input, target);
+    return operation.importSubmission({
+      input,
+      target,
+      ...(engagementOnly ? { engagementOnly } : {}),
+    });
   });
 }
 

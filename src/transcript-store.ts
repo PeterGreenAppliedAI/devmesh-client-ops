@@ -254,8 +254,6 @@ export interface TranscriptStore {
 
 const INPUT_KEYS = ["kind", "text", "bytes", "filename"] as const;
 const CREATE_KEYS = ["clientId", "engagementId", "projectId", "title", "date", "notes"] as const;
-/** The create keys plus the handler's internal marker for an explicitly blank project. */
-const SUPPLIED_CREATE_KEYS = [...CREATE_KEYS, "engagementOnly"] as const;
 const TARGET_KEYS = ["create", "meetingId"] as const;
 
 function requireRecord(value: unknown, what: string, keys: readonly string[]): Record<string, unknown> {
@@ -337,10 +335,27 @@ interface CommitStore {
   writeBlock(): PersistenceError | null;
 }
 
-/** A meeting create together with the project control that was explicitly blank. */
-interface SuppliedCreate extends TranscriptMeetingCreate {
+/**
+ * The handler's request to import inside the store's queue turn the caller
+ * already holds. The explicitly blank project selection travels privately in
+ * `engagementOnly`, never through the public `TranscriptTarget` parser.
+ */
+interface SubmissionImport {
+  readonly input: TranscriptInput;
+  readonly target: TranscriptTarget;
   /** True when the submission explicitly left the project blank (engagement only). */
   readonly engagementOnly?: boolean;
+}
+
+/**
+ * The import an owned service exposes to the submission handler: it imports
+ * inside the caller's already-admitted queue turn, and it does not enqueue
+ * again (a turn awaiting its own admission would leave the queue unsettled).
+ * It is reachable only through the service's own operation, never as a bare
+ * function that skips the store's admission.
+ */
+interface SubmissionImportOperation {
+  importSubmission(request: SubmissionImport): Promise<TranscriptImportResult>;
 }
 
 /** The supplied meeting create, normalized after validation. */
@@ -426,16 +441,36 @@ class TranscriptStoreImpl implements TranscriptStore {
    * malformed call, a parser refusal or an invalid parent writes nothing.
    */
   importTranscript(input: TranscriptInput, target: TranscriptTarget): Promise<TranscriptImportResult> {
-    return this.exclusive(() => this.importInTurn(input, target));
+    return this.exclusive(() => this.importInTurn({ input, target }));
+  }
+
+  /**
+   * Run the submission handler's import inside the store's queue turn that the
+   * handler already holds: the handler admitted the whole submission with
+   * `runExclusive` and hands its resolved input and target here. It commits
+   * inside that turn and never enqueues again. The service exposes it only
+   * through `importSubmission`, so no caller can reach an unchecked import.
+   */
+  importSubmission(request: SubmissionImport): Promise<TranscriptImportResult> {
+    // The request shape is checked before the queue admission, so a malformed
+    // request writes nothing and never enters the queue.
+    const shape = requireRecord(request, "transcript submission import", ["input", "target", "engagementOnly"] as const);
+    if (shape.engagementOnly !== undefined && shape.engagementOnly !== true) {
+      throw new ValidationError("transcript submission import.engagementOnly must be true when present");
+    }
+    // Never enqueue again here: the handler already holds the store's turn, and
+    // a turn awaiting its own admission would leave the queue unsettled.
+    return this.importInTurn(request);
   }
 
   /**
    * The import itself, run inside a workspace store's queue turn that the caller
-   * already holds (see `importTranscriptInTurn`). It commits inside that turn and
-   * never enqueues again, since a turn awaiting its own admission would leave
-   * the queue unsettled; admission was decided by the caller's turn.
+   * already holds (the handler's submission operation or this service's own
+   * `importTranscript`). It commits inside that turn and never enqueues again,
+   * since a turn awaiting its own admission would leave the queue unsettled;
+   * admission was decided by the caller's turn.
    */
-  importInTurn(input: TranscriptInput, target: TranscriptTarget): Promise<TranscriptImportResult> {
+  private importInTurn(request: SubmissionImport): Promise<TranscriptImportResult> {
     return (async () => {
       // Admission was decided when this import entered the store's queue: an
       // import accepted before close keeps running while close drains the queue.
@@ -444,12 +479,12 @@ class TranscriptStoreImpl implements TranscriptStore {
       if (blocked !== null) throw blocked;
       // The arguments are checked before any read or write, so a malformed
       // call writes nothing at all.
-      const parsed = this.parseTarget(target);
-      const prepared = await this.prepare(input);
+      const parsed = this.parseTarget(request.target, request.engagementOnly === true);
+      const prepared = await this.prepare(request.input);
       const snapshot = this.store.snapshot();
       const committed =
         parsed.create !== undefined
-          ? this.planCreate(prepared, parsed.create, snapshot)
+          ? this.planCreate(prepared, parsed.create, snapshot, request.engagementOnly === true)
           : this.planTarget(prepared, parsed.meetingId!, snapshot);
       return this.commit(prepared, committed);
     })();
@@ -534,6 +569,7 @@ class TranscriptStoreImpl implements TranscriptStore {
   /** Validate the target: exactly one of a meeting create or a meeting id. */
   private parseTarget(
     target: TranscriptTarget,
+    engagementOnly = false,
   ): { create?: TranscriptMeetingCreate; meetingId?: string } {
     const record = requireRecord(target, "transcript target", TARGET_KEYS);
     const hasCreate = record.create !== undefined;
@@ -542,15 +578,10 @@ class TranscriptStoreImpl implements TranscriptStore {
       throw new ValidationError("transcript target must carry either a meeting create or a target meetingId");
     }
     if (hasCreate) {
-      const create = requireRecord(
-        record.create,
-        "transcript target.create",
-        SUPPLIED_CREATE_KEYS,
-      ) as unknown as SuppliedCreate;
-      if (create.engagementOnly !== undefined && create.engagementOnly !== true) {
-        throw new ValidationError("transcript target.create.engagementOnly must be true when present");
-      }
-      if (create.engagementOnly === true && create.projectId !== undefined) {
+      // The public parser accepts only the supplied create keys; the handler's
+      // private engagement-only marker is carried separately, never here.
+      const create = requireRecord(record.create, "transcript target.create", CREATE_KEYS);
+      if (engagementOnly && create.projectId !== undefined) {
         throw new ValidationError("transcript target.create cannot carry a project and an engagement-only selection");
       }
       requireNonblank(create.clientId, "transcript target.create.clientId");
@@ -559,7 +590,7 @@ class TranscriptStoreImpl implements TranscriptStore {
       requireNonblank(create.title, "transcript target.create.title");
       requireNonblank(create.date, "transcript target.create.date");
       optionalText(create.notes, "transcript target.create.notes");
-      return { create };
+      return { create: create as unknown as TranscriptMeetingCreate };
     }
     const meetingId = requireNonblank(record.meetingId, "transcript target.meetingId");
     return { meetingId };
@@ -740,7 +771,11 @@ class TranscriptStoreImpl implements TranscriptStore {
    * blank notes (`""`) that differs from preserved notes; notes that were not
    * supplied at all are not a difference.
    */
-  private conflicts(create: TranscriptMeetingCreate, meeting: Meeting): TranscriptConflict[] {
+  private conflicts(
+    create: TranscriptMeetingCreate,
+    meeting: Meeting,
+    engagementOnly = false,
+  ): TranscriptConflict[] {
     const conflicts: TranscriptConflict[] = [];
     const title = create.title as string;
     if (title !== meeting.title) {
@@ -756,7 +791,7 @@ class TranscriptStoreImpl implements TranscriptStore {
     // (supplied as "") and differs from a preserved project like any other
     // selection; the canonical holder's project is still preserved.
     const projectId = create.projectId as string | undefined;
-    const suppliedProject = (create as SuppliedCreate).engagementOnly === true ? "" : projectId;
+    const suppliedProject = engagementOnly ? "" : projectId;
     if (suppliedProject !== undefined && suppliedProject !== (meeting.projectId ?? "")) {
       conflicts.push({
         field: "projectId",
@@ -781,11 +816,12 @@ class TranscriptStoreImpl implements TranscriptStore {
     prepared: PreparedImport,
     create: TranscriptMeetingCreate,
     snapshot: Snapshot,
+    engagementOnly = false,
   ): CommitPlan {
     const normalized = this.requireCreateParents(snapshot, create);
     const canonical = this.canonicalFor(snapshot, normalized.engagementId, prepared.result.canonicalText);
     if (canonical !== undefined) {
-      return this.planReuse(prepared, canonical, this.conflicts(create, canonical.meeting));
+      return this.planReuse(prepared, canonical, this.conflicts(create, canonical.meeting, engagementOnly));
     }
     // The proposed metadata, transcript and source are all validated before the
     // blob is published.
@@ -1300,24 +1336,24 @@ export function transcriptService(
 }
 
 /**
- * Perform one import inside the workspace store's queue turn that the caller
- * already holds. The submission handler admits the whole submission once with
- * `store.runExclusive`, checks the URL record and the submitted assertions
- * inside that turn, and then commits the import here: it must not enqueue again,
- * because a turn awaiting its own admission would leave the queue unsettled. A
- * service built by `openTranscriptStore` or `transcriptService` has this
- * turn-aware import; any other `TranscriptStore` is refused.
+ * The submission operation of a transcript service: the handler admits the
+ * whole submission once with `store.runExclusive`, checks the URL record and the
+ * submitted assertions inside that turn, and then hands its request here. The
+ * returned operation imports inside that turn and never enqueues again. A
+ * service built by `openTranscriptStore` or `transcriptService` has it; any
+ * other `TranscriptStore` is refused.
  */
-export function importTranscriptInTurn(
-  service: TranscriptStore,
-  input: TranscriptInput,
-  target: TranscriptTarget,
-): Promise<TranscriptImportResult> {
-  const importer = service as unknown as { importInTurn?: TranscriptStoreImpl["importInTurn"] };
-  if (typeof importer.importInTurn !== "function") {
+export function submissionOperation(service: TranscriptStore): SubmissionImportOperation {
+  const importer = service as unknown as Partial<SubmissionImportOperation>;
+  if (typeof importer.importSubmission !== "function") {
     throw new ValidationError("the transcript service must share the workspace store's own queue");
   }
-  return importer.importInTurn(input, target);
+  // Bind the method to the service: it uses the service's own store and
+  // originals, and an unbound call would have no `this`.
+  const importSubmission = importer.importSubmission!.bind(service);
+  return {
+    importSubmission: (request) => importSubmission(request),
+  };
 }
 
 /**
