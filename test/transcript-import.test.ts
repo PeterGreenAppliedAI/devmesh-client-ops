@@ -5,11 +5,14 @@ import {
   fsyncSync,
   mkdtempSync,
   openSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
+  writeFileSync,
   writeSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -23,6 +26,7 @@ import {
 import { openStore } from "../src/store.ts";
 import { ORIGINALS_DIRECTORY } from "../src/transcript-files.ts";
 import { transcriptService, type TranscriptStore } from "../src/transcript-store.ts";
+import { canonicalIdentityOf } from "../src/transcript.ts";
 import {
   submitTranscript,
   type SubmissionFile,
@@ -842,6 +846,41 @@ describe("transcript submission handler: borrowed service lifecycle", () => {
     }
   });
 
+  it("accepts a submission as route kind, raw id, decoded fields and file only", async () => {
+    const fx = await fixture();
+    try {
+      // The service's submission interface takes the resolved route kind, the
+      // raw id, the decoded controls and the file as data: no resolver, no
+      // engagement-only marker and no target object can be supplied. A service
+      // caller that tries to shape the target itself is refused as an
+      // unsupported field, so URL resolution and the blank selection are always
+      // derived from the submission inside the admitted turn.
+      const [fields, file] = pasted(PASTED_TEXT, { title: "Interface", date: "2026-11-01" });
+      const shaped = {
+        kind: "engagement",
+        rawId: encodeURIComponent(fx.engagementId),
+        fields,
+        file,
+        target: { meetingId: "meeting-999" },
+        engagementOnly: true,
+      } as unknown as TranscriptSubmission;
+      const before = counts(fx.store);
+      await assert.rejects(fx.service.submitTranscript(shaped), ValidationError);
+      assert.deepEqual(counts(fx.store), before, "the refused submission writes nothing");
+      assert.equal(existsSync(join(fx.dir, ORIGINALS_DIRECTORY)), false);
+      // The same submission as plain data commits normally.
+      const result = await fx.service.submitTranscript({
+        kind: "engagement",
+        rawId: encodeURIComponent(fx.engagementId),
+        fields,
+        file,
+      });
+      assert.equal(result.meeting.title, "Interface");
+    } finally {
+      await fx.close();
+    }
+  });
+
   it("keeps the public target parser closed to the handler's private blank-project marker", async () => {
     const dir = tempDir();
     const store = await openStore(dir);
@@ -950,6 +989,68 @@ describe("transcript submission handler: the import's own commit", () => {
       assert.equal(result.meeting.title, "Uncommitted");
     } finally {
       await reopened.close();
+    }
+  });
+});
+
+describe("transcript submission handler: a refused proposal publishes no original", () => {
+  it("refuses a source id that duplicates a stored source id before publishing its original", async () => {
+    const dir = tempDir();
+    const store = await openStore(dir);
+    let reopened: Store | undefined;
+    try {
+      const client = await store.createClient({ name: "Acme" });
+      const engagement = await store.createEngagement({ clientId: client.id, name: "Eng" });
+      const service = transcriptService(store);
+      const [fields, file] = pasted("Canonical words.", { title: "First", date: "2026-10-01" });
+      const created = await submitTranscript(service, submission("engagement", engagement.id, fields, file));
+      // A stored source whose id already equals the id a distinct incoming
+      // file will be given. Schema 6 accepts the stored id as it is, but the
+      // incoming id must match its own canonical content; the edit must refuse
+      // the duplicate source before its original is published.
+      const incomingText = "  Canonical words.  ";
+      const incomingBytes = encoder(incomingText);
+      const incomingSha256 = createHash("sha256").update(incomingBytes).digest("hex");
+      const wantedId = `${canonicalIdentityOf(incomingText).slice("sha256:".length)}.file.${incomingSha256}`;
+      const storedText = "Canonical words.";
+      const source = {
+        id: wantedId,
+        format: "paste",
+        filename: "stored.txt",
+        originalText: storedText,
+        extractedText: storedText,
+        passages: [
+          {
+            id: `${wantedId}/p1`,
+            sourceId: wantedId,
+            range: { start: 0, end: storedText.length },
+            location: { start: 0, end: storedText.length, line: 1, column: 1 },
+            text: storedText,
+          },
+        ],
+      };
+      await store.close();
+      const saved = JSON.parse(readFileSync(storePath(dir), "utf8"));
+      saved.transcripts[0].sources.push(source);
+      writeFileSync(storePath(dir), JSON.stringify(saved));
+      reopened = await openStore(dir);
+      const reopenedService = transcriptService(reopened);
+      const before = counts(reopened);
+      const originalsDir = join(dir, ORIGINALS_DIRECTORY);
+      const filesBefore = existsSync(originalsDir) ? readdirSync(originalsDir).length : 0;
+      await assert.rejects(
+        reopenedService.importTranscript(
+          { kind: "file", bytes: incomingBytes, filename: "incoming.txt" },
+          { meetingId: created.meeting.id },
+        ),
+        ValidationError,
+      );
+      const filesAfter = existsSync(originalsDir) ? readdirSync(originalsDir).length : 0;
+      assert.equal(filesAfter, filesBefore, "the refused proposal published no original");
+      assert.deepEqual(counts(reopened), before, "the refused proposal wrote no metadata");
+      assert.equal(reopened.snapshot().transcripts?.[0].sources.length, 2);
+    } finally {
+      await reopened?.close();
     }
   });
 });
