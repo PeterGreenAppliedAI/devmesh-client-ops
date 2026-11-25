@@ -464,24 +464,15 @@ export function sourceRows(document: string): SourceRow[] {
   return rows;
 }
 
-/** A source row with each of its three links resolved on the meeting page that
- * rendered it: root-relative request targets on the application's own origin,
- * as a browser would follow and as a restart baseline saves them. */
-export interface ResolvedSourceRow {
-  readonly filename: string;
-  readonly format: string;
-  readonly original: string;
-  readonly text: string;
-  readonly passages: string;
-}
-
 /**
  * Resolve every link of every source row rendered on the meeting page at
  * `meetingPath`, against that page. A relative href resolves against the
  * meeting path's directory, a same-origin absolute href keeps its path and
- * query, and a link naming another origin is refused.
+ * query, and a link naming another origin is refused. Each resolved row has
+ * the same fields as a rendered row, now holding root-relative request targets
+ * on the application's own origin, so it can be saved as a restart baseline.
  */
-export function meetingSourceRows(base: string, meetingPath: string, document: string): ResolvedSourceRow[] {
+export function meetingSourceRows(base: string, meetingPath: string, document: string): SourceRow[] {
   return sourceRows(document).map((row) => ({
     filename: row.filename,
     format: row.format,
@@ -531,16 +522,6 @@ export function renderedPassages(document: string): RenderedPassage[] {
     });
   }
   return passages;
-}
-
-/**
- * The fragment of a fragment link: the part after `#`, already decoded to the
- * anchor the browser would find, exactly as `renderedPassages` reads an `id`.
- */
-export function fragmentOf(link: string): string {
-  const at = link.indexOf("#");
-  assert.ok(at >= 0, `the link ${link} carries a fragment`);
-  return decodeURIComponent(link.slice(at + 1));
 }
 
 /**

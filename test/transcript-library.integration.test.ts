@@ -149,7 +149,7 @@ async function importThrough(
   const page = await get(base, pagePath);
   assert.equal(page.status, 200, `${pagePath} is rendered`);
   const form = parseForm(page.body);
-  assert.equal(form.action, actionPath, `the form at ${pagePath} posts to ${actionPath}`);
+  assert.equal(splitLink(base, pagePath, form.action).path, actionPath, `the form at ${pagePath} posts to ${actionPath}`);
   assert.equal(form.method, "post", "the import form posts");
   assert.equal(form.enctype, "multipart/form-data", "the import form is a multipart form");
   const reply = await submit(base, pagePath, form, values);
@@ -348,10 +348,20 @@ async function readSource(
     const passagePage = splitLink(base, row.passages, passage.link);
     passageFragments.push(passagePage.fragment);
     const resolved = await resolvePassageLink(base, row.passages, passage, passage.text);
-    assert.deepEqual(
-      [resolved.path, resolved.fragment],
-      [passagePage.path, passage.anchor],
-      `${row.filename} passage link ${passage.link} names its own row on its passages page`,
+    // The destination must be the row's own passages page: its path and query
+    // come from that page's target, not from the link's own resolution, so a
+    // consistently misdirected href cannot pass by serving the same anchor.
+    assert.equal(
+      resolved.path,
+      splitLink(base, "/", row.passages).path,
+      `${row.filename} passage link ${passage.link} stays on its passages page ${row.passages}`,
+    );
+    // A fragment link is a same-page anchor: the browser decodes the raw
+    // fragment to find the row's HTML id, while the raw fragment is saved.
+    assert.equal(
+      decodeURIComponent(resolved.fragment),
+      passage.anchor,
+      `${row.filename} passage link ${passage.link} names its own row ${passage.anchor}`,
     );
     passageLinks.push(resolved);
   }
@@ -635,7 +645,7 @@ describe("transcript library over loopback HTTP", () => {
       // its notes untouched, and the saved source link still reads back.
       const manualAfterRefusal = await get(base, manualMeetingPath);
       assert.equal(profileValue(manualAfterRefusal.body, "Notes"), MANUAL_NOTES, "the refused replacement kept the notes");
-      assert.deepEqual(sourceRows(manualAfterRefusal.body), manualRows, "the refused replacement added no source");
+      assert.deepEqual(meetingSourceRows(base, manualMeetingPath, manualAfterRefusal.body), manualRows, "the refused replacement added no source");
       assert.equal((await readSource(base, manualMeetingPath, manualRows[0], 2)).text, ATTACHED, "the saved source link still reads the attachment");
 
       // -- Import 7: the DOCX and 8: the PDF, through the project's action. --
@@ -1033,7 +1043,7 @@ describe("transcript library over loopback HTTP", () => {
       const projectArchivePage = await get(base, projectHref);
       assert.equal(projectArchivePage.status, 200, "the project page is readable");
       const archiveForm = parseForm(projectArchivePage.body);
-      assert.equal(archiveForm.action, `${projectHref}/archive`, "the project page offers its archive action");
+      assert.equal(splitLink(base, projectHref, archiveForm.action).path, `${projectHref}/archive`, "the project page offers its archive action");
       assert.ok(
         archiveForm.enctype === null || archiveForm.enctype === "application/x-www-form-urlencoded",
         `the archive form is a url-encoded form, not ${archiveForm.enctype}`,
@@ -1104,7 +1114,7 @@ describe("transcript library over loopback HTTP", () => {
         const page = await get(base, meeting);
         assert.equal(page.status, 200, `${meeting} stays directly readable`);
         assert.match(page.body, /archived/, "the archived meeting page says it is archived");
-        const rows = sourceRows(page.body);
+        const rows = meetingSourceRows(base, meeting, page.body);
         assert.equal(rows.length, 1, `${meeting} still lists its source`);
         assert.equal(rows[0].filename, meeting === docxMeeting ? "blocks.docx" : "report.pdf");
       }
@@ -1170,7 +1180,7 @@ describe("transcript library over loopback HTTP", () => {
         const savedRows = saved.sourcesAll
           .filter((candidate) => candidate.meeting === meeting)
           .map((candidate) => savedRow(candidate));
-        assert.deepEqual(sourceRows(page.body), savedRows, `${meeting} keeps its saved source rows after the restart`);
+        assert.deepEqual(meetingSourceRows(restarted, meeting, page.body), savedRows, `${meeting} keeps its saved source rows after the restart`);
       }
       // Every active history entry is selected by its visible label, its own
       // href is followed, and the destination meeting page and its sources are
@@ -1226,7 +1236,7 @@ describe("transcript library over loopback HTTP", () => {
             offsets: passage.offsets,
             position: passage.position,
             location: passage.location,
-            fragment: source.view.passageFragments[index],
+            fragment: view.passageFragments[index],
           })),
           source.view.passages.map((passage, index) => ({
             anchor: passage.anchor,
@@ -1293,7 +1303,7 @@ describe("transcript library over loopback HTTP", () => {
           assert.deepEqual(
             { path: followed.path, fragment: followed.fragment },
             {
-              path: splitLink(restarted, source.passages, savedBaseline.link).path,
+              path: splitLink(restarted, "/", source.passages).path,
               fragment: source.view.passageLinks[index].fragment,
             },
             `${source.filename} saved passage link ${index} still reaches the same destination and fragment`,
