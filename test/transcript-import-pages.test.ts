@@ -251,15 +251,8 @@ function declaredOversizeRequest(origin: string, path: string, contentType: stri
         res.on("error", reject);
       },
     );
-    // The request is destroyed once the reply is read, so a socket reset after
-    // that point is expected; a failure before any reply is still reported.
-    let replied = false;
-    req.on("response", () => {
-      replied = true;
-    });
-    req.on("error", (error) => {
-      if (!replied) reject(error);
-    });
+    // A request error fails the pending test, wherever it happens.
+    req.on("error", reject);
     req.flushHeaders();
   });
 }
@@ -1367,7 +1360,8 @@ describe("transcript import submissions", () => {
       // body total: the server refuses the declared length before reading a
       // byte, naming the whole-submission limit. Send only the headers, wait
       // for the 413, then destroy the request rather than racing a 15 MiB
-      // write against the server closing the connection.
+      // write against the server closing the connection. A request error
+      // fails the test; draining and transport behaviour are not exercised.
       const reply = await declaredOversizeRequest(
         server.origin,
         engagementImportHref(server.engagementId),
@@ -1377,7 +1371,12 @@ describe("transcript import submissions", () => {
       assert.equal(reply.status, 413);
       assert.match(reply.body, /too large/);
       assert.match(reply.body, /nothing was truncated/);
-      assert.match(reply.body, new RegExp(`at most ${MAX_MULTIPART_BYTES} bytes|at most ${MAX_MULTIPART_BYTES / 1024 / 1024} MiB`));
+      // The limit the reply names applies to the whole submission, not to the file.
+      assert.match(
+        reply.body,
+        new RegExp(`Keep the whole submission at most ${MAX_MULTIPART_BYTES} bytes|Keep the whole submission at most ${MAX_MULTIPART_BYTES / 1024 / 1024} MiB`),
+      );
+      assert.doesNotMatch(reply.body, /the file at most/i);
       assert.deepEqual(counts(server.store), before, "no meeting or source was created");
     } finally {
       await server.close();
