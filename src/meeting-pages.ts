@@ -931,7 +931,7 @@ export function meetingRoutes(store: Store): MeetingRoutes {
           // also offers. This place in the page body is kept beside the source
           // list, exactly as before sources gained their own section.
           title: "Transcript",
-          body: link(meetingImportHref(meeting.id), "Import transcript"),
+          body: `<p>${link(meetingImportHref(meeting.id), "Import transcript")}</p>`,
         },
         {
           // Every committed source of this meeting, from the snapshot metadata

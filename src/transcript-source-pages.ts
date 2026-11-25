@@ -136,7 +136,7 @@ function fromUnitHex(hex: string): string {
  * `_`) is safe in a path segment, a query and an HTML attribute, and no value
  * starts with a dot, so a browser's URL resolution never drops or re-reads it.
  */
-export function encodeSegment(value: string): string {
+function encodeSegment(value: string): string {
   const hex = unitHex(value);
   return `${SEGMENT_PREFIX}${hex === "" ? "" : Buffer.from(hex, "utf8").toString("base64url")}`;
 }
@@ -147,7 +147,7 @@ export function encodeSegment(value: string): string {
  * and is refused here rather than encoded into a link; every other value is the
  * reversible encoding above.
  */
-export function recordSegment(value: string): string {
+function recordSegment(value: string): string {
   if (value === "") {
     throw new MissingRecordError("No record for that path");
   }
@@ -162,7 +162,7 @@ export function recordSegment(value: string): string {
  * the exact stored string, so two ids differing in one code unit never decode
  * alike.
  */
-export function decodeSegment(raw: string): string {
+function decodeSegment(raw: string): string {
   if (!raw.startsWith(SEGMENT_PREFIX)) throw new MissingRecordError("No record for that path");
   const body = raw.slice(SEGMENT_PREFIX.length);
   if (body === "" || !/^[A-Za-z0-9_-]+$/.test(body)) throw new MissingRecordError("No record for that path");

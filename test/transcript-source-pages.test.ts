@@ -184,42 +184,34 @@ function segment(id: string): string {
 }
 
 /**
- * The decoded ids of one source link, read back through the production
- * interfaces only: one view link is split into its raw segments, the route
- * handler decodes each exactly once, and the read's own source id names the
- * third. A segment the handler refuses is reported as such.
+ * Send one source link through the production route handler, which decodes each
+ * segment exactly once. The reply, or the error the handler refused it with, is
+ * returned so a caller can tell a malformed encoding from a missing record.
  */
-async function decodeHref(store: Store, href: string, view: "text" | "original" | "passages" = "text"): Promise<{
-  meetingId: string;
-  transcriptId: string;
-  sourceId: string;
-}> {
+async function renderHref(
+  store: Store,
+  href: string,
+): Promise<
+  | { readonly ok: true; readonly headers: Readonly<Record<string, string>>; readonly bytes: Uint8Array }
+  | { readonly ok: false; readonly message: string }
+> {
   const parts = href.split("?")[0].split("/");
   assert.equal(parts.length, 8, href);
-  const routes = transcriptSourceRoutes(store);
-  const read = await routes[view].get.render({
-    method: "GET",
-    meetingId: parts[2],
-    transcriptId: parts[4],
-    sourceId: parts[6],
-  });
-  return { meetingId: parts[2], transcriptId: parts[4], sourceId: (read as unknown as TranscriptSourceRead).sourceId };
-}
-
-/** True when a source link is refused as no record, before any record read. */
-async function segmentRefused(store: Store, href: string): Promise<boolean> {
-  const parts = href.split("?")[0].split("/");
   try {
-    await transcriptSourceRoutes(store).text.get.render({
+    const result = await transcriptSourceRoutes(store).original.get.render({
       method: "GET",
       meetingId: parts[2],
       transcriptId: parts[4],
       sourceId: parts[6],
     });
-    return false;
+    return {
+      ok: true,
+      headers: (result as { readonly headers?: Readonly<Record<string, string>> }).headers ?? {},
+      bytes: (result as { readonly body: Uint8Array }).body,
+    };
   } catch (error) {
     assert.equal(error instanceof MissingRecordError, true, String(error));
-    return true;
+    return { ok: false, message: (error as Error).message };
   }
 }
 
@@ -382,30 +374,51 @@ describe("transcript source paths: exact fixed shapes", () => {
   });
 
   it("refuses any segment that is not the exact encoding", async () => {
-    const store = await openStore(tempDir());
+    // A resolvable positive control: a real committed source whose link the
+    // handler decodes back to its own stored ids and whose text it returns.
+    const server = await running();
     try {
-      const good = sourceHref("meeting-1", "transcript-1", "source-1", "text");
+      const parents = await hierarchy(server.store);
+      const meetingId = await notesMeeting(server.store, parents, "Encoded", "2026-08-08");
+      const imported = await importFor(server.store, meetingId, { kind: "paste", text: "Encoded words." });
+      const row = await onlyRow(server, meetingId);
+      // Both views carry the same ids; the handler decodes them from whichever
+      // link is used, so the two spellings are checked against each other.
+      const good = row.viewLinks.text;
       const parts = good.split("/");
-      // The exact spelling is accepted (it resolves no record in a blank store,
-      // so the handler then reports the missing meeting, not a bad segment).
-      assert.equal(await decodeHref(store, good).then(() => "decoded", () => "refused"), "refused");
-      // A bare id, a percent-escaped prefix, a padded tail, a trailing-bit
-      // variant, an invalid hex spelling and the blank encoding are refused as
-      // no record before any read.
-      const badSegments = [
+      assert.equal(row.viewLinks.original.split("/").slice(2, 7).join("/"), parts.slice(2, 7).join("/"));
+      const resolved = await renderHref(server.store, row.viewLinks.original);
+      assert.equal(resolved.ok, true, "the exact encoding of a stored source is accepted");
+      assert.equal(resolved.ok && new TextDecoder().decode(resolved.bytes), "Encoded words.");
+      assert.equal(imported.sourceId.length > 0, true);
+
+      // A segment that is not the exact encoding names no record: the handler
+      // refuses it before any lookup, so its message is the decoder's refusal
+      // and never a lookup's missing-record report for a decoded id.
+      const malformed = [
         parts[2].slice(1),
         "%7E" + parts[2].slice(1),
         parts[2] + "=",
         parts[2] + "YQ",
         "~!!!!",
         "~",
+        "~0",
+        "~" + Buffer.from("zzzz", "utf8").toString("base64url"),
       ];
-      for (const bad of badSegments) {
-        const path = `/meetings/${bad}/transcripts/${parts[4]}/sources/${parts[6]}/text`;
-        assert.equal(await segmentRefused(store, path), true, bad);
+      for (const bad of malformed) {
+        const path = `/meetings/${bad}/transcripts/${parts[4]}/sources/${parts[6]}/original`;
+        const reply = await renderHref(server.store, path);
+        assert.equal(reply.ok, false, bad);
+        assert.equal(reply.ok === false && reply.message, "No record for that path", bad);
       }
+      // A decodable but absent id is a different, later refusal: the lookup's
+      // message names the decoded id, so the two refusals are distinguishable.
+      const absent = `/meetings/${segment("no-such-meeting")}/transcripts/${parts[4]}/sources/${parts[6]}/original`;
+      const absentReply = await renderHref(server.store, absent);
+      assert.equal(absentReply.ok, false);
+      assert.match(absentReply.ok === false ? absentReply.message : "", /^No meeting with id /);
     } finally {
-      await store.close();
+      await server.close();
     }
   });
 
@@ -908,10 +921,19 @@ describe("transcript source views: resolved references", () => {
       assert.ok(secondReplies.passages.body.includes("Second words."));
 
       // Swapping the meeting (or the transcript) makes the reference mismatched.
+      // The swapped paths take every segment from the two detail rows' own
+      // links: nothing here is built by a production URL helper.
+      const firstLinks = firstRow.viewLinks;
+      const secondLinks = secondRow.viewLinks;
+      const segmentOf = (link: string, index: number): string => link.split("/")[index];
+      const pathFrom = (meeting: DetailRow, transcript: DetailRow, source: DetailRow): string =>
+        `/meetings/${segmentOf(meeting.viewLinks.text, 2)}` +
+        `/transcripts/${segmentOf(transcript.viewLinks.text, 4)}` +
+        `/sources/${segmentOf(source.viewLinks.text, 6)}/text`;
       for (const path of [
-        sourceHref(secondMeeting, first.transcriptId, first.sourceId, "text"),
-        sourceHref(firstMeeting, second.transcriptId, second.sourceId, "text"),
-        sourceHref(secondMeeting, second.transcriptId, first.sourceId, "text"),
+        pathFrom(secondRow, firstRow, firstRow),
+        pathFrom(firstRow, secondRow, secondRow),
+        pathFrom(secondRow, secondRow, firstRow),
       ]) {
         const reply = await send(server.origin, path);
         assert.equal(reply.status, 404, path);
@@ -921,10 +943,10 @@ describe("transcript source views: resolved references", () => {
       // A reference that is not the exact single-segment encoding is a 404
       // before any read: a malformed escape, a bare stored id, a percent-escaped
       // encoding and a padded or trailing-bit variant of a valid one.
-      const good = sourceHref(firstMeeting, first.transcriptId, first.sourceId, "text");
-      const encodedSource = segment(first.sourceId);
-      const encodedMeeting = segment(firstMeeting);
-      const encodedTranscript = segment(first.transcriptId);
+      const good = firstLinks.text;
+      const encodedSource = segmentOf(good, 6);
+      const encodedMeeting = segmentOf(good, 2);
+      const encodedTranscript = segmentOf(good, 4);
       for (const path of [
         `/meetings/${encodedMeeting}/transcripts/%E0%A4%A/sources/${encodedSource}/text`,
         `/meetings/${encodedMeeting}/transcripts/${encodedTranscript}/sources/%ZZ/text`,
@@ -961,6 +983,17 @@ describe("transcript source views: resolved references", () => {
       const snapshot = server.store.snapshot();
       const transcript = snapshot.transcripts!.find((candidate) => candidate.meetingId === meetingId)!;
       const source = transcript.sources.find((candidate) => candidate.id === imported.sourceId)!;
+      const hashPath = `/meetings/${segment(meetingId)}/transcripts/${segment(transcript.id)}/sources/${segment(source.originalSha256!)}/text`;
+
+      // On the live store the source is listed and read by its source id, while
+      // the retained original's hash is refused as a source id: there is no
+      // direct hash endpoint, and no source id aliases the hash.
+      const liveRow = await onlyRow(server, meetingId);
+      assert.equal(liveRow.filename, "orphan.txt");
+      const live = await followRowLinks(server, liveRow);
+      assert.equal(live.text.body, "Orphan original words.");
+      assert.deepEqual(new Uint8Array(live.original.bytes), encoder.encode("Orphan original words."));
+      assert.equal((await send(server.origin, hashPath)).status, 404, "the original's hash is no source id");
 
       // A detached snapshot where the transcript's recorded meeting is absent:
       // every reference to it resolves to nothing (the encoded ids decode, but
@@ -1051,8 +1084,7 @@ describe("transcript source views: resolved references", () => {
           );
           assert.equal(reply.status, 404, view);
         }
-        const hashPath = `/meetings/${segment(meetingId)}/transcripts/${segment(transcript.id)}/sources/${segment(source.originalSha256!)}/text`;
-        assert.equal((await send(orphanServer.origin, hashPath)).status, 404, "no source id equals the hash");
+        assert.equal((await send(orphanServer.origin, hashPath)).status, 404, "the hash is still no source id");
       } finally {
         await orphanServer.close();
       }
@@ -1095,10 +1127,14 @@ describe("transcript source views: resolved references", () => {
       assert.equal(otherText.body, " Shared words.\r\n");
       assert.deepEqual(new Uint8Array(acmeText.bytes), encoder.encode("Shared words."));
       assert.deepEqual(new Uint8Array(otherText.bytes), encoder.encode(" Shared words.\r\n"));
-      // A cross-engagement swap is a mismatched reference.
+      // A cross-engagement swap is a mismatched reference: the acme meeting
+      // segment with the other engagement's transcript and source segments, all
+      // taken from the two detail rows' own links.
       const crossed = await send(
         server.origin,
-        sourceHref(acmeMeeting, otherImport.transcriptId, otherImport.sourceId, "text"),
+        `/meetings/${acmeRow.viewLinks.text.split("/")[2]}` +
+          `/transcripts/${otherRow.viewLinks.text.split("/")[4]}` +
+          `/sources/${otherRow.viewLinks.text.split("/")[6]}/text`,
       );
       assert.equal(crossed.status, 404);
     } finally {
@@ -1260,13 +1296,13 @@ describe("transcript source pages: snapshot-built listing and route table", () =
     // The empty section repeats no second import action; the meeting's own
     // header already offers it once.
     assert.equal(section.includes("/transcripts/import"), false);
-    // A source link for an id is one prefixed segment; the handler decodes it
-    // back to the exact stored id (a blank record id names no record at all,
-    // and a link for it is refused before any read).
-    assert.equal(sourceHref("meeting-1", "t", "s", "text").split("/")[2], segment("meeting-1"));
-    assert.equal(sourceHref("meeting-1", "t", "s", "text").split("/")[6], segment("s"));
     // No transcript collection at all is still an empty list, never a failure.
     assert.equal(section.includes("card-list"), false);
+    // A blank record id names no record, so the link builder refuses it before
+    // it can render a link at all.
+    assert.throws(() => sourceHref("", "t", "s", "text"), /No record for that path/);
+    assert.throws(() => sourceHref("meeting-1", "", "s", "text"), /No record for that path/);
+    assert.throws(() => sourceHref("meeting-1", "t", "", "text"), /No record for that path/);
   });
 
   it("borrows the transcript service on demand from the application's own open store", async () => {
