@@ -887,8 +887,13 @@ describe("transcript source views: escaped text and quotes", () => {
       const meetingId = await notesMeeting(server.store, parents, "Rendered", "2026-03-09");
       await importFor(server.store, meetingId, { kind: "paste", text: "Body words." });
       const row = await onlyRow(server, meetingId);
-      const passages = await send(server.origin, row.viewLinks.passages);
+      // Every link the row renders is followed; the passages answer is checked
+      // against the helper below.
+      const replies = await followRowLinks(server, row);
+      const passages = replies.passages;
       assert.equal(passages.status, 200);
+      assert.deepEqual(new Uint8Array(replies.original.bytes), encoder.encode("Body words."));
+      assert.equal(replies.text.body, "Body words.");
       const transcript = server.store.snapshot().transcripts![0];
       const source = transcript.sources[0];
       const section = passagesSection(
@@ -1165,9 +1170,15 @@ describe("transcript source views: resolved references", () => {
       const meetingId = await notesMeeting(server.store, parents);
       const imported = await importFor(server.store, meetingId, { kind: "paste", text: "Read only." });
       const before = JSON.stringify(server.store.snapshot());
-      // A POST to the detail page's own text link is refused by the shell.
       const row = await onlyRow(server, meetingId);
       assert.equal(imported.sourceId, imported.sourceIds[0]);
+      // The row's three rendered GET links each answer their view before the
+      // write is attempted.
+      const served = await followRowLinks(server, row);
+      assert.deepEqual(new Uint8Array(served.original.bytes), encoder.encode("Read only."));
+      assert.equal(served.text.body, "Read only.");
+      assert.ok(served.passages.body.includes("Read only."));
+      // A POST to the detail page's own text link is refused by the shell.
       const reply = await send(server.origin, row.viewLinks.text, "POST", server.origin);
       assert.equal(reply.status, 405);
       assert.equal(JSON.stringify(server.store.snapshot()), before, "a source request writes nothing");
@@ -1385,6 +1396,12 @@ describe("transcript source pages: snapshot-built listing and route table", () =
       assert.equal(sourceRoute!.method, "GET");
       assert.equal(server.store.snapshot().transcripts![0].sources.length, 1);
       const row = await onlyRow(server, meetingId);
+      // The row's three rendered links are followed over HTTP, and the text one
+      // still serves the store's own committed text.
+      const rows = await followRowLinks(server, row);
+      assert.deepEqual(new Uint8Array(rows.original.bytes), encoder.encode("Borrowed words."));
+      assert.equal(rows.text.body, "Borrowed words.");
+      assert.ok(rows.passages.body.includes("Borrowed words."));
       assert.equal((await send(server.origin, row.viewLinks.text)).body, "Borrowed words.");
 
       // The table's meeting slot is still a GET, and the source slots are GET-only.
