@@ -639,10 +639,16 @@ describe("transcript library over loopback HTTP", () => {
         },
       ];
       // The engagement's meetings before any refusal, captured from the page,
-      // so a refusal that changed the list is visible.
+      // so a refusal that changed the list is visible; and the source rows of
+      // every meeting in the engagement, so a refusal that appended a source to
+      // any meeting (not only the one it was aimed past) is visible.
       const meetingsBeforeRefusals = historyMeetingIds(sectionOf((await get(base, alphaHref)).body, "Meeting history"));
       const meetingCountBefore = meetingsBeforeRefusals.length;
       const rowsBefore = await meetingSources(base, pasteMeeting);
+      const meetingRowsBefore = new Map<string, ReturnType<typeof sourceRows>>();
+      for (const meeting of meetingsBeforeRefusals) {
+        meetingRowsBefore.set(meeting, await meetingSources(base, meeting));
+      }
       const pastedViewBefore = await readSource(base, rowsBefore[0], 2);
       for (const refusal of refusals) {
         const form = parseForm((await get(base, pasteAction)).body);
@@ -668,13 +674,26 @@ describe("transcript library over loopback HTTP", () => {
           [...meetingsBeforeRefusals].sort(),
           `${refusal.name} kept the meetings the engagement already had`,
         );
-        assert.deepEqual(await meetingSources(base, pasteMeeting), rowsBefore, `${refusal.name} added no source to the paste meeting`);
+        for (const [meeting, savedRows] of meetingRowsBefore) {
+          assert.deepEqual(await meetingSources(base, meeting), savedRows, `${refusal.name} added no source to ${meeting}`);
+        }
         assert.deepEqual((await readSource(base, rowsBefore[0], 2)).originalBytes, pastedViewBefore.originalBytes, `${refusal.name} kept the prior original bytes`);
+        // The saved source links captured before the refusals still read back.
+        const savedPaste = await get(base, rowsBefore[0].text);
+        assert.equal(savedPaste.status, 200, `${refusal.name} kept the saved text link readable`);
+        assert.equal(savedPaste.body, pastedViewBefore.text, `${refusal.name} kept the saved text link serving the same text`);
       }
-      // The prior source links still work after the refusals.
+      // The prior source links still work after the refusals, read from the
+      // saved URLs captured before them.
       const afterRefusalsRows = await meetingSources(base, pasteMeeting);
       assert.deepEqual(afterRefusalsRows, rowsBefore, "the earlier sources are unchanged by refusals");
-      await readSource(base, afterRefusalsRows[0], 2);
+      const savedAfterRows = await readSource(base, rowsBefore[0], 2);
+      const savedAfterTxt = await readSource(base, rowsBefore[1], 2);
+      assert.equal((await get(base, rowsBefore[0].text)).body, savedAfterRows.text, "the pasted source's saved text link still serves its text");
+      assert.equal((await get(base, rowsBefore[1].text)).body, savedAfterTxt.text, "the distinct original's saved text link still serves its text");
+      for (const row of rowsBefore) {
+        assert.equal((await get(base, row.original)).status, 200, "a saved original link still reads");
+      }
 
       // -- The client history across engagements. ----------------------------
       const clientPath = `/clients/${encodeURIComponent(clientId)}`;
