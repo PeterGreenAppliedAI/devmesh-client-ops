@@ -50,6 +50,25 @@ import {
 /** The result of rendering one meeting page: a page, or a fixed redirect. */
 export type MeetingPage = Page | Redirect;
 
+/**
+ * The transcript import path of one engagement, with its id encoded. The meeting
+ * pages link their scopes' histories to it; it is declared here so the meeting
+ * and import pages share one spelling of the fixed route.
+ */
+export function engagementImportHref(engagementId: string): string {
+  return `/engagements/${encodeURIComponent(engagementId)}/transcripts/import`;
+}
+
+/** The transcript import path of one project, with its id encoded. */
+export function projectImportHref(projectId: string): string {
+  return `/projects/${encodeURIComponent(projectId)}/transcripts/import`;
+}
+
+/** The transcript import path of one meeting, with its id encoded. */
+export function meetingImportHref(meetingId: string): string {
+  return `/meetings/${encodeURIComponent(meetingId)}/transcripts/import`;
+}
+
 /** What a meeting route may read from an accepted request. */
 export interface MeetingRequest {
   readonly method: "GET" | "POST";
@@ -217,22 +236,30 @@ export function meetingList(meetings: readonly Meeting[]): string {
  * next step: the scope's own creation link when it has one, otherwise the
  * `nextStep` the caller supplies (for a client-wide history, the client's
  * engagement choice). Without either, the sentence stands alone.
+ *
+ * `importHref` is the optional transcript import action of the same scope. It
+ * is offered beside the creation action when the scope has one, and it is the
+ * empty history's next step when the scope offers no creation link: a history
+ * with no meetings and no creation scope still offers the way to import one.
  */
 export function meetingSection(
   title: string,
   newHref: string,
   meetings: readonly Meeting[],
   nextStep?: { readonly href: string; readonly label: string },
+  importHref = "",
 ): PageSection {
   const body: string[] = [];
   if (newHref !== "") body.push(primaryAction(newHref, "New meeting"));
+  if (importHref !== "") body.push(primaryAction(importHref, "Import transcript"));
   if (meetings.length === 0) {
-    body.push(
-      emptyState(
-        "No meetings recorded yet.",
-        newHref !== "" ? { href: newHref, label: "New meeting" } : nextStep,
-      ),
-    );
+    const next =
+      newHref !== ""
+        ? { href: newHref, label: "New meeting" }
+        : importHref !== ""
+          ? { href: importHref, label: "Import transcript" }
+          : nextStep;
+    body.push(emptyState("No meetings recorded yet.", next));
   } else {
     body.push(meetingList(meetings));
   }
@@ -837,12 +864,17 @@ export function meetingRoutes(store: Store): MeetingRoutes {
       [
         ...meetingBreadcrumbs(client, engagement, meeting.projectId, snap),
         { label: "Edit meeting", href: `/meetings/${encodeURIComponent(meeting.id)}/edit` },
+        { label: "Import transcript", href: meetingImportHref(meeting.id) },
       ],
       [
         { title: "Archive", body: archiveNotice(snap, meeting) },
         {
           title: "Meeting",
           body: displayList(displayValues(MEETING_PROFILE_FIELDS, profile)),
+        },
+        {
+          title: "Transcript",
+          body: `<p>${link(meetingImportHref(meeting.id), "Import transcript")}</p>`,
         },
         {
           title: "Identity and parents",

@@ -16,8 +16,9 @@
  *   that meeting's metadata (its notes included when it has any).
  * - A content the engagement already holds reuses its canonical meeting,
  *   archived matches included, and preserves the stored metadata and project;
- *   every supplied difference (title, date, project or explicitly supplied
- *   notes) is reported as a conflict and is never written.
+ *   every supplied difference (title, date, project — an explicit blank
+ *   engagement-only selection included — or explicitly supplied notes) is
+ *   reported as a conflict and is never written.
  * - A repeat aimed at another meeting leaves that target unchanged and returns
  *   the canonical meeting with an explanation.
  * - Different content aimed at a meeting that already holds an attachment is
@@ -39,7 +40,13 @@
  *   its turn it commits directly and never enqueues again, and a meeting id is
  *   allocated from the draft that is actually persisted. An import accepted
  *   before `close` finishes and commits while close waits for the queue, exactly
- *   like an ordinary mutation close drains; a call after close is refused.
+ *   like an ordinary mutation close drains; a call admitted after close is
+ *   refused. The submission handler hands the service the submitted route kind,
+ *   raw id, decoded controls and selected file; the service admits the whole
+ *   submission as one queue turn, resolves the URL record, checks the submitted
+ *   assertions, validates the target and commits the import inside that turn
+ *   without enqueuing again, so the explicit blank selection is read from the
+ *   controls the handler supplied and never from an import caller.
  * - The complete proposed metadata is validated before any blob is published,
  *   so a validation failure writes nothing at all, blobs included.
  * - Original files are published and verified before the JSON that names them
@@ -78,6 +85,7 @@ import {
 } from "./transcript.ts";
 import { importDocx, type DocxParser } from "./transcript-docx.ts";
 import { importPdf, type PdfParser } from "./transcript-pdf.ts";
+import { isEffectivelyArchived } from "./archive.ts";
 import {
   clone,
   deepFreeze,
@@ -207,7 +215,14 @@ export type TranscriptTarget =
   | { readonly meetingId: unknown; readonly create?: undefined };
 
 /** Options accepted by `openTranscriptStore`; only tests pass them. */
-export interface TranscriptStoreOptions extends StoreOptions {
+export interface TranscriptStoreOptions extends StoreOptions, TranscriptServiceOptions {}
+
+/**
+ * Options accepted by `transcriptService`: only the adapters that a borrowed
+ * service needs, since the workspace store it borrows is already open and its
+ * filesystem, clock, originals and lock are the open store's own.
+ */
+export interface TranscriptServiceOptions {
   /** Overrides the DOCX parser, so a parser refusal can be injected. */
   docxParser?: DocxParser;
   /** Overrides the PDF parser, so a parser refusal can be injected. */
@@ -223,6 +238,14 @@ export interface TranscriptStore {
    * commit its transcript metadata. See the module comment for the rules.
    */
   importTranscript(input: TranscriptInput, target: TranscriptTarget): Promise<TranscriptImportResult>;
+  /**
+   * Handle one submission (see `transcript-import.ts`) as one admission to the
+   * workspace store's own queue: the service reads the URL record, checks the
+   * submitted assertions and validates the target inside that turn, and the
+   * import commits there. Nothing about the submission is a caller-defined
+   * behaviour: the raw route, controls and file are data.
+   */
+  submitTranscript(submission: TranscriptSubmission): Promise<TranscriptImportResult>;
   /** Read one committed source with its verified original and detached values. */
   readSource(
     transcriptId: unknown,
@@ -231,7 +254,12 @@ export interface TranscriptStore {
   ): Promise<TranscriptSourceRead>;
   /** Detached, read-only committed transcript metadata. */
   transcripts(): readonly Transcript[];
-  /** Release ownership of the workspace. */
+  /**
+   * Release this service's ownership of the workspace. A service built by
+   * `openTranscriptStore` owns the store it opened and closes it; a service
+   * built by `transcriptService` borrows an already-open store and leaves it
+   * open, so the caller keeps the store and closes it (`close` is then a no-op).
+   */
   close(): Promise<void>;
 }
 
@@ -297,16 +325,23 @@ interface PreparedImport {
   readonly originalBytes: Uint8Array;
 }
 
-/** The mutable transcript draft a commit is applied to. */
-interface DraftState {
+/** The mutable workspace draft a commit is applied to: the committed state. */
+interface DraftState extends Snapshot {
   meetings: Meeting[];
   transcripts: Transcript[];
-  [key: string]: unknown;
 }
 
 /** The store's internal transcript commit, over the committed state. */
 interface CommitStore {
+  /** Allocate the next id of a collection from the draft that is persisted. */
   nextId(draft: DraftState, key: "meetings"): string;
+  /**
+   * Apply one mutation to a draft of the committed state, validate the
+   * resulting transcripts exactly as reopening would, persist the draft and
+   * record the mutation's one event, if any. This never enqueues: it is called
+   * inside the turn `runExclusive` admitted, so the whole import commits with
+   * that one admission and no further turn waits behind it.
+   */
   commitTranscripts(
     mutate: (draft: DraftState) => {
       value: unknown;
@@ -316,6 +351,339 @@ interface CommitStore {
   originalFiles(): OriginalStore;
   /** The failure that refuses a write on a store whose state is not committed. */
   writeBlock(): PersistenceError | null;
+  /**
+   * The store's own queue admission: it decides acceptance now and runs the
+   * operation later. A store that has been closed or blocked is refused at
+   * admission, so a submission that is admitted before close is still admitted
+   * after it.
+   */
+  runExclusive<T>(operation: () => Promise<T>): Promise<T>;
+}
+
+/** The record kind a submission URL names. */
+export type SubmissionRouteKind = "engagement" | "project" | "meeting";
+
+/** The separately submitted file, as the multipart decoder returns it. */
+export interface SubmissionFile {
+  /** The plain, nonempty filename parameter, exactly as submitted. */
+  readonly filename: string;
+  /** The file payload's exact bytes. */
+  readonly bytes: Uint8Array;
+}
+
+/**
+ * One accepted submission for an engagement, project or meeting URL: the
+ * resolved route kind, the raw (still encoded) id path segment, the decoded
+ * text controls and the separately submitted file. These are data only; the
+ * service derives every decision from them and from the committed records.
+ */
+export interface TranscriptSubmission {
+  readonly kind: SubmissionRouteKind;
+  /** The raw (still encoded) id path segment; absent or non-string names no record. */
+  readonly rawId?: string;
+  readonly fields: Readonly<Record<string, string>>;
+  readonly file: SubmissionFile | null;
+}
+
+/**
+ * The validated target: either a meeting create captured as an immutable copy
+ * of the fields that were validated, or a meeting id. Capturing the copy means
+ * a caller that mutates its own target object while a plan or publication is
+ * pending cannot change what is committed: the validated values are used.
+ */
+interface ValidatedTarget {
+  readonly create?: TranscriptMeetingCreate;
+  readonly meetingId?: string;
+}
+
+const SUBMISSION_KEYS = ["kind", "rawId", "fields", "file"] as const;
+const FILE_KEYS = ["filename", "bytes"] as const;
+
+/** The text control that carries pasted transcript text. */
+const PASTE_CONTROL = "paste";
+
+/** The controls a submission may carry; other controls are ignored. */
+const SUBMISSION_CONTROLS = [
+  "id",
+  "meetingId",
+  "clientId",
+  "engagementId",
+  "projectId",
+  "title",
+  "date",
+  "notes",
+  PASTE_CONTROL,
+] as const;
+
+/** The resolved URL record and the authoritative parents derived from it. */
+interface ResolvedScope {
+  readonly kind: SubmissionRouteKind;
+  readonly rawId: string;
+  readonly recordId: string;
+  readonly clientId: string;
+  readonly engagementId: string;
+  readonly urlProjectId?: string;
+  readonly meeting?: Meeting;
+}
+
+/** The submission's own raw import, target and explicit blank selection. */
+interface SubmissionRequest {
+  readonly input: TranscriptInput;
+  readonly target: TranscriptTarget;
+  /** True when the submission explicitly left the project blank (engagement only). */
+  readonly engagementOnly: boolean;
+}
+
+/**
+ * Shape-check one submitted submission: the resolved route kind, the raw id,
+ * the decoded text controls and the optional file, all as data. Unrelated
+ * controls are ignored; the controls the handler uses must be strings.
+ */
+function requireSubmission(value: TranscriptSubmission): TranscriptSubmission {
+  const record = requireRecord(value, "transcript submission", SUBMISSION_KEYS);
+  const kind = record.kind;
+  if (kind !== "engagement" && kind !== "project" && kind !== "meeting") {
+    throw new ValidationError('transcript submission kind must be "engagement", "project" or "meeting"');
+  }
+  // A raw id that is absent or not a string names no URL record: it is carried
+  // through so decoding it reports a missing record (404), never a 400.
+  const rawId = typeof record.rawId === "string" ? record.rawId : "";
+  if (typeof record.fields !== "object" || record.fields === null || Array.isArray(record.fields)) {
+    throw new ValidationError("transcript submission fields must be an object");
+  }
+  const fields = record.fields as Record<string, unknown>;
+  for (const key of SUBMISSION_CONTROLS) {
+    if (Object.hasOwn(fields, key) && typeof fields[key] !== "string") {
+      throw new ValidationError(`transcript submission field ${JSON.stringify(key)} must be a string`);
+    }
+  }
+  let file: SubmissionFile | null = null;
+  if (record.file !== undefined && record.file !== null) {
+    const selected = requireRecord(record.file, "transcript submission file", FILE_KEYS) as Record<string, unknown>;
+    if (typeof selected.filename !== "string" || !(selected.bytes instanceof Uint8Array)) {
+      throw new ValidationError("the submitted file must have a filename string and bytes");
+    }
+    file = { filename: selected.filename, bytes: new Uint8Array(selected.bytes) };
+  }
+  return {
+    kind,
+    rawId,
+    fields: record.fields as Readonly<Record<string, string>>,
+    file,
+  };
+}
+
+/** Decode a raw path id; an empty or malformed escape names no record. */
+function decodeId(rawId: string | undefined, kind: SubmissionRouteKind): string {
+  if (rawId === undefined || rawId === "") throw new MissingRecordError(`No ${kind} for that path`);
+  try {
+    return decodeURIComponent(rawId);
+  } catch {
+    throw new MissingRecordError(`No ${kind} for that path`);
+  }
+}
+
+/** A missing record: the URL record. */
+function missingRecord(kind: string, id: string): MissingRecordError {
+  return new MissingRecordError(`No ${kind} with id ${JSON.stringify(id)}`);
+}
+
+/** Resolve the URL record and derive its authoritative client and engagement. */
+function resolveScope(snapshot: Snapshot, kind: SubmissionRouteKind, rawId: string | undefined): ResolvedScope {
+  if (kind === "engagement") {
+    const id = decodeId(rawId, kind);
+    const engagement = snapshot.engagements.find((e) => e.id === id);
+    if (engagement === undefined) throw missingRecord("engagement", id);
+    if (!snapshot.clients.some((c) => c.id === engagement.clientId)) {
+      throw new ValidationError(`engagement ${JSON.stringify(engagement.id)} references a missing client`);
+    }
+    return {
+      kind,
+      rawId: rawId ?? "",
+      recordId: engagement.id,
+      clientId: engagement.clientId,
+      engagementId: engagement.id,
+    };
+  }
+  if (kind === "project") {
+    const id = decodeId(rawId, kind);
+    const project = snapshot.projects.find((p) => p.id === id);
+    if (project === undefined) throw missingRecord("project", id);
+    const engagement = snapshot.engagements.find((e) => e.id === project.engagementId);
+    if (engagement === undefined) {
+      throw new ValidationError(`project ${JSON.stringify(project.id)} references a missing engagement`);
+    }
+    if (!snapshot.clients.some((c) => c.id === engagement.clientId)) {
+      throw new ValidationError(`engagement ${JSON.stringify(engagement.id)} references a missing client`);
+    }
+    return {
+      kind,
+      rawId: rawId ?? "",
+      recordId: project.id,
+      clientId: engagement.clientId,
+      engagementId: engagement.id,
+      urlProjectId: project.id,
+    };
+  }
+  const id = decodeId(rawId, kind);
+  const meeting = snapshot.meetings.find((m) => m.id === id);
+  if (meeting === undefined) throw missingRecord("meeting", id);
+  const engagement = snapshot.engagements.find((e) => e.id === meeting.engagementId);
+  if (engagement === undefined) {
+    throw new ValidationError(`meeting ${JSON.stringify(meeting.id)} references a missing engagement`);
+  }
+  if (engagement.clientId !== meeting.clientId) {
+    throw new ValidationError(`meeting ${JSON.stringify(meeting.id)} has mismatched client and engagement links`);
+  }
+  if (!snapshot.clients.some((c) => c.id === meeting.clientId)) {
+    throw new ValidationError(`meeting ${JSON.stringify(meeting.id)} references a missing client`);
+  }
+  if (meeting.projectId !== undefined) {
+    const project = snapshot.projects.find((p) => p.id === meeting.projectId);
+    if (project === undefined || project.engagementId !== meeting.engagementId) {
+      throw new ValidationError(`meeting ${JSON.stringify(meeting.id)} references a missing or mismatched project`);
+    }
+  }
+  return {
+    kind,
+    rawId: rawId ?? "",
+    recordId: meeting.id,
+    clientId: meeting.clientId,
+    engagementId: meeting.engagementId,
+    ...(meeting.projectId === undefined ? {} : { urlProjectId: meeting.projectId }),
+    meeting,
+  };
+}
+
+/**
+ * Refuse a supplied identity or parent control that asserts a value other than
+ * the derived one. An omitted control asserts nothing; a present value,
+ * including a blank one, must name exactly the derived value. On a create the
+ * project control is an ordinary selection (blank means the engagement only)
+ * and is validated by `createRequest`; on an attachment it is an assertion
+ * against the preserved meeting.
+ */
+function requireAssertions(
+  fields: Readonly<Record<string, string>>,
+  scope: ResolvedScope,
+  create: boolean,
+): void {
+  const assert = (name: string, expected: string): void => {
+    if (!Object.hasOwn(fields, name)) return;
+    const supplied = fields[name];
+    if (supplied !== expected) {
+      throw new ValidationError(
+        `Submitted ${name} ${JSON.stringify(supplied)} conflicts with the URL's ${name} ${JSON.stringify(expected)}`,
+      );
+    }
+  };
+  assert("clientId", scope.clientId);
+  assert("engagementId", scope.engagementId);
+  if (Object.hasOwn(fields, "meetingId")) {
+    if (create) {
+      throw new ValidationError(
+        `Submitted meetingId ${JSON.stringify(fields.meetingId)} conflicts with a create that names no meeting`,
+      );
+    }
+    assert("meetingId", scope.meeting?.id ?? "");
+  }
+  if (!create && Object.hasOwn(fields, "projectId")) {
+    assert("projectId", scope.meeting?.projectId ?? "");
+  }
+  assert("id", scope.recordId);
+}
+
+/** The one raw import a submission carries: exactly one paste or one file. */
+function requireInput(
+  fields: Readonly<Record<string, string>>,
+  file: SubmissionFile | null,
+): TranscriptInput {
+  let paste: string | undefined;
+  if (Object.hasOwn(fields, PASTE_CONTROL)) paste = fields[PASTE_CONTROL];
+  const hasPaste = paste !== undefined && paste !== "";
+  const hasFile = file !== null;
+  if (hasPaste === hasFile) {
+    throw new ValidationError(
+      "Submit exactly one transcript: a nonempty paste or a selected file, never both and never neither",
+    );
+  }
+  if (hasFile) {
+    const selected = file as SubmissionFile;
+    if (selected.filename === "") {
+      throw new ValidationError("the submitted file must have a nonempty filename");
+    }
+    return { kind: "file", bytes: new Uint8Array(selected.bytes), filename: selected.filename };
+  }
+  return { kind: "paste", text: paste };
+}
+
+/**
+ * The meeting create a submission asks for, with the URL-derived parents, the
+ * required title and date, the notes only when supplied, and the project chosen
+ * by the control or defaulted to the URL project. An explicit blank project
+ * selects the engagement only and is marked as such privately, so a reuse of the
+ * canonical meeting reports it as a supplied difference without the marker
+ * reaching the public target parser. Any other selected project must be a
+ * project of the URL engagement; a selection that is not is invalid input.
+ */
+function createRequest(
+  snapshot: Snapshot,
+  fields: Readonly<Record<string, string>>,
+  scope: ResolvedScope,
+): { target: TranscriptTarget; engagementOnly: boolean } {
+  if (!Object.hasOwn(fields, "title") || !Object.hasOwn(fields, "date")) {
+    throw new ValidationError("creating a meeting needs a title and a date");
+  }
+  let projectId: string | undefined;
+  let engagementOnly = false;
+  if (Object.hasOwn(fields, "projectId")) {
+    const supplied = fields.projectId;
+    if (supplied === "") {
+      engagementOnly = true;
+    } else {
+      const selected = snapshot.projects.find((p) => p.id === supplied);
+      if (selected === undefined || selected.engagementId !== scope.engagementId) {
+        throw new ValidationError(
+          `Submitted projectId ${JSON.stringify(supplied)} is not a project of engagement ${JSON.stringify(scope.engagementId)}`,
+        );
+      }
+      projectId = selected.id;
+    }
+  } else {
+    projectId = scope.urlProjectId;
+  }
+  return {
+    target: {
+      create: {
+        clientId: scope.clientId,
+        engagementId: scope.engagementId,
+        ...(projectId === undefined ? {} : { projectId }),
+        title: fields.title,
+        date: fields.date,
+        ...(Object.hasOwn(fields, "notes") ? { notes: fields.notes } : {}),
+      },
+    },
+    engagementOnly,
+  };
+}
+
+/**
+ * Resolve one submission against the committed state it is given into its raw
+ * import, its validated target and its explicit blank selection. The URL record
+ * and the derived parents, the assertions, the single input and the target are
+ * all read here, so they are checked against the records the import is applied
+ * to.
+ */
+function resolveSubmission(snapshot: Snapshot, submission: TranscriptSubmission): SubmissionRequest {
+  const scope = resolveScope(snapshot, submission.kind, submission.rawId);
+  const create = submission.kind !== "meeting";
+  requireAssertions(submission.fields, scope, create);
+  const input = requireInput(submission.fields, submission.file);
+  if (create) {
+    const built = createRequest(snapshot, submission.fields, scope);
+    return { input, target: built.target, engagementOnly: built.engagementOnly };
+  }
+  return { input, target: { meetingId: scope.meeting!.id }, engagementOnly: false };
 }
 
 /** The supplied meeting create, normalized after validation. */
@@ -355,17 +723,21 @@ class TranscriptStoreImpl implements TranscriptStore {
   private readonly originals: OriginalStore;
   private readonly docxParser: DocxParser | undefined;
   private readonly pdfParser: PdfParser | undefined;
+  /** Whether this service owns the store it was built over and closes it. */
+  private readonly ownsStore: boolean;
 
   constructor(
     store: Store,
     originals: OriginalStore,
     docxParser: DocxParser | undefined,
     pdfParser: PdfParser | undefined,
+    ownsStore: boolean,
   ) {
     this.store = store;
     this.originals = originals;
     this.docxParser = docxParser;
     this.pdfParser = pdfParser;
+    this.ownsStore = ownsStore;
   }
 
   transcripts(): readonly Transcript[] {
@@ -374,11 +746,21 @@ class TranscriptStoreImpl implements TranscriptStore {
 
   /** Run an operation inside the workspace store's own mutation queue. */
   private exclusive<T>(operation: () => Promise<T>): Promise<T> {
-    return (this.store as unknown as { runExclusive<T>(op: () => Promise<T>): Promise<T> }).runExclusive(operation);
+    return this.internals().runExclusive(operation);
   }
 
   private internals(): CommitStore {
     return this.store as unknown as CommitStore;
+  }
+
+  /** The committed state as a draft a plan or a submission check can read. */
+  private draftState(): DraftState {
+    const snapshot = this.store.snapshot();
+    return {
+      ...snapshot,
+      meetings: [...snapshot.meetings],
+      transcripts: [...(snapshot.transcripts ?? [])],
+    };
   }
 
   /** The failure that refuses an accepted import's write when it is blocked. */
@@ -397,23 +779,108 @@ class TranscriptStoreImpl implements TranscriptStore {
    * malformed call, a parser refusal or an invalid parent writes nothing.
    */
   importTranscript(input: TranscriptInput, target: TranscriptTarget): Promise<TranscriptImportResult> {
-    return this.exclusive(async () => {
+    // The public target parser accepts only the supplied create keys, so a
+    // direct import never selects the handler's private blank marker: it is
+    // only ever derived from a submission's own controls.
+    return this.exclusive(() =>
+      this.importInTurn(() => ({ input, target, engagementOnly: false })),
+    );
+  }
+
+  /**
+   * Handle one submission as one admission to the store's own mutation queue.
+   * The service resolves the submitted route kind, raw id, decoded controls and
+   * file against the committed state: it reads the URL record, checks the
+   * assertions, validates the target and derives the explicit blank selection,
+   * so all of that and the import's commit are admitted together by the store.
+   * A store closed or blocked before admission is refused. The import commits
+   * inside that turn and never enqueues again, since a turn awaiting its own
+   * admission would leave the queue unsettled. A malformed submission writes
+   * nothing and enters no queue.
+   */
+  submitTranscript(submission: TranscriptSubmission): Promise<TranscriptImportResult> {
+    // A malformed submission resolves like any other failure: a rejected
+    // promise, never a synchronous throw, and nothing is written.
+    return (async () => {
+      const checked = requireSubmission(submission);
+      // The submission is resolved against the draft the commit is applied to,
+      // so the URL record, the assertions, the input and the target see every
+      // write queued before it, and the explicit blank selection is read from
+      // the submitted controls only.
+      return this.exclusive(() => this.importInTurn((draft) => resolveSubmission(draft, checked)));
+    })();
+  }
+
+  /**
+   * The import itself, run inside the workspace store's queue turn this call was
+   * admitted to. The request is resolved against the committed state the turn
+   * sees, so a submission's URL record and assertion checks see every write
+   * queued before it; this method then prepares, plans and commits inside that
+   * turn through one `commitTranscripts`, which rebuilds the plan against the
+   * draft that is actually persisted and validates it, and never enqueues again.
+   */
+  private importInTurn(resolve: (draft: DraftState) => SubmissionRequest): Promise<TranscriptImportResult> {
+    return (async () => {
       // Admission was decided when this import entered the store's queue: an
       // import accepted before close keeps running while close drains the queue.
       // A store that became blocked may not build on uncommitted state.
       const blocked = this.writeBlock();
       if (blocked !== null) throw blocked;
-      // The arguments are checked before any read or write, so a malformed
-      // call writes nothing at all.
-      const parsed = this.parseTarget(target);
-      const prepared = await this.prepare(input);
-      const snapshot = this.store.snapshot();
-      const committed =
-        parsed.create !== undefined
-          ? this.planCreate(prepared, parsed.create, snapshot)
-          : this.planTarget(prepared, parsed.meetingId!, snapshot);
-      return this.commit(prepared, committed);
-    });
+      // Resolve the submission against the committed state the turn sees, read
+      // its one raw import, and plan the whole import with its complete proposal
+      // validated as reopening would accept it. This all happens inside the
+      // admitted turn, so the URL record and the submitted assertions are
+      // checked against the records the import is applied to, and a proposal the
+      // store refuses is refused before any blob is published.
+      const request = resolve(this.draftState());
+      const parsed = this.parseTarget(request.target, request.engagementOnly);
+      const prepared = await this.prepare(request.input);
+      const planned = this.planImport(prepared, parsed, request.engagementOnly);
+      // Only a distinct original is published; it is published and verified
+      // before the JSON that names it is committed, and a persistence failure
+      // leaves the published original retained.
+      if (planned.write !== "noop") await this.publish(prepared);
+      let plan: CommitPlan | undefined;
+      await this.internals().commitTranscripts((draft) => {
+        // The plan is rebuilt against the draft that is actually persisted and
+        // applied there, and the store validates the resulting transcript list
+        // exactly as reopening would before it saves them. A rebuilt plan that
+        // would publish a different original refuses the commit rather than
+        // commit an original that was never validated for it.
+        plan = this.planImport(prepared, parsed, request.engagementOnly, draft);
+        if (this.publicationOf(plan, prepared) !== this.publicationOf(planned, prepared)) {
+          throw new ValidationError("the plan changed before its commit; its original was not published for it");
+        }
+        return this.commitChange(prepared, plan, draft);
+      });
+      return this.result(plan!);
+    })();
+  }
+
+  /** Plan one prepared import for its parsed target against a snapshot. */
+  private planImport(
+    prepared: PreparedImport,
+    parsed: ValidatedTarget,
+    engagementOnly: boolean,
+    snapshot: Snapshot = this.store.snapshot(),
+  ): CommitPlan {
+    return parsed.create !== undefined
+      ? this.planCreate(prepared, parsed.create, engagementOnly, snapshot)
+      : this.planTarget(prepared, parsed.meetingId!, snapshot);
+  }
+
+  /**
+   * The original a plan would publish, as its kind and exact text/bytes, or
+   * undefined for a no-op. Two plans that would publish the same original are
+   * interchangeable for publication; anything else is a plan the published
+   * original was not validated for.
+   */
+  private publicationOf(plan: CommitPlan, prepared: PreparedImport): string | undefined {
+    if (plan.write === "noop") return undefined;
+    const planned = plan.prepared ?? prepared;
+    const text = planned.pastedText;
+    if (text !== undefined) return `paste\u0000${text}`;
+    return `file\u0000${sha256Hex(planned.originalBytes)}`;
   }
 
   /**
@@ -495,7 +962,8 @@ class TranscriptStoreImpl implements TranscriptStore {
   /** Validate the target: exactly one of a meeting create or a meeting id. */
   private parseTarget(
     target: TranscriptTarget,
-  ): { create?: TranscriptMeetingCreate; meetingId?: string } {
+    engagementOnly = false,
+  ): ValidatedTarget {
     const record = requireRecord(target, "transcript target", TARGET_KEYS);
     const hasCreate = record.create !== undefined;
     const hasMeeting = record.meetingId !== undefined;
@@ -503,21 +971,41 @@ class TranscriptStoreImpl implements TranscriptStore {
       throw new ValidationError("transcript target must carry either a meeting create or a target meetingId");
     }
     if (hasCreate) {
-      const create = requireRecord(
-        record.create,
-        "transcript target.create",
-        CREATE_KEYS,
-      ) as unknown as TranscriptMeetingCreate;
-      requireNonblank(create.clientId, "transcript target.create.clientId");
-      requireNonblank(create.engagementId, "transcript target.create.engagementId");
-      optionalNonblank(create.projectId, "transcript target.create.projectId");
-      requireNonblank(create.title, "transcript target.create.title");
-      requireNonblank(create.date, "transcript target.create.date");
-      optionalText(create.notes, "transcript target.create.notes");
-      return { create };
+      // The public parser accepts only the supplied create keys; the handler's
+      // private engagement-only marker is carried separately, never here.
+      const create = requireRecord(record.create, "transcript target.create", CREATE_KEYS);
+      // Read each field exactly once into a local constant, then validate the
+      // constants and build the frozen copy from the validator results, so the
+      // commit uses exactly the validated values even if the caller mutates its
+      // own object after validation.
+      const rawClientId = create.clientId;
+      const rawEngagementId = create.engagementId;
+      const rawProjectId = create.projectId;
+      const rawTitle = create.title;
+      const rawDate = create.date;
+      const rawNotes = create.notes;
+      if (engagementOnly && rawProjectId !== undefined) {
+        throw new ValidationError("transcript target.create cannot carry a project and an engagement-only selection");
+      }
+      const clientId = requireNonblank(rawClientId, "transcript target.create.clientId");
+      const engagementId = requireNonblank(rawEngagementId, "transcript target.create.engagementId");
+      const projectId = optionalNonblank(rawProjectId, "transcript target.create.projectId");
+      const title = requireNonblank(rawTitle, "transcript target.create.title");
+      const date = requireNonblank(rawDate, "transcript target.create.date");
+      const notes = optionalText(rawNotes, "transcript target.create.notes");
+      return Object.freeze({
+        create: Object.freeze({
+          clientId,
+          engagementId,
+          ...(projectId === undefined ? {} : { projectId }),
+          title,
+          date,
+          ...(notes === undefined ? {} : { notes }),
+        }),
+      });
     }
     const meetingId = requireNonblank(record.meetingId, "transcript target.meetingId");
-    return { meetingId };
+    return Object.freeze({ meetingId });
   }
 
   /**
@@ -595,7 +1083,11 @@ class TranscriptStoreImpl implements TranscriptStore {
    * meeting's own valid parent chain, so a caller's scope is never trusted and
    * an identical transcript in another engagement is never mistaken for this one.
    */
-  private canonicalFor(snapshot: Snapshot, engagementId: string, canonicalText: string): CanonicalMatch | undefined {
+  private canonicalFor(
+    snapshot: Snapshot,
+    engagementId: string,
+    canonicalText: string,
+  ): CanonicalMatch | undefined {
     for (const transcript of snapshot.transcripts ?? []) {
       if (transcript.canonicalText !== canonicalText) continue;
       const holder = snapshot.meetings.find((m) => m.id === transcript.meetingId);
@@ -612,13 +1104,12 @@ class TranscriptStoreImpl implements TranscriptStore {
   }
 
   /**
-   * Whether the canonical meeting's engagement or client is archived. Archived
-   * canonical meetings are reused like active ones, and the result says so.
+   * Whether the canonical meeting is effectively archived: its client, its
+   * engagement or its own project carries the flag. Archived canonical meetings
+   * are reused like active ones, and the result says so.
    */
   private isArchived(snapshot: Snapshot, meeting: Meeting): boolean {
-    const engagement = snapshot.engagements.find((e) => e.id === meeting.engagementId);
-    const client = snapshot.clients.find((c) => c.id === meeting.clientId);
-    return engagement?.archived === true || client?.archived === true;
+    return isEffectivelyArchived(snapshot, meeting);
   }
 
   /**
@@ -670,6 +1161,14 @@ class TranscriptStoreImpl implements TranscriptStore {
     };
   }
 
+  /** The transcript as it will be committed after adding this original. */
+  private withOriginal(transcript: Transcript, prepared: PreparedImport): Transcript {
+    return {
+      ...transcript,
+      sources: this.proposedSources(transcript, this.newSource(prepared)),
+    };
+  }
+
   /** The stored source list as it will be committed after adding `source`. */
   private proposedSources(transcript: Transcript, source: TranscriptSource): TranscriptSource[] {
     return [...transcript.sources, source];
@@ -685,8 +1184,29 @@ class TranscriptStoreImpl implements TranscriptStore {
     snapshot: Snapshot,
     meeting: Meeting,
     transcript: { id: string; canonicalText: string; meetingId: string; sources: readonly TranscriptSource[] },
+    replacing?: string,
   ): void {
-    validateTranscripts([transcript], { ...snapshot, meetings: [...snapshot.meetings, meeting] } as Snapshot);
+    // Validate the complete resulting transcript list, exactly as reopening
+    // would accept it, against the meeting's authoritative engagement: a fresh
+    // transcript alongside the stored ones, or the stored ones with the edited
+    // transcript replacing its committed version. Another engagement's identical
+    // transcript is a separate scope and never a clash, so only the transcripts
+    // whose meeting belongs to this engagement are validated with the proposal.
+    // A duplicate source id or a clash with a stored transcript of this
+    // engagement is refused here, before any blob is published.
+    const meetings = snapshot.meetings.some((m) => m.id === meeting.id)
+      ? snapshot.meetings
+      : [...snapshot.meetings, meeting];
+    const engagementId = meeting.engagementId;
+    const stored = [...(snapshot.transcripts ?? [])].filter((t) => {
+      if (t.id === replacing) return false;
+      const holder = meetings.find((m) => m.id === t.meetingId);
+      return holder !== undefined && holder.engagementId === engagementId;
+    });
+    validateTranscripts([...stored, transcript], {
+      ...snapshot,
+      meetings: [...meetings],
+    } as Snapshot);
   }
 
   /**
@@ -696,7 +1216,11 @@ class TranscriptStoreImpl implements TranscriptStore {
    * blank notes (`""`) that differs from preserved notes; notes that were not
    * supplied at all are not a difference.
    */
-  private conflicts(create: TranscriptMeetingCreate, meeting: Meeting): TranscriptConflict[] {
+  private conflicts(
+    create: TranscriptMeetingCreate,
+    meeting: Meeting,
+    engagementOnly = false,
+  ): TranscriptConflict[] {
     const conflicts: TranscriptConflict[] = [];
     const title = create.title as string;
     if (title !== meeting.title) {
@@ -708,10 +1232,17 @@ class TranscriptStoreImpl implements TranscriptStore {
     }
     // An omitted project is not a supplied one: only a project the caller
     // actually supplied and that differs from the preserved project is a
-    // difference.
+    // difference. An explicitly blank project selects the engagement only
+    // (supplied as "") and differs from a preserved project like any other
+    // selection; the canonical holder's project is still preserved.
     const projectId = create.projectId as string | undefined;
-    if (projectId !== undefined && projectId !== meeting.projectId) {
-      conflicts.push({ field: "projectId", supplied: projectId, preserved: meeting.projectId ?? "" });
+    const suppliedProject = engagementOnly ? "" : projectId;
+    if (suppliedProject !== undefined && suppliedProject !== (meeting.projectId ?? "")) {
+      conflicts.push({
+        field: "projectId",
+        supplied: suppliedProject,
+        preserved: meeting.projectId ?? "",
+      });
     }
     if (create.notes !== undefined && create.notes !== meeting.notes) {
       conflicts.push({ field: "notes", supplied: create.notes as string, preserved: meeting.notes });
@@ -729,12 +1260,13 @@ class TranscriptStoreImpl implements TranscriptStore {
   private planCreate(
     prepared: PreparedImport,
     create: TranscriptMeetingCreate,
-    snapshot: Snapshot,
+    engagementOnly = false,
+    snapshot: Snapshot = this.store.snapshot(),
   ): CommitPlan {
     const normalized = this.requireCreateParents(snapshot, create);
     const canonical = this.canonicalFor(snapshot, normalized.engagementId, prepared.result.canonicalText);
     if (canonical !== undefined) {
-      return this.planReuse(prepared, canonical, this.conflicts(create, canonical.meeting));
+      return this.planReuse(prepared, canonical, this.conflicts(create, canonical.meeting, engagementOnly));
     }
     // The proposed metadata, transcript and source are all validated before the
     // blob is published.
@@ -753,6 +1285,10 @@ class TranscriptStoreImpl implements TranscriptStore {
       meetingId: meeting.id,
       sources: [this.newSource(prepared)],
     };
+    // The proposed metadata, transcript and source are validated as if the
+    // meeting already existed; its id is allocated from the draft the store
+    // actually persists, so the meeting, its transcript's association and its
+    // event all name that id.
     this.validateProposal(snapshot, meeting, transcript);
     return {
       outcome: "created",
@@ -760,8 +1296,10 @@ class TranscriptStoreImpl implements TranscriptStore {
       meetingId: "", // allocated from the committed draft
       createdMeeting: true,
       write: "create",
-      meeting: { ...meeting, id: "", clientId: normalized.clientId, engagementId: normalized.engagementId },
-      transcript,
+      canonicalText: prepared.result.canonicalText,
+      meeting: { ...meeting, id: "" },
+      transcript: { ...transcript, meetingId: "" },
+      event: { action: "create", targetKind: "meeting", targetId: "" },
       conflicts: [],
       attachedOriginal: true,
     };
@@ -776,7 +1314,11 @@ class TranscriptStoreImpl implements TranscriptStore {
    * already is refused before anything is written, because an attachment is
    * never replaced and different content never becomes a second transcript.
    */
-  private planTarget(prepared: PreparedImport, meetingId: string, snapshot: Snapshot): CommitPlan {
+  private planTarget(
+    prepared: PreparedImport,
+    meetingId: string,
+    snapshot: Snapshot = this.store.snapshot(),
+  ): CommitPlan {
     const target = this.findMeeting(snapshot, meetingId);
     const canonical = this.canonicalFor(snapshot, target.engagementId, prepared.result.canonicalText);
     if (canonical !== undefined) {
@@ -798,6 +1340,8 @@ class TranscriptStoreImpl implements TranscriptStore {
       meetingId: target.id,
       sources: [this.newSource(prepared)],
     };
+    // The proposed metadata, transcript and source are validated before the
+    // store saves the draft.
     this.validateProposal(snapshot, target, transcript);
     return {
       outcome: "attached",
@@ -805,8 +1349,9 @@ class TranscriptStoreImpl implements TranscriptStore {
       meetingId: target.id,
       createdMeeting: false,
       write: "attach",
-      meeting: null,
+      canonicalText: prepared.result.canonicalText,
       transcript,
+      event: { action: "edit", targetKind: "meeting", targetId: target.id },
       conflicts: [],
       attachedOriginal: true,
     };
@@ -838,47 +1383,113 @@ class TranscriptStoreImpl implements TranscriptStore {
         ...base,
         outcome: "reused",
         write: "noop",
-        meeting: null,
-        transcript: null,
         attachedOriginal: false,
       };
     }
-    const proposed = {
-      id: transcript.id,
-      canonicalText: transcript.canonicalText,
-      meetingId: meeting.id,
-      sources: this.proposedSources(transcript, this.newSource(prepared)),
-    };
-    this.validateProposal(this.store.snapshot(), meeting, proposed);
+    // The edited transcript must be accepted exactly as reopening would accept
+    // it, against the complete stored list, before its original is published.
+    this.validateProposal(this.store.snapshot(), meeting, this.withOriginal(transcript, prepared), transcript.id);
     return {
       ...base,
       outcome: "new_source",
       write: "edit",
-      meeting: null,
-      transcript: proposed,
+      planTranscriptId: transcript.id,
+      prepared,
+      originalBytes: prepared.originalBytes,
+      originalPastedText: prepared.pastedText,
+      event: { action: "edit", targetKind: "meeting", targetId: meeting.id },
       attachedOriginal: true,
     };
   }
 
   /**
-   * Carry out a planned import: publish the blob (for a file original that is
-   * not already stored), then run the one metadata commit (or the no-op save)
-   * and look the committed records up. Nothing is published as memory before
-   * the whole commit succeeds.
+   * The change a plan makes to the draft that the store persists: a no-op save
+   * for an exact repeat, the planned meeting and its new transcript for a create,
+   * the new transcript for an attachment, or the edit that adds a distinct
+   * original to the canonical transcript. The draft is re-checked inside the
+   * serialized commit so a plan never commits onto state it did not plan on, and
+   * the store then validates it exactly as reopening would, saves it and records
+   * the plan's one activity event, if any.
    */
-  private async commit(prepared: PreparedImport, plan: CommitPlan): Promise<TranscriptImportResult> {
-    if (plan.write !== "noop") await this.publish(prepared);
-    if (plan.write === "noop") {
-      await this.noop();
-    } else if (plan.write === "create") {
-      await this.writeCreate(prepared, plan);
-    } else {
-      await this.writeEdit(prepared, plan);
+  private commitChange(
+    prepared: PreparedImport,
+    plan: CommitPlan,
+    draft: DraftState,
+  ): {
+    value: CommitPlan;
+    event?: { action: "create" | "edit"; targetKind: "meeting"; targetId: string };
+  } {
+    const meetings = draft.meetings as Meeting[];
+    const transcripts = draft.transcripts as Transcript[];
+    if (plan.write === "create") {
+      // The meeting id is allocated from the draft that is actually persisted,
+      // so the meeting, its transcript's association and its event all name it.
+      this.recheckNewContent(draft, plan);
+      const id = this.internals().nextId(draft, "meetings");
+      const created = parseMeeting({ ...plan.meeting!, id });
+      plan.meetingId = id;
+      if (plan.event !== undefined) plan.event.targetId = id;
+      meetings.push(created);
+      transcripts.push({ ...plan.transcript!, meetingId: id });
+    } else if (plan.write === "attach") {
+      this.recheckNewContent(draft, plan);
+      transcripts.push(plan.transcript!);
+    } else if (plan.write === "edit") {
+      // The draft must still hold the canonical transcript this original joins.
+      const index = transcripts.findIndex(
+        (t) => t.id === plan.planTranscriptId && t.meetingId === plan.meetingId,
+      );
+      const transcript = index < 0 ? undefined : transcripts[index];
+      if (transcript === undefined) {
+        throw new ValidationError(`transcript ${JSON.stringify(plan.planTranscriptId)} is no longer stored`);
+      }
+      // The plan's prepared import names exactly the original the plan validated
+      // and published, so this edit adds that same source to the draft.
+      const plannedPrepared = plan.prepared;
+      if (plannedPrepared === undefined) {
+        throw new ValidationError("an edit plan carries its prepared original");
+      }
+      transcripts[index] = this.withOriginal(transcript, plannedPrepared);
     }
-    return this.result(plan);
+    return plan.event === undefined ? { value: plan } : { value: plan, event: plan.event };
   }
 
-  /** Publish the prepared file original before the JSON that names it. */
+  /**
+   * Re-check a plan that adds content to the committed draft: the engagement
+   * must still hold no transcript of this canonical content, and a target
+   * meeting must still hold no transcript of its own (a create's meeting is
+   * new, so this only guards an attachment).
+   */
+  private recheckNewContent(draft: DraftState, plan: CommitPlan): void {
+    const meeting = draft.meetings.find((m) => m.id === plan.meetingId);
+    if (plan.write !== "create" && meeting === undefined) {
+      throw new MissingRecordError(`No meeting with id ${JSON.stringify(plan.meetingId)}`);
+    }
+    if (plan.write === "attach" && meeting !== undefined && this.transcriptOf(draft, meeting.id) !== undefined) {
+      throw new ValidationError(
+        `meeting ${JSON.stringify(meeting.id)} already holds a transcript of different content; ` +
+          "an attachment is never replaced",
+      );
+    }
+    const engagementId = meeting?.engagementId ?? plan.engagementId;
+    const clash = (draft.transcripts ?? []).some(
+      (t) =>
+        t.canonicalText === plan.canonicalText &&
+        draft.meetings.some((m) => m.id === t.meetingId && m.engagementId === engagementId),
+    );
+    if (clash) {
+      throw new ValidationError(
+        `engagement ${JSON.stringify(engagementId)} already holds this canonical transcript`,
+      );
+    }
+  }
+
+  /**
+   * Publish and verify a prepared file original in the workspace's own original
+   * repository, before the JSON that names it is committed. The published bytes
+   * are retained even when the commit later fails, and a retry or a reopen
+   * verifies and reuses them.
+   */
   private async publish(prepared: PreparedImport): Promise<void> {
     if (!prepared.file) return;
     let reference: { sha256: string; byteLength: number };
@@ -895,72 +1506,6 @@ class TranscriptStoreImpl implements TranscriptStore {
         "The published transcript original does not verify against its stored hash",
       );
     }
-  }
-
-  /**
-   * Create one meeting, its transcript and one create event in a single write.
-   * The meeting id is allocated from the draft that is actually persisted, so
-   * the meeting, its transcript's association and its event all name that id.
-   */
-  private async writeCreate(prepared: PreparedImport, plan: CommitPlan): Promise<void> {
-    const meeting = plan.meeting!;
-    const transcript = plan.transcript!;
-    await this.internals().commitTranscripts((draft) => {
-      const id = this.internals().nextId(draft, "meetings");
-      const created = parseMeeting({ ...meeting, id });
-      draft.meetings.push(created);
-      draft.transcripts.push({ ...transcript, id: prepared.result.id, meetingId: id });
-      plan.meetingId = id;
-      return { value: undefined, event: { action: "create", targetKind: "meeting", targetId: id } };
-    });
-  }
-
-  /**
-   * Commit one edit: a fresh transcript that attaches once to the supplied
-   * meeting, or a new original added to the canonical transcript. The draft is
-   * re-checked inside the serialized write: the target must still hold no
-   * transcript of its own, and the engagement must still not hold this content
-   * elsewhere.
-   */
-  private async writeEdit(prepared: PreparedImport, plan: CommitPlan): Promise<void> {
-    const proposed = plan.transcript!;
-    await this.internals().commitTranscripts((draft) => {
-      const meeting = draft.meetings.find((m) => m.id === plan.meetingId);
-      if (meeting === undefined) throw new MissingRecordError(`No meeting with id ${JSON.stringify(plan.meetingId)}`);
-      const current = draft.transcripts.find((t) => t.meetingId === meeting.id);
-      if (current === undefined) {
-        const clash = draft.transcripts.some(
-          (t) =>
-            t.canonicalText === proposed.canonicalText &&
-            draft.meetings.some((m) => m.id === t.meetingId && m.engagementId === meeting.engagementId),
-        );
-        if (clash) {
-          throw new ValidationError(
-            `engagement ${JSON.stringify(meeting.engagementId)} already holds this canonical transcript`,
-          );
-        }
-        draft.transcripts.push(proposed);
-      } else {
-        if (current.id !== proposed.id) {
-          throw new ValidationError(
-            `meeting ${JSON.stringify(meeting.id)} holds transcript ${JSON.stringify(current.id)}, not ` +
-              JSON.stringify(proposed.id),
-          );
-        }
-        draft.transcripts[draft.transcripts.indexOf(current)] = { ...current, sources: proposed.sources };
-      }
-      return { value: undefined, event: { action: "edit", targetKind: "meeting", targetId: meeting.id } };
-    });
-  }
-
-  /**
-   * Persist an exact repeat through the ordinary no-op path: the commit's draft
-   * is unchanged, so the store validates the committed state, saves it exactly
-   * as before and records no event. A save failure rejects exactly as for any
-   * other write and adds nothing.
-   */
-  private async noop(): Promise<void> {
-    await this.internals().commitTranscripts(() => ({ value: undefined }));
   }
 
   /**
@@ -1149,27 +1694,49 @@ class TranscriptStoreImpl implements TranscriptStore {
   }
 
   async close(): Promise<void> {
+    // A borrowed store stays open: the caller that opened it closes it.
+    if (!this.ownsStore) return;
     await this.store.close();
   }
 }
 
-/** A validated plan for one import, before its blob and JSON are committed. */
+/** A validated plan for one import, applied to the draft that is committed. */
 interface CommitPlan {
   readonly outcome: CommittedOutcome["outcome"];
   readonly engagementId: string;
-  /** The meeting the import commits to (allocated for a create at write time). */
+  /** The meeting the import commits to (allocated for a create in the draft). */
   meetingId: string;
   readonly createdMeeting: boolean;
-  /** What the commit does: a no-op save, a create, or one edit. */
+  /** What the commit does: a no-op save, a create, an attachment or one edit. */
   readonly write: "noop" | "create" | "attach" | "edit";
-  /** The meeting to create (a create only), with an id to be allocated. */
-  readonly meeting: Meeting | null;
-  /** The whole transcript as it will be committed, or null for a no-op. */
-  readonly transcript: Transcript | null;
+  /** The one activity event the commit records, if it records any. */
+  event?: { action: "create" | "edit"; targetKind: "meeting"; targetId: string };
+  /** The canonical transcript that gains a new original (an edit only). */
+  readonly planTranscriptId?: string;
+  /** The canonical content a create or attachment adds (for its draft re-check). */
+  readonly canonicalText?: string;
+  /** The prepared import whose original this edit adds, when it is an edit. */
+  readonly prepared?: PreparedImport;
+  /** The exact bytes of the new original this edit adds. */
+  readonly originalBytes?: Uint8Array;
+  /** The original's exact text when it is a paste. */
+  readonly originalPastedText?: string;
+  /** The meeting a create adds to the draft. */
+  readonly meeting?: Meeting;
+  /** The transcript a create or attachment adds to the draft. */
+  readonly transcript?: Transcript;
   readonly conflicts: TranscriptConflict[];
   readonly attachedOriginal: boolean;
   /** The supplied target meeting, when the import was aimed at one. */
   readonly wantedMeetingId?: string;
+}
+
+/** The original a plan's edit adds, as the prepared import's own fields. */
+function planOriginals(plan: CommitPlan): Pick<PreparedImport, "originalBytes" | "pastedText"> {
+  if (plan.originalBytes === undefined) {
+    throw new ValidationError("an edit plan carries its new original");
+  }
+  return { originalBytes: plan.originalBytes, pastedText: plan.originalPastedText };
 }
 
 /** The supported format named by a filename, in any case, or "unsupported". */
@@ -1230,6 +1797,23 @@ function requireWellFormed(result: ImportResult): void {
 }
 
 /**
+ * Build a transcript service over an already-open workspace store. The service
+ * shares that store's own mutation queue and original-file store, so an import
+ * and an ordinary store write are serialized together and name originals in the
+ * same repository the workspace keeps. The service does not own the store: the
+ * caller keeps it open and closes it, and closing the borrowed service is a
+ * no-op. Only the adapters a borrowed service needs can be overridden; the
+ * workspace's filesystem, clock, originals and lock stay the open store's own.
+ */
+export function transcriptService(
+  store: Store,
+  options: TranscriptServiceOptions = {},
+): TranscriptStore {
+  const internals = store as unknown as CommitStore;
+  return new TranscriptStoreImpl(store, internals.originalFiles(), options.docxParser, options.pdfParser, false);
+}
+
+/**
  * Open the workspace store and a transcript store over it. The original-file
  * store is the workspace's own, so the metadata the transcript store commits
  * names originals in the same repository the workspace keeps.
@@ -1241,7 +1825,14 @@ export async function openTranscriptStore(
   const store = await openStore(directory, options);
   try {
     const internals = store as unknown as CommitStore;
-    return new TranscriptStoreImpl(store, internals.originalFiles(), options.docxParser, options.pdfParser);
+    // An opened store is owned by its service: closing the service closes it.
+    return new TranscriptStoreImpl(
+      store,
+      internals.originalFiles(),
+      options.docxParser,
+      options.pdfParser,
+      true,
+    );
   } catch (cause) {
     await store.close();
     throw cause;

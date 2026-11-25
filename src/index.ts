@@ -27,6 +27,14 @@ import { matchMeetingPath, meetingRoutes, routeForMeetingPattern, type MeetingPa
 import type { MeetingRoute } from "./meeting-pages.ts";
 import { archivedRoutes, archiveRoutes, matchArchivePath, type ArchivePath, type ArchiveRoute } from "./archive-pages.ts";
 import { kanbanRoutes, matchKanbanPath, routeForKanbanPattern, type KanbanPath, type KanbanRoute } from "./kanban-pages.ts";
+import {
+  matchTranscriptImportPath,
+  routeForTranscriptImportPattern,
+  transcriptImportRoutes,
+  type TranscriptImportPath,
+  type TranscriptImportRoute,
+  type TranscriptImportRoutes,
+} from "./transcript-import-pages.ts";
 import { openStore, type Store } from "./store.ts";
 
 export function health(): { status: "ok" } {
@@ -123,7 +131,7 @@ export interface Application {
  * what a match is and how it maps to a guarded route.
  */
 export interface HierarchyPathMatch {
-  readonly pattern: HierarchyPath | WorkPath | MeetingPath | ArchivePath | KanbanPath | "/archived";
+  readonly pattern: HierarchyPath | WorkPath | MeetingPath | ArchivePath | KanbanPath | TranscriptImportPath | "/archived";
   readonly id: string;
 }
 
@@ -138,6 +146,13 @@ export interface HierarchyPathMatch {
  * every list, tally and history does.
  */
 export function registerRoutes(store: Store): Routes {
+  // The transcript import routes are built over the same owned store, and their
+  // transcript service borrows that store, so an import and every ordinary
+  // store write share the store's one mutation queue and originals; the
+  // application displays and commits one workspace. The service is built only
+  // when an import POST first needs it, so registering the routes (and a
+  // startup that never imports) needs nothing beyond what every existing page
+  // already reads.
   const base: Routes = appRoutes(store);
   const hierarchy = hierarchyRoutes(store);
   const work = workRoutes(store);
@@ -145,12 +160,14 @@ export function registerRoutes(store: Store): Routes {
   const archive = archiveRoutes(store);
   const archived = archivedRoutes(store).archived;
   const kanban = kanbanRoutes(store);
+  const imports = transcriptImportRoutes(store);
   const table: PathRouteTable<HierarchyPathMatch> = {
     match: (path: string) => {
       // The archive endpoints and the archived discovery page are matched
-      // first (their paths are exact), then the hierarchy paths, then the
-      // fixed work and meeting patterns. An unknown path matches none and is
-      // refused by the shell.
+      // first (their paths are exact), then the hierarchy paths, the fixed work
+      // and meeting patterns, and the fixed transcript import paths, which are
+      // four-segment shapes no other fixed route matches. An unknown path
+      // matches none and is refused by the shell.
       const archiveMatch = matchArchivePath(path);
       if (archiveMatch !== null) return archiveMatch;
       if (path.split("?")[0] === "/archived") return { pattern: "/archived", id: "" };
@@ -163,20 +180,26 @@ export function registerRoutes(store: Store): Routes {
       if (board !== null) return board;
       const work = matchWorkPath(path);
       if (work !== null) return work;
-      return matchMeetingPath(path);
+      const meeting = matchMeetingPath(path);
+      if (meeting !== null) return meeting;
+      return matchTranscriptImportPath(path);
     },
     route: (matched, method) => {
       // `matched` is only produced by `match` above, so its pattern is one of
-      // the fixed hierarchy, work, meeting or archive shapes, never a
-      // request-controlled destination. The archive endpoints are POST-only:
-      // a GET finds the unarchive slot's `get`, which is absent, and the shell
-      // answers 405 before any handler runs.
+      // the fixed hierarchy, work, meeting, archive or transcript import
+      // shapes, never a request-controlled destination. The archive endpoints
+      // are POST-only: a GET finds the unarchive slot's `get`, which is absent,
+      // and the shell answers 405 before any handler runs.
       if (matched.pattern === "/archived") {
         return method === "GET" ? adaptRoute(archived.get) : undefined;
       }
       if (matched.pattern.endsWith("/archive") || matched.pattern.endsWith("/unarchive")) {
         const action = matched.pattern.endsWith("/unarchive") ? archive.unarchive : archive.archive;
         const route = method === "POST" ? action.post : undefined;
+        return route === undefined ? undefined : adaptRoute(route);
+      }
+      if (isTranscriptImportPath(matched.pattern)) {
+        const route = routeForTranscriptImportPattern(imports, matched.pattern, method);
         return route === undefined ? undefined : adaptRoute(route);
       }
       const route = isKanbanPath(matched.pattern)
@@ -233,8 +256,31 @@ function isMeetingPath(pattern: string): pattern is MeetingPath {
   return (MEETING_PATTERNS as readonly string[]).includes(pattern);
 }
 
-/** Adapt a hierarchy, work, meeting or archive route to the shell's generic route interface. */
-function adaptRoute(route: HierarchyRoute | WorkRoute | MeetingRoute | ArchiveRoute | KanbanRoute): { readonly method: "GET" | "POST"; render(request: RouteRequest): Promise<RouteResult> | RouteResult } {
+/** The fixed transcript import patterns; a matched pattern outside every list is a hierarchy pattern. */
+const TRANSCRIPT_IMPORT_PATTERNS: readonly TranscriptImportPath[] = Object.freeze([
+  "/engagements/:id/transcripts/import",
+  "/projects/:id/transcripts/import",
+  "/meetings/:id/transcripts/import",
+]);
+
+function isTranscriptImportPath(pattern: string): pattern is TranscriptImportPath {
+  return (TRANSCRIPT_IMPORT_PATTERNS as readonly string[]).includes(pattern);
+}
+
+/**
+ * Adapt a hierarchy, work, meeting, archive or transcript import route to the
+ * shell's generic route interface. The transcript import POST slots carry the
+ * multipart body policy; every other route leaves it absent.
+ */
+function adaptRoute(route: HierarchyRoute | WorkRoute | MeetingRoute | ArchiveRoute | KanbanRoute | TranscriptImportRoute): Route {
+  if ("bodyPolicy" in route && route.bodyPolicy === "Multipart") {
+    return {
+      method: route.method,
+      bodyPolicy: "Multipart",
+      render: (request: RouteRequest) =>
+        route.render({ method: request.method, path: request.path, form: request.form, file: request.file }),
+    };
+  }
   return {
     method: route.method,
     render: (request: RouteRequest) => route.render(request),
@@ -296,6 +342,9 @@ export async function startApplication(
 
   let server: StartedServer;
   try {
+    // The existing registration entry point wires the one owned store: its
+    // transcript service borrows that same store (built on the first import),
+    // so every import shares the store's own queue and originals with every page.
     const serverOptions: ServerOptions = {
       store,
       port: options.port,

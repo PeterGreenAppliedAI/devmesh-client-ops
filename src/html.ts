@@ -119,6 +119,14 @@ export class FormError extends Error {
    * edit or create page keeps its page marked and usable. Empty by default.
    */
   notice: string;
+  /**
+   * The form's encoding, as the form that produced the refusal stated it. A
+   * corrected multipart form must be submitted the same way, so a route that
+   * opts into `multipart/form-data` sets it here and the corrected form keeps
+   * that encoding. Empty by default, which keeps the browser's url-encoded
+   * default.
+   */
+  enctype: string;
 
   constructor(
     message: string,
@@ -134,6 +142,7 @@ export class FormError extends Error {
     this.fields = [...fields];
     this.action = action;
     this.notice = "";
+    this.enctype = "";
   }
   /**
    * Attach the escaped notice to show above the corrected form and return the
@@ -142,6 +151,14 @@ export class FormError extends Error {
    */
   withNotice(notice: string): this {
     this.notice = notice;
+    return this;
+  }
+  /**
+   * Attach the form's encoding to the corrected form and return the same
+   * error, so a refused multipart submission is shown as a multipart form.
+   */
+  withEnctype(enctype: string): this {
+    this.enctype = enctype;
     return this;
   }
 }
@@ -164,6 +181,7 @@ export function renderFormError(
     errors: error.fieldErrors,
     summary: error.message,
     submitLabel: "Try again",
+    ...(error.enctype === "" ? {} : { enctype: error.enctype }),
   });
   // A notice a route attached to the refusal is shown above the form; it is
   // already escaped HTML, and it never replaces the form or its messages.
@@ -200,7 +218,8 @@ export interface DisplayValue {
 export interface FieldSpec {
   readonly name: string;
   readonly label: string;
-  readonly type?: "text" | "textarea" | "select" | "date";
+  /** The control kind: a text, textarea, select, date or native file input. */
+  readonly type?: "text" | "textarea" | "select" | "date" | "file";
   /** Presentation metadata; absent for an ordinary editable value. */
   readonly presentation?: FieldPresentation;
   /** Options for a select control. */
@@ -534,6 +553,12 @@ export function renderForm(options: {
   readonly errors?: readonly FieldError[];
   readonly summary?: string;
   readonly submitLabel?: string;
+  /**
+   * The form's encoding attribute. A form that carries a file control states
+   * `multipart/form-data` so the browser submits its file without a script;
+   * absent, the form keeps the browser's default url-encoded submission.
+   */
+  readonly enctype?: string;
 }): string {
   const values = options.values ?? {};
   const errors = options.errors ?? [];
@@ -541,7 +566,8 @@ export function renderForm(options: {
   if (options.summary !== undefined) {
     parts.push(renderFormSummary(options.summary, errors));
   }
-  parts.push(`<form method="post" action="${escapeHtml(options.action)}">`);
+  const enctype = options.enctype === undefined ? "" : ` enctype="${escapeHtml(options.enctype)}"`;
+  parts.push(`<form method="post" action="${escapeHtml(options.action)}"${enctype}>`);
   for (const field of options.fields) {
     const value = values[field.name] ?? field.value ?? "";
     if (field.hidden) {
@@ -587,6 +613,17 @@ export function renderForm(options: {
       parts.push(
         `<select id="${id}" name="${escapeHtml(field.name)}"${required}${invalid}>${choices.join("")}</select>`,
       );
+    } else if (field.type === "file") {
+      // A file control carries no value: the browser sends the selected file as
+      // its own multipart part, and an unchanged one shows nothing. A rejected
+      // file is named beside the control, escaped, so the user knows which file
+      // was refused; the file itself is never re-submitted by the browser.
+      parts.push(
+        `<input type="file" id="${id}" name="${escapeHtml(field.name)}"${required}${invalid}>`,
+      );
+      if (value !== "") {
+        parts.push(`<p>Submitted file: ${escapeHtml(value)}</p>`);
+      }
     } else {
       parts.push(
         `<input type="${inputType(field, value)}" id="${id}" name="${escapeHtml(field.name)}" value="${escapeHtml(value)}"${required}${invalid}>`,

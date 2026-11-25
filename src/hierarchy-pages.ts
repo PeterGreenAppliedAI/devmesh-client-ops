@@ -61,8 +61,10 @@ import {
 import { archiveControl, archiveNotice, archiveNoticeFor, visibleRecords } from "./archive-pages.ts";
 import {
   clientMeetings,
+  engagementImportHref,
   engagementMeetings,
   meetingSection,
+  projectImportHref,
   projectMeetings,
 } from "./meeting-pages.ts";
 
@@ -606,6 +608,8 @@ function engagementShowPage(engagement: Engagement, snapshot: Snapshot, store: S
       "Meeting history",
       `/engagements/${encodeURIComponent(engagementId)}/meetings/new`,
       engagementMeetings(store, clientId, engagementId),
+      undefined,
+      engagementImportHref(engagement.id),
     ),
   );
 
@@ -684,6 +688,8 @@ function projectShowPage(project: Project, snapshot: Snapshot, store: Store): Pa
         "Meeting history",
         `/projects/${encodeURIComponent(project.id)}/meetings/new`,
         projectMeetings(store, client.id, engagement.id, project.id),
+        undefined,
+        projectImportHref(project.id),
       ),
     ],
   );
