@@ -1022,7 +1022,6 @@ describe("transcript import submissions", () => {
           ["title", "Project kickoff"],
           ["date", "2026-02-03"],
           ["notes", ""],
-          ["projectId", server.projectId],
           [FILE_CONTROL, { filename: "transcript.txt", body: "File words here." }],
         ]),
       );
@@ -1211,7 +1210,9 @@ describe("transcript import submissions", () => {
       assert.ok(page.includes('aria-invalid="true"'));
       assert.match(page, /<textarea[^>]*name="paste"[^>]*>Words\.<\/textarea>/);
       assert.deepEqual(counts(server.store), before);
-      // A missing title is refused like a missing date.
+      // A missing title is refused like a missing date. The browser's blank title
+      // (a blank text control at its rendered default) is refused by the store's
+      // own nonblank check.
       const noTitle = (await submitPaste(
         server.origin,
         engagementImportHref(server.engagementId),
@@ -1221,9 +1222,22 @@ describe("transcript import submissions", () => {
         ]),
       )).reply;
       assert.equal(noTitle.status, 400);
-      // A missing title is refused like a missing date: the rendered required
-      // title starts blank, and the browser submits that blank title.
       assert.match(mainOf(noTitle.body), /title must be a nonblank string/);
+      assert.deepEqual(counts(server.store), before);
+      // A submission that omits the title control entirely is refused as a
+      // missing meeting field, with the original guidance and no write.
+      const omittedTitle = await postBytes(
+        server.origin,
+        engagementImportHref(server.engagementId),
+        MULTIPART_TYPE,
+        multipart([
+          { name: "date", body: "2026-05-02" },
+          { name: PASTE_CONTROL, body: "Words." },
+          { name: FILE_CONTROL, filename: "", body: "" },
+        ]),
+      );
+      assert.equal(omittedTitle.status, 400);
+      assert.match(mainOf(omittedTitle.body), /needs a title and a date/);
       assert.deepEqual(counts(server.store), before);
     } finally {
       await server.close();
