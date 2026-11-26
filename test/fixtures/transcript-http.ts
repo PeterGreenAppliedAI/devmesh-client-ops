@@ -501,30 +501,35 @@ export interface StagedSendOptions {
   readonly deadlineMs?: number;
 }
 
-/** Parse every complete Content-Length-framed reply in the received bytes. */
-function parseReplies(bytes: Buffer): Reply[] {
+/**
+ * Parse every complete Content-Length-framed reply in the received bytes. The
+ * final reply's declared body must end at the final received byte; a partial
+ * second reply or any trailing junk makes the whole exchange incomplete rather
+ * than silently returning the replies parsed before it.
+ */
+function parseReplies(bytes: Buffer): { readonly replies: Reply[]; readonly complete: boolean } {
   const replies: Reply[] = [];
   let offset = 0;
   while (offset < bytes.length) {
     const headEnd = bytes.indexOf("\r\n\r\n", offset);
-    if (headEnd < 0) break;
+    if (headEnd < 0) return { replies, complete: false };
     const lines = bytes.subarray(offset, headEnd).toString("utf8").split("\r\n");
     const status = Number(lines[0]?.split(" ")[1] ?? NaN);
-    if (!Number.isInteger(status)) break;
+    if (!Number.isInteger(status)) return { replies, complete: false };
     const headers: Record<string, string> = {};
     for (const line of lines.slice(1)) {
       const at = line.indexOf(":");
       if (at > 0) headers[line.slice(0, at).trim().toLowerCase()] = line.slice(at + 1).trim();
     }
     const declared = headers["content-length"];
-    if (declared === undefined || !/^\d+$/.test(declared)) break;
+    if (declared === undefined || !/^\d+$/.test(declared)) return { replies, complete: false };
     const length = Number(declared);
     const bodyStart = headEnd + 4;
-    if (bytes.length < bodyStart + length) break;
+    if (bytes.length < bodyStart + length) return { replies, complete: false };
     replies.push(replyFrom(status, headers, bytes.subarray(bodyStart, bodyStart + length)));
     offset = bodyStart + length;
   }
-  return replies;
+  return { replies, complete: true };
 }
 
 /**
@@ -581,8 +586,19 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
     };
     const finish = (): void => {
       if (settled) return;
+      // A peer close dispatched after the expiry but before the timer callback
+      // still fails; the monotonic deadline is checked at completion too.
+      if (timedOut()) {
+        fail(timeoutError());
+        return;
+      }
       const bytes = Buffer.concat(chunks);
-      const replies = parseReplies(bytes);
+      const parsed = parseReplies(bytes);
+      if (!parsed.complete) {
+        fail(socketError ?? new Error("the peer closed with a truncated reply"));
+        return;
+      }
+      const replies = parsed.replies;
       if (replies.length === 0) {
         fail(socketError ?? new Error("the peer closed with no complete reply"));
         return;

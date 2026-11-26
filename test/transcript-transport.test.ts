@@ -510,16 +510,17 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
         paste: "Bob: the in-flight source.",
       });
       assert.equal(body.byteLength, OVERSIZED_BODY_BYTES, "the valid body is exactly the declared over-limit length");
-      const prefix = body.subarray(0, 64 * 1024);
-      assert.ok(prefix.length > 0 && prefix.length < body.byteLength, "only part of the declared body is in flight before the reply");
 
-      // Start sending the declared body, then a follow-up request, before
-      // reading the reply; the 413 still answers from the declared headers.
+      // Start sending the whole declared body, then a follow-up request, before
+      // reading the reply; the 413 still answers from the declared headers. The
+      // GET follows every declared body byte, so it is a real next request on
+      // the socket rather than more POST body. The peer may close before Node
+      // emits that request event; either way no handler may run.
       const pending = sendStaged(runningFixture.server.origin, {
         path: importPath,
         contentType: MULTIPART_TYPE,
         declaredLength: OVERSIZED_BODY_BYTES,
-        bodyPrefix: prefix,
+        bodyPrefix: body,
         followUp: rawGet(runningFixture.server.origin, "/health"),
       });
       pending.catch(() => undefined);
