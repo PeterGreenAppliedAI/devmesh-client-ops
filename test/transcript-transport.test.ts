@@ -25,6 +25,8 @@ import { openStore, type Snapshot, type Store } from "../src/store.ts";
 import { ORIGINALS_DIRECTORY } from "../src/transcript-files.ts";
 import {
   BOUNDARY,
+  deadlineOrderRegression,
+  earlyFiringRegression,
   keepAliveTransport,
   MULTIPART_TYPE,
   send,
@@ -40,15 +42,6 @@ function tempDir(): string {
   const dir = mkdtempSync(join(tmpdir(), "transcript-transport-"));
   roots.push(dir);
   return dir;
-}
-
-/** Wait until `ready` holds, yielding to the event loop between checks. */
-async function until(ready: () => boolean, why: string): Promise<void> {
-  const limit = Date.now() + 5000;
-  while (!ready()) {
-    assert.ok(Date.now() < limit, `timed out waiting until ${why}`);
-    await new Promise((resolve) => setImmediate(resolve));
-  }
 }
 
 /** The workspace file inside a store directory. */
@@ -394,8 +387,9 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
   it("fails a reply that is held open past its deadline and closes it", async () => {
     const transport = keepAliveTransport();
     // The listener reads the whole request but holds the reply open, so the
-    // helper's own deadline is the only reason the request fails. The held
-    // response is closed during teardown.
+    // helper's own deadline is the only reason the request fails. The request
+    // may expire before or after the listener receives it: both are valid
+    // timeout outcomes, so nothing waits for the reply to be held.
     let held: import("node:http").ServerResponse | null = null;
     const listener = createServer((req, res) => {
       req.resume();
@@ -403,15 +397,20 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
         held = res;
       });
     });
+    const guard = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error("watchdog: the held-reply scenario did not finish")), 5000);
+    });
     try {
       await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", () => resolve()));
       const port = (listener.address() as { port: number }).port;
-      await assert.rejects(
-        send(transport, `http://127.0.0.1:${port}`, { path: "/", deadlineMs: 40 }),
-        /no reply within 40 ms/,
-        "a held-open reply is failed by the deadline",
-      );
-      await until(() => held !== null, "the listener held its reply open");
+      await Promise.race([
+        assert.rejects(
+          send(transport, `http://127.0.0.1:${port}`, { path: "/", deadlineMs: 40 }),
+          /no reply within 40 ms/,
+          "a held-open reply is failed by the deadline",
+        ),
+        guard,
+      ]);
     } finally {
       transport.close();
       // Close the held response before the listener, so no socket outlives it.
@@ -421,6 +420,12 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       });
     }
   });
+
+  // The fixture's two fixed deadline-order regressions, registered here so the
+  // private fake clock and the clock-taking request path are exercised without
+  // exposing scheduler control to fixture callers.
+  deadlineOrderRegression();
+  earlyFiringRegression();
 
   it("fails a request Node cannot construct without leaving a deadline behind", async () => {
     const transport = keepAliveTransport();
