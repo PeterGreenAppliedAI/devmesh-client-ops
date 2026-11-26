@@ -299,7 +299,8 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
     }
   });
 
-  it("fails a request that outstays its deadline and aborts it", async () => {    const dir = tempDir();
+  it("fails a request that outstays its deadline and aborts it", async () => {
+    const dir = tempDir();
     const store = await openStore(dir);
     const transport = keepAliveTransport();
     let server: StartedServer | null = null;
