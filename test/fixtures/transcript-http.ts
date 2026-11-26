@@ -491,6 +491,11 @@ export interface StagedSendOptions {
   /** Bytes of the declared body written after the headers, before the reply. */
   readonly bodyPrefix?: Uint8Array;
   /**
+   * Send the body prefix as one chunk and finish the chunked body with a zero
+   * chunk, letting Node frame it, instead of declaring the exact length.
+   */
+  readonly chunked?: boolean;
+  /**
    * A raw follow-up request written on the same socket after the body prefix,
    * before the reply is read. It is never awaited as a separate reply.
    */
@@ -568,6 +573,16 @@ function parseReplies(bytes: Buffer): { readonly replies: Reply[]; readonly comp
       (fields[lower] ??= []).push(value);
       headers[lower] = value;
     }
+    // A reply's Content-Type is a single field. Conflicting occurrences must
+    // not be resolved by the last header line, which would let an earlier value
+    // be overwritten in the returned headers.
+    const contentTypes = fields["content-type"];
+    if (contentTypes !== undefined) {
+      const first = contentTypes[0];
+      for (const value of contentTypes) {
+        if (value !== first) return { replies, complete: false };
+      }
+    }
     // This reader frames replies by Content-Length only, so any transfer coding
     // is conflicting framing and cannot complete a reply.
     if (fields["transfer-encoding"] !== undefined) return { replies, complete: false };
@@ -612,6 +627,8 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
     Number.isSafeInteger(options.declaredLength) && options.declaredLength >= 0,
     "the declared length is a finite byte count",
   );
+  const chunked = options.chunked === true;
+  if (chunked) assert.ok(options.bodyPrefix !== undefined, "a chunked staged send carries a body prefix");
   const cap = options.responseCap ?? DEFAULT_RESPONSE_CAP;
   const deadlineMs = options.deadlineMs ?? DEFAULT_DEADLINE_MS;
   assert.ok(Number.isSafeInteger(cap) && cap >= 0, "the response cap is a finite byte count");
@@ -701,13 +718,20 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
           `Host: ${url.host}`,
           `Origin: ${url.origin}`,
           `Content-Type: ${options.contentType}`,
-          `Content-Length: ${options.declaredLength}`,
+          chunked ? "Transfer-Encoding: chunked" : `Content-Length: ${options.declaredLength}`,
           "Connection: keep-alive",
           "",
           "",
         ];
         socket.write(lines.join("\r\n"));
-        if (options.bodyPrefix !== undefined) socket.write(Buffer.from(options.bodyPrefix));
+        if (chunked) {
+          const prefix = Buffer.from(options.bodyPrefix!);
+          socket.write(`${prefix.byteLength.toString(16)}\r\n`);
+          socket.write(prefix);
+          socket.write("\r\n0\r\n\r\n");
+        } else if (options.bodyPrefix !== undefined) {
+          socket.write(Buffer.from(options.bodyPrefix));
+        }
         if (options.followUp !== undefined) socket.write(Buffer.from(options.followUp));
       } catch (error) {
         fail(error as Error);

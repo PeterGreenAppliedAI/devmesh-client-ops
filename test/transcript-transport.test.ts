@@ -498,7 +498,7 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
     }
   });
 
-  it("refuses an oversized declared import while its body is in flight and excludes a follow-up", async () => {
+  it("refuses an oversized declared import in flight, excludes a follow-up and ignores a parser failure during retirement", async () => {
     const runningFixture = await running();
     const guard = watchdog(5000, "the in-flight refusal did not finish");
     try {
@@ -511,24 +511,71 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       });
       assert.equal(body.byteLength, OVERSIZED_BODY_BYTES, "the valid body is exactly the declared over-limit length");
 
-      // Start sending the whole declared body, then a follow-up request, before
-      // reading the reply; the 413 still answers from the declared headers. The
-      // GET follows every declared body byte, so it is a real next request on
-      // the socket rather than more POST body. The peer may close before Node
-      // emits that request event; either way no handler may run.
+      // Start sending the whole declared body, then a complete follow-up GET
+      // and trailing malformed request bytes, before reading the reply; the 413
+      // still answers from the declared headers. The GET follows every declared
+      // body byte, so it is a real next request on the socket rather than more
+      // POST body. The trailing bytes make Node's parser fail while the socket
+      // is retiring. Both the request event and the parser failure must be
+      // discarded: no handler may run and the parser failure must not replace,
+      // truncate or duplicate the one 413.
       const pending = sendStaged(runningFixture.server.origin, {
         path: importPath,
         contentType: MULTIPART_TYPE,
         declaredLength: OVERSIZED_BODY_BYTES,
         bodyPrefix: body,
-        followUp: rawGet(runningFixture.server.origin, "/health"),
+        followUp: Buffer.concat([
+          rawGet(runningFixture.server.origin, "/health"),
+          Buffer.from("GARBAGE\r\n\r\n", "utf8"),
+        ]),
       });
       pending.catch(() => undefined);
       const exchange = await Promise.race([pending, guard.promise]);
-      assertOversizedRefusal(exchange, "in-flight body");
+      assertOversizedRefusal(exchange, "in-flight body with parser failure");
       assert.equal(runningFixture.renders.import, 0, "the refused import never reached a handler");
       assert.equal(runningFixture.renders.followUp, 0, "the follow-up on the retiring socket never reached a handler");
       assertUnchanged(runningFixture, before, "after the in-flight refusal");
+    } finally {
+      guard.clear();
+      await runningFixture.close();
+    }
+  });
+
+  it("excludes a follow-up and ignores a parser failure after a streaming multipart overflow during retirement", async () => {
+    const runningFixture = await running();
+    const guard = watchdog(5000, "the streaming in-flight refusal did not finish");
+    try {
+      const before = baselineOf(runningFixture);
+      const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
+      const body = oversizedMultipart({
+        title: "Streaming oversized import",
+        date: "2026-09-04",
+        paste: "Carol: the streaming source.",
+      });
+      assert.equal(body.byteLength, OVERSIZED_BODY_BYTES, "the chunked body is exactly the over-limit length");
+
+      // Send the body as one chunk that crosses the limit, then a complete
+      // follow-up GET and trailing malformed request bytes, before reading the
+      // reply. Draining the reserved socket lets Node emit the follow-up request
+      // event and then fail its parser; neither may reach a handler, replace the
+      // 413 or add another reply.
+      const pending = sendStaged(runningFixture.server.origin, {
+        path: importPath,
+        contentType: MULTIPART_TYPE,
+        declaredLength: body.byteLength,
+        chunked: true,
+        bodyPrefix: body,
+        followUp: Buffer.concat([
+          rawGet(runningFixture.server.origin, "/health"),
+          Buffer.from("GARBAGE\r\n\r\n", "utf8"),
+        ]),
+      });
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assertOversizedRefusal(exchange, "streaming body with parser failure");
+      assert.equal(runningFixture.renders.import, 0, "the refused import never reached a handler");
+      assert.equal(runningFixture.renders.followUp, 0, "the follow-up on the retiring socket never reached a handler");
+      assertUnchanged(runningFixture, before, "after the streaming refusal");
     } finally {
       guard.clear();
       await runningFixture.close();
@@ -775,6 +822,41 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
         }),
       );
       const expected = assert.rejects(pending, /truncated reply/, "a bare line feed in a length cannot complete a reply");
+      expected.catch(() => undefined);
+      await Promise.race([Promise.all([listener.ready, expected]), guard.promise]);
+    } finally {
+      guard.clear();
+      await listener.close();
+    }
+  });
+
+  it("rejects a staged reply whose Content-Type fields conflict before counting it", async () => {
+    const listener = testListener((req) => {
+      req.resume();
+      // The first Content-Type is not the expected plain text, while the later
+      // field overwrites it in the returned headers. Conflicting singleton
+      // fields must not be resolved by the last header line.
+      req.socket.write(
+        "HTTP/1.1 413 Payload Too Large\r\n" +
+          "content-length: 9\r\n" +
+          "content-type: text/html\r\n" +
+          "content-type: text/plain\r\n" +
+          "cache-control: no-store\r\n" +
+          "connection: close\r\n\r\n" +
+          "too large",
+      );
+      req.socket.end();
+    });
+    const guard = watchdog(5000, "the conflicting Content-Type staged reply did not finish");
+    try {
+      const pending = listener.ready.then(() =>
+        sendStaged(`http://127.0.0.1:${listener.port()}`, {
+          path: "/",
+          contentType: "text/plain",
+          declaredLength: 0,
+        }),
+      );
+      const expected = assert.rejects(pending, /truncated reply/, "conflicting Content-Type fields cannot complete a reply");
       expected.catch(() => undefined);
       await Promise.race([Promise.all([listener.ready, expected]), guard.promise]);
     } finally {
