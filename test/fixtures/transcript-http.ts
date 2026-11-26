@@ -17,7 +17,6 @@ import {
   type ClientRequest,
   type IncomingMessage,
 } from "node:http";
-import { it } from "node:test";
 
 /** The boundary the helper uses for every submitted multipart body. */
 export const BOUNDARY = "transcript-library-boundary";
@@ -198,11 +197,12 @@ export const DEFAULT_DEADLINE_MS = 5000;
  * A monotonic millisecond clock and timer scheduler: the helper's only source
  * of time. Monotonic milliseconds never go backwards and are unaffected by
  * wall-clock steps, so the deadline cannot be extended or exhausted early by
- * an adjustment to the system time. Private: exported `send()` always uses the
- * system clock, so no caller can control when a deadline fires; only the
- * fixture's own regressions use a fake clock.
+ * an adjustment to the system time. Exported `send()` always uses the system
+ * clock, so no caller can control when a deadline fires; this interface and
+ * `sendWithClock` below are the seam the transport suite's deterministic
+ * deadline-order regressions drive, and nothing else uses them.
  */
-interface Clock {
+export interface Clock {
   /** Monotonic milliseconds; never goes backwards and is unaffected by wall-clock steps. */
   now(): number;
   /** Run `callback` once at least `delayMs` after the current time; returns a cancel handle. */
@@ -211,8 +211,8 @@ interface Clock {
   clearTimer(handle: TimerHandle): void;
 }
 
-/** A scheduler's timer handle, opaque to the helper. Private, like `Clock`. */
-interface TimerHandle {
+/** A scheduler's timer handle, opaque to the helper, like `Clock`. */
+export interface TimerHandle {
   readonly handle: object;
 }
 
@@ -296,12 +296,13 @@ export function send(transport: Transport, base: string, options: SendOptions): 
 
 /**
  * The request helper's one implementation, taking its time source explicitly.
- * Exported `send()` always passes the system's clock; the fixture's own
- * regressions pass a fake clock, so the public path and the deterministic
- * tests exercise the same response-end and timer handlers. Private: no caller
- * outside this fixture can supply a clock, so a finite deadline always binds.
+ * Exported `send()` always passes the system's clock; the transport suite's
+ * deterministic regressions pass a fake clock, so the public path and those
+ * tests exercise the same response-end and timer handlers. `SendOptions` has
+ * no clock field, so a caller reaching `send()` cannot control when a
+ * deadline fires and a finite deadline always binds.
  */
-function sendWithClock(
+export function sendWithClock(
   clock: Clock,
   transport: Transport,
   base: string,
@@ -511,225 +512,6 @@ function sendWithClock(
       fail(error as Error);
     }
   });
-}
-
-// ---------------------------------------------------------------------------
-// Deadline-order regressions
-// ---------------------------------------------------------------------------
-
-/**
- * A fake monotonic clock whose timers fire only when the test fires them. Its
- * milliseconds advance only when the test advances them, so a deadline can be
- * brought to expiry without a real wait, and an armed timer can be fired early
- * on purpose. Private to the fixture: no caller can supply it to `send()`.
- */
-class FakeClock implements Clock {
-  private milliseconds = 0;
-  private pending: FakeTimer[] = [];
-
-  now(): number {
-    return this.milliseconds;
-  }
-
-  setTimer(delayMs: number, callback: () => void): TimerHandle {
-    const timer: FakeTimer = { handle: {}, due: this.milliseconds + delayMs, callback, cancelled: false };
-    this.pending.push(timer);
-    return timer;
-  }
-
-  clearTimer(handle: TimerHandle): void {
-    (handle as FakeTimer).cancelled = true;
-  }
-
-  /** Advance the fake time without firing any timer. */
-  advance(milliseconds: number): void {
-    this.milliseconds += milliseconds;
-  }
-
-  /** The timers armed and not yet cancelled, in arming order. */
-  armed(): readonly FakeTimer[] {
-    return this.pending.filter((timer) => !timer.cancelled);
-  }
-
-  /** Fire the first armed timer now, whether or not its due time has come. */
-  fireFirst(): void {
-    const timer = this.armed()[0];
-    if (timer === undefined) throw new Error("no timer is armed to fire");
-    timer.cancelled = true;
-    timer.callback();
-  }
-}
-
-/** One timer armed on the fake clock: its handle, due time, callback and state. */
-interface FakeTimer extends TimerHandle {
-  readonly handle: object;
-  readonly due: number;
-  readonly callback: () => void;
-  cancelled: boolean;
-}
-
-/**
- * A real watchdog, independent of the helper's deadline, that rejects with an
- * error the expected rejection can never match. Used to bound a scenario that
- * waits on fake time. Its rejection is observed the moment it is created, so it
- * cannot surface as an unhandled rejection, and its timer is cleared on every
- * exit.
- */
-function watchdog(milliseconds: number, reason: string): {
-  readonly promise: Promise<never>;
-  readonly clear: () => void;
-} {
-  let handle: ReturnType<typeof setTimeout> | null = null;
-  const promise = new Promise<never>((_, reject) => {
-    handle = setTimeout(() => reject(new Error(`watchdog: ${reason}`)), milliseconds);
-  });
-  // Observe the rejection at creation. A watchdog that fires while the scenario
-  // is waiting for setup or delivery is then handled even if nothing races it
-  // at that moment.
-  promise.catch(() => undefined);
-  return {
-    promise,
-    clear() {
-      if (handle !== null) {
-        clearTimeout(handle);
-        handle = null;
-      }
-    },
-  };
-}
-
-/**
- * One held reply and the listener that holds it: the held response exists only
- * after the listener has received the whole request, and teardown destroys it
- * before closing the listener so no socket outlives the scenario.
- */
-interface HeldListener {
-  readonly port: number;
-  held(): import("node:http").ServerResponse | null;
-  close(): Promise<void>;
-}
-
-/** Start a listener that reads each request fully and holds its reply open. */
-async function heldListener(): Promise<HeldListener> {
-  let held: import("node:http").ServerResponse | null = null;
-  const listener = createServer((req, res) => {
-    req.resume();
-    req.on("end", () => {
-      held = res;
-    });
-  });
-  await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", () => resolve()));
-  const port = (listener.address() as { port: number }).port;
-  return {
-    port,
-    held: () => held,
-    async close() {
-      held?.destroy();
-      await new Promise<void>((resolve, reject) => {
-        listener.close((error) => (error ? reject(error) : resolve()));
-      });
-    },
-  };
-}
-
-/**
- * The fixture registers two fixed deadline-order regressions for the private
- * fake clock and the clock-taking request path. They live here, at module
- * scope, as ordinary `it` tests rather than as exported registration functions,
- * so no caller of the fixture can drive a scheduler or register its own tests.
- * Both observe every promise they create at creation and bound each wait,
- * including the listener setup and the request delivery, by a real watchdog.
- */
-
-// The late-response-end regression: a reply that ends after the deadline, but
-// before the armed timer runs, must fail with the end handler's own message,
-// so removing that handler's expiry check makes this test fail.
-it("fails a reply that ends after the deadline and before the timer fires", async () => {
-  const transport = keepAliveTransport();
-  const clock = new FakeClock();
-  const deadlineMs = 40;
-  let listener: HeldListener | null = null;
-  const guard = watchdog(5000, "the late-end scenario did not finish");
-  try {
-    // The watchdog bounds the listener setup, so a hung setup still reaches the
-    // owning test instead of rejecting with nobody observing it.
-    listener = await Promise.race([heldListener(), guard.promise]);
-    const pending = sendWithClock(clock, transport, `http://127.0.0.1:${listener.port}`, {
-      path: "/",
-      deadlineMs,
-    });
-    // Observe the request promise at creation, so an early request error cannot
-    // surface as an unhandled rejection while the test waits for delivery.
-    pending.catch(() => undefined);
-    await Promise.race([until(() => listener!.held() !== null, "the listener held its reply open"), guard.promise]);
-    // Advance to the deadline without firing the armed timer, then send a
-    // complete, correctly sized reply; the end handler must reject it.
-    clock.advance(deadlineMs);
-    const reply = listener!.held()!;
-    reply.writeHead(200, { "content-length": "2", "content-type": "text/plain" });
-    reply.end("ok");
-    await Promise.race([
-      assert.rejects(pending, new RegExp(`the reply ended after the ${deadlineMs} ms deadline`), "an end after the deadline fails at the end handler"),
-      guard.promise,
-    ]);
-    assert.equal(clock.armed().length, 0, "settlement cleared the armed deadline timer");
-  } finally {
-    guard.clear();
-    transport.close();
-    if (listener !== null) await listener.close();
-  }
-});
-
-// The early-firing regression: a timer that fires before the expiry must not
-// reject; it must rearm one replacement for the time still left, and the
-// replacement must reject at expiry with the missing-reply message.
-it("rearms an early-firing timer for the time still left and rejects at expiry", async () => {
-  const transport = keepAliveTransport();
-  const clock = new FakeClock();
-  const deadlineMs = 40;
-  let listener: HeldListener | null = null;
-  const guard = watchdog(5000, "the early-firing scenario did not finish");
-  try {
-    // The watchdog bounds the listener setup, so a hung setup still reaches the
-    // owning test instead of rejecting with nobody observing it.
-    listener = await Promise.race([heldListener(), guard.promise]);
-    const pending = sendWithClock(clock, transport, `http://127.0.0.1:${listener.port}`, {
-      path: "/",
-      deadlineMs,
-    });
-    // Observe the request promise at creation, so an early request error cannot
-    // surface as an unhandled rejection while the test waits for delivery.
-    pending.catch(() => undefined);
-    await Promise.race([until(() => listener!.held() !== null, "the listener held its reply open"), guard.promise]);
-    assert.equal(clock.armed().length, 1, "the deadline arms exactly one timer");
-    // Fire the armed timer at 25 of the 40 ms deadline: it has not expired,
-    // so it must rearm one replacement for the remaining 15 ms.
-    clock.advance(25);
-    clock.fireFirst();
-    const rearmed = clock.armed();
-    assert.equal(rearmed.length, 1, "an early firing arms exactly one replacement timer");
-    assert.equal(rearmed[0].due - clock.now(), deadlineMs - 25, "the replacement waits for the time still left");
-    // Fire the replacement at expiry; the missing reply must be rejected.
-    clock.advance(deadlineMs - 25);
-    clock.fireFirst();
-    await Promise.race([
-      assert.rejects(pending, new RegExp(`no reply within ${deadlineMs} ms`), "an expired missing reply is rejected at expiry"),
-      guard.promise,
-    ]);
-  } finally {
-    guard.clear();
-    transport.close();
-    if (listener !== null) await listener.close();
-  }
-});
-
-/** Wait until `ready` holds, yielding to the event loop between checks. */
-async function until(ready: () => boolean, why: string): Promise<void> {
-  const limit = performance.now() + 5000;
-  while (!ready()) {
-    assert.ok(performance.now() < limit, `timed out waiting until ${why}`);
-    await new Promise((resolve) => setImmediate(resolve));
-  }
 }
 
 // ---------------------------------------------------------------------------
