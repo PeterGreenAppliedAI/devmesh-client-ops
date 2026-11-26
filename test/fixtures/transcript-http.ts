@@ -438,7 +438,7 @@ export function send(transport: Transport, base: string, options: SendOptions): 
             return;
           }
           fail(timeoutError());
-        });
+        }, remaining);
         return true;
       };
       // A budget exhausted during construction fails before any body is copied

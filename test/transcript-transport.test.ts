@@ -245,22 +245,24 @@ function testListener(
   onRequest: (req: import("node:http").IncomingMessage, res: ServerResponse) => void,
 ): TestListener {
   const listener = createServer(onRequest);
-  let binding = true;
+  let bindState: "pending" | "listening" | "failed" = "pending";
+  let bindError: Error | null = null;
   let lateError: Error | null = null;
   // Settles once with the bind outcome: null for success, the error otherwise.
   const outcome = new Promise<Error | null>((resolve) => {
     listener.on("error", (error: Error) => {
-      if (binding) {
-        binding = false;
+      if (bindState === "pending") {
+        bindState = "failed";
+        bindError = error;
         resolve(error);
-      } else {
-        // Keep the handler installed so this is reported by `close` instead of
-        // disappearing into a bind promise that has already settled.
+      } else if (bindState === "listening") {
+        // Keep the handler installed so a later server error is reported by
+        // `close` instead of disappearing into an already-settled bind promise.
         lateError = error;
       }
     });
     listener.listen(0, "127.0.0.1", () => {
-      binding = false;
+      bindState = "listening";
       resolve(null);
     });
   });
@@ -280,10 +282,28 @@ function testListener(
       return address.port;
     },
     async close() {
-      // Wait for the bind outcome before closing: a bind still pending, or one
-      // that failed after the watchdog won, is owned here.
-      const bindError = await outcome;
-      if (bindError !== null) throw bindError;
+      if (bindState === "pending") {
+        // Do not wait for a bind that has not settled: close cancels the
+        // outstanding listen, so a stalled bind cannot hold up the failure the
+        // watchdog is about to report. Node reports ERR_SERVER_NOT_RUNNING for
+        // a close of a server that never started listening; that cancellation is
+        // expected here. A bind that failed while closing is still reported.
+        let closeError: unknown = null;
+        try {
+          await new Promise<void>((resolve, reject) => {
+            listener.close((error) => (error ? reject(error) : resolve()));
+          });
+        } catch (error) {
+          closeError = error;
+        }
+        // The bind may have failed while the close was cancelling it.
+        if (bindError !== null) throw bindError;
+        if (closeError !== null && (closeError as { code?: string }).code !== "ERR_SERVER_NOT_RUNNING") {
+          throw closeError;
+        }
+        return;
+      }
+      if (bindState === "failed") throw bindError ?? new Error("the listener failed to bind");
       let closeError: unknown = null;
       try {
         await new Promise<void>((resolve, reject) => {
@@ -414,13 +434,16 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       });
     });
     try {
-      await Promise.race([listener.ready, guard.promise]);
-      const pending = send(transport, `http://127.0.0.1:${listener.port()}`, { path: "/", responseCap: 1 });
-      // Attach the rejection handler before any await, and observe the
-      // assertion at creation so a watchdog win cannot leave it unhandled.
+      // The request is readiness-dependent, but its rejection handler is
+      // attached before this test yields, and the watchdog bounds the setup
+      // wait as well as the request itself.
+      const pending = listener.ready.then(() =>
+        send(transport, `http://127.0.0.1:${listener.port()}`, { path: "/", responseCap: 1 }),
+      );
       const expected = assert.rejects(pending, /exceeded the 1-byte cap/, "a reply over the cap fails instead of being buffered unbounded");
+      // Observe the assertion at creation so a watchdog win cannot leave it unhandled.
       expected.catch(() => undefined);
-      await Promise.race([expected, guard.promise]);
+      await Promise.race([Promise.all([listener.ready, expected]), guard.promise]);
     } finally {
       guard.clear();
       transport.close();
@@ -513,17 +536,25 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
         held.response = res;
       });
     });
+    let startedAt = 0;
     try {
-      // The listener is created and bound before this await; its close is
-      // registered in the finally below, so a bind that succeeds late still has
-      // a teardown owner.
-      await Promise.race([listener.ready, guard.promise]);
-      const pending = send(transport, `http://127.0.0.1:${listener.port()}`, { path: "/", deadlineMs: 40 });
-      // Attach the rejection handler before any await, and observe the
-      // assertion at creation so a watchdog win cannot leave it unhandled.
+      // The listener is created before this await; its close is registered in
+      // the finally below, so a bind that succeeds late still has a teardown
+      // owner. The request is readiness-dependent, but its rejection handler is
+      // attached before this test yields, and the watchdog bounds the setup wait
+      // as well as the request itself.
+      const pending = listener.ready.then(() => {
+        startedAt = performance.now();
+        return send(transport, `http://127.0.0.1:${listener.port()}`, { path: "/", deadlineMs: 40 });
+      });
       const expected = assert.rejects(pending, /no reply within 40 ms/, "a held-open reply is failed by the deadline");
+      // Observe the assertion at creation so a watchdog win cannot leave it unhandled.
       expected.catch(() => undefined);
-      await Promise.race([expected, guard.promise]);
+      await Promise.race([Promise.all([listener.ready, expected]), guard.promise]);
+      // The rejection must come from the real clock, not merely carry the
+      // timeout message: the whole 40 ms budget must have elapsed.
+      const elapsed = performance.now() - startedAt;
+      assert.ok(elapsed >= 40, `the deadline held for its full 40 ms budget: ${elapsed.toFixed(1)} ms`);
     } finally {
       guard.clear();
       transport.close();
