@@ -535,7 +535,13 @@ function parseReplies(bytes: Buffer): { readonly replies: Reply[]; readonly comp
       if (at <= 0) return { replies, complete: false };
       const name = line.slice(0, at);
       if (!HEADER_NAME.test(name)) return { replies, complete: false };
-      headers[name.toLowerCase()] = line.slice(at + 1).trim();
+      const value = line.slice(at + 1).trim();
+      // A truncated header line can run into the next reply's status line,
+      // making that status line the value of this header. The later reply then
+      // supplies the same header name and overwrites this evidence, so reject
+      // any header value that carries a status line before counting the reply.
+      if (/HTTP\/1\.[01]\s+\d{3}/.test(value)) return { replies, complete: false };
+      headers[name.toLowerCase()] = value;
     }
     const declared = headers["content-length"];
     if (declared === undefined || !/^\d+$/.test(declared)) return { replies, complete: false };
