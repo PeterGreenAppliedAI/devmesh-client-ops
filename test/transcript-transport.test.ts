@@ -25,8 +25,6 @@ import { openStore, type Snapshot, type Store } from "../src/store.ts";
 import { ORIGINALS_DIRECTORY } from "../src/transcript-files.ts";
 import {
   BOUNDARY,
-  deadlineOrderRegression,
-  earlyFiringRegression,
   keepAliveTransport,
   MULTIPART_TYPE,
   send,
@@ -397,11 +395,20 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
         held = res;
       });
     });
+    // The watchdog is retained so its timer is cleared on every exit, and its
+    // rejection is observed at creation so it never surfaces unhandled.
+    let watchdogHandle: ReturnType<typeof setTimeout> | null = null;
     const guard = new Promise<never>((_, reject) => {
-      setTimeout(() => reject(new Error("watchdog: the held-reply scenario did not finish")), 5000);
+      watchdogHandle = setTimeout(() => reject(new Error("watchdog: the held-reply scenario did not finish")), 5000);
     });
+    guard.catch(() => undefined);
     try {
-      await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", () => resolve()));
+      // Race the setup against the watchdog, so a hung listen still reaches the
+      // test instead of waiting forever.
+      await Promise.race([
+        new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", () => resolve())),
+        guard,
+      ]);
       const port = (listener.address() as { port: number }).port;
       await Promise.race([
         assert.rejects(
@@ -412,6 +419,10 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
         guard,
       ]);
     } finally {
+      if (watchdogHandle !== null) {
+        clearTimeout(watchdogHandle);
+        watchdogHandle = null;
+      }
       transport.close();
       // Close the held response before the listener, so no socket outlives it.
       (held as import("node:http").ServerResponse | null)?.destroy();
@@ -421,11 +432,8 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
     }
   });
 
-  // The fixture's two fixed deadline-order regressions, registered here so the
-  // private fake clock and the clock-taking request path are exercised without
-  // exposing scheduler control to fixture callers.
-  deadlineOrderRegression();
-  earlyFiringRegression();
+  // The fixture registers its two fixed deadline-order regressions itself when
+  // it is imported; they need no call here.
 
   it("fails a request Node cannot construct without leaving a deadline behind", async () => {
     const transport = keepAliveTransport();
