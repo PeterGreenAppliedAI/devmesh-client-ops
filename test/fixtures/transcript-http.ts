@@ -508,7 +508,7 @@ const STATUS_LINE = /^HTTP\/1\.[01] ([1-5]\d\d)(?: [^\r\n]*)?$/;
 const HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 
 /** One Connection field value: comma-separated connection-option tokens. */
-const CONNECTION_VALUE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+(?:\s*,\s*[!#$%&'*+\-.^_`|~0-9A-Za-z]+)*$/;
+const CONNECTION_VALUE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+(?:[ \t]*,[ \t]*[!#$%&'*+\-.^_`|~0-9A-Za-z]+)*$/;
 
 /**
  * Parse every complete Content-Length-framed reply in the received bytes. The
@@ -519,10 +519,18 @@ const CONNECTION_VALUE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+(?:\s*,\s*[!#$%&'*+\-.^_`
  * cannot be ignored and absorbed into an otherwise valid reply.
  *
  * Content-Length fields must agree before a reply is counted, so conflicting
- * framing is never resolved by the last header line. Connection fields are
- * validated as comma-separated option tokens; this rejects a truncated header
- * whose value absorbed the next reply's status line, while leaving unrelated
- * header values (which may legally contain status-line-looking text) alone.
+ * framing is never resolved by the last header line. Any Transfer-Encoding is
+ * rejected because this reader frames replies by Content-Length only.
+ * Connection fields are validated as comma-separated option tokens; this
+ * rejects a truncated header whose value absorbed the next reply's status line,
+ * while leaving unrelated header values (which may legally contain
+ * status-line-looking text) alone.
+ *
+ * Field values are validated raw, before any permitted whitespace is removed,
+ * and only space and horizontal tab count as HTTP whitespace. The collected
+ * fields and the returned headers use prototype-free objects, so a legal field
+ * name such as `constructor` is stored as data rather than an inherited
+ * property.
  */
 function parseReplies(bytes: Buffer): { readonly replies: Reply[]; readonly complete: boolean } {
   const replies: Reply[] = [];
@@ -538,17 +546,21 @@ function parseReplies(bytes: Buffer): { readonly replies: Reply[]; readonly comp
     const statusMatch = STATUS_LINE.exec(statusLine);
     if (statusMatch === null) return { replies, complete: false };
     const status = Number(statusMatch[1]);
-    const headers: Record<string, string> = {};
-    const fields: Record<string, string[]> = {};
+    const headers: Record<string, string> = Object.create(null);
+    const fields: Record<string, string[]> = Object.create(null);
     for (const line of lines.slice(1)) {
       const at = line.indexOf(":");
       if (at <= 0) return { replies, complete: false };
       const name = line.slice(0, at);
       if (!HEADER_NAME.test(name)) return { replies, complete: false };
-      const value = line.slice(at + 1).trim();
-      if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(value)) {
+      // Validate the received value before removing permitted HTTP whitespace:
+      // CR, LF, DEL and the other controls are never legal in a header value.
+      const rawValue = line.slice(at + 1);
+      if (/[\u0000-\u0008\u000A-\u001F\u007F]/.test(rawValue)) {
         return { replies, complete: false };
       }
+      // Only space and horizontal tab are HTTP whitespace; strip just those.
+      const value = rawValue.replace(/^[ \t]+|[ \t]+$/g, "");
       const lower = name.toLowerCase();
       if (lower === "connection" && !CONNECTION_VALUE.test(value)) {
         return { replies, complete: false };
@@ -556,12 +568,15 @@ function parseReplies(bytes: Buffer): { readonly replies: Reply[]; readonly comp
       (fields[lower] ??= []).push(value);
       headers[lower] = value;
     }
+    // This reader frames replies by Content-Length only, so any transfer coding
+    // is conflicting framing and cannot complete a reply.
+    if (fields["transfer-encoding"] !== undefined) return { replies, complete: false };
     const lengths = fields["content-length"];
     if (lengths === undefined) return { replies, complete: false };
     let length: number | null = null;
     for (const field of lengths) {
       for (const part of field.split(",")) {
-        const text = part.trim();
+        const text = part.replace(/^[ \t]+|[ \t]+$/g, "");
         if (!/^\d+$/.test(text)) return { replies, complete: false };
         const value = Number(text);
         if (!Number.isSafeInteger(value) || value < 0) return { replies, complete: false };

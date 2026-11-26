@@ -645,6 +645,144 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
     }
   });
 
+  it("counts a complete staged reply with a legal constructor header", async () => {
+    const listener = testListener((req) => {
+      req.resume();
+      // `constructor` is a legal header field name. It must be stored as data,
+      // not confused with a property inherited by a plain object.
+      req.socket.write(
+        "HTTP/1.1 413 Payload Too Large\r\n" +
+          "content-length: 9\r\n" +
+          "content-type: text/plain\r\n" +
+          "cache-control: no-store\r\n" +
+          "connection: close\r\n" +
+          "constructor: data\r\n\r\n" +
+          "too large",
+      );
+      req.socket.end();
+    });
+    const guard = watchdog(5000, "the constructor-header staged reply did not finish");
+    try {
+      const pending = listener.ready.then(() =>
+        sendStaged(`http://127.0.0.1:${listener.port()}`, {
+          path: "/",
+          contentType: "text/plain",
+          declaredLength: 0,
+        }),
+      );
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assert.equal(exchange.replies.length, 1, "the reply with a legal constructor header is counted once");
+      const reply = exchange.replies[0]!;
+      assert.equal(reply.headers["constructor"], "data", "the constructor header value is stored as data");
+      assert.equal(Object.getPrototypeOf(reply.headers), null, "the returned headers use prototype-free storage");
+      assert.equal(reply.body, "too large", "the counted reply carries its declared body");
+    } finally {
+      guard.clear();
+      await listener.close();
+    }
+  });
+
+  it("rejects a staged reply that declares Transfer-Encoding alongside Content-Length", async () => {
+    const listener = testListener((req) => {
+      req.resume();
+      // This reader frames replies by Content-Length only, so a transfer coding
+      // is conflicting framing even when the declared length matches the body.
+      req.socket.write(
+        "HTTP/1.1 413 Payload Too Large\r\n" +
+          "content-length: 9\r\n" +
+          "transfer-encoding: chunked\r\n" +
+          "content-type: text/plain\r\n" +
+          "cache-control: no-store\r\n" +
+          "connection: close\r\n\r\n" +
+          "too large",
+      );
+      req.socket.end();
+    });
+    const guard = watchdog(5000, "the transfer-framed staged reply did not finish");
+    try {
+      const pending = listener.ready.then(() =>
+        sendStaged(`http://127.0.0.1:${listener.port()}`, {
+          path: "/",
+          contentType: "text/plain",
+          declaredLength: 0,
+        }),
+      );
+      const expected = assert.rejects(pending, /truncated reply/, "conflicting transfer framing cannot complete a reply");
+      expected.catch(() => undefined);
+      await Promise.race([Promise.all([listener.ready, expected]), guard.promise]);
+    } finally {
+      guard.clear();
+      await listener.close();
+    }
+  });
+
+  it("rejects a staged reply whose header value carries a bare carriage return", async () => {
+    const listener = testListener((req) => {
+      req.resume();
+      // A bare CR inside a field value is a control character, not line framing.
+      req.socket.write(
+        "HTTP/1.1 413 Payload Too Large\r\n" +
+          "content-length: 9\r\n" +
+          "x-diagnostic: before\rafter\r\n" +
+          "content-type: text/plain\r\n" +
+          "cache-control: no-store\r\n" +
+          "connection: close\r\n\r\n" +
+          "too large",
+      );
+      req.socket.end();
+    });
+    const guard = watchdog(5000, "the bare-carriage-return staged reply did not finish");
+    try {
+      const pending = listener.ready.then(() =>
+        sendStaged(`http://127.0.0.1:${listener.port()}`, {
+          path: "/",
+          contentType: "text/plain",
+          declaredLength: 0,
+        }),
+      );
+      const expected = assert.rejects(pending, /truncated reply/, "a bare carriage return cannot complete a reply");
+      expected.catch(() => undefined);
+      await Promise.race([Promise.all([listener.ready, expected]), guard.promise]);
+    } finally {
+      guard.clear();
+      await listener.close();
+    }
+  });
+
+  it("rejects a staged reply whose Content-Length value carries a bare line feed", async () => {
+    const listener = testListener((req) => {
+      req.resume();
+      // The bare LF before the digits must not be stripped and counted as a
+      // valid length; it is a control character in the raw field value.
+      req.socket.write(
+        "HTTP/1.1 413 Payload Too Large\r\n" +
+          "content-length: \n9\r\n" +
+          "content-type: text/plain\r\n" +
+          "cache-control: no-store\r\n" +
+          "connection: close\r\n\r\n" +
+          "too large",
+      );
+      req.socket.end();
+    });
+    const guard = watchdog(5000, "the bare-line-feed staged reply did not finish");
+    try {
+      const pending = listener.ready.then(() =>
+        sendStaged(`http://127.0.0.1:${listener.port()}`, {
+          path: "/",
+          contentType: "text/plain",
+          declaredLength: 0,
+        }),
+      );
+      const expected = assert.rejects(pending, /truncated reply/, "a bare line feed in a length cannot complete a reply");
+      expected.catch(() => undefined);
+      await Promise.race([Promise.all([listener.ready, expected]), guard.promise]);
+    } finally {
+      guard.clear();
+      await listener.close();
+    }
+  });
+
   it("rejects a staged reply whose Content-Length fields conflict before counting it", async () => {
     const listener = testListener((req) => {
       req.resume();
