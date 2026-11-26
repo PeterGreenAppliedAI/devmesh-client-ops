@@ -507,6 +507,9 @@ const STATUS_LINE = /^HTTP\/1\.[01] ([1-5]\d\d)(?: [^\r\n]*)?$/;
 /** One valid HTTP header field-name token. */
 const HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 
+/** One Connection field value: comma-separated connection-option tokens. */
+const CONNECTION_VALUE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+(?:\s*,\s*[!#$%&'*+\-.^_`|~0-9A-Za-z]+)*$/;
+
 /**
  * Parse every complete Content-Length-framed reply in the received bytes. The
  * final reply's declared body must end at the final received byte; a partial
@@ -514,6 +517,12 @@ const HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
  * than silently returning the replies parsed before it. The status line and
  * every header line are validated strictly, so a malformed or concatenated line
  * cannot be ignored and absorbed into an otherwise valid reply.
+ *
+ * Content-Length fields must agree before a reply is counted, so conflicting
+ * framing is never resolved by the last header line. Connection fields are
+ * validated as comma-separated option tokens; this rejects a truncated header
+ * whose value absorbed the next reply's status line, while leaving unrelated
+ * header values (which may legally contain status-line-looking text) alone.
  */
 function parseReplies(bytes: Buffer): { readonly replies: Reply[]; readonly complete: boolean } {
   const replies: Reply[] = [];
@@ -530,22 +539,37 @@ function parseReplies(bytes: Buffer): { readonly replies: Reply[]; readonly comp
     if (statusMatch === null) return { replies, complete: false };
     const status = Number(statusMatch[1]);
     const headers: Record<string, string> = {};
+    const fields: Record<string, string[]> = {};
     for (const line of lines.slice(1)) {
       const at = line.indexOf(":");
       if (at <= 0) return { replies, complete: false };
       const name = line.slice(0, at);
       if (!HEADER_NAME.test(name)) return { replies, complete: false };
       const value = line.slice(at + 1).trim();
-      // A truncated header line can run into the next reply's status line,
-      // making that status line the value of this header. The later reply then
-      // supplies the same header name and overwrites this evidence, so reject
-      // any header value that carries a status line before counting the reply.
-      if (/HTTP\/1\.[01]\s+\d{3}/.test(value)) return { replies, complete: false };
-      headers[name.toLowerCase()] = value;
+      if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(value)) {
+        return { replies, complete: false };
+      }
+      const lower = name.toLowerCase();
+      if (lower === "connection" && !CONNECTION_VALUE.test(value)) {
+        return { replies, complete: false };
+      }
+      (fields[lower] ??= []).push(value);
+      headers[lower] = value;
     }
-    const declared = headers["content-length"];
-    if (declared === undefined || !/^\d+$/.test(declared)) return { replies, complete: false };
-    const length = Number(declared);
+    const lengths = fields["content-length"];
+    if (lengths === undefined) return { replies, complete: false };
+    let length: number | null = null;
+    for (const field of lengths) {
+      for (const part of field.split(",")) {
+        const text = part.trim();
+        if (!/^\d+$/.test(text)) return { replies, complete: false };
+        const value = Number(text);
+        if (!Number.isSafeInteger(value) || value < 0) return { replies, complete: false };
+        if (length === null) length = value;
+        else if (length !== value) return { replies, complete: false };
+      }
+    }
+    if (length === null) return { replies, complete: false };
     const bodyStart = headEnd + 4;
     if (bytes.length < bodyStart + length) return { replies, complete: false };
     replies.push(replyFrom(status, headers, bytes.subarray(bodyStart, bodyStart + length)));

@@ -607,6 +607,78 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
     }
   });
 
+  it("counts a complete staged reply whose optional header value mentions a status line", async () => {
+    const listener = testListener((req) => {
+      req.resume();
+      // An unrelated header value may legally mention a status line; it must
+      // not make the parser reject an otherwise complete, correctly framed 413.
+      req.socket.write(
+        "HTTP/1.1 413 Payload Too Large\r\n" +
+          "content-length: 9\r\n" +
+          "content-type: text/plain\r\n" +
+          "cache-control: no-store\r\n" +
+          "connection: close\r\n" +
+          "X-Diagnostic: upstream returned HTTP/1.1 200 OK\r\n\r\n" +
+          "too large",
+      );
+      req.socket.end();
+    });
+    const guard = watchdog(5000, "the complete staged reply did not finish");
+    try {
+      const pending = listener.ready.then(() =>
+        sendStaged(`http://127.0.0.1:${listener.port()}`, {
+          path: "/",
+          contentType: "text/plain",
+          declaredLength: 0,
+        }),
+      );
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assert.equal(exchange.replies.length, 1, "the reply with an unrelated diagnostic header is counted once");
+      const reply = exchange.replies[0]!;
+      assert.equal(reply.status, 413, "the counted reply is a 413");
+      assert.equal(reply.headers["x-diagnostic"], "upstream returned HTTP/1.1 200 OK", "the diagnostic header value is preserved");
+      assert.equal(reply.body, "too large", "the counted reply carries its declared body");
+    } finally {
+      guard.clear();
+      await listener.close();
+    }
+  });
+
+  it("rejects a staged reply whose Content-Length fields conflict before counting it", async () => {
+    const listener = testListener((req) => {
+      req.resume();
+      // The last Content-Length agrees with the body, but the earlier field does
+      // not: overwriting the earlier field would wrongly count this reply.
+      req.socket.write(
+        "HTTP/1.1 413 Payload Too Large\r\n" +
+          "content-length: 10\r\n" +
+          "content-length: 9\r\n" +
+          "content-type: text/plain\r\n" +
+          "cache-control: no-store\r\n" +
+          "connection: close\r\n\r\n" +
+          "too large",
+      );
+      req.socket.end();
+    });
+    const guard = watchdog(5000, "the conflicting staged reply did not finish");
+    try {
+      const pending = listener.ready.then(() =>
+        sendStaged(`http://127.0.0.1:${listener.port()}`, {
+          path: "/",
+          contentType: "text/plain",
+          declaredLength: 0,
+        }),
+      );
+      const expected = assert.rejects(pending, /truncated reply/, "conflicting Content-Length fields cannot complete a reply");
+      expected.catch(() => undefined);
+      await Promise.race([Promise.all([listener.ready, expected]), guard.promise]);
+    } finally {
+      guard.clear();
+      await listener.close();
+    }
+  });
+
   it("commits two exact-limit imports sequentially, the second chunked, and reuses one socket for each health read", async () => {
     const runningFixture = await running();
     const transport = keepAliveTransport();
