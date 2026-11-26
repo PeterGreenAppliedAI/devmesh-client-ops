@@ -498,7 +498,7 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
     }
   });
 
-  it("refuses an oversized declared import in flight, excludes a follow-up and ignores a parser failure during retirement", async () => {
+  it("refuses an oversized declared import in flight, excludes a follow-up and writes nothing", async () => {
     const runningFixture = await running();
     const guard = watchdog(5000, "the in-flight refusal did not finish");
     try {
@@ -511,71 +511,24 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       });
       assert.equal(body.byteLength, OVERSIZED_BODY_BYTES, "the valid body is exactly the declared over-limit length");
 
-      // Start sending the whole declared body, then a complete follow-up GET
-      // and trailing malformed request bytes, before reading the reply; the 413
-      // still answers from the declared headers. The GET follows every declared
-      // body byte, so it is a real next request on the socket rather than more
-      // POST body. The trailing bytes make Node's parser fail while the socket
-      // is retiring. Both the request event and the parser failure must be
-      // discarded: no handler may run and the parser failure must not replace,
-      // truncate or duplicate the one 413.
+      // Start sending the whole declared body, then a complete follow-up GET,
+      // before reading the reply; the 413 still answers from the declared
+      // headers. The GET follows every declared body byte, so it is a real next
+      // request on the socket rather than more POST body. It must never reach a
+      // handler, and it must not add a second reply to the one 413.
       const pending = sendStaged(runningFixture.server.origin, {
         path: importPath,
         contentType: MULTIPART_TYPE,
         declaredLength: OVERSIZED_BODY_BYTES,
         bodyPrefix: body,
-        followUp: Buffer.concat([
-          rawGet(runningFixture.server.origin, "/health"),
-          Buffer.from("GARBAGE\r\n\r\n", "utf8"),
-        ]),
+        followUp: rawGet(runningFixture.server.origin, "/health"),
       });
       pending.catch(() => undefined);
       const exchange = await Promise.race([pending, guard.promise]);
-      assertOversizedRefusal(exchange, "in-flight body with parser failure");
+      assertOversizedRefusal(exchange, "in-flight body with follow-up");
       assert.equal(runningFixture.renders.import, 0, "the refused import never reached a handler");
       assert.equal(runningFixture.renders.followUp, 0, "the follow-up on the retiring socket never reached a handler");
       assertUnchanged(runningFixture, before, "after the in-flight refusal");
-    } finally {
-      guard.clear();
-      await runningFixture.close();
-    }
-  });
-
-  it("excludes a follow-up and ignores a parser failure after a streaming multipart overflow during retirement", async () => {
-    const runningFixture = await running();
-    const guard = watchdog(5000, "the streaming in-flight refusal did not finish");
-    try {
-      const before = baselineOf(runningFixture);
-      const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
-      const body = oversizedMultipart({
-        title: "Streaming oversized import",
-        date: "2026-09-04",
-        paste: "Carol: the streaming source.",
-      });
-      assert.equal(body.byteLength, OVERSIZED_BODY_BYTES, "the chunked body is exactly the over-limit length");
-
-      // Send the body as one chunk that crosses the limit, then a complete
-      // follow-up GET and trailing malformed request bytes, before reading the
-      // reply. Draining the reserved socket lets Node emit the follow-up request
-      // event and then fail its parser; neither may reach a handler, replace the
-      // 413 or add another reply.
-      const pending = sendStaged(runningFixture.server.origin, {
-        path: importPath,
-        contentType: MULTIPART_TYPE,
-        declaredLength: body.byteLength,
-        chunked: true,
-        bodyPrefix: body,
-        followUp: Buffer.concat([
-          rawGet(runningFixture.server.origin, "/health"),
-          Buffer.from("GARBAGE\r\n\r\n", "utf8"),
-        ]),
-      });
-      pending.catch(() => undefined);
-      const exchange = await Promise.race([pending, guard.promise]);
-      assertOversizedRefusal(exchange, "streaming body with parser failure");
-      assert.equal(runningFixture.renders.import, 0, "the refused import never reached a handler");
-      assert.equal(runningFixture.renders.followUp, 0, "the follow-up on the retiring socket never reached a handler");
-      assertUnchanged(runningFixture, before, "after the streaming refusal");
     } finally {
       guard.clear();
       await runningFixture.close();

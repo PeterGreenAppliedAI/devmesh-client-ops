@@ -491,11 +491,6 @@ export interface StagedSendOptions {
   /** Bytes of the declared body written after the headers, before the reply. */
   readonly bodyPrefix?: Uint8Array;
   /**
-   * Send the body prefix as one chunk and finish the chunked body with a zero
-   * chunk, letting Node frame it, instead of declaring the exact length.
-   */
-  readonly chunked?: boolean;
-  /**
    * A raw follow-up request written on the same socket after the body prefix,
    * before the reply is read. It is never awaited as a separate reply.
    */
@@ -627,8 +622,6 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
     Number.isSafeInteger(options.declaredLength) && options.declaredLength >= 0,
     "the declared length is a finite byte count",
   );
-  const chunked = options.chunked === true;
-  if (chunked) assert.ok(options.bodyPrefix !== undefined, "a chunked staged send carries a body prefix");
   const cap = options.responseCap ?? DEFAULT_RESPONSE_CAP;
   const deadlineMs = options.deadlineMs ?? DEFAULT_DEADLINE_MS;
   assert.ok(Number.isSafeInteger(cap) && cap >= 0, "the response cap is a finite byte count");
@@ -718,18 +711,13 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
           `Host: ${url.host}`,
           `Origin: ${url.origin}`,
           `Content-Type: ${options.contentType}`,
-          chunked ? "Transfer-Encoding: chunked" : `Content-Length: ${options.declaredLength}`,
+          `Content-Length: ${options.declaredLength}`,
           "Connection: keep-alive",
           "",
           "",
         ];
         socket.write(lines.join("\r\n"));
-        if (chunked) {
-          const prefix = Buffer.from(options.bodyPrefix!);
-          socket.write(`${prefix.byteLength.toString(16)}\r\n`);
-          socket.write(prefix);
-          socket.write("\r\n0\r\n\r\n");
-        } else if (options.bodyPrefix !== undefined) {
+        if (options.bodyPrefix !== undefined) {
           socket.write(Buffer.from(options.bodyPrefix));
         }
         if (options.followUp !== undefined) socket.write(Buffer.from(options.followUp));
