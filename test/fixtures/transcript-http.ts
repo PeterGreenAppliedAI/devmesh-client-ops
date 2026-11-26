@@ -10,7 +10,13 @@
  */
 
 import assert from "node:assert/strict";
-import { request as httpRequest } from "node:http";
+import {
+  Agent,
+  createServer,
+  request as httpRequest,
+  type ClientRequest,
+  type IncomingMessage,
+} from "node:http";
 
 /** The boundary the helper uses for every submitted multipart body. */
 export const BOUNDARY = "transcript-library-boundary";
@@ -27,14 +33,48 @@ export interface Reply {
   readonly body: string;
 }
 
+/**
+ * A reply read by the bounded helper: the legacy reply fields plus the client
+ * socket's local port, captured while that socket was attached to the reply.
+ * Two sequential requests served by one kept-alive socket report the same port,
+ * so a reconnect would show up as a different one. Only the bounded helper
+ * observes the port; the legacy helpers keep their four-field `Reply`.
+ */
+interface TransportReply extends Reply {
+  readonly localPort: number;
+}
+
 /** The application base URL's origin, for the origin checks. */
 function originOf(base: string): URL {
   return new URL(base);
 }
 
-/** A reply body decoded as a string; text is UTF-8 in this application. */
-function replyFrom(status: number, headers: Record<string, string | string[] | undefined>, bytes: Buffer): Reply {
+/**
+ * The local port of a reply's socket, which the socket exposes while attached.
+ * Returns null when the socket or its port is unavailable.
+ */
+function localPortOf(res: IncomingMessage): number | null {
+  const port = res.socket?.localPort;
+  return typeof port === "number" && Number.isInteger(port) && port > 0 ? port : null;
+}
+
+/** A legacy reply: its status, headers and raw body bytes, with no port. */
+function replyFrom(
+  status: number,
+  headers: Record<string, string | string[] | undefined>,
+  bytes: Buffer,
+): Reply {
   return { status, headers, bytes, body: bytes.toString("utf8") };
+}
+
+/** A bounded reply: the legacy fields plus the captured local port. */
+function transportReplyFrom(
+  status: number,
+  headers: Record<string, string | string[] | undefined>,
+  bytes: Buffer,
+  localPort: number,
+): TransportReply {
+  return { ...replyFrom(status, headers, bytes), localPort };
 }
 
 /**
@@ -94,7 +134,9 @@ export function get(base: string, path: string): Promise<Reply> {
       (res) => {
         const chunks: Buffer[] = [];
         res.on("data", (chunk: Buffer) => chunks.push(chunk));
-        res.on("end", () => resolve(replyFrom(res.statusCode ?? 0, res.headers, Buffer.concat(chunks))));
+        res.on("end", () => {
+          resolve(replyFrom(res.statusCode ?? 0, res.headers, Buffer.concat(chunks)));
+        });
         res.on("error", reject);
       },
     );
@@ -127,12 +169,301 @@ function postBytes(
       (res) => {
         const chunks: Buffer[] = [];
         res.on("data", (chunk: Buffer) => chunks.push(chunk));
-        res.on("end", () => resolve(replyFrom(res.statusCode ?? 0, res.headers, Buffer.concat(chunks))));
+        res.on("end", () => {
+          resolve(replyFrom(res.statusCode ?? 0, res.headers, Buffer.concat(chunks)));
+        });
         res.on("error", reject);
       },
     );
     req.on("error", reject);
     req.end(body);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Bounded kept-alive requests
+// ---------------------------------------------------------------------------
+
+/** Node's largest supported timer delay, in milliseconds. */
+const MAX_TIMEOUT_MS = 2_147_483_647;
+
+/** The default inclusive cap, in bytes, for a bounded reply body. */
+export const DEFAULT_RESPONSE_CAP = 8 * 1024 * 1024;
+
+/** The default deadline, in milliseconds, for a bounded request's whole life. */
+export const DEFAULT_DEADLINE_MS = 5000;
+
+/** One request the bounded helper sends; `body` makes it a POST. */
+export interface SendOptions {
+  /** `GET` (the default) or `POST`. */
+  readonly method?: "GET" | "POST";
+  /** A root-relative request target (its query included). */
+  readonly path: string;
+  /** The POST body's `Content-Type`; ignored for a bodyless GET. */
+  readonly contentType?: string;
+  /** The POST body; its exact bytes are sent. */
+  readonly body?: Uint8Array;
+  /**
+   * Send a POST body chunked, letting Node frame it, instead of declaring its
+   * exact `Content-Length`.
+   */
+  readonly chunked?: boolean;
+  /** The inclusive reply body cap; a larger reply fails the request. */
+  readonly responseCap?: number;
+  /** The deadline, from request creation through response end. */
+  readonly deadlineMs?: number;
+}
+
+/**
+ * A transport owning one `Agent` shared across sequential requests. The agent
+ * keeps sockets alive and pools at most one, so two sequential requests reuse
+ * the same connection instead of opening a second one.
+ */
+export interface Transport {
+  readonly agent: Agent;
+  /** Destroy the agent, releasing its kept-alive sockets. */
+  close(): void;
+}
+
+/** Create the shared keep-alive transport with at most one pooled socket. */
+export function keepAliveTransport(): Transport {
+  const agent = new Agent({ keepAlive: true, maxSockets: 1 });
+  return {
+    agent,
+    close() {
+      agent.destroy();
+    },
+  };
+}
+
+/** The declared reply length, which must be one finite decimal count. */
+function declaredLength(headers: Record<string, string | string[] | undefined>): number {
+  const value = headers["content-length"];
+  assert.equal(typeof value, "string", "the reply declares a single Content-Length header");
+  assert.match(value as string, /^\d+$/, "the reply's Content-Length is a decimal byte count");
+  const length = Number(value);
+  assert.ok(Number.isSafeInteger(length) && length >= 0, "the reply's Content-Length is a finite byte count");
+  return length;
+}
+
+/**
+ * Send one bounded request over a shared keep-alive transport.
+ *
+ * The reply is consumed to its end and read only through Node's HTTP parser: a
+ * reply body larger than the finite `responseCap` fails the request as it
+ * arrives, the response must be complete (`IncomingMessage.complete`) and the
+ * received byte count must equal the parsed `Content-Length` header. A missing
+ * reply, a premature close, a deadline expiry, a request or response error, an
+ * invalid length or a cap overflow rejects, and every exit clears the deadline
+ * and aborts outstanding I/O by destroying the request.
+ *
+ * The `Host` (and, for a POST, the `Origin`) is the listener's own authority,
+ * so the same-origin checks accept the request.
+ */
+export function send(transport: Transport, base: string, options: SendOptions): Promise<TransportReply> {
+  const url = originOf(base);
+  assert.ok(options.path.startsWith("/"), `the request target ${options.path} is root-relative`);
+  const method = options.method ?? "GET";
+  const chunked = options.chunked === true;
+  if (options.body !== undefined) assert.equal(method, "POST", "a request body is sent with POST");
+  if (chunked) assert.ok(options.body !== undefined, "a chunked request carries a body");
+  const cap = options.responseCap ?? DEFAULT_RESPONSE_CAP;
+  const deadlineMs = options.deadlineMs ?? DEFAULT_DEADLINE_MS;
+  // A monotonic expiry keeps the budget independent of wall-clock
+  // adjustments: the clock never steps, so a backward adjustment cannot
+  // extend the deadline and a forward one cannot exhaust it early.
+  const expiresAt = performance.now() + deadlineMs;
+  const timedOut = (): boolean => performance.now() >= expiresAt;
+  const timeoutError = (): Error => new Error(`no reply within ${deadlineMs} ms`);
+  assert.ok(Number.isSafeInteger(cap) && cap >= 0, "the response cap is a finite byte count");
+  // Node's timer stores its delay as a signed 32-bit integer and clamps a
+  // longer one to 1 ms, so a deadline above that range would fire at once
+  // instead of when asked. Refuse it rather than silently mis-time the run.
+  assert.ok(
+    Number.isSafeInteger(deadlineMs) && deadlineMs > 0 && deadlineMs <= MAX_TIMEOUT_MS,
+    `the deadline is a finite positive duration of at most ${MAX_TIMEOUT_MS} ms`,
+  );
+
+  const headers: Record<string, string> = { host: url.host };
+  if (method === "POST") headers.origin = url.origin;
+  if (options.contentType !== undefined) headers["content-type"] = options.contentType;
+  if (options.body !== undefined && !chunked) headers["content-length"] = String(options.body.byteLength);
+  if (options.body === undefined) headers["content-length"] = "0";
+
+  return new Promise<TransportReply>((resolve, reject) => {
+    let settled = false;
+    let seenResponse = false;
+    let response: IncomingMessage | null = null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const clearDeadline = (): void => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
+    const abort = (): void => {
+      response?.destroy();
+      request?.destroy();
+    };
+    const fail = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearDeadline();
+      abort();
+      reject(error);
+    };
+    const finish = (reply: TransportReply): void => {
+      if (settled) return;
+      settled = true;
+      clearDeadline();
+      resolve(reply);
+    };
+
+    // The monotonic deadline's expiry was fixed above, before construction, so
+    // synchronous construction time counts against the caller's whole-request
+    // budget. A construction error then rejects through `fail`, which tolerates
+    // a request that was never created and leaves no timer behind.
+    let request: ClientRequest;
+    try {
+      request = httpRequest(
+        {
+          host: url.hostname,
+          port: Number(url.port),
+          method,
+          path: options.path,
+          headers,
+          agent: transport.agent,
+        },
+        (res) => {
+          seenResponse = true;
+          response = res;
+          try {
+            // The port is read once, while the response's socket is attached. A
+            // socket without a usable port rejects through `fail`, so a reply is
+            // never resolved with a stale or invented port.
+            const localPort = localPortOf(res);
+            if (localPort === null) {
+              fail(new Error("the reply socket carries no positive local port"));
+              return;
+            }
+            const chunks: Buffer[] = [];
+            let received = 0;
+            let ended = false;
+            res.on("data", (chunk: Buffer) => {
+              if (settled) return;
+              received += chunk.byteLength;
+              if (received > cap) {
+                fail(new Error(`the reply body exceeded the ${cap}-byte cap`));
+                return;
+              }
+              chunks.push(chunk);
+            });
+            res.on("end", () => {
+              if (settled) return;
+              ended = true;
+              if (!res.complete) {
+                fail(new Error("the reply ended before its message was complete"));
+                return;
+              }
+              // An end dispatched after the deadline but before its timer
+              // callback still fails: the expiry is checked here as well, with
+              // its own message so a late end is distinguishable from a reply
+              // that never ended at all.
+              if (timedOut()) {
+                fail(new Error(`the reply ended after the ${deadlineMs} ms deadline`));
+                return;
+              }
+              try {
+                const declared = declaredLength(res.headers);
+                if (declared !== received) {
+                  fail(new Error(`the reply carried ${received} bytes but declared ${declared}`));
+                  return;
+                }
+                // Building the reply (including decoding the body as a string)
+                // is inside this try, so a throw here reaches `fail` and clears
+                // the deadline instead of escaping the event callback.
+                finish(transportReplyFrom(res.statusCode ?? 0, res.headers, Buffer.concat(chunks), localPort));
+              } catch (error) {
+                fail(error as Error);
+                return;
+              }
+            });
+            res.on("aborted", () => fail(new Error("the connection closed before the reply completed")));
+            res.on("error", (error: Error) => fail(error));
+            // A close before the reply's own end is a premature close.
+            res.on("close", () => {
+              if (!ended) fail(new Error("the connection closed before the reply completed"));
+            });
+          } catch (error) {
+            // A synchronous throw while attaching handlers still rejects through
+            // `fail`, which clears the deadline and aborts the request.
+            fail(error as Error);
+          }
+        },
+      );
+    } catch (error) {
+      // The request was never created: fail with no request to destroy, but the
+      // cleanup still tolerates it and no deadline was armed.
+      fail(error as Error);
+      return;
+    }
+    try {
+      request.on("error", (error: Error) => fail(error));
+      // A close without any response at all is a missing reply.
+      request.on("close", () => {
+        if (!seenResponse && !settled) fail(new Error("the connection closed with no reply"));
+      });
+
+      // The deadline spans the whole request: creation, the reply and its end.
+      // Construction already spent part of it, so only the remaining time is
+      // armed. A fractional remainder may schedule a timer that fires before
+      // the monotonic expiry, and a timer may be dispatched late; either way
+      // the callback re-checks the clock, so it only rejects when the expiry
+      // has truly passed and otherwise rearms for the time still left, directly
+      // from the callback before it returns. An end dispatched after the expiry
+      // is failed by the end handler above, with its own message, whether or
+      // not the timer has run yet.
+      const armDeadline = (): boolean => {
+        const remaining = expiresAt - performance.now();
+        if (remaining <= 0) {
+          fail(timeoutError());
+          return false;
+        }
+        timer = setTimeout(() => {
+          // The callback fires with `timer` still set, so a settlement that
+          // happens inside it still clears the timer the scheduler just ran.
+          if (!settled && !timedOut()) {
+            armDeadline();
+            return;
+          }
+          fail(timeoutError());
+        }, remaining);
+        return true;
+      };
+      // A budget exhausted during construction fails before any body is copied
+      // or written to the destroyed request.
+      if (!armDeadline()) return;
+
+      // A chunked body is written and then ended, so Node frames the body
+      // itself; any other body is sent with the declared length in `end()`.
+      // Re-check the deadline first: a long synchronous copy may have used the
+      // rest of the budget, and nothing more is written to the request then.
+      if (timedOut()) {
+        fail(timeoutError());
+        return;
+      }
+      if (options.body === undefined) {
+        request.end();
+      } else if (chunked) {
+        request.write(Buffer.from(options.body));
+        request.end();
+      } else {
+        request.end(Buffer.from(options.body));
+      }
+    } catch (error) {
+      fail(error as Error);
+    }
   });
 }
 
