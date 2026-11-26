@@ -17,6 +17,7 @@ import {
   type ClientRequest,
   type IncomingMessage,
 } from "node:http";
+import { createConnection } from "node:net";
 
 /** The boundary the helper uses for every submitted multipart body. */
 export const BOUNDARY = "transcript-library-boundary";
@@ -464,6 +465,192 @@ export function send(transport: Transport, base: string, options: SendOptions): 
     } catch (error) {
       fail(error as Error);
     }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Staged raw exchanges read through peer closure
+// ---------------------------------------------------------------------------
+
+/** One raw exchange: every byte read before the peer closed, and its replies. */
+export interface ClosedExchange {
+  readonly bytes: Buffer;
+  /** Every complete reply parsed from the bytes read through peer closure. */
+  readonly replies: readonly Reply[];
+  /** The client socket's local port, captured while it was connected. */
+  readonly localPort: number;
+}
+
+/** A staged POST whose body and follow-up bytes are written before the reply. */
+export interface StagedSendOptions {
+  /** A root-relative request target (its query included). */
+  readonly path: string;
+  readonly contentType: string;
+  /** The declared POST body length; no body is required for the server's reply. */
+  readonly declaredLength: number;
+  /** Bytes of the declared body written after the headers, before the reply. */
+  readonly bodyPrefix?: Uint8Array;
+  /**
+   * A raw follow-up request written on the same socket after the body prefix,
+   * before the reply is read. It is never awaited as a separate reply.
+   */
+  readonly followUp?: Uint8Array;
+  /** The inclusive cap for all bytes read through closure. */
+  readonly responseCap?: number;
+  /** The deadline, from connection creation through peer closure. */
+  readonly deadlineMs?: number;
+}
+
+/** Parse every complete Content-Length-framed reply in the received bytes. */
+function parseReplies(bytes: Buffer): Reply[] {
+  const replies: Reply[] = [];
+  let offset = 0;
+  while (offset < bytes.length) {
+    const headEnd = bytes.indexOf("\r\n\r\n", offset);
+    if (headEnd < 0) break;
+    const lines = bytes.subarray(offset, headEnd).toString("utf8").split("\r\n");
+    const status = Number(lines[0]?.split(" ")[1] ?? NaN);
+    if (!Number.isInteger(status)) break;
+    const headers: Record<string, string> = {};
+    for (const line of lines.slice(1)) {
+      const at = line.indexOf(":");
+      if (at > 0) headers[line.slice(0, at).trim().toLowerCase()] = line.slice(at + 1).trim();
+    }
+    const declared = headers["content-length"];
+    if (declared === undefined || !/^\d+$/.test(declared)) break;
+    const length = Number(declared);
+    const bodyStart = headEnd + 4;
+    if (bytes.length < bodyStart + length) break;
+    replies.push(replyFrom(status, headers, bytes.subarray(bodyStart, bodyStart + length)));
+    offset = bodyStart + length;
+  }
+  return replies;
+}
+
+/**
+ * Send a staged POST and read every byte until the peer closes the connection.
+ *
+ * The headers declare the whole body length, then the optional body prefix and
+ * follow-up request are written on the same socket before any reply is read. A
+ * reply is complete only when its headers and declared body have fully arrived;
+ * the exchange resolves with every such reply it saw and the raw bytes read
+ * through closure. A missing or truncated reply, a cap overflow, a socket error
+ * before any complete reply, or the deadline rejects. A socket reset after a
+ * complete reply still resolves: the reply is what the caller checks, and the
+ * peer closure has already happened.
+ */
+export function sendStaged(base: string, options: StagedSendOptions): Promise<ClosedExchange> {
+  const url = originOf(base);
+  assert.ok(options.path.startsWith("/"), `the request target ${options.path} is root-relative`);
+  assert.ok(
+    Number.isSafeInteger(options.declaredLength) && options.declaredLength >= 0,
+    "the declared length is a finite byte count",
+  );
+  const cap = options.responseCap ?? DEFAULT_RESPONSE_CAP;
+  const deadlineMs = options.deadlineMs ?? DEFAULT_DEADLINE_MS;
+  assert.ok(Number.isSafeInteger(cap) && cap >= 0, "the response cap is a finite byte count");
+  assert.ok(
+    Number.isSafeInteger(deadlineMs) && deadlineMs > 0 && deadlineMs <= MAX_TIMEOUT_MS,
+    `the deadline is a finite positive duration of at most ${MAX_TIMEOUT_MS} ms`,
+  );
+  const expiresAt = performance.now() + deadlineMs;
+  const timedOut = (): boolean => performance.now() >= expiresAt;
+  const timeoutError = (): Error => new Error(`no reply within ${deadlineMs} ms`);
+
+  return new Promise<ClosedExchange>((resolve, reject) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let socketError: Error | null = null;
+    let localPort = 0;
+    const chunks: Buffer[] = [];
+    let received = 0;
+    const socket = createConnection({ host: url.hostname, port: Number(url.port) });
+
+    const clearDeadline = (): void => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
+    const fail = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearDeadline();
+      socket.destroy();
+      reject(error);
+    };
+    const finish = (): void => {
+      if (settled) return;
+      const bytes = Buffer.concat(chunks);
+      const replies = parseReplies(bytes);
+      if (replies.length === 0) {
+        fail(socketError ?? new Error("the peer closed with no complete reply"));
+        return;
+      }
+      if (!(Number.isInteger(localPort) && localPort > 0)) {
+        fail(new Error("the exchange socket carries no positive local port"));
+        return;
+      }
+      settled = true;
+      clearDeadline();
+      socket.destroy();
+      resolve({ bytes, replies, localPort });
+    };
+    const armDeadline = (): boolean => {
+      const remaining = expiresAt - performance.now();
+      if (remaining <= 0) {
+        fail(timeoutError());
+        return false;
+      }
+      timer = setTimeout(() => {
+        if (!settled && !timedOut()) {
+          armDeadline();
+          return;
+        }
+        fail(timeoutError());
+      }, remaining);
+      return true;
+    };
+
+    socket.on("connect", () => {
+      localPort = socket.localPort ?? 0;
+      if (timedOut()) {
+        fail(timeoutError());
+        return;
+      }
+      try {
+        const lines = [
+          `POST ${options.path} HTTP/1.1`,
+          `Host: ${url.host}`,
+          `Origin: ${url.origin}`,
+          `Content-Type: ${options.contentType}`,
+          `Content-Length: ${options.declaredLength}`,
+          "Connection: keep-alive",
+          "",
+          "",
+        ];
+        socket.write(lines.join("\r\n"));
+        if (options.bodyPrefix !== undefined) socket.write(Buffer.from(options.bodyPrefix));
+        if (options.followUp !== undefined) socket.write(Buffer.from(options.followUp));
+      } catch (error) {
+        fail(error as Error);
+      }
+    });
+    socket.on("data", (chunk: Buffer) => {
+      if (settled) return;
+      received += chunk.byteLength;
+      if (received > cap) {
+        fail(new Error(`the reply bytes exceeded the ${cap}-byte cap`));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    socket.on("end", finish);
+    socket.on("close", finish);
+    socket.on("error", (error: Error) => {
+      if (!settled) socketError = error;
+    });
+    if (!armDeadline()) return;
   });
 }
 

@@ -28,6 +28,8 @@ import {
   keepAliveTransport,
   MULTIPART_TYPE,
   send,
+  sendStaged,
+  type ClosedExchange,
   type Transport,
 } from "./fixtures/transcript-http.ts";
 
@@ -77,11 +79,17 @@ function workspaceBytes(dir: string): Buffer {
  * server starts, so the baseline state is the one the refused import must leave
  * unchanged.
  */
+interface RenderCounts {
+  import: number;
+  followUp: number;
+}
+
 interface Running {
   readonly dir: string;
   readonly store: Store;
   readonly server: StartedServer;
   readonly engagementId: string;
+  readonly renders: RenderCounts;
   close(): Promise<void>;
 }
 
@@ -92,12 +100,50 @@ async function running(): Promise<Running> {
   try {
     const client = await store.createClient({ name: "Acme" });
     const engagement = await store.createEngagement({ clientId: client.id, name: "Eng" });
-    server = await startServer({ store, port: 0, routes: registerRoutes(store) });
+    const baseRoutes = registerRoutes(store);
+    const renders: RenderCounts = { import: 0, followUp: 0 };
+    // Count every route render while preserving the routes themselves: a GET
+    // /health is the follow-up, and any hierarchy POST is the import path.
+    const health = baseRoutes.health.get;
+    const hierarchy = baseRoutes.hierarchy;
+    const routes: Routes = {
+      ...baseRoutes,
+      health: {
+        ...baseRoutes.health,
+        get: {
+          ...health,
+          render(request) {
+            renders.followUp += 1;
+            return health.render(request);
+          },
+        },
+      },
+      ...(hierarchy === undefined
+        ? {}
+        : {
+            hierarchy: {
+              match: (path: string) => hierarchy.match(path),
+              route(matched: unknown, method: "GET" | "POST") {
+                const route = hierarchy.route(matched, method);
+                if (route === undefined || method !== "POST") return route;
+                return {
+                  ...route,
+                  render(request) {
+                    renders.import += 1;
+                    return route.render(request);
+                  },
+                };
+              },
+            },
+          }),
+    };
+    server = await startServer({ store, port: 0, routes });
     return {
       dir,
       store,
       server,
       engagementId: engagement.id,
+      renders,
       async close() {
         // Attempt every teardown step even when one fails, so a failed server
         // close cannot skip the store close that protects the workspace. Both
@@ -175,6 +221,45 @@ function exactLimitMultipart(fields: Readonly<Record<string, string>>): Buffer {
   const complete = completeMultipart(fields);
   assert.ok(complete.length <= EXACT_BODY_BYTES, `the controls fit inside ${EXACT_BODY_BYTES} bytes`);
   return Buffer.concat([complete, Buffer.alloc(EXACT_BODY_BYTES - complete.length, 0x65)]);
+}
+
+/** The declared length one byte past the owner-specified inclusive body limit. */
+const OVERSIZED_BODY_BYTES = EXACT_BODY_BYTES + 1;
+
+/**
+ * A complete multipart body grown to the declared over-limit length only by a
+ * legal epilogue after the CRLF-terminated closing delimiter. The controls stay
+ * valid and small, so only the declared whole-body length is in excess.
+ */
+function oversizedMultipart(fields: Readonly<Record<string, string>>): Buffer {
+  const complete = completeMultipart(fields);
+  assert.ok(complete.length <= OVERSIZED_BODY_BYTES, `the controls fit inside ${OVERSIZED_BODY_BYTES} bytes`);
+  return Buffer.concat([complete, Buffer.alloc(OVERSIZED_BODY_BYTES - complete.length, 0x65)]);
+}
+
+/** A raw follow-up GET request, written on the retiring socket. */
+function rawGet(base: string, path: string): Buffer {
+  const url = new URL(base);
+  return Buffer.from(`GET ${path} HTTP/1.1\r\nHost: ${url.host}\r\nConnection: keep-alive\r\n\r\n`, "utf8");
+}
+
+/** The one complete 413 a retiring connection must deliver, with its guidance. */
+function assertOversizedRefusal(exchange: ClosedExchange, why: string): void {
+  assert.equal(exchange.replies.length, 1, `${why}: the connection carries exactly one complete reply`);
+  const reply = exchange.replies[0]!;
+  assert.equal(reply.status, 413, `${why}: the reply is a 413`);
+  assert.match(String(reply.headers["content-type"]), /^text\/plain; charset=utf-8/, `${why}: the reply is plain text`);
+  assert.equal(reply.headers["cache-control"], "no-store", `${why}: the reply is not cached`);
+  assert.equal(reply.headers["connection"], "close", `${why}: the reply retires the connection`);
+  assert.equal(
+    reply.body,
+    `The request body is too large.\n\nKeep the whole submission at most ${EXACT_BODY_BYTES} bytes; nothing was truncated.\n`,
+    `${why}: the reply carries the whole-body limit guidance`,
+  );
+  assert.ok(
+    Number.isInteger(exchange.localPort) && exchange.localPort > 0,
+    `${why}: the exchange used one positive client local port: ${exchange.localPort}`,
+  );
 }
 
 /** The decoder's exact message for a body that has no closing delimiter. */
@@ -376,6 +461,75 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       assertUnchanged(runningFixture, before, "after the health read");
     } finally {
       transport.close();
+      await runningFixture.close();
+    }
+  });
+
+  it("refuses an oversized declared import on headers alone and writes nothing", async () => {
+    const runningFixture = await running();
+    const guard = watchdog(5000, "the withheld-body refusal did not finish");
+    try {
+      const before = baselineOf(runningFixture);
+      const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
+      const body = oversizedMultipart({
+        title: "Withheld oversized import",
+        date: "2026-09-02",
+        paste: "Alice: the withheld source.",
+      });
+      assert.equal(body.byteLength, OVERSIZED_BODY_BYTES, "the valid body is exactly the declared over-limit length");
+      assert.ok(body.byteLength > EXACT_BODY_BYTES, "the declared whole-body length is over the inclusive limit");
+
+      // No body byte is written at all, so the 413 must arrive from the
+      // declared headers alone and the socket must then retire.
+      const pending = sendStaged(runningFixture.server.origin, {
+        path: importPath,
+        contentType: MULTIPART_TYPE,
+        declaredLength: OVERSIZED_BODY_BYTES,
+      });
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assertOversizedRefusal(exchange, "withheld body");
+      assert.equal(runningFixture.renders.import, 0, "the refused import never reached a handler");
+      assert.equal(runningFixture.renders.followUp, 0, "no follow-up handler ran on the retiring socket");
+      assertUnchanged(runningFixture, before, "after the withheld-body refusal");
+    } finally {
+      guard.clear();
+      await runningFixture.close();
+    }
+  });
+
+  it("refuses an oversized declared import while its body is in flight and excludes a follow-up", async () => {
+    const runningFixture = await running();
+    const guard = watchdog(5000, "the in-flight refusal did not finish");
+    try {
+      const before = baselineOf(runningFixture);
+      const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
+      const body = oversizedMultipart({
+        title: "In-flight oversized import",
+        date: "2026-09-03",
+        paste: "Bob: the in-flight source.",
+      });
+      assert.equal(body.byteLength, OVERSIZED_BODY_BYTES, "the valid body is exactly the declared over-limit length");
+      const prefix = body.subarray(0, 64 * 1024);
+      assert.ok(prefix.length > 0 && prefix.length < body.byteLength, "only part of the declared body is in flight before the reply");
+
+      // Start sending the declared body, then a follow-up request, before
+      // reading the reply; the 413 still answers from the declared headers.
+      const pending = sendStaged(runningFixture.server.origin, {
+        path: importPath,
+        contentType: MULTIPART_TYPE,
+        declaredLength: OVERSIZED_BODY_BYTES,
+        bodyPrefix: prefix,
+        followUp: rawGet(runningFixture.server.origin, "/health"),
+      });
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assertOversizedRefusal(exchange, "in-flight body");
+      assert.equal(runningFixture.renders.import, 0, "the refused import never reached a handler");
+      assert.equal(runningFixture.renders.followUp, 0, "the follow-up on the retiring socket never reached a handler");
+      assertUnchanged(runningFixture, before, "after the in-flight refusal");
+    } finally {
+      guard.clear();
       await runningFixture.close();
     }
   });
