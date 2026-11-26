@@ -501,11 +501,19 @@ export interface StagedSendOptions {
   readonly deadlineMs?: number;
 }
 
+/** One valid HTTP/1.x status line, with a three-digit status and optional reason. */
+const STATUS_LINE = /^HTTP\/1\.[01] ([1-5]\d\d)(?: [^\r\n]*)?$/;
+
+/** One valid HTTP header field-name token. */
+const HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
 /**
  * Parse every complete Content-Length-framed reply in the received bytes. The
  * final reply's declared body must end at the final received byte; a partial
  * second reply or any trailing junk makes the whole exchange incomplete rather
- * than silently returning the replies parsed before it.
+ * than silently returning the replies parsed before it. The status line and
+ * every header line are validated strictly, so a malformed or concatenated line
+ * cannot be ignored and absorbed into an otherwise valid reply.
  */
 function parseReplies(bytes: Buffer): { readonly replies: Reply[]; readonly complete: boolean } {
   const replies: Reply[] = [];
@@ -514,12 +522,20 @@ function parseReplies(bytes: Buffer): { readonly replies: Reply[]; readonly comp
     const headEnd = bytes.indexOf("\r\n\r\n", offset);
     if (headEnd < 0) return { replies, complete: false };
     const lines = bytes.subarray(offset, headEnd).toString("utf8").split("\r\n");
-    const status = Number(lines[0]?.split(" ")[1] ?? NaN);
-    if (!Number.isInteger(status)) return { replies, complete: false };
+    const statusLine = lines[0] ?? "";
+    // A second status line concatenated into the first line is not a reason
+    // phrase; it is a truncated reply followed by another one.
+    if ((statusLine.match(/HTTP\//g) ?? []).length !== 1) return { replies, complete: false };
+    const statusMatch = STATUS_LINE.exec(statusLine);
+    if (statusMatch === null) return { replies, complete: false };
+    const status = Number(statusMatch[1]);
     const headers: Record<string, string> = {};
     for (const line of lines.slice(1)) {
       const at = line.indexOf(":");
-      if (at > 0) headers[line.slice(0, at).trim().toLowerCase()] = line.slice(at + 1).trim();
+      if (at <= 0) return { replies, complete: false };
+      const name = line.slice(0, at);
+      if (!HEADER_NAME.test(name)) return { replies, complete: false };
+      headers[name.toLowerCase()] = line.slice(at + 1).trim();
     }
     const declared = headers["content-length"];
     if (declared === undefined || !/^\d+$/.test(declared)) return { replies, complete: false };

@@ -535,6 +535,41 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
     }
   });
 
+  it("rejects a staged reply whose partial status line runs into a second reply", async () => {
+    const listener = testListener((req) => {
+      req.resume();
+      // A truncated 413 status line immediately followed by a complete 413:
+      // the old parser ignored the second status line as a header without a
+      // colon and counted the whole block as one valid reply.
+      req.socket.write(
+        "HTTP/1.1 413 Payload Too Large\r\n" +
+          "HTTP/1.1 413 Payload Too Large\r\n" +
+          "content-length: 9\r\n" +
+          "content-type: text/plain\r\n" +
+          "cache-control: no-store\r\n" +
+          "connection: close\r\n\r\n" +
+          "too large",
+      );
+      req.socket.end();
+    });
+    const guard = watchdog(5000, "the malformed staged reply did not finish");
+    try {
+      const pending = listener.ready.then(() =>
+        sendStaged(`http://127.0.0.1:${listener.port()}`, {
+          path: "/",
+          contentType: "text/plain",
+          declaredLength: 0,
+        }),
+      );
+      const expected = assert.rejects(pending, /truncated reply/, "a partial status line cannot absorb a following reply");
+      expected.catch(() => undefined);
+      await Promise.race([Promise.all([listener.ready, expected]), guard.promise]);
+    } finally {
+      guard.clear();
+      await listener.close();
+    }
+  });
+
   it("commits two exact-limit imports sequentially, the second chunked, and reuses one socket for each health read", async () => {
     const runningFixture = await running();
     const transport = keepAliveTransport();
