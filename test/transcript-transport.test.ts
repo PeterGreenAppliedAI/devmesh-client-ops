@@ -15,6 +15,7 @@
  */
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -99,14 +100,37 @@ async function running(): Promise<Running> {
       server,
       engagementId: engagement.id,
       async close() {
-        await server!.close();
-        await store.close();
+        // Attempt every teardown step even when one fails, so a failed server
+        // close cannot skip the store close that protects the workspace.
+        let serverError: unknown = null;
+        try {
+          await server!.close();
+        } catch (error) {
+          serverError = error;
+        }
+        try {
+          await store.close();
+        } catch (error) {
+          if (serverError === null) throw error;
+        }
+        if (serverError !== null) throw serverError;
       },
     };
   } catch (error) {
-    if (server !== null) await server.close();
-    await store.close();
-    throw error;
+    let firstError: unknown = error;
+    if (server !== null) {
+      try {
+        await server.close();
+      } catch (closeError) {
+        firstError = firstError ?? closeError;
+      }
+    }
+    try {
+      await store.close();
+    } catch (closeError) {
+      firstError = firstError ?? closeError;
+    }
+    throw firstError;
   }
 }
 
@@ -229,6 +253,37 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
     }
   });
 
+  it("frames a chunked POST with Transfer-Encoding, not Content-Length", async () => {
+    const transport = keepAliveTransport();
+    const seen: Array<Record<string, string | string[] | undefined>> = [];
+    const listener = createServer((req, res) => {
+      seen.push({ ...req.headers });
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(200, { "content-length": "2", "content-type": "text/plain" });
+        res.end("ok");
+      });
+    });
+    try {
+      await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", () => resolve()));
+      const port = (listener.address() as { port: number }).port;
+      const reply = await send(transport, `http://127.0.0.1:${port}`, {
+        method: "POST",
+        path: "/chunked",
+        contentType: "text/plain",
+        body: Buffer.from("hello"),
+        chunked: true,
+      });
+      assert.equal(reply.status, 200, "the chunked POST gets a reply");
+      assert.equal(seen.length, 1, "the listener saw one request");
+      assert.equal(seen[0]["content-length"], undefined, "a chunked POST declares no Content-Length");
+      assert.equal(seen[0]["transfer-encoding"], "chunked", "a chunked POST is framed by Node with Transfer-Encoding: chunked");
+    } finally {
+      transport.close();
+      await new Promise<void>((resolve) => listener.close(() => resolve()));
+    }
+  });
+
   it("fails a reply that exceeds the inclusive response cap", async () => {
     const runningFixture = await running();
     const transport = keepAliveTransport();
@@ -244,8 +299,7 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
     }
   });
 
-  it("fails a request that outstays its deadline and aborts it", async () => {
-    const dir = tempDir();
+  it("fails a request that outstays its deadline and aborts it", async () => {    const dir = tempDir();
     const store = await openStore(dir);
     const transport = keepAliveTransport();
     let server: StartedServer | null = null;
@@ -276,8 +330,54 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       await new Promise((resolve) => setTimeout(resolve, 300));
     } finally {
       transport.close();
-      if (server !== null) await server.close();
-      await store.close();
+      // Close the server and the store independently: a failed server close
+      // must not skip the store close.
+      let serverError: unknown = null;
+      if (server !== null) {
+        try {
+          await server.close();
+        } catch (error) {
+          serverError = error;
+        }
+      }
+      try {
+        await store.close();
+      } catch (error) {
+        if (serverError === null) throw error;
+      }
+      if (serverError !== null) throw serverError;
+    }
+  });
+
+  it("refuses a deadline above the timer's supported range", async () => {
+    const transport = keepAliveTransport();
+    try {
+      // Node clamps a delay above 2^31-1 ms to 1 ms; accepting it would fail a
+      // valid reply long before the caller's deadline, so it is refused.
+      assert.throws(
+        () => send(transport, "http://127.0.0.1:1", { path: "/", deadlineMs: 2_147_483_648 }),
+        /the deadline is a finite positive duration of at most 2147483647 ms/,
+        "an out-of-range deadline is refused instead of mis-timed",
+      );
+    } finally {
+      transport.close();
+    }
+  });
+
+  it("fails a request Node cannot construct without leaving a deadline behind", async () => {
+    const transport = keepAliveTransport();
+    try {
+      // A CR in the request target makes Node's own construction throw. The
+      // helper must reject through its cleanup, which tolerates a request that
+      // was never created, and must not leave an armed timer that would touch
+      // an uninitialised request.
+      await assert.rejects(
+        send(transport, "http://127.0.0.1:1", { path: "/bad\rpath" }),
+        (error: unknown) => error instanceof Error,
+        "a construction error rejects instead of escaping",
+      );
+    } finally {
+      transport.close();
     }
   });
 });

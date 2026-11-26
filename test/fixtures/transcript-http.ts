@@ -43,11 +43,15 @@ function originOf(base: string): URL {
   return new URL(base);
 }
 
-/** The local port of a reply's socket, which the socket exposes while attached. */
-function localPortOf(res: IncomingMessage): number {
+/**
+ * The local port of a reply's socket, which the socket exposes while attached.
+ * Returns null when the socket or its port is unavailable (for example after
+ * the response has been torn down); the bounded helper turns a missing port
+ * into a failure, while a legacy read keeps its former Reply contract.
+ */
+function localPortOf(res: IncomingMessage): number | null {
   const port = res.socket?.localPort;
-  assert.ok(typeof port === "number" && Number.isInteger(port) && port > 0, "the reply socket carries a positive local port");
-  return port;
+  return typeof port === "number" && Number.isInteger(port) && port > 0 ? port : null;
 }
 
 /** A reply body decoded as a string; text is UTF-8 in this application. */
@@ -55,9 +59,9 @@ function replyFrom(
   status: number,
   headers: Record<string, string | string[] | undefined>,
   bytes: Buffer,
-  localPort: number,
+  localPort: number | null,
 ): Reply {
-  return { status, headers, bytes, body: bytes.toString("utf8"), localPort };
+  return { status, headers, bytes, body: bytes.toString("utf8"), localPort: localPort ?? 0 };
 }
 
 /**
@@ -117,7 +121,12 @@ export function get(base: string, path: string): Promise<Reply> {
       (res) => {
         const chunks: Buffer[] = [];
         res.on("data", (chunk: Buffer) => chunks.push(chunk));
-        res.on("end", () => resolve(replyFrom(res.statusCode ?? 0, res.headers, Buffer.concat(chunks), localPortOf(res))));
+        res.on("end", () => {
+          // The legacy helpers keep their former Reply contract: the reply is
+          // read from its status, headers and body, and a port that is no
+          // longer available is not a reason to fail an otherwise good read.
+          resolve(replyFrom(res.statusCode ?? 0, res.headers, Buffer.concat(chunks), localPortOf(res)));
+        });
         res.on("error", reject);
       },
     );
@@ -150,7 +159,9 @@ function postBytes(
       (res) => {
         const chunks: Buffer[] = [];
         res.on("data", (chunk: Buffer) => chunks.push(chunk));
-        res.on("end", () => resolve(replyFrom(res.statusCode ?? 0, res.headers, Buffer.concat(chunks), localPortOf(res))));
+        res.on("end", () => {
+          resolve(replyFrom(res.statusCode ?? 0, res.headers, Buffer.concat(chunks), localPortOf(res)));
+        });
         res.on("error", reject);
       },
     );
@@ -162,6 +173,9 @@ function postBytes(
 // ---------------------------------------------------------------------------
 // Bounded kept-alive requests
 // ---------------------------------------------------------------------------
+
+/** Node's largest supported timer delay, in milliseconds. */
+const MAX_TIMEOUT_MS = 2_147_483_647;
 
 /** The default inclusive cap, in bytes, for a bounded reply body. */
 export const DEFAULT_RESPONSE_CAP = 8 * 1024 * 1024;
@@ -246,7 +260,13 @@ export function send(transport: Transport, base: string, options: SendOptions): 
   const cap = options.responseCap ?? DEFAULT_RESPONSE_CAP;
   const deadlineMs = options.deadlineMs ?? DEFAULT_DEADLINE_MS;
   assert.ok(Number.isSafeInteger(cap) && cap >= 0, "the response cap is a finite byte count");
-  assert.ok(Number.isSafeInteger(deadlineMs) && deadlineMs > 0, "the deadline is a finite positive duration");
+  // Node's timer stores its delay as a signed 32-bit integer and clamps a
+  // longer one to 1 ms, so a deadline above that range would fire at once
+  // instead of when asked. Refuse it rather than silently mis-time the run.
+  assert.ok(
+    Number.isSafeInteger(deadlineMs) && deadlineMs > 0 && deadlineMs <= MAX_TIMEOUT_MS,
+    `the deadline is a finite positive duration of at most ${MAX_TIMEOUT_MS} ms`,
+  );
 
   const headers: Record<string, string> = { host: url.host };
   if (method === "POST") headers.origin = url.origin;
@@ -268,7 +288,7 @@ export function send(transport: Transport, base: string, options: SendOptions): 
     };
     const abort = (): void => {
       response?.destroy();
-      request.destroy();
+      request?.destroy();
     };
     const fail = (error: Error): void => {
       if (settled) return;
@@ -284,70 +304,105 @@ export function send(transport: Transport, base: string, options: SendOptions): 
       resolve(reply);
     };
 
-    // The deadline spans the whole request: creation, the reply and its end.
-    timer = setTimeout(() => fail(new Error(`no reply within ${deadlineMs} ms`)), deadlineMs);
-
-    const request: ClientRequest = httpRequest(
-      {
-        host: url.hostname,
-        port: Number(url.port),
-        method,
-        path: options.path,
-        headers,
-        agent: transport.agent,
-      },
-      (res) => {
+    // Construct the request before arming the deadline: a synchronous
+    // construction error rejects through `fail`, which tolerates a request that
+    // was never created and leaves no timer behind.
+    let request: ClientRequest;
+    try {
+      request = httpRequest(
+        {
+          host: url.hostname,
+          port: Number(url.port),
+          method,
+          path: options.path,
+          headers,
+          agent: transport.agent,
+        },
+        (res) => {
         seenResponse = true;
         response = res;
-        const localPort = localPortOf(res);
-        const chunks: Buffer[] = [];
-        let received = 0;
-        let ended = false;
-        res.on("data", (chunk: Buffer) => {
-          if (settled) return;
-          received += chunk.byteLength;
-          if (received > cap) {
-            fail(new Error(`the reply body exceeded the ${cap}-byte cap`));
+        try {
+          // The port is read once, while the response's socket is attached. A
+          // socket without a usable port rejects through `fail`, so a reply is
+          // never resolved with a stale or invented port.
+          const localPort = localPortOf(res);
+          if (localPort === null) {
+            fail(new Error("the reply socket carries no positive local port"));
             return;
           }
-          chunks.push(chunk);
-        });
-        res.on("end", () => {
-          if (settled) return;
-          ended = true;
-          if (!res.complete) {
-            fail(new Error("the reply ended before its message was complete"));
-            return;
-          }
-          try {
-            const declared = declaredLength(res.headers);
-            if (declared !== received) {
-              fail(new Error(`the reply carried ${received} bytes but declared ${declared}`));
+          const chunks: Buffer[] = [];
+          let received = 0;
+          let ended = false;
+          res.on("data", (chunk: Buffer) => {
+            if (settled) return;
+            received += chunk.byteLength;
+            if (received > cap) {
+              fail(new Error(`the reply body exceeded the ${cap}-byte cap`));
               return;
             }
-          } catch (error) {
-            fail(error as Error);
-            return;
-          }
-          finish(replyFrom(res.statusCode ?? 0, res.headers, Buffer.concat(chunks), localPort));
-        });
-        res.on("aborted", () => fail(new Error("the connection closed before the reply completed")));
-        res.on("error", (error: Error) => fail(error));
-        // A close before the reply's own end is a premature close.
-        res.on("close", () => {
-          if (!ended) fail(new Error("the connection closed before the reply completed"));
-        });
+            chunks.push(chunk);
+          });
+          res.on("end", () => {
+            if (settled) return;
+            ended = true;
+            if (!res.complete) {
+              fail(new Error("the reply ended before its message was complete"));
+              return;
+            }
+            try {
+              const declared = declaredLength(res.headers);
+              if (declared !== received) {
+                fail(new Error(`the reply carried ${received} bytes but declared ${declared}`));
+                return;
+              }
+            } catch (error) {
+              fail(error as Error);
+              return;
+            }
+            finish(replyFrom(res.statusCode ?? 0, res.headers, Buffer.concat(chunks), localPort));
+          });
+          res.on("aborted", () => fail(new Error("the connection closed before the reply completed")));
+          res.on("error", (error: Error) => fail(error));
+          // A close before the reply's own end is a premature close.
+          res.on("close", () => {
+            if (!ended) fail(new Error("the connection closed before the reply completed"));
+          });
+        } catch (error) {
+          // A synchronous throw while attaching handlers still rejects through
+          // `fail`, which clears the deadline and aborts the request.
+          fail(error as Error);
+        }
       },
-    );
+      );
+    } catch (error) {
+      // The request was never created: fail with no request to destroy, but the
+      // cleanup still tolerates it and no deadline was armed.
+      fail(error as Error);
+      return;
+    }
+    try {
+      request.on("error", (error: Error) => fail(error));
+      // A close without any response at all is a missing reply.
+      request.on("close", () => {
+        if (!seenResponse && !settled) fail(new Error("the connection closed with no reply"));
+      });
 
-    request.on("error", (error: Error) => fail(error));
-    // A close without any response at all is a missing reply.
-    request.on("close", () => {
-      if (!seenResponse && !settled) fail(new Error("the connection closed with no reply"));
-    });
+      // The deadline spans the whole request: creation, the reply and its end.
+      timer = setTimeout(() => fail(new Error(`no reply within ${deadlineMs} ms`)), deadlineMs);
 
-    if (options.body === undefined) request.end();
-    else request.end(Buffer.from(options.body));
+      // A chunked body is written and then ended, so Node frames the body
+      // itself; any other body is sent with the declared length in `end()`.
+      if (options.body === undefined) {
+        request.end();
+      } else if (chunked) {
+        request.write(Buffer.from(options.body));
+        request.end();
+      } else {
+        request.end(Buffer.from(options.body));
+      }
+    } catch (error) {
+      fail(error as Error);
+    }
   });
 }
 
