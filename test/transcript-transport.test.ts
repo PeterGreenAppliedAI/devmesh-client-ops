@@ -162,6 +162,21 @@ function completeMultipart(fields: Readonly<Record<string, string>>): Buffer {
   return Buffer.concat([...pieces, Buffer.from(`--${BOUNDARY}--\r\n`, "utf8")]);
 }
 
+/** The owner-specified inclusive whole-body limit, written out independently. */
+const EXACT_BODY_BYTES = 15_728_640;
+
+/**
+ * A complete multipart body grown to exactly the whole-body limit only by a
+ * legal epilogue after the CRLF-terminated closing delimiter. No submitted
+ * control carries padding, so each paste still equals the text the request
+ * supplied when the decoder stops at that close.
+ */
+function exactLimitMultipart(fields: Readonly<Record<string, string>>): Buffer {
+  const complete = completeMultipart(fields);
+  assert.ok(complete.length <= EXACT_BODY_BYTES, `the controls fit inside ${EXACT_BODY_BYTES} bytes`);
+  return Buffer.concat([complete, Buffer.alloc(EXACT_BODY_BYTES - complete.length, 0x65)]);
+}
+
 /** The decoder's exact message for a body that has no closing delimiter. */
 const MISSING_CLOSING = "The multipart body is not valid: the body has no closing boundary.";
 /** The decoder's full corrective guidance for an invalid multipart body. */
@@ -359,6 +374,83 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
 
       // Neither a GET nor a refusal changed the workspace.
       assertUnchanged(runningFixture, before, "after the health read");
+    } finally {
+      transport.close();
+      await runningFixture.close();
+    }
+  });
+
+  it("commits two exact-limit imports sequentially, the second chunked, and reuses one socket for each health read", async () => {
+    const runningFixture = await running();
+    const transport = keepAliveTransport();
+    try {
+      const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
+      const requests = [
+        {
+          title: "First exact-limit import",
+          date: "2026-09-02",
+          paste: "Alice: the first small paste.",
+          chunked: false,
+        },
+        {
+          title: "Second exact-limit import",
+          date: "2026-09-03",
+          paste: "Bob: the second small paste.",
+          chunked: true,
+        },
+      ] as const;
+      assert.notEqual(
+        requests[0].paste.replace(/\s+/g, " ").trim(),
+        requests[1].paste.replace(/\s+/g, " ").trim(),
+        "the two small pastes remain distinct after whitespace normalization",
+      );
+
+      for (const [index, request] of requests.entries()) {
+        const body = exactLimitMultipart({
+          title: request.title,
+          date: request.date,
+          paste: request.paste,
+        });
+        assert.equal(body.byteLength, EXACT_BODY_BYTES, `import ${index + 1} is exactly ${EXACT_BODY_BYTES} bytes before transfer coding`);
+        const before = runningFixture.store.snapshot();
+
+        const reply = await send(transport, runningFixture.server.origin, {
+          method: "POST",
+          path: importPath,
+          contentType: MULTIPART_TYPE,
+          body,
+          chunked: request.chunked,
+        });
+        assert.equal(reply.status, 200, `import ${index + 1} is a complete 200: ${reply.body.slice(0, 200)}`);
+
+        const after = runningFixture.store.snapshot();
+        const meetingIdsBefore = new Set(before.meetings.map((meeting) => meeting.id));
+        const newMeetings = after.meetings.filter(
+          (meeting) => !meetingIdsBefore.has(meeting.id) && meeting.engagementId === runningFixture.engagementId,
+        );
+        assert.equal(newMeetings.length, 1, `import ${index + 1} creates exactly one new meeting in the engagement`);
+        const meeting = newMeetings[0]!;
+        assert.equal(meeting.title, request.title, `import ${index + 1} keeps its title`);
+        assert.equal(meeting.date, request.date, `import ${index + 1} keeps its date`);
+
+        const transcriptIdsBefore = new Set((before.transcripts ?? []).map((transcript) => transcript.id));
+        const newTranscripts = (after.transcripts ?? []).filter((transcript) => !transcriptIdsBefore.has(transcript.id));
+        const attached = newTranscripts.filter((transcript) => transcript.meetingId === meeting.id);
+        assert.equal(attached.length, 1, `import ${index + 1} creates exactly one transcript whose meetingId names the new meeting`);
+        assert.equal(newTranscripts.length, 1, `import ${index + 1} creates no transcript for another meeting`);
+        const transcript = attached[0]!;
+        assert.equal(transcript.sources.length, 1, `import ${index + 1} stores exactly one source`);
+        const source = transcript.sources[0]!;
+        assert.equal(source.format, "paste", `import ${index + 1} stores a pasted source`);
+        assert.equal(source.originalText, request.paste, `import ${index + 1}'s pasted source is exactly its small text, without the padded epilogue`);
+
+        const health = await send(transport, runningFixture.server.origin, { path: "/health" });
+        assert.equal(health.status, 200, `the health read after import ${index + 1} is a complete 200`);
+        assert.ok(health.body.includes("ok"), `the health read after import ${index + 1} reports its status: ${health.body}`);
+        assert.ok(isPositiveInteger(reply.localPort), `import ${index + 1}'s local port is a positive integer: ${reply.localPort}`);
+        assert.ok(isPositiveInteger(health.localPort), `the health read after import ${index + 1} has a positive local port: ${health.localPort}`);
+        assert.equal(reply.localPort, health.localPort, `import ${index + 1} and its health read reused one connection`);
+      }
     } finally {
       transport.close();
       await runningFixture.close();
