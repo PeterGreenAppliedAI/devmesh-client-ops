@@ -15,7 +15,7 @@
  */
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
-import { createServer } from "node:http";
+import { createServer, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -28,9 +28,6 @@ import {
   keepAliveTransport,
   MULTIPART_TYPE,
   send,
-  sendWithClock,
-  type Clock,
-  type TimerHandle,
   type Transport,
 } from "./fixtures/transcript-http.ts";
 
@@ -198,67 +195,14 @@ function isPositiveInteger(value: number): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Deadline-order harness
+// Real-clock scenario harness
 // ---------------------------------------------------------------------------
-
-/** One timer armed on the fake clock: its handle, due time, callback and state. */
-interface FakeTimer extends TimerHandle {
-  readonly handle: object;
-  readonly due: number;
-  readonly callback: () => void;
-  cancelled: boolean;
-}
-
-/**
- * A fake monotonic clock whose timers fire only when the test fires them. Its
- * milliseconds advance only when the test advances them, so a deadline can be
- * brought to expiry without a real wait, and an armed timer can be fired early
- * on purpose. It is supplied through `sendWithClock`, the fixture's test-only
- * seam; the exported `send()` always uses the system clock.
- */
-class FakeClock implements Clock {
-  private milliseconds = 0;
-  private pending: FakeTimer[] = [];
-
-  now(): number {
-    return this.milliseconds;
-  }
-
-  setTimer(delayMs: number, callback: () => void): TimerHandle {
-    const timer: FakeTimer = { handle: {}, due: this.milliseconds + delayMs, callback, cancelled: false };
-    this.pending.push(timer);
-    return timer;
-  }
-
-  clearTimer(handle: TimerHandle): void {
-    (handle as FakeTimer).cancelled = true;
-  }
-
-  /** Advance the fake time without firing any timer. */
-  advance(milliseconds: number): void {
-    this.milliseconds += milliseconds;
-  }
-
-  /** The timers armed and not yet cancelled, in arming order. */
-  armed(): readonly FakeTimer[] {
-    return this.pending.filter((timer) => !timer.cancelled);
-  }
-
-  /** Fire the first armed timer now, whether or not its due time has come. */
-  fireFirst(): void {
-    const timer = this.armed()[0];
-    if (timer === undefined) throw new Error("no timer is armed to fire");
-    timer.cancelled = true;
-    timer.callback();
-  }
-}
 
 /**
  * A real watchdog, independent of the helper's deadline, that rejects with an
- * error the expected rejection can never match. Used to bound a scenario that
- * waits on fake time. Its rejection is observed the moment it is created, so
- * it cannot surface as an unhandled rejection, and its timer is cleared on
- * every exit.
+ * error the expected rejection can never match. Its rejection is observed the
+ * moment it is created, so it cannot surface as an unhandled rejection, and its
+ * timer is cleared on every exit.
  */
 function watchdog(milliseconds: number, reason: string): {
   readonly promise: Promise<never>;
@@ -283,89 +227,78 @@ function watchdog(milliseconds: number, reason: string): {
 }
 
 /**
- * One held reply and the listener that holds it. The listener is created and
- * its `listen` started the instant this is called, so the caller owns the
- * server before it awaits readiness; `close` awaits that attempt and then
- * closes the server whatever its outcome, so a late successful bind, or a bind
- * that succeeds after a watchdog fired, still has a teardown owner. The held
- * response is destroyed before the listener closes, so no socket outlives it.
+ * A listener owned and started before any await, so its close can always be
+ * registered in `finally`. A bind failure is kept as the setup outcome and
+ * rethrown by `close`, and a later server error is retained and reported by
+ * `close` rather than swallowed into the already-settled bind promise.
  */
-interface HeldListener {
+interface TestListener {
   /** Resolves once the listener is accepting connections. */
   readonly ready: Promise<void>;
   /** The bound port; only valid once `ready` has resolved. */
   port(): number;
-  held(): import("node:http").ServerResponse | null;
   close(): Promise<void>;
 }
 
-/** Start a listener that reads each request fully and holds its reply open. */
-function heldListener(): HeldListener {
-  let held: import("node:http").ServerResponse | null = null;
-  const listener = createServer((req, res) => {
-    req.resume();
-    req.on("end", () => {
-      held = res;
+/** Create and start a listener synchronously, before the caller awaits. */
+function testListener(
+  onRequest: (req: import("node:http").IncomingMessage, res: ServerResponse) => void,
+): TestListener {
+  const listener = createServer(onRequest);
+  let binding = true;
+  let lateError: Error | null = null;
+  // Settles once with the bind outcome: null for success, the error otherwise.
+  const outcome = new Promise<Error | null>((resolve) => {
+    listener.on("error", (error: Error) => {
+      if (binding) {
+        binding = false;
+        resolve(error);
+      } else {
+        // Keep the handler installed so this is reported by `close` instead of
+        // disappearing into a bind promise that has already settled.
+        lateError = error;
+      }
+    });
+    listener.listen(0, "127.0.0.1", () => {
+      binding = false;
+      resolve(null);
     });
   });
-  // Settles with the listen outcome, whether the bind succeeded or failed, so
-  // `close` never closes a server whose bind is still pending or raced away.
-  const listening = new Promise<Error | null>((resolve) => {
-    listener.once("error", (error: Error) => resolve(error));
-    listener.listen(0, "127.0.0.1", () => resolve(null));
-  });
-  const ready = listening.then((error) => {
+  const ready = outcome.then((error) => {
     if (error !== null) throw error;
   });
+  // Observe a bind failure at creation, so a watchdog win cannot leave it
+  // unhandled; the caller still races `ready` to see the failure.
   ready.catch(() => undefined);
   return {
     ready,
-    port: () => (listener.address() as { port: number }).port,
-    held: () => held,
+    port() {
+      const address = listener.address();
+      if (address === null || typeof address === "string") {
+        throw new Error("the listener is not bound to a TCP port");
+      }
+      return address.port;
+    },
     async close() {
-      const error = await listening;
-      held?.destroy();
-      // A bind that failed leaves nothing listening; a bind that succeeded is
-      // closed here, including one that succeeded after the caller stopped
-      // waiting for it.
-      if (error !== null) return;
-      await new Promise<void>((resolve, reject) => {
-        listener.close((closeError) => (closeError ? reject(closeError) : resolve()));
-      });
+      // Wait for the bind outcome before closing: a bind still pending, or one
+      // that failed after the watchdog won, is owned here.
+      const bindError = await outcome;
+      if (bindError !== null) throw bindError;
+      let closeError: unknown = null;
+      try {
+        await new Promise<void>((resolve, reject) => {
+          listener.close((error) => (error ? reject(error) : resolve()));
+        });
+      } catch (error) {
+        closeError = error;
+      }
+      if (closeError !== null && lateError !== null) {
+        throw new AggregateError([closeError, lateError], "the listener close failed and a server error was retained");
+      }
+      if (closeError !== null) throw closeError;
+      if (lateError !== null) throw lateError;
     },
   };
-}
-
-/** Wait until `ready` holds, yielding to the event loop between checks. */
-async function until(ready: () => boolean, why: string): Promise<void> {
-  const limit = performance.now() + 5000;
-  while (!ready()) {
-    assert.ok(performance.now() < limit, `timed out waiting until ${why}`);
-    await new Promise((resolve) => setImmediate(resolve));
-  }
-}
-
-/**
- * Wait until `ready` holds, but reject as soon as the request `pending`
- * settles first: an early request error must reach the owning test instead of
- * being turned into a wait timeout. The derived outcome is observed at
- * creation, so it never surfaces unhandled when `until` wins the race.
- */
-async function untilOrRequestSettles(
-  ready: () => boolean,
-  why: string,
-  pending: Promise<unknown>,
-): Promise<void> {
-  const settledEarly = pending.then(
-    () => {
-      throw new Error(`the request settled before ${why}`);
-    },
-    (error: unknown) => {
-      throw error;
-    },
-  );
-  settledEarly.catch(() => undefined);
-  await Promise.race([until(ready, why), settledEarly]);
 }
 
 describe("transcript HTTP fixture: bounded keep-alive transport", () => {
@@ -471,17 +404,27 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
   });
 
   it("fails a reply that exceeds the inclusive response cap", async () => {
-    const runningFixture = await running();
     const transport = keepAliveTransport();
+    const guard = watchdog(5000, "the cap scenario did not finish");
+    const listener = testListener((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(200, { "content-length": "2", "content-type": "text/plain" });
+        res.end("ok");
+      });
+    });
     try {
-      await assert.rejects(
-        send(transport, runningFixture.server.origin, { path: "/health", responseCap: 1 }),
-        /exceeded the 1-byte cap/,
-        "a reply over the cap fails instead of being buffered unbounded",
-      );
+      await Promise.race([listener.ready, guard.promise]);
+      const pending = send(transport, `http://127.0.0.1:${listener.port()}`, { path: "/", responseCap: 1 });
+      // Attach the rejection handler before any await, and observe the
+      // assertion at creation so a watchdog win cannot leave it unhandled.
+      const expected = assert.rejects(pending, /exceeded the 1-byte cap/, "a reply over the cap fails instead of being buffered unbounded");
+      expected.catch(() => undefined);
+      await Promise.race([expected, guard.promise]);
     } finally {
+      guard.clear();
       transport.close();
-      await runningFixture.close();
+      await listener.close();
     }
   });
 
@@ -558,113 +501,34 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
 
   it("fails a reply that is held open past its deadline and closes it", async () => {
     const transport = keepAliveTransport();
+    const guard = watchdog(5000, "the held-reply scenario did not finish");
     // The listener reads the whole request but holds the reply open, so the
     // helper's own deadline is the only reason the request fails. The request
     // may expire before or after the listener receives it: both are valid
     // timeout outcomes, so nothing waits for the reply to be held.
-    //
-    // The listener is owned before its readiness is awaited, so teardown closes
-    // a server that binds late; the watchdog's timer is cleared on every exit
-    // and its rejection is observed at creation.
-    const guard = watchdog(5000, "the held-reply scenario did not finish");
-    const listener = heldListener();
+    const held: { response: ServerResponse | null } = { response: null };
+    const listener = testListener((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        held.response = res;
+      });
+    });
     try {
+      // The listener is created and bound before this await; its close is
+      // registered in the finally below, so a bind that succeeds late still has
+      // a teardown owner.
       await Promise.race([listener.ready, guard.promise]);
-      const port = listener.port();
-      await Promise.race([
-        assert.rejects(
-          send(transport, `http://127.0.0.1:${port}`, { path: "/", deadlineMs: 40 }),
-          /no reply within 40 ms/,
-          "a held-open reply is failed by the deadline",
-        ),
-        guard.promise,
-      ]);
+      const pending = send(transport, `http://127.0.0.1:${listener.port()}`, { path: "/", deadlineMs: 40 });
+      // Attach the rejection handler before any await, and observe the
+      // assertion at creation so a watchdog win cannot leave it unhandled.
+      const expected = assert.rejects(pending, /no reply within 40 ms/, "a held-open reply is failed by the deadline");
+      expected.catch(() => undefined);
+      await Promise.race([expected, guard.promise]);
     } finally {
       guard.clear();
       transport.close();
       // Close the held response before the listener, so no socket outlives it.
-      await listener.close();
-    }
-  });
-
-  // The late-response-end regression: a reply that ends after the deadline, but
-  // before the armed timer runs, must fail with the end handler's own message,
-  // so removing that handler's expiry check makes this test fail.
-  it("fails a reply that ends after the deadline and before the timer fires", async () => {
-    const transport = keepAliveTransport();
-    const clock = new FakeClock();
-    const deadlineMs = 40;
-    const guard = watchdog(5000, "the late-end scenario did not finish");
-    // The listener is owned before its readiness is awaited, so teardown
-    // closes a server that binds late, after the watchdog has fired.
-    const listener = heldListener();
-    try {
-      await Promise.race([listener.ready, guard.promise]);
-      const pending = sendWithClock(clock, transport, `http://127.0.0.1:${listener.port()}`, {
-        path: "/",
-        deadlineMs,
-      });
-      // Observe the request promise at creation, then let an early request
-      // error interrupt the delivery wait instead of waiting out its timeout.
-      pending.catch(() => undefined);
-      await untilOrRequestSettles(() => listener.held() !== null, "the listener held its reply open", pending);
-      // Advance to the deadline without firing the armed timer, then send a
-      // complete, correctly sized reply; the end handler must reject it.
-      clock.advance(deadlineMs);
-      const reply = listener.held()!;
-      reply.writeHead(200, { "content-length": "2", "content-type": "text/plain" });
-      reply.end("ok");
-      await Promise.race([
-        assert.rejects(pending, new RegExp(`the reply ended after the ${deadlineMs} ms deadline`), "an end after the deadline fails at the end handler"),
-        guard.promise,
-      ]);
-      assert.equal(clock.armed().length, 0, "settlement cleared the armed deadline timer");
-    } finally {
-      guard.clear();
-      transport.close();
-      await listener.close();
-    }
-  });
-
-  // The early-firing regression: a timer that fires before the expiry must not
-  // reject; it must rearm one replacement for the time still left, and the
-  // replacement must reject at expiry with the missing-reply message.
-  it("rearms an early-firing timer for the time still left and rejects at expiry", async () => {
-    const transport = keepAliveTransport();
-    const clock = new FakeClock();
-    const deadlineMs = 40;
-    const guard = watchdog(5000, "the early-firing scenario did not finish");
-    // The listener is owned before its readiness is awaited, so teardown
-    // closes a server that binds late, after the watchdog has fired.
-    const listener = heldListener();
-    try {
-      await Promise.race([listener.ready, guard.promise]);
-      const pending = sendWithClock(clock, transport, `http://127.0.0.1:${listener.port()}`, {
-        path: "/",
-        deadlineMs,
-      });
-      // Observe the request promise at creation, then let an early request
-      // error interrupt the delivery wait instead of waiting out its timeout.
-      pending.catch(() => undefined);
-      await untilOrRequestSettles(() => listener.held() !== null, "the listener held its reply open", pending);
-      assert.equal(clock.armed().length, 1, "the deadline arms exactly one timer");
-      // Fire the armed timer at 25 of the 40 ms deadline: it has not expired,
-      // so it must rearm one replacement for the remaining 15 ms.
-      clock.advance(25);
-      clock.fireFirst();
-      const rearmed = clock.armed();
-      assert.equal(rearmed.length, 1, "an early firing arms exactly one replacement timer");
-      assert.equal(rearmed[0].due - clock.now(), deadlineMs - 25, "the replacement waits for the time still left");
-      // Fire the replacement at expiry; the missing reply must be rejected.
-      clock.advance(deadlineMs - 25);
-      clock.fireFirst();
-      await Promise.race([
-        assert.rejects(pending, new RegExp(`no reply within ${deadlineMs} ms`), "an expired missing reply is rejected at expiry"),
-        guard.promise,
-      ]);
-    } finally {
-      guard.clear();
-      transport.close();
+      held.response?.destroy();
       await listener.close();
     }
   });

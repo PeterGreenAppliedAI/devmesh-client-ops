@@ -193,36 +193,6 @@ export const DEFAULT_RESPONSE_CAP = 8 * 1024 * 1024;
 /** The default deadline, in milliseconds, for a bounded request's whole life. */
 export const DEFAULT_DEADLINE_MS = 5000;
 
-/**
- * A monotonic millisecond clock and timer scheduler: the helper's only source
- * of time. Monotonic milliseconds never go backwards and are unaffected by
- * wall-clock steps, so the deadline cannot be extended or exhausted early by
- * an adjustment to the system time. Exported `send()` always uses the system
- * clock, so no caller can control when a deadline fires; this interface and
- * `sendWithClock` below are the seam the transport suite's deterministic
- * deadline-order regressions drive, and nothing else uses them.
- */
-export interface Clock {
-  /** Monotonic milliseconds; never goes backwards and is unaffected by wall-clock steps. */
-  now(): number;
-  /** Run `callback` once at least `delayMs` after the current time; returns a cancel handle. */
-  setTimer(delayMs: number, callback: () => void): TimerHandle;
-  /** Cancel a timer that has not fired yet. */
-  clearTimer(handle: TimerHandle): void;
-}
-
-/** A scheduler's timer handle, opaque to the helper, like `Clock`. */
-export interface TimerHandle {
-  readonly handle: object;
-}
-
-/** The process's monotonic clock and its timers. */
-const SYSTEM_CLOCK: Clock = {
-  now: () => performance.now(),
-  setTimer: (delayMs, callback) => ({ handle: setTimeout(callback, delayMs) }),
-  clearTimer: (timer) => clearTimeout(timer.handle as ReturnType<typeof setTimeout>),
-};
-
 /** One request the bounded helper sends; `body` makes it a POST. */
 export interface SendOptions {
   /** `GET` (the default) or `POST`. */
@@ -291,23 +261,6 @@ function declaredLength(headers: Record<string, string | string[] | undefined>):
  * so the same-origin checks accept the request.
  */
 export function send(transport: Transport, base: string, options: SendOptions): Promise<TransportReply> {
-  return sendWithClock(SYSTEM_CLOCK, transport, base, options);
-}
-
-/**
- * The request helper's one implementation, taking its time source explicitly.
- * Exported `send()` always passes the system's clock; the transport suite's
- * deterministic regressions pass a fake clock, so the public path and those
- * tests exercise the same response-end and timer handlers. `SendOptions` has
- * no clock field, so a caller reaching `send()` cannot control when a
- * deadline fires and a finite deadline always binds.
- */
-export function sendWithClock(
-  clock: Clock,
-  transport: Transport,
-  base: string,
-  options: SendOptions,
-): Promise<TransportReply> {
   const url = originOf(base);
   assert.ok(options.path.startsWith("/"), `the request target ${options.path} is root-relative`);
   const method = options.method ?? "GET";
@@ -319,8 +272,8 @@ export function sendWithClock(
   // A monotonic expiry keeps the budget independent of wall-clock
   // adjustments: the clock never steps, so a backward adjustment cannot
   // extend the deadline and a forward one cannot exhaust it early.
-  const expiresAt = clock.now() + deadlineMs;
-  const timedOut = (): boolean => clock.now() >= expiresAt;
+  const expiresAt = performance.now() + deadlineMs;
+  const timedOut = (): boolean => performance.now() >= expiresAt;
   const timeoutError = (): Error => new Error(`no reply within ${deadlineMs} ms`);
   assert.ok(Number.isSafeInteger(cap) && cap >= 0, "the response cap is a finite byte count");
   // Node's timer stores its delay as a signed 32-bit integer and clamps a
@@ -341,11 +294,11 @@ export function sendWithClock(
     let settled = false;
     let seenResponse = false;
     let response: IncomingMessage | null = null;
-    let timer: TimerHandle | null = null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
 
     const clearDeadline = (): void => {
       if (timer !== null) {
-        clock.clearTimer(timer);
+        clearTimeout(timer);
         timer = null;
       }
     };
@@ -472,12 +425,12 @@ export function sendWithClock(
       // is failed by the end handler above, with its own message, whether or
       // not the timer has run yet.
       const armDeadline = (): boolean => {
-        const remaining = expiresAt - clock.now();
+        const remaining = expiresAt - performance.now();
         if (remaining <= 0) {
           fail(timeoutError());
           return false;
         }
-        timer = clock.setTimer(remaining, () => {
+        timer = setTimeout(() => {
           // The callback fires with `timer` still set, so a settlement that
           // happens inside it still clears the timer the scheduler just ran.
           if (!settled && !timedOut()) {
