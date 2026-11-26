@@ -1,0 +1,552 @@
+/**
+ * Loopback HTTP helpers for the transcript library integration test: reading
+ * rendered pages, following a rendered multipart form the way a browser does,
+ * and reading a source's three views over the network.
+ *
+ * These helpers use only Node's built-in `http` module. They never build a URL
+ * the application did not render: form actions and links are read from the
+ * page markup and sent back unchanged, so a misdirected or mislabelled link
+ * fails the test instead of being papered over by a hand-built path.
+ */
+
+import assert from "node:assert/strict";
+import { request as httpRequest } from "node:http";
+
+/** The boundary the helper uses for every submitted multipart body. */
+export const BOUNDARY = "transcript-library-boundary";
+
+/** The `Content-Type` of a submitted multipart body with that boundary. */
+export const MULTIPART_TYPE = `multipart/form-data; boundary=${BOUNDARY}`;
+
+/** One HTTP reply: its status, headers and raw body bytes. */
+export interface Reply {
+  readonly status: number;
+  readonly headers: Record<string, string | string[] | undefined>;
+  readonly bytes: Buffer;
+  /** The body decoded as UTF-8, for HTML and text replies. */
+  readonly body: string;
+}
+
+/** The application base URL's origin, for the origin checks. */
+function originOf(base: string): URL {
+  return new URL(base);
+}
+
+/** A reply body decoded as a string; text is UTF-8 in this application. */
+function replyFrom(status: number, headers: Record<string, string | string[] | undefined>, bytes: Buffer): Reply {
+  return { status, headers, bytes, body: bytes.toString("utf8") };
+}
+
+/**
+ * A resolved link: the absolute href a browser follows (origin, path and query)
+ * and the fragment it resolves locally. The fragment is returned raw, exactly
+ * as it appears in the href, and the href keeps its origin, so a link pointing
+ * at another origin is visible instead of being reduced to the local path.
+ */
+interface SplitLink {
+  readonly href: string;
+  readonly path: string;
+  readonly fragment: string;
+}
+
+/**
+ * Resolve one rendered href against the page that rendered it on the running
+ * application: a root-relative href, a same-page `#fragment` href, a relative
+ * or an absolute href becomes the absolute URL a browser would follow, and the
+ * fragment is kept raw. The page is resolved against the application's own
+ * origin and a link naming another origin is refused, so a link that leaves the
+ * application is never requested from the local pages instead.
+ */
+export function splitLink(base: string, fromPath: string, href: string): SplitLink {
+  assert.ok(href !== "", `the link ${href || "(empty)"} is not empty`);
+  const origin = new URL(base).origin;
+  const resolved = new URL(href, new URL(fromPath, origin));
+  assert.equal(resolved.origin, origin, `the link ${href} on ${fromPath} names the application's own origin`);
+  return {
+    href: resolved.href,
+    path: `${resolved.pathname}${resolved.search}`,
+    fragment: resolved.hash === "" ? "" : resolved.hash.slice(1),
+  };
+}
+
+/**
+ * Send one GET over loopback HTTP. `path` is a root-relative request target
+ * (its query included) or an absolute URL naming the application's own origin;
+ * a target naming another origin, or a relative one resolved against `/`, is
+ * refused, so a misdirected link fails instead of being fetched locally. A
+ * fragment is resolved by the browser and never sent: the request target is
+ * the path and query. The Host header is the origin's own authority; a plain
+ * GET carries no Origin and is accepted by the shell.
+ */
+export function get(base: string, path: string): Promise<Reply> {
+  const url = originOf(base);
+  assert.ok(path.startsWith("/") || path.startsWith(`${url.origin}/`), `the request target ${path} is root-relative`);
+  const resolved = new URL(path, url.origin);
+  assert.equal(resolved.origin, url.origin, `the request target ${path} names the application's own origin`);
+  const target = `${resolved.pathname}${resolved.search}`;
+  const headers: Record<string, string | number> = {
+    host: url.host,
+    "content-length": 0,
+  };
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      { host: url.hostname, port: Number(url.port), method: "GET", path: target, headers, agent: false },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("end", () => resolve(replyFrom(res.statusCode ?? 0, res.headers, Buffer.concat(chunks))));
+        res.on("error", reject);
+      },
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+/**
+ * Send one POST over loopback HTTP with an exact byte body. The Origin header
+ * is the request's own origin, as a browser would send it for a same-origin
+ * form submission.
+ */
+function postBytes(
+  base: string,
+  path: string,
+  contentType: string,
+  body: Uint8Array,
+): Promise<Reply> {
+  const url = originOf(base);
+  const headers: Record<string, string> = {
+    host: url.host,
+    origin: url.origin,
+    "content-length": String(body.byteLength),
+    "content-type": contentType,
+  };
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      { host: url.hostname, port: Number(url.port), method: "POST", path, headers, agent: false },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("end", () => resolve(replyFrom(res.statusCode ?? 0, res.headers, Buffer.concat(chunks))));
+        res.on("error", reject);
+      },
+    );
+    req.on("error", reject);
+    req.end(body);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// HTML reading
+// ---------------------------------------------------------------------------
+
+/** Undo the five HTML escapes the renderer writes, and nothing else. */
+export function unescapeHtml(value: string): string {
+  return value
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+/** One section of a page: from its own `<h2>` to the next one. */
+export function sectionOf(body: string, title: string): string {
+  const heading = `<h2>${unescapeHtml(title).replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char] ?? char)}</h2>`;
+  const start = body.indexOf(heading);
+  if (start < 0) return "";
+  const rest = body.slice(start + heading.length);
+  const next = rest.indexOf("<h2>");
+  return next < 0 ? rest : rest.slice(0, next);
+}
+
+/** One rendered form control, keeping the type it is rendered with. */
+interface FormControl {
+  readonly name: string;
+  /** The control's rendered type: `text`, `date`, `textarea`, `select`, `file`, `hidden`. */
+  readonly type: string;
+  /** The rendered value; a file control has none. */
+  readonly value: string;
+  /** True for a control a browser would submit (never a disabled one). */
+  readonly enabled: boolean;
+}
+
+/** The single `<form>` of a page: its action, encoding, method and controls. */
+export interface ParsedForm {
+  readonly action: string;
+  readonly method: string;
+  readonly enctype: string | null;
+  /** Every named control with its rendered type, value and enabled state. */
+  readonly controls: Map<string, FormControl>;
+  /** Select controls: name to the option values an operator can select. */
+  readonly options: Map<string, string[]>;
+  /** Names the page renders as a select, whether or not it offers an option. */
+  readonly selects: ReadonlySet<string>;
+}
+
+/** True for an element rendered with a `disabled` attribute. */
+function isDisabled(attributes: string): boolean {
+  return /\sdisabled(?:[=\s]|>|$)/.test(attributes);
+}
+
+/**
+ * The positions of the form's `<fieldset ... disabled>` elements (and of their
+ * closing tags), so a control rendered inside one is recognised as unavailable:
+ * a browser does not submit a control of a disabled fieldset even when the
+ * control itself carries no `disabled` attribute.
+ */
+function disabledFieldsets(inner: string): { readonly start: number; readonly end: number }[] {
+  const spans: { start: number; end: number }[] = [];
+  const tags = [...inner.matchAll(/<fieldset([^>]*)>|<\/fieldset>/g)];
+  for (const [index, match] of tags.entries()) {
+    if (match[0] === "</fieldset>") continue;
+    if (!isDisabled(match[1])) continue;
+    // The fieldset's own close is the first closing tag with no further open
+    // fieldset between them, so a nested fieldset's close does not end it.
+    let depth = 0;
+    let end = inner.length;
+    for (const nested of tags.slice(index + 1)) {
+      if (nested[0] === "</fieldset>") {
+        if (depth === 0) {
+          end = nested.index!;
+          break;
+        }
+        depth -= 1;
+      } else {
+        depth += 1;
+      }
+    }
+    spans.push({ start: match.index!, end });
+  }
+  return spans;
+}
+
+/** True when a control at `index` lies inside one of the disabled fieldsets. */
+function insideDisabledFieldset(spans: readonly { readonly start: number; readonly end: number }[], index: number): boolean {
+  return spans.some((span) => index > span.start && index < span.end);
+}
+
+/** Parse the one form of a rendered page, keeping each control's rendered type. */
+export function parseForm(document: string): ParsedForm {
+  const form = /<form[^>]*>([\s\S]*?)<\/form>/.exec(document);
+  assert.ok(form !== null, "the page carries a form");
+  const open = /<form[^>]*>/.exec(form[0])![0];
+  const attribute = (name: string): string | null => {
+    const match = new RegExp(`\\s${name}="([^"]*)"`).exec(open);
+    return match === null ? null : unescapeHtml(match[1]);
+  };
+  const action = attribute("action");
+  assert.notEqual(action, null, "the form carries an action");
+  const controls = new Map<string, FormControl>();
+  const options = new Map<string, string[]>();
+  const selects = new Set<string>();
+  const inner = form[1];
+  const disabledSpans = disabledFieldsets(inner);
+  for (const match of inner.matchAll(/<textarea([^>]*)>([\s\S]*?)<\/textarea>/g)) {
+    const name = /\sname="([^"]+)"/.exec(match[1]);
+    if (name === null) continue;
+    controls.set(unescapeHtml(name[1]), {
+      name: unescapeHtml(name[1]),
+      type: "textarea",
+      value: unescapeHtml(match[2]),
+      enabled: !isDisabled(match[1]) && !insideDisabledFieldset(disabledSpans, match.index!),
+    });
+  }
+  for (const match of inner.matchAll(/<input([^>]*)>/g)) {
+    const attrs = match[1];
+    const name = /\sname="([^"]+)"/.exec(attrs);
+    if (name === null) continue;
+    const type = /\stype="([^"]*)"/.exec(attrs);
+    const value = /\svalue="([^"]*)"/.exec(attrs);
+    controls.set(unescapeHtml(name[1]), {
+      name: unescapeHtml(name[1]),
+      type: unescapeHtml(type === null ? "text" : type[1]).toLowerCase(),
+      value: value === null ? "" : unescapeHtml(value[1]),
+      enabled: !isDisabled(attrs) && !insideDisabledFieldset(disabledSpans, match.index!),
+    });
+  }
+  for (const match of inner.matchAll(/<select([^>]*)>([\s\S]*?)<\/select>/g)) {
+    const name = /\sname="([^"]+)"/.exec(match[1]);
+    assert.notEqual(name, null, "the select carries a name");
+    const content = match[2];
+    // An option inside a disabled optgroup, like a disabled option itself, is
+    // unavailable to the operator, so the choices are only the enabled ones.
+    const groups = [...content.matchAll(/<optgroup([^>]*)>/g)];
+    const disabledGroups = groups
+      .filter((group) => isDisabled(group[1]))
+      .map((group) => {
+        const rest = content.slice(group.index!);
+        const close = rest.indexOf("</optgroup>");
+        return { start: group.index!, end: close < 0 ? content.length : group.index! + close };
+      });
+    const offered = [...content.matchAll(/<option([^>]*)>/g)].filter(
+      (option) =>
+        !isDisabled(option[1]) &&
+        !disabledGroups.some((span) => option.index! >= span.start && option.index! < span.end),
+    );
+    const valueOf = (attributes: string): string => {
+      const value = /\svalue="([^"]*)"/.exec(attributes);
+      return unescapeHtml(value === null ? "" : value[1]);
+    };
+    const choices = offered.map((option) => valueOf(option[1]));
+    // The rendered default is the last enabled offered option marked selected,
+    // or the first enabled offered option, never a disabled option.
+    const selected = offered.filter((option) => /\sselected(?:[=\s]|>|$)/.test(option[1])).pop();
+    const value = selected === undefined ? (choices[0] ?? "") : valueOf(selected[1]);
+    options.set(unescapeHtml(name![1]), choices);
+    selects.add(unescapeHtml(name![1]));
+    controls.set(unescapeHtml(name![1]), {
+      name: unescapeHtml(name![1]),
+      type: "select",
+      value,
+      enabled: !isDisabled(match[1]) && !insideDisabledFieldset(disabledSpans, match.index!),
+    });
+  }
+  return {
+    action: action!,
+    method: (attribute("method") ?? "get").toLowerCase(),
+    enctype: attribute("enctype"),
+    controls,
+    options,
+    selects,
+  };
+}
+
+/** The form controls whose submitted value is a choice from a list. */
+const CHOICE_CONTROLS: ReadonlySet<string> = new Set(["projectId"]);
+
+/**
+ * Submit a rendered form over HTTP exactly as a browser would. For a
+ * multipart form the file control is sent as its own file part (or as the
+ * empty filename a browser sends when no file was chosen); every other control
+ * is sent as a text part carrying the value the caller supplied or the value
+ * the form rendered. For a url-encoded form, every control is one field.
+ *
+ * A fixture file may be supplied only for a control the page actually renders
+ * as an enabled file input, so a replaced picker cannot silently carry an
+ * upload.
+ */
+export function submit(
+  base: string,
+  pagePath: string,
+  form: ParsedForm,
+  values: Readonly<Record<string, string | { readonly filename: string; readonly body: string | Uint8Array }>> = {},
+): Promise<Reply> {
+  // A submitted form is always a POST, as the pages render it; a creation or
+  // archive form that renders GET or omits its method is not followed here.
+  assert.equal(form.method, "post", `the form at ${form.action} posts`);
+  for (const [name, supplied] of Object.entries(values)) {
+    const control = form.controls.get(name);
+    assert.ok(control !== undefined, `the form carries ${name}`);
+    assert.ok(control!.enabled, `the supplied control ${name} is enabled`);
+    if (typeof supplied !== "string") {
+      assert.equal(control!.type, "file", `the form renders ${name} as a file control`);
+    } else if (CHOICE_CONTROLS.has(name) || form.selects.has(name)) {
+      // The import forms' choice controls are projects. A supplied choice must
+      // come from the rendered, enabled select and be one of its enabled
+      // options; a hidden or ordinary input standing in for the select, or a
+      // value the operator cannot pick, is refused.
+      assert.equal(control!.type, "select", `the form renders the choice ${name} as a select, not ${control!.type}`);
+      const choices = form.options.get(name) ?? [];
+      assert.ok(choices.includes(supplied), `the select ${name} offers ${JSON.stringify(supplied)}`);
+    } else {
+      assert.notEqual(control!.type, "select", `the select ${name} is rendered with its options`);
+    }
+  }
+  // A browser does not submit a control rendered unavailable, so neither does
+  // the helper: a disabled control is left out of the request.
+  const parts: Part[] = [];
+  for (const [name, control] of form.controls) {
+    if (!control.enabled) continue;
+    const supplied = values[name];
+    parts.push({
+      control,
+      value: supplied === undefined ? control.value : supplied,
+    });
+  }
+  const multipartBody = form.enctype === "multipart/form-data";
+  for (const part of parts) {
+    if (multipartBody && typeof part.value !== "string") {
+      assert.equal(part.control.type, "file", `a file part is sent only for a file control, not ${part.control.name}`);
+    }
+  }
+  // The action is the link the page rendered, resolved against the page it was
+  // rendered on (a page-relative action stays on that page's directory) and
+  // naming the application's own origin; a misdirected action is refused.
+  const { path } = splitLink(base, pagePath, form.action);
+  if (multipartBody) {
+    return postBytes(base, path, MULTIPART_TYPE, multipart(parts));
+  }
+  const fields = new URLSearchParams();
+  for (const part of parts) {
+    if (typeof part.value !== "string") assert.fail(`the url-encoded form carries text for ${part.control.name}`);
+    fields.set(part.control.name, part.value);
+  }
+  const body = Buffer.from(fields.toString(), "utf8");
+  return postBytes(base, path, "application/x-www-form-urlencoded", body);
+}
+
+/** One submitted control: its rendered control and the text or file it carries. */
+interface Part {
+  readonly control: FormControl;
+  readonly value: string | { readonly filename: string; readonly body: string | Uint8Array };
+}
+
+/** Build one complete multipart/form-data body with the helper's boundary. */
+function multipart(parts: readonly Part[]): Buffer {
+  const pieces = parts.map((part) => {
+    const isFile = typeof part.value !== "string";
+    const disposition = [`name="${part.control.name}"`];
+    if (isFile) disposition.push(`filename="${part.value.filename}"`);
+    const lines = [
+      `--${BOUNDARY}`,
+      `Content-Disposition: form-data; ${disposition.join("; ")}`,
+      ...(isFile ? ["Content-Type: application/octet-stream"] : []),
+      "",
+      "",
+    ];
+    let payload: Buffer;
+    if (typeof part.value === "string") {
+      payload = Buffer.from(part.value, "utf8");
+    } else if (typeof part.value.body === "string") {
+      payload = Buffer.from(part.value.body, "utf8");
+    } else {
+      payload = Buffer.from(part.value.body);
+    }
+    return Buffer.concat([Buffer.from(lines.join("\r\n"), "utf8"), payload, Buffer.from("\r\n")]);
+  });
+  return Buffer.concat([...pieces, Buffer.from(`--${BOUNDARY}--\r\n`)]);
+}
+
+// ---------------------------------------------------------------------------
+// Source rows and their three views
+// ---------------------------------------------------------------------------
+
+/** One listed source on a meeting's detail page, read from its own markup. */
+export interface SourceRow {
+  readonly filename: string;
+  readonly format: string;
+  readonly original: string;
+  readonly text: string;
+  readonly passages: string;
+}
+
+/**
+ * The source rows of a meeting's detail page, in rendered order. Each row is
+ * the list item carrying a source's filename and its three labelled links;
+ * the links are read from the page, never built here.
+ */
+export function sourceRows(document: string): SourceRow[] {
+  const rows: SourceRow[] = [];
+  for (const match of document.matchAll(/<li class="card">([\s\S]*?)<\/li>/g)) {
+    const inner = match[1];
+    const filename = /<span class="source-filename">([\s\S]*?)<\/span>/.exec(inner);
+    if (filename === null) continue;
+    const format = /<span class="source-format">([\s\S]*?)<\/span>/.exec(inner);
+    assert.notEqual(format, null, "a source row shows its stored format");
+    const byLabel = new Map(
+      [...inner.matchAll(/<a href="([^"]+)">([^<]+)<\/a>/g)].map((anchor) => [unescapeHtml(anchor[2]), unescapeHtml(anchor[1])]),
+    );
+    const original = byLabel.get("Download original");
+    const text = byLabel.get("Extracted text");
+    const passages = byLabel.get("Passages");
+    assert.notEqual(original, undefined, "a source row links its original");
+    assert.notEqual(text, undefined, "a source row links its text");
+    assert.notEqual(passages, undefined, "a source row links its passages");
+    rows.push({
+      filename: unescapeHtml(filename[1]),
+      format: unescapeHtml(format![1]),
+      original: original!,
+      text: text!,
+      passages: passages!,
+    });
+  }
+  return rows;
+}
+
+/**
+ * Resolve every link of every source row rendered on the meeting page at
+ * `meetingPath`, against that page. A relative href resolves against the
+ * meeting path's directory, a same-origin absolute href keeps its path and
+ * query, and a link naming another origin is refused. Each resolved row has
+ * the same fields as a rendered row, now holding root-relative request targets
+ * on the application's own origin, so it can be saved as a restart baseline.
+ */
+export function meetingSourceRows(base: string, meetingPath: string, document: string): SourceRow[] {
+  return sourceRows(document).map((row) => ({
+    filename: row.filename,
+    format: row.format,
+    original: splitLink(base, meetingPath, row.original).path,
+    text: splitLink(base, meetingPath, row.text).path,
+    passages: splitLink(base, meetingPath, row.passages).path,
+  }));
+}
+
+/** One passage as the passages page renders it: its anchor, text, and metadata. */
+export interface RenderedPassage {
+  readonly anchor: string;
+  readonly text: string;
+  readonly offsets: string;
+  readonly position: string;
+  readonly location: string;
+  /** The fragment link the row renders, unescaped. */
+  readonly link: string;
+}
+
+/**
+ * The passages a passages page renders, in stored order. The anchor, the
+ * escaped passage text and the offsets, line/column and location metadata are
+ * read from the page's own markup, so a changed text, range or location fails.
+ */
+export function renderedPassages(document: string): RenderedPassage[] {
+  const passages: RenderedPassage[] = [];
+  for (const match of document.matchAll(/<li class="passage" id="([^"]+)">([\s\S]*?)<\/li>/g)) {
+    const anchor = unescapeHtml(match[1]);
+    const inner = match[2];
+    const text = /<p class="passage-text">([\s\S]*?)<\/p>/.exec(inner);
+    assert.notEqual(text, null, "a passage row shows its text");
+    const offsets = /<span class="offsets">([\s\S]*?)<\/span>/.exec(inner);
+    const position = /<span class="position">([\s\S]*?)<\/span>/.exec(inner);
+    assert.notEqual(offsets, null, "a passage row shows its offsets");
+    assert.notEqual(position, null, "a passage row shows its position");
+    const location = /<span class="location">([\s\S]*?)<\/span>/.exec(inner);
+    const link = /<a class="passage-link" href="([^"]+)">/.exec(inner);
+    assert.notEqual(link, null, "a passage row links itself");
+    passages.push({
+      anchor,
+      text: unescapeHtml(text![1]),
+      offsets: unescapeHtml(offsets![1]),
+      position: unescapeHtml(position![1]),
+      location: location === null ? "" : unescapeHtml(location[1]),
+      link: unescapeHtml(link![1]),
+    });
+  }
+  return passages;
+}
+
+/**
+ * Resolve one rendered passage link, rendered on the page at `fromPath` on the
+ * running application, against the page that rendered it. The destination must
+ * be the application's own, carry exactly one row with the decoded fragment's
+ * anchor, and that row must show the passage's own quote. A fragment link is a
+ * same-page anchor: the fragment names a row on the page, and the page is
+ * fetched, so the resolved request target and raw fragment are returned.
+ */
+export async function resolvePassageLink(
+  base: string,
+  fromPath: string,
+  passage: RenderedPassage,
+  expectedText: string = passage.text,
+): Promise<{ readonly path: string; readonly fragment: string }> {
+  const { href, path, fragment } = splitLink(base, fromPath, passage.link);
+  assert.notEqual(fragment, "", `the passage link ${passage.link} carries a fragment`);
+  // The browser decodes the fragment to find the anchor; the raw fragment is
+  // kept for the saved URL, and the decoded one is compared with the HTML id.
+  const anchor = decodeURIComponent(fragment);
+  const destination = await get(base, href);
+  assert.equal(destination.status, 200, `the passage link destination ${href} is readable`);
+  const targets = renderedPassages(destination.body).filter((row) => row.anchor === anchor);
+  assert.equal(targets.length, 1, `the fragment ${anchor} targets exactly one passage row at ${href}`);
+  assert.equal(targets[0].text, expectedText, `the target row ${anchor} shows the passage's own quote`);
+  return { path, fragment };
+}

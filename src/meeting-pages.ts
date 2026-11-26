@@ -46,6 +46,13 @@ import {
   showValue,
   type PageSection,
 } from "./work-pages.ts";
+import {
+  meetingSourceSection,
+  transcriptSourceRoutes,
+  type SourceView,
+  type TranscriptSourceRoute,
+  type TranscriptSourceRoutes,
+} from "./transcript-source-pages.ts";
 
 /** The result of rendering one meeting page: a page, or a fixed redirect. */
 export type MeetingPage = Page | Redirect;
@@ -99,6 +106,11 @@ export interface MeetingRoutes {
   readonly meetingsRecord: MeetingPathRoute;
   readonly meetingsEdit: MeetingPathRoute;
   readonly meetingsNew: MeetingPathRoute;
+  /**
+   * The three read-only source GETs, matched only when the path is one of the
+   * fixed source shapes; every other meeting path keeps the routes above.
+   */
+  readonly sources: TranscriptSourceRoutes;
 }
 
 /** The fixed paths the meeting table registers, used for matching. */
@@ -138,6 +150,48 @@ export function matchMeetingPath(
     }
   }
   return null;
+}
+
+/**
+ * Pick the route for a path: when `source` is supplied (the shell matched a
+ * fixed source shape) the source view's GET slot; for a POST to that shape there
+ * is no slot, so the shell answers 405. Otherwise the ordinary meeting, edit or
+ * creation slot for the matched pattern.
+ */
+export function routeForMeetingRequest(
+  routes: MeetingRoutes,
+  path: string,
+  method: "GET" | "POST",
+  source?: { readonly view: SourceView },
+): MeetingRoute | TranscriptSourceRoute | undefined {
+  if (source !== undefined) {
+    const slot = sourceSlot(routes.sources, source.view);
+    if (slot === null) return undefined;
+    return method === "GET" ? slot.get : undefined;
+  }
+  const matched = matchMeetingPath(path);
+  if (matched === null) return undefined;
+  return routeForMeetingPattern(routes, matched.pattern, method);
+}
+
+/**
+ * The GET slot of one source view, chosen by the three exact view literals. Only
+ * a GET is served (a POST finds no slot and the shell answers 405), and no
+ * other view name can reach the table, so an inherited property name is never
+ * read as a slot.
+ */
+function sourceSlot(
+  sources: TranscriptSourceRoutes,
+  view: SourceView,
+): { readonly get: TranscriptSourceRoute } | null {
+  switch (view) {
+    case "original":
+      return sources.original;
+    case "text":
+      return sources.text;
+    case "passages":
+      return sources.passages;
+  }
 }
 
 /** Pick the registered route for a matched pattern from the table. */
@@ -873,8 +927,17 @@ export function meetingRoutes(store: Store): MeetingRoutes {
           body: displayList(displayValues(MEETING_PROFILE_FIELDS, profile)),
         },
         {
+          // The transcript actions of this meeting: the import form the header
+          // also offers. This place in the page body is kept beside the source
+          // list, exactly as before sources gained their own section.
           title: "Transcript",
           body: `<p>${link(meetingImportHref(meeting.id), "Import transcript")}</p>`,
+        },
+        {
+          // Every committed source of this meeting, from the snapshot metadata
+          // alone, so a missing original cannot break the page.
+          title: "Sources",
+          body: meetingSourceSection(snap, meeting.id),
         },
         {
           title: "Identity and parents",
@@ -892,6 +955,7 @@ export function meetingRoutes(store: Store): MeetingRoutes {
     meetingsRecord: {
       get: { method: "GET", render: (request) => showMeeting(request) },
     },
+    sources: transcriptSourceRoutes(store),
     meetingsEdit: {
       get: { method: "GET", render: (request) => editMeetingForm(request) },
       post: {

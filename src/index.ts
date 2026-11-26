@@ -23,8 +23,9 @@ import { hierarchyRoutes, matchHierarchyPath, routeForPattern, type HierarchyPat
 import type { HierarchyRoute } from "./hierarchy-pages.ts";
 import { matchWorkPath, routeForWorkPattern, workRoutes, type WorkPath } from "./work-pages.ts";
 import type { WorkRoute } from "./work-pages.ts";
-import { matchMeetingPath, meetingRoutes, routeForMeetingPattern, type MeetingPath } from "./meeting-pages.ts";
+import { matchMeetingPath, meetingRoutes, routeForMeetingPattern, routeForMeetingRequest, type MeetingPath } from "./meeting-pages.ts";
 import type { MeetingRoute } from "./meeting-pages.ts";
+import { matchTranscriptSourcePath, type SourceView, type TranscriptSourceRoute } from "./transcript-source-pages.ts";
 import { archivedRoutes, archiveRoutes, matchArchivePath, type ArchivePath, type ArchiveRoute } from "./archive-pages.ts";
 import { kanbanRoutes, matchKanbanPath, routeForKanbanPattern, type KanbanPath, type KanbanRoute } from "./kanban-pages.ts";
 import {
@@ -133,6 +134,13 @@ export interface Application {
 export interface HierarchyPathMatch {
   readonly pattern: HierarchyPath | WorkPath | MeetingPath | ArchivePath | KanbanPath | TranscriptImportPath | "/archived";
   readonly id: string;
+  /**
+   * Set only for a matched transcript source path: its view and raw segment
+   * ids. Such a match carries the fixed `/meetings/:id` pattern beside it, so
+   * the source path never falls into the hierarchy lookup; the `route` lookup
+   * reads this field to find the source view's GET slot.
+   */
+  readonly source?: { readonly view: SourceView; readonly meetingId: string; readonly transcriptId: string; readonly sourceId: string };
 }
 
 /**
@@ -182,7 +190,13 @@ export function registerRoutes(store: Store): Routes {
       if (work !== null) return work;
       const meeting = matchMeetingPath(path);
       if (meeting !== null) return meeting;
-      return matchTranscriptImportPath(path);
+      const importPath = matchTranscriptImportPath(path);
+      if (importPath !== null) return importPath;
+      // The source GETs are a fixed seven-segment shape under `/meetings` that
+      // neither the meeting nor the import shapes match; they are matched last.
+      const source = matchTranscriptSourcePath(path);
+      if (source !== null) return { pattern: "/meetings/:id", id: source.meetingId, source };
+      return null;
     },
     route: (matched, method) => {
       // `matched` is only produced by `match` above, so its pattern is one of
@@ -201,6 +215,18 @@ export function registerRoutes(store: Store): Routes {
       if (isTranscriptImportPath(matched.pattern)) {
         const route = routeForTranscriptImportPattern(imports, matched.pattern, method);
         return route === undefined ? undefined : adaptRoute(route);
+      }
+      if (matched.source !== undefined) {
+        // The matched raw segments are already single-segment encoded ids; the
+        // route decodes each exactly once, so it receives the request's own
+        // spelling and refuses anything that is not the canonical encoding.
+        const sourceRoute = routeForMeetingRequest(
+          meetings,
+          "",
+          method,
+          { view: matched.source.view },
+        );
+        return sourceRoute === undefined ? undefined : adaptSourceRoute(sourceRoute as TranscriptSourceRoute, matched.source);
       }
       const route = isKanbanPath(matched.pattern)
         ? routeForKanbanPattern(kanban, matched.pattern, method)
@@ -284,6 +310,22 @@ function adaptRoute(route: HierarchyRoute | WorkRoute | MeetingRoute | ArchiveRo
   return {
     method: route.method,
     render: (request: RouteRequest) => route.render(request),
+  };
+}
+
+/**
+ * Adapt a transcript source GET to the shell's generic route interface. The
+ * shell already matched the exact source shape and holds its raw segment ids in
+ * the matched value, so the route receives them instead of re-reading the path.
+ */
+function adaptSourceRoute(
+  route: TranscriptSourceRoute,
+  source: { readonly meetingId: string; readonly transcriptId: string; readonly sourceId: string },
+): Route {
+  return {
+    method: route.method,
+    render: (request: RouteRequest) =>
+      route.render({ method: "GET", meetingId: source.meetingId, transcriptId: source.transcriptId, sourceId: source.sourceId }),
   };
 }
 

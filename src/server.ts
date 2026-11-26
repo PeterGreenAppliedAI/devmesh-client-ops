@@ -45,11 +45,16 @@ export type { FieldError, FieldSpec, Page, Redirect } from "./html.ts";
 export const DEFAULT_MAX_BODY_BYTES = 16 * 1024;
 
 /**
- * A route's result: a page, a redirect, or a plain-text error. A route reports
- * missing records by throwing `MissingRecordError` and invalid input by
- * throwing `ValidationError`; a form problem is reported with `FormError`.
- * Headers on every result are advisory: the shell sets Content-Type and the
- * no-store policy itself, so a result can neither omit nor override them.
+ * A route's result: a page, a redirect, a plain-text error, or a binary body.
+ * A route reports missing records by throwing `MissingRecordError` and invalid
+ * input by throwing `ValidationError`; a form problem is reported with
+ * `FormError`.
+ *
+ * A text result's Content-Type and no-store policy are the shell's own, so a
+ * result can neither omit nor override them. A binary result (`body` is bytes)
+ * is a download: the shell sends it as `application/octet-stream` with no-store,
+ * an exact Content-Length taken from the bytes themselves, and the route's other
+ * headers, so the bytes a route returns are exactly the bytes sent.
  */
 export type RouteResult =
   | Page
@@ -58,6 +63,14 @@ export type RouteResult =
       readonly status: number;
       readonly body: string;
       readonly headers?: Readonly<Record<string, string>>;
+      /** Never set for a text body; distinguishes a binary result from a text one. */
+      readonly binary?: undefined;
+    }
+  | {
+      readonly status: number;
+      readonly body: Uint8Array;
+      readonly headers?: Readonly<Record<string, string>>;
+      readonly binary: true;
     };
 
 /**
@@ -181,11 +194,11 @@ const SHELL_HEADERS: ReadonlySet<string> = new Set(["content-type", "cache-contr
 function send(
   res: ServerResponse,
   status: number,
-  body: string,
+  body: string | Uint8Array,
   contentType: string,
   extra: Readonly<Record<string, string>> = {},
 ): void {
-  const payload = Buffer.from(body, "utf8");
+  const payload = typeof body === "string" ? Buffer.from(body, "utf8") : Buffer.from(body);
   const headers: Record<string, string> = {};
   for (const [name, value] of Object.entries(extra)) {
     if (!SHELL_HEADERS.has(name.toLowerCase())) headers[name] = value;
@@ -219,6 +232,13 @@ function sendRouteResult(
   }
   if ("html" in result) {
     sendLayoutPage(res, 200, result, requestPath, store);
+    return;
+  }
+  if (result.binary === true) {
+    // The binary body is sent exactly as returned; a download's Content-Type is
+    // its own (the shell still owns no-store, Content-Length and the other
+    // response headers it sets for every result).
+    send(res, result.status, result.body, "application/octet-stream", result.headers);
     return;
   }
   send(res, result.status, result.body, "text/plain; charset=utf-8", result.headers);
