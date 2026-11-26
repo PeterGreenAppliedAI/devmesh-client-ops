@@ -367,9 +367,11 @@ export function send(transport: Transport, base: string, options: SendOptions): 
               return;
             }
             // An end dispatched after the deadline but before its timer
-            // callback still fails: the expiry is checked here as well.
+            // callback still fails: the expiry is checked here as well, with
+            // its own message so a late end is distinguishable from a reply
+            // that never ended at all.
             if (timedOut()) {
-              fail(timeoutError());
+              fail(new Error(`the reply ended after the ${deadlineMs} ms deadline`));
               return;
             }
             try {
@@ -415,13 +417,34 @@ export function send(transport: Transport, base: string, options: SendOptions): 
 
       // The deadline spans the whole request: creation, the reply and its end.
       // Construction already spent part of it, so only the remaining time is
-      // armed; when construction elapsed the deadline, fail at once.
-      const remaining = expiresAt - performance.now();
-      if (remaining <= 0) {
-        fail(timeoutError());
-        return;
-      }
-      timer = setTimeout(() => fail(timeoutError()), remaining);
+      // armed. Node stores a timer delay as a whole number of milliseconds, so
+      // a fractional remainder can schedule a timer that fires before the
+      // monotonic expiry. The callback therefore re-checks the clock: when the
+      // timer fired early it rearms for the time still left instead of failing
+      // a request that is still within its deadline; only a timer that fires
+      // at or past the expiry rejects. When construction already elapsed the
+      // deadline, the first arming fails at once.
+      const armDeadline = (): void => {
+        const remaining = expiresAt - performance.now();
+        if (remaining <= 0) {
+          fail(timeoutError());
+          return;
+        }
+        timer = setTimeout(() => {
+          timer = null;
+          if (!timedOut()) {
+            armDeadline();
+            return;
+          }
+          // The deadline passed. A reply whose end is already readable in the
+          // poll phase runs before this check-phase callback, so defer the
+          // timeout rejection by one turn of the loop: an end the timer would
+          // otherwise preempt then fails through the end handler's own expiry
+          // check, and a reply that truly never ended still times out here.
+          setImmediate(() => fail(timeoutError()));
+        }, remaining);
+      };
+      armDeadline();
 
       // A chunked body is written and then ended, so Node frames the body
       // itself; any other body is sent with the declared length in `end()`.
