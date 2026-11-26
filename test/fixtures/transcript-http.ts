@@ -192,6 +192,32 @@ export const DEFAULT_RESPONSE_CAP = 8 * 1024 * 1024;
 /** The default deadline, in milliseconds, for a bounded request's whole life. */
 export const DEFAULT_DEADLINE_MS = 5000;
 
+/**
+ * A monotonic millisecond clock and timer scheduler: the helper's only source
+ * of time. A test substitutes its own to decide exactly when the deadline
+ * passes and when the deadline timer fires, without waiting on the real clock.
+ */
+export interface Clock {
+  /** Monotonic milliseconds; never goes backwards and is unaffected by wall-clock steps. */
+  now(): number;
+  /** Run `callback` once at least `delayMs` after the current time; returns a cancel handle. */
+  setTimer(delayMs: number, callback: () => void): TimerHandle;
+  /** Cancel a timer that has not fired yet. */
+  clearTimer(handle: TimerHandle): void;
+}
+
+/** A scheduler's timer handle, opaque to the helper. */
+export interface TimerHandle {
+  readonly handle: object;
+}
+
+/** The process's monotonic clock and its timers. */
+const SYSTEM_CLOCK: Clock = {
+  now: () => performance.now(),
+  setTimer: (delayMs, callback) => ({ handle: setTimeout(callback, delayMs) }),
+  clearTimer: (timer) => clearTimeout(timer.handle as ReturnType<typeof setTimeout>),
+};
+
 /** One request the bounded helper sends; `body` makes it a POST. */
 export interface SendOptions {
   /** `GET` (the default) or `POST`. */
@@ -211,6 +237,8 @@ export interface SendOptions {
   readonly responseCap?: number;
   /** The deadline, from request creation through response end. */
   readonly deadlineMs?: number;
+  /** The clock measuring the deadline; the monotonic system clock by default. */
+  readonly clock?: Clock;
 }
 
 /**
@@ -261,6 +289,7 @@ function declaredLength(headers: Record<string, string | string[] | undefined>):
  */
 export function send(transport: Transport, base: string, options: SendOptions): Promise<TransportReply> {
   const url = originOf(base);
+  const clock = options.clock ?? SYSTEM_CLOCK;
   assert.ok(options.path.startsWith("/"), `the request target ${options.path} is root-relative`);
   const method = options.method ?? "GET";
   const chunked = options.chunked === true;
@@ -269,11 +298,10 @@ export function send(transport: Transport, base: string, options: SendOptions): 
   const cap = options.responseCap ?? DEFAULT_RESPONSE_CAP;
   const deadlineMs = options.deadlineMs ?? DEFAULT_DEADLINE_MS;
   // A monotonic expiry keeps the budget independent of wall-clock
-  // adjustments: `performance.now()` is unaffected by a clock step, so a
-  // backward adjustment cannot extend the deadline and a forward one cannot
-  // exhaust it early.
-  const expiresAt = performance.now() + deadlineMs;
-  const timedOut = (): boolean => performance.now() >= expiresAt;
+  // adjustments: the clock never steps, so a backward adjustment cannot
+  // extend the deadline and a forward one cannot exhaust it early.
+  const expiresAt = clock.now() + deadlineMs;
+  const timedOut = (): boolean => clock.now() >= expiresAt;
   const timeoutError = (): Error => new Error(`no reply within ${deadlineMs} ms`);
   assert.ok(Number.isSafeInteger(cap) && cap >= 0, "the response cap is a finite byte count");
   // Node's timer stores its delay as a signed 32-bit integer and clamps a
@@ -294,11 +322,11 @@ export function send(transport: Transport, base: string, options: SendOptions): 
     let settled = false;
     let seenResponse = false;
     let response: IncomingMessage | null = null;
-    let timer: ReturnType<typeof setTimeout> | null = null;
+    let timer: TimerHandle | null = null;
 
     const clearDeadline = (): void => {
       if (timer !== null) {
-        clearTimeout(timer);
+        clock.clearTimer(timer);
         timer = null;
       }
     };
@@ -336,71 +364,71 @@ export function send(transport: Transport, base: string, options: SendOptions): 
           agent: transport.agent,
         },
         (res) => {
-        seenResponse = true;
-        response = res;
-        try {
-          // The port is read once, while the response's socket is attached. A
-          // socket without a usable port rejects through `fail`, so a reply is
-          // never resolved with a stale or invented port.
-          const localPort = localPortOf(res);
-          if (localPort === null) {
-            fail(new Error("the reply socket carries no positive local port"));
-            return;
-          }
-          const chunks: Buffer[] = [];
-          let received = 0;
-          let ended = false;
-          res.on("data", (chunk: Buffer) => {
-            if (settled) return;
-            received += chunk.byteLength;
-            if (received > cap) {
-              fail(new Error(`the reply body exceeded the ${cap}-byte cap`));
+          seenResponse = true;
+          response = res;
+          try {
+            // The port is read once, while the response's socket is attached. A
+            // socket without a usable port rejects through `fail`, so a reply is
+            // never resolved with a stale or invented port.
+            const localPort = localPortOf(res);
+            if (localPort === null) {
+              fail(new Error("the reply socket carries no positive local port"));
               return;
             }
-            chunks.push(chunk);
-          });
-          res.on("end", () => {
-            if (settled) return;
-            ended = true;
-            if (!res.complete) {
-              fail(new Error("the reply ended before its message was complete"));
-              return;
-            }
-            // An end dispatched after the deadline but before its timer
-            // callback still fails: the expiry is checked here as well, with
-            // its own message so a late end is distinguishable from a reply
-            // that never ended at all.
-            if (timedOut()) {
-              fail(new Error(`the reply ended after the ${deadlineMs} ms deadline`));
-              return;
-            }
-            try {
-              const declared = declaredLength(res.headers);
-              if (declared !== received) {
-                fail(new Error(`the reply carried ${received} bytes but declared ${declared}`));
+            const chunks: Buffer[] = [];
+            let received = 0;
+            let ended = false;
+            res.on("data", (chunk: Buffer) => {
+              if (settled) return;
+              received += chunk.byteLength;
+              if (received > cap) {
+                fail(new Error(`the reply body exceeded the ${cap}-byte cap`));
                 return;
               }
-              // Building the reply (including decoding the body as a string)
-              // is inside this try, so a throw here reaches `fail` and clears
-              // the deadline instead of escaping the event callback.
-              finish(transportReplyFrom(res.statusCode ?? 0, res.headers, Buffer.concat(chunks), localPort));
-            } catch (error) {
-              fail(error as Error);
-              return;
-            }
-          });
-          res.on("aborted", () => fail(new Error("the connection closed before the reply completed")));
-          res.on("error", (error: Error) => fail(error));
-          // A close before the reply's own end is a premature close.
-          res.on("close", () => {
-            if (!ended) fail(new Error("the connection closed before the reply completed"));
-          });
-        } catch (error) {
-          // A synchronous throw while attaching handlers still rejects through
-          // `fail`, which clears the deadline and aborts the request.
-          fail(error as Error);
-        }
-      },
+              chunks.push(chunk);
+            });
+            res.on("end", () => {
+              if (settled) return;
+              ended = true;
+              if (!res.complete) {
+                fail(new Error("the reply ended before its message was complete"));
+                return;
+              }
+              // An end dispatched after the deadline but before its timer
+              // callback still fails: the expiry is checked here as well, with
+              // its own message so a late end is distinguishable from a reply
+              // that never ended at all.
+              if (timedOut()) {
+                fail(new Error(`the reply ended after the ${deadlineMs} ms deadline`));
+                return;
+              }
+              try {
+                const declared = declaredLength(res.headers);
+                if (declared !== received) {
+                  fail(new Error(`the reply carried ${received} bytes but declared ${declared}`));
+                  return;
+                }
+                // Building the reply (including decoding the body as a string)
+                // is inside this try, so a throw here reaches `fail` and clears
+                // the deadline instead of escaping the event callback.
+                finish(transportReplyFrom(res.statusCode ?? 0, res.headers, Buffer.concat(chunks), localPort));
+              } catch (error) {
+                fail(error as Error);
+                return;
+              }
+            });
+            res.on("aborted", () => fail(new Error("the connection closed before the reply completed")));
+            res.on("error", (error: Error) => fail(error));
+            // A close before the reply's own end is a premature close.
+            res.on("close", () => {
+              if (!ended) fail(new Error("the connection closed before the reply completed"));
+            });
+          } catch (error) {
+            // A synchronous throw while attaching handlers still rejects through
+            // `fail`, which clears the deadline and aborts the request.
+            fail(error as Error);
+          }
+        },
       );
     } catch (error) {
       // The request was never created: fail with no request to destroy, but the
@@ -417,32 +445,30 @@ export function send(transport: Transport, base: string, options: SendOptions): 
 
       // The deadline spans the whole request: creation, the reply and its end.
       // Construction already spent part of it, so only the remaining time is
-      // armed. Node stores a timer delay as a whole number of milliseconds, so
-      // a fractional remainder can schedule a timer that fires before the
-      // monotonic expiry. The callback therefore re-checks the clock: when the
-      // timer fired early it rearms for the time still left instead of failing
-      // a request that is still within its deadline; only a timer that fires
-      // at or past the expiry rejects. When construction already elapsed the
-      // deadline, the first arming fails at once.
+      // armed. A fractional remainder may schedule a timer that fires before
+      // the monotonic expiry, and a timer may be dispatched late; either way
+      // the callback re-checks the clock, so it only rejects when the expiry
+      // has truly passed and otherwise rearms for the time still left. An end
+      // dispatched after the expiry is failed by the end handler above, with
+      // its own message, whether or not the timer has run yet.
+      // A rearm is queued rather than done inside the timer callback, so the
+      // scheduler is asked for the next timer after the firing callback has
+      // returned: a scheduler may forget a timer while running it, so this
+      // never depends on what clearing a firing timer does.
       const armDeadline = (): void => {
-        const remaining = expiresAt - performance.now();
+        const remaining = expiresAt - clock.now();
         if (remaining <= 0) {
           fail(timeoutError());
           return;
         }
-        timer = setTimeout(() => {
+        timer = clock.setTimer(remaining, () => {
           timer = null;
-          if (!timedOut()) {
-            armDeadline();
+          if (!settled && !timedOut()) {
+            setImmediate(armDeadline);
             return;
           }
-          // The deadline passed. A reply whose end is already readable in the
-          // poll phase runs before this check-phase callback, so defer the
-          // timeout rejection by one turn of the loop: an end the timer would
-          // otherwise preempt then fails through the end handler's own expiry
-          // check, and a reply that truly never ended still times out here.
-          setImmediate(() => fail(timeoutError()));
-        }, remaining);
+          fail(timeoutError());
+        });
       };
       armDeadline();
 
