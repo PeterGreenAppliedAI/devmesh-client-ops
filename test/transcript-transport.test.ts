@@ -28,7 +28,7 @@ import {
   keepAliveTransport,
   MULTIPART_TYPE,
   send,
-  type Reply,
+  type TransportReply,
   type Transport,
 } from "./fixtures/transcript-http.ts";
 
@@ -101,36 +101,46 @@ async function running(): Promise<Running> {
       engagementId: engagement.id,
       async close() {
         // Attempt every teardown step even when one fails, so a failed server
-        // close cannot skip the store close that protects the workspace.
+        // close cannot skip the store close that protects the workspace. Both
+        // results are retained; if both fail, the store's error is rethrown as
+        // the cause of the server's, so neither failure is swallowed.
         let serverError: unknown = null;
         try {
           await server!.close();
         } catch (error) {
           serverError = error;
         }
+        let storeError: unknown = null;
         try {
           await store.close();
         } catch (error) {
-          if (serverError === null) throw error;
+          storeError = error;
+        }
+        if (serverError !== null && storeError !== null) {
+          throw new AggregateError([serverError, storeError], "both the server and the store failed to close");
         }
         if (serverError !== null) throw serverError;
+        if (storeError !== null) throw storeError;
       },
     };
   } catch (error) {
-    let firstError: unknown = error;
+    // Clean up after a failed setup, retaining each cleanup failure instead of
+    // discarding a later one behind the setup error.
+    const failures: unknown[] = [error];
     if (server !== null) {
       try {
         await server.close();
       } catch (closeError) {
-        firstError = firstError ?? closeError;
+        failures.push(closeError);
       }
     }
     try {
       await store.close();
     } catch (closeError) {
-      firstError = firstError ?? closeError;
+      failures.push(closeError);
     }
-    throw firstError;
+    if (failures.length === 1) throw error;
+    throw new AggregateError(failures, "the setup failed and cleanup failed too");
   }
 }
 
@@ -195,7 +205,7 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
 
       // The POST sends the malformed body with an accurate Content-Length to the
       // engagement's import route, over the listener's own Host and Origin.
-      const refused: Reply = await send(transport, runningFixture.server.origin, {
+      const refused: TransportReply = await send(transport, runningFixture.server.origin, {
         method: "POST",
         path: importPath,
         contentType: MULTIPART_TYPE,
@@ -209,7 +219,7 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       assertUnchanged(runningFixture, before, "after the refused import");
 
       // A following GET over the same transport is a complete 200.
-      const health: Reply = await send(transport, runningFixture.server.origin, { path: "/health" });
+      const health: TransportReply = await send(transport, runningFixture.server.origin, { path: "/health" });
       assert.equal(health.status, 200, "the health page is a 200");
       assert.ok(health.body.includes("ok"), `the health page reports its status: ${health.body}`);
 
@@ -280,7 +290,10 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       assert.equal(seen[0]["transfer-encoding"], "chunked", "a chunked POST is framed by Node with Transfer-Encoding: chunked");
     } finally {
       transport.close();
-      await new Promise<void>((resolve) => listener.close(() => resolve()));
+      // Propagate the listener's close error rather than resolving regardless.
+      await new Promise<void>((resolve, reject) => {
+        listener.close((error) => (error ? reject(error) : resolve()));
+      });
     }
   });
 
@@ -331,8 +344,8 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       await new Promise((resolve) => setTimeout(resolve, 300));
     } finally {
       transport.close();
-      // Close the server and the store independently: a failed server close
-      // must not skip the store close.
+      // Close the server and the store independently, retaining each cleanup
+      // failure; a failed server close must not swallow a store close error.
       let serverError: unknown = null;
       if (server !== null) {
         try {
@@ -341,12 +354,17 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
           serverError = error;
         }
       }
+      let storeError: unknown = null;
       try {
         await store.close();
       } catch (error) {
-        if (serverError === null) throw error;
+        storeError = error;
+      }
+      if (serverError !== null && storeError !== null) {
+        throw new AggregateError([serverError, storeError], "both the server and the store failed to close");
       }
       if (serverError !== null) throw serverError;
+      if (storeError !== null) throw storeError;
     }
   });
 

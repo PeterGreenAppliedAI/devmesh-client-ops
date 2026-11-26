@@ -30,11 +30,16 @@ export interface Reply {
   readonly bytes: Buffer;
   /** The body decoded as UTF-8, for HTML and text replies. */
   readonly body: string;
-  /**
-   * The client socket's local port, captured while that socket was attached to
-   * the reply. Two sequential requests served by one kept-alive socket report
-   * the same port, so a reconnect would show up as a different one.
-   */
+}
+
+/**
+ * A reply read by the bounded helper: the legacy reply fields plus the client
+ * socket's local port, captured while that socket was attached to the reply.
+ * Two sequential requests served by one kept-alive socket report the same port,
+ * so a reconnect would show up as a different one. Only the bounded helper
+ * observes the port; the legacy helpers keep their four-field `Reply`.
+ */
+export interface TransportReply extends Reply {
   readonly localPort: number;
 }
 
@@ -45,23 +50,30 @@ function originOf(base: string): URL {
 
 /**
  * The local port of a reply's socket, which the socket exposes while attached.
- * Returns null when the socket or its port is unavailable (for example after
- * the response has been torn down); the bounded helper turns a missing port
- * into a failure, while a legacy read keeps its former Reply contract.
+ * Returns null when the socket or its port is unavailable.
  */
 function localPortOf(res: IncomingMessage): number | null {
   const port = res.socket?.localPort;
   return typeof port === "number" && Number.isInteger(port) && port > 0 ? port : null;
 }
 
-/** A reply body decoded as a string; text is UTF-8 in this application. */
+/** A legacy reply: its status, headers and raw body bytes, with no port. */
 function replyFrom(
   status: number,
   headers: Record<string, string | string[] | undefined>,
   bytes: Buffer,
-  localPort: number | null,
 ): Reply {
-  return { status, headers, bytes, body: bytes.toString("utf8"), localPort: localPort ?? 0 };
+  return { status, headers, bytes, body: bytes.toString("utf8") };
+}
+
+/** A bounded reply: the legacy fields plus the captured local port. */
+function transportReplyFrom(
+  status: number,
+  headers: Record<string, string | string[] | undefined>,
+  bytes: Buffer,
+  localPort: number,
+): TransportReply {
+  return { ...replyFrom(status, headers, bytes), localPort };
 }
 
 /**
@@ -122,10 +134,7 @@ export function get(base: string, path: string): Promise<Reply> {
         const chunks: Buffer[] = [];
         res.on("data", (chunk: Buffer) => chunks.push(chunk));
         res.on("end", () => {
-          // The legacy helpers keep their former Reply contract: the reply is
-          // read from its status, headers and body, and a port that is no
-          // longer available is not a reason to fail an otherwise good read.
-          resolve(replyFrom(res.statusCode ?? 0, res.headers, Buffer.concat(chunks), localPortOf(res)));
+          resolve(replyFrom(res.statusCode ?? 0, res.headers, Buffer.concat(chunks)));
         });
         res.on("error", reject);
       },
@@ -160,7 +169,7 @@ function postBytes(
         const chunks: Buffer[] = [];
         res.on("data", (chunk: Buffer) => chunks.push(chunk));
         res.on("end", () => {
-          resolve(replyFrom(res.statusCode ?? 0, res.headers, Buffer.concat(chunks), localPortOf(res)));
+          resolve(replyFrom(res.statusCode ?? 0, res.headers, Buffer.concat(chunks)));
         });
         res.on("error", reject);
       },
@@ -250,7 +259,7 @@ function declaredLength(headers: Record<string, string | string[] | undefined>):
  * The `Host` (and, for a POST, the `Origin`) is the listener's own authority,
  * so the same-origin checks accept the request.
  */
-export function send(transport: Transport, base: string, options: SendOptions): Promise<Reply> {
+export function send(transport: Transport, base: string, options: SendOptions): Promise<TransportReply> {
   const url = originOf(base);
   assert.ok(options.path.startsWith("/"), `the request target ${options.path} is root-relative`);
   const method = options.method ?? "GET";
@@ -274,7 +283,7 @@ export function send(transport: Transport, base: string, options: SendOptions): 
   if (options.body !== undefined && !chunked) headers["content-length"] = String(options.body.byteLength);
   if (options.body === undefined) headers["content-length"] = "0";
 
-  return new Promise<Reply>((resolve, reject) => {
+  return new Promise<TransportReply>((resolve, reject) => {
     let settled = false;
     let seenResponse = false;
     let response: IncomingMessage | null = null;
@@ -297,16 +306,18 @@ export function send(transport: Transport, base: string, options: SendOptions): 
       abort();
       reject(error);
     };
-    const finish = (reply: Reply): void => {
+    const finish = (reply: TransportReply): void => {
       if (settled) return;
       settled = true;
       clearDeadline();
       resolve(reply);
     };
 
-    // Construct the request before arming the deadline: a synchronous
-    // construction error rejects through `fail`, which tolerates a request that
-    // was never created and leaves no timer behind.
+    // Record the deadline's start before construction, so synchronous
+    // construction time counts against the caller's whole-request budget. A
+    // construction error then rejects through `fail`, which tolerates a request
+    // that was never created and leaves no timer behind.
+    const startedAt = Date.now();
     let request: ClientRequest;
     try {
       request = httpRequest(
@@ -355,11 +366,14 @@ export function send(transport: Transport, base: string, options: SendOptions): 
                 fail(new Error(`the reply carried ${received} bytes but declared ${declared}`));
                 return;
               }
+              // Building the reply (including decoding the body as a string)
+              // is inside this try, so a throw here reaches `fail` and clears
+              // the deadline instead of escaping the event callback.
+              finish(transportReplyFrom(res.statusCode ?? 0, res.headers, Buffer.concat(chunks), localPort));
             } catch (error) {
               fail(error as Error);
               return;
             }
-            finish(replyFrom(res.statusCode ?? 0, res.headers, Buffer.concat(chunks), localPort));
           });
           res.on("aborted", () => fail(new Error("the connection closed before the reply completed")));
           res.on("error", (error: Error) => fail(error));
@@ -388,7 +402,14 @@ export function send(transport: Transport, base: string, options: SendOptions): 
       });
 
       // The deadline spans the whole request: creation, the reply and its end.
-      timer = setTimeout(() => fail(new Error(`no reply within ${deadlineMs} ms`)), deadlineMs);
+      // Construction already spent part of it, so only the remaining time is
+      // armed; when construction elapsed the deadline, fail at once.
+      const remaining = deadlineMs - (Date.now() - startedAt);
+      if (remaining <= 0) {
+        fail(new Error(`no reply within ${deadlineMs} ms`));
+        return;
+      }
+      timer = setTimeout(() => fail(new Error(`no reply within ${deadlineMs} ms`)), remaining);
 
       // A chunked body is written and then ended, so Node frames the body
       // itself; any other body is sent with the declared length in `end()`.
