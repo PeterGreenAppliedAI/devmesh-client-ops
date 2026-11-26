@@ -28,7 +28,6 @@ import {
   keepAliveTransport,
   MULTIPART_TYPE,
   send,
-  type TransportReply,
   type Transport,
 } from "./fixtures/transcript-http.ts";
 
@@ -205,7 +204,7 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
 
       // The POST sends the malformed body with an accurate Content-Length to the
       // engagement's import route, over the listener's own Host and Origin.
-      const refused: TransportReply = await send(transport, runningFixture.server.origin, {
+      const refused = await send(transport, runningFixture.server.origin, {
         method: "POST",
         path: importPath,
         contentType: MULTIPART_TYPE,
@@ -219,7 +218,7 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       assertUnchanged(runningFixture, before, "after the refused import");
 
       // A following GET over the same transport is a complete 200.
-      const health: TransportReply = await send(transport, runningFixture.server.origin, { path: "/health" });
+      const health = await send(transport, runningFixture.server.origin, { path: "/health" });
       assert.equal(health.status, 200, "the health page is a 200");
       assert.ok(health.body.includes("ok"), `the health page reports its status: ${health.body}`);
 
@@ -380,6 +379,38 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       );
     } finally {
       transport.close();
+    }
+  });
+
+  it("fails a reply whose end arrives after the deadline but before its timer", async () => {
+    const transport = keepAliveTransport();
+    // Hold the response end past the deadline without a timer of the helper's
+    // own firing first: the client's `setImmediate` callbacks run before the
+    // helper's deadline timer can, so only the end handler's own expiry check
+    // can fail this reply.
+    const listener = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(200, { "content-length": "2", "content-type": "text/plain" });
+        res.end("ok");
+      });
+    });
+    try {
+      await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", () => resolve()));
+      const port = (listener.address() as { port: number }).port;
+      const reply = send(transport, `http://127.0.0.1:${port}`, { path: "/", deadlineMs: 40 });
+      // Burn the deadline synchronously, so the timer is armed with no time
+      // left and the response handlers cannot run before the expiry either.
+      const until = performance.now() + 45;
+      while (performance.now() < until) {
+        // Deliberately occupied: a synchronous wait, not a sleep.
+      }
+      await assert.rejects(reply, /no reply within 40 ms/, "an end dispatched after expiry fails");
+    } finally {
+      transport.close();
+      await new Promise<void>((resolve, reject) => {
+        listener.close((error) => (error ? reject(error) : resolve()));
+      });
     }
   });
 

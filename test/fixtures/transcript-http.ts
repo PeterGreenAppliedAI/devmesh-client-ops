@@ -39,7 +39,7 @@ export interface Reply {
  * so a reconnect would show up as a different one. Only the bounded helper
  * observes the port; the legacy helpers keep their four-field `Reply`.
  */
-export interface TransportReply extends Reply {
+interface TransportReply extends Reply {
   readonly localPort: number;
 }
 
@@ -268,6 +268,13 @@ export function send(transport: Transport, base: string, options: SendOptions): 
   if (chunked) assert.ok(options.body !== undefined, "a chunked request carries a body");
   const cap = options.responseCap ?? DEFAULT_RESPONSE_CAP;
   const deadlineMs = options.deadlineMs ?? DEFAULT_DEADLINE_MS;
+  // A monotonic expiry keeps the budget independent of wall-clock
+  // adjustments: `performance.now()` is unaffected by a clock step, so a
+  // backward adjustment cannot extend the deadline and a forward one cannot
+  // exhaust it early.
+  const expiresAt = performance.now() + deadlineMs;
+  const timedOut = (): boolean => performance.now() >= expiresAt;
+  const timeoutError = (): Error => new Error(`no reply within ${deadlineMs} ms`);
   assert.ok(Number.isSafeInteger(cap) && cap >= 0, "the response cap is a finite byte count");
   // Node's timer stores its delay as a signed 32-bit integer and clamps a
   // longer one to 1 ms, so a deadline above that range would fire at once
@@ -313,11 +320,10 @@ export function send(transport: Transport, base: string, options: SendOptions): 
       resolve(reply);
     };
 
-    // Record the deadline's start before construction, so synchronous
-    // construction time counts against the caller's whole-request budget. A
-    // construction error then rejects through `fail`, which tolerates a request
-    // that was never created and leaves no timer behind.
-    const startedAt = Date.now();
+    // The monotonic deadline's expiry was fixed above, before construction, so
+    // synchronous construction time counts against the caller's whole-request
+    // budget. A construction error then rejects through `fail`, which tolerates
+    // a request that was never created and leaves no timer behind.
     let request: ClientRequest;
     try {
       request = httpRequest(
@@ -358,6 +364,12 @@ export function send(transport: Transport, base: string, options: SendOptions): 
             ended = true;
             if (!res.complete) {
               fail(new Error("the reply ended before its message was complete"));
+              return;
+            }
+            // An end dispatched after the deadline but before its timer
+            // callback still fails: the expiry is checked here as well.
+            if (timedOut()) {
+              fail(timeoutError());
               return;
             }
             try {
@@ -404,12 +416,12 @@ export function send(transport: Transport, base: string, options: SendOptions): 
       // The deadline spans the whole request: creation, the reply and its end.
       // Construction already spent part of it, so only the remaining time is
       // armed; when construction elapsed the deadline, fail at once.
-      const remaining = deadlineMs - (Date.now() - startedAt);
+      const remaining = expiresAt - performance.now();
       if (remaining <= 0) {
-        fail(new Error(`no reply within ${deadlineMs} ms`));
+        fail(timeoutError());
         return;
       }
-      timer = setTimeout(() => fail(new Error(`no reply within ${deadlineMs} ms`)), remaining);
+      timer = setTimeout(() => fail(timeoutError()), remaining);
 
       // A chunked body is written and then ended, so Node frames the body
       // itself; any other body is sent with the declared length in `end()`.
