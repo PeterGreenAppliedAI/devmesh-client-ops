@@ -10,7 +10,12 @@
  */
 
 import assert from "node:assert/strict";
-import { request as httpRequest } from "node:http";
+import {
+  Agent,
+  request as httpRequest,
+  type ClientRequest,
+  type IncomingMessage,
+} from "node:http";
 
 /** The boundary the helper uses for every submitted multipart body. */
 export const BOUNDARY = "transcript-library-boundary";
@@ -25,6 +30,12 @@ export interface Reply {
   readonly bytes: Buffer;
   /** The body decoded as UTF-8, for HTML and text replies. */
   readonly body: string;
+  /**
+   * The client socket's local port, captured while that socket was attached to
+   * the reply. Two sequential requests served by one kept-alive socket report
+   * the same port, so a reconnect would show up as a different one.
+   */
+  readonly localPort: number;
 }
 
 /** The application base URL's origin, for the origin checks. */
@@ -32,9 +43,21 @@ function originOf(base: string): URL {
   return new URL(base);
 }
 
+/** The local port of a reply's socket, which the socket exposes while attached. */
+function localPortOf(res: IncomingMessage): number {
+  const port = res.socket?.localPort;
+  assert.ok(typeof port === "number" && Number.isInteger(port) && port > 0, "the reply socket carries a positive local port");
+  return port;
+}
+
 /** A reply body decoded as a string; text is UTF-8 in this application. */
-function replyFrom(status: number, headers: Record<string, string | string[] | undefined>, bytes: Buffer): Reply {
-  return { status, headers, bytes, body: bytes.toString("utf8") };
+function replyFrom(
+  status: number,
+  headers: Record<string, string | string[] | undefined>,
+  bytes: Buffer,
+  localPort: number,
+): Reply {
+  return { status, headers, bytes, body: bytes.toString("utf8"), localPort };
 }
 
 /**
@@ -94,7 +117,7 @@ export function get(base: string, path: string): Promise<Reply> {
       (res) => {
         const chunks: Buffer[] = [];
         res.on("data", (chunk: Buffer) => chunks.push(chunk));
-        res.on("end", () => resolve(replyFrom(res.statusCode ?? 0, res.headers, Buffer.concat(chunks))));
+        res.on("end", () => resolve(replyFrom(res.statusCode ?? 0, res.headers, Buffer.concat(chunks), localPortOf(res))));
         res.on("error", reject);
       },
     );
@@ -127,12 +150,204 @@ function postBytes(
       (res) => {
         const chunks: Buffer[] = [];
         res.on("data", (chunk: Buffer) => chunks.push(chunk));
-        res.on("end", () => resolve(replyFrom(res.statusCode ?? 0, res.headers, Buffer.concat(chunks))));
+        res.on("end", () => resolve(replyFrom(res.statusCode ?? 0, res.headers, Buffer.concat(chunks), localPortOf(res))));
         res.on("error", reject);
       },
     );
     req.on("error", reject);
     req.end(body);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Bounded kept-alive requests
+// ---------------------------------------------------------------------------
+
+/** The default inclusive cap, in bytes, for a bounded reply body. */
+export const DEFAULT_RESPONSE_CAP = 8 * 1024 * 1024;
+
+/** The default deadline, in milliseconds, for a bounded request's whole life. */
+export const DEFAULT_DEADLINE_MS = 5000;
+
+/** One request the bounded helper sends; `body` makes it a POST. */
+export interface SendOptions {
+  /** `GET` (the default) or `POST`. */
+  readonly method?: "GET" | "POST";
+  /** A root-relative request target (its query included). */
+  readonly path: string;
+  /** The POST body's `Content-Type`; ignored for a bodyless GET. */
+  readonly contentType?: string;
+  /** The POST body; its exact bytes are sent. */
+  readonly body?: Uint8Array;
+  /**
+   * Send a POST body chunked, letting Node frame it, instead of declaring its
+   * exact `Content-Length`.
+   */
+  readonly chunked?: boolean;
+  /** The inclusive reply body cap; a larger reply fails the request. */
+  readonly responseCap?: number;
+  /** The deadline, from request creation through response end. */
+  readonly deadlineMs?: number;
+}
+
+/**
+ * A transport owning one `Agent` shared across sequential requests. The agent
+ * keeps sockets alive and pools at most one, so two sequential requests reuse
+ * the same connection instead of opening a second one.
+ */
+export interface Transport {
+  readonly agent: Agent;
+  /** Destroy the agent, releasing its kept-alive sockets. */
+  close(): void;
+}
+
+/** Create the shared keep-alive transport with at most one pooled socket. */
+export function keepAliveTransport(): Transport {
+  const agent = new Agent({ keepAlive: true, maxSockets: 1 });
+  return {
+    agent,
+    close() {
+      agent.destroy();
+    },
+  };
+}
+
+/** The declared reply length, which must be one finite decimal count. */
+function declaredLength(headers: Record<string, string | string[] | undefined>): number {
+  const value = headers["content-length"];
+  assert.equal(typeof value, "string", "the reply declares a single Content-Length header");
+  assert.match(value as string, /^\d+$/, "the reply's Content-Length is a decimal byte count");
+  const length = Number(value);
+  assert.ok(Number.isSafeInteger(length) && length >= 0, "the reply's Content-Length is a finite byte count");
+  return length;
+}
+
+/**
+ * Send one bounded request over a shared keep-alive transport.
+ *
+ * The reply is consumed to its end and read only through Node's HTTP parser: a
+ * reply body larger than the finite `responseCap` fails the request as it
+ * arrives, the response must be complete (`IncomingMessage.complete`) and the
+ * received byte count must equal the parsed `Content-Length` header. A missing
+ * reply, a premature close, a deadline expiry, a request or response error, an
+ * invalid length or a cap overflow rejects, and every exit clears the deadline
+ * and aborts outstanding I/O by destroying the request.
+ *
+ * The `Host` (and, for a POST, the `Origin`) is the listener's own authority,
+ * so the same-origin checks accept the request.
+ */
+export function send(transport: Transport, base: string, options: SendOptions): Promise<Reply> {
+  const url = originOf(base);
+  assert.ok(options.path.startsWith("/"), `the request target ${options.path} is root-relative`);
+  const method = options.method ?? "GET";
+  const chunked = options.chunked === true;
+  if (options.body !== undefined) assert.equal(method, "POST", "a request body is sent with POST");
+  if (chunked) assert.ok(options.body !== undefined, "a chunked request carries a body");
+  const cap = options.responseCap ?? DEFAULT_RESPONSE_CAP;
+  const deadlineMs = options.deadlineMs ?? DEFAULT_DEADLINE_MS;
+  assert.ok(Number.isSafeInteger(cap) && cap >= 0, "the response cap is a finite byte count");
+  assert.ok(Number.isSafeInteger(deadlineMs) && deadlineMs > 0, "the deadline is a finite positive duration");
+
+  const headers: Record<string, string> = { host: url.host };
+  if (method === "POST") headers.origin = url.origin;
+  if (options.contentType !== undefined) headers["content-type"] = options.contentType;
+  if (options.body !== undefined && !chunked) headers["content-length"] = String(options.body.byteLength);
+  if (options.body === undefined) headers["content-length"] = "0";
+
+  return new Promise<Reply>((resolve, reject) => {
+    let settled = false;
+    let seenResponse = false;
+    let response: IncomingMessage | null = null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const clearDeadline = (): void => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
+    const abort = (): void => {
+      response?.destroy();
+      request.destroy();
+    };
+    const fail = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearDeadline();
+      abort();
+      reject(error);
+    };
+    const finish = (reply: Reply): void => {
+      if (settled) return;
+      settled = true;
+      clearDeadline();
+      resolve(reply);
+    };
+
+    // The deadline spans the whole request: creation, the reply and its end.
+    timer = setTimeout(() => fail(new Error(`no reply within ${deadlineMs} ms`)), deadlineMs);
+
+    const request: ClientRequest = httpRequest(
+      {
+        host: url.hostname,
+        port: Number(url.port),
+        method,
+        path: options.path,
+        headers,
+        agent: transport.agent,
+      },
+      (res) => {
+        seenResponse = true;
+        response = res;
+        const localPort = localPortOf(res);
+        const chunks: Buffer[] = [];
+        let received = 0;
+        let ended = false;
+        res.on("data", (chunk: Buffer) => {
+          if (settled) return;
+          received += chunk.byteLength;
+          if (received > cap) {
+            fail(new Error(`the reply body exceeded the ${cap}-byte cap`));
+            return;
+          }
+          chunks.push(chunk);
+        });
+        res.on("end", () => {
+          if (settled) return;
+          ended = true;
+          if (!res.complete) {
+            fail(new Error("the reply ended before its message was complete"));
+            return;
+          }
+          try {
+            const declared = declaredLength(res.headers);
+            if (declared !== received) {
+              fail(new Error(`the reply carried ${received} bytes but declared ${declared}`));
+              return;
+            }
+          } catch (error) {
+            fail(error as Error);
+            return;
+          }
+          finish(replyFrom(res.statusCode ?? 0, res.headers, Buffer.concat(chunks), localPort));
+        });
+        res.on("aborted", () => fail(new Error("the connection closed before the reply completed")));
+        res.on("error", (error: Error) => fail(error));
+        // A close before the reply's own end is a premature close.
+        res.on("close", () => {
+          if (!ended) fail(new Error("the connection closed before the reply completed"));
+        });
+      },
+    );
+
+    request.on("error", (error: Error) => fail(error));
+    // A close without any response at all is a missing reply.
+    request.on("close", () => {
+      if (!seenResponse && !settled) fail(new Error("the connection closed with no reply"));
+    });
+
+    if (options.body === undefined) request.end();
+    else request.end(Buffer.from(options.body));
   });
 }
 
