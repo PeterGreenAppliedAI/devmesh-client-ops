@@ -11,14 +11,8 @@
  * a complete 200, and both replies must report the same positive client local
  * port, so the two requests reused one connection instead of reconnecting.
  *
- * Two further regressions refuse over-limit declared imports over staged raw
- * sockets: one withholds every body byte, so the 413 must answer from the
- * declared headers alone; the other sends the whole declared body and a
- * follow-up GET before the reply is read. Each exchange is read through peer
- * closure and must contain exactly one complete plain-text 413 with the
- * whole-body limit guidance, Cache-Control: no-store and Connection: close,
- * leaving the workspace byte-for-byte unchanged and rendering neither the
- * refused import nor the follow-up.
+ * Slice 1 is tests-only by the owner's decision; the reservation, draining and
+ * clientError mechanisms belong to slices 2 and 3.
  *
  * Only the temporary workspace receives data, and it is removed afterwards.
  */
