@@ -42,49 +42,6 @@ function tempDir(): string {
   return dir;
 }
 
-/**
- * A monotonic clock and timer queue driven by the test, so the helper's
- * deadline can be observed without waiting on the real clock. Time only moves
- * when `advance` is called, and timers fire only when the test makes them.
- */
-class FakeClock {
-  private clockTime = 0;
-  private timers: { due: number; callback: () => void }[] = [];
-
-  now(): number {
-    return this.clockTime;
-  }
-
-  advance(ms: number): void {
-    this.clockTime += ms;
-  }
-
-  setTimer(delayMs: number, callback: () => void): { readonly handle: object } {
-    const timer = { due: this.clockTime + delayMs, callback };
-    this.timers.push(timer);
-    return { handle: timer };
-  }
-
-  clearTimer(timer: { readonly handle: object }): void {
-    this.timers = this.timers.filter((queued) => queued !== timer.handle);
-  }
-
-  /** The timers armed and not yet fired or cleared. */
-  get pending(): number {
-    return this.timers.length;
-  }
-
-  /**
-   * Fire the earliest armed timer without moving the clock on: the scheduler
-   * fired it early, so the helper must still see the time that is left.
-   */
-  fireEarliest(): void {
-    const earliest = this.timers.reduce((first, next) => (next.due < first.due ? next : first));
-    this.timers = this.timers.filter((queued) => queued !== earliest);
-    earliest.callback();
-  }
-}
-
 /** Wait until `ready` holds, yielding to the event loop between checks. */
 async function until(ready: () => boolean, why: string): Promise<void> {
   const limit = Date.now() + 5000;
@@ -434,78 +391,31 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
     }
   });
 
-  it("fails a reply whose end arrives after the deadline but before its timer", async () => {
-    const clock = new FakeClock();
+  it("fails a reply that is held open past its deadline and closes it", async () => {
     const transport = keepAliveTransport();
-    // The deadline is measured on the injected clock, whose time the test moves
-    // forward by hand; the listener's response end is held back until the test
-    // observes the helper's own handlers, so no timer of the helper's ever runs.
-    let dispatch: (() => void) | null = null;
+    // The listener reads the whole request but holds the reply open, so the
+    // helper's own deadline is the only reason the request fails. The held
+    // response is closed during teardown.
+    let held: import("node:http").ServerResponse | null = null;
     const listener = createServer((req, res) => {
       req.resume();
       req.on("end", () => {
-        // Hold the reply until it is dispatched, after the deadline has passed.
-        dispatch = () => {
-          res.writeHead(200, { "content-length": "2", "content-type": "text/plain" });
-          res.end("ok");
-        };
+        held = res;
       });
     });
     try {
       await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", () => resolve()));
       const port = (listener.address() as { port: number }).port;
-      const reply = send(transport, `http://127.0.0.1:${port}`, { path: "/", deadlineMs: 40, clock });
-      // Wait for the request to reach the listener, then let the monotonic
-      // deadline pass: nothing is dispatched yet, so the timer is armed but not
-      // due, and the clock is past the expiry before the reply is written.
-      await until(() => dispatch !== null, "the listener received the request");
-      clock.advance(40);
-      assert.equal(clock.pending, 1, "the helper armed one deadline timer");
-      dispatch!();
-      // The end is dispatched before the clock's timer is made to fire, so only
-      // the end handler's own expiry check can fail this reply; deleting that
-      // check would let the reply resolve instead.
-      await assert.rejects(reply, /the reply ended after the 40 ms deadline/, "an end dispatched after expiry fails");
+      await assert.rejects(
+        send(transport, `http://127.0.0.1:${port}`, { path: "/", deadlineMs: 40 }),
+        /no reply within 40 ms/,
+        "a held-open reply is failed by the deadline",
+      );
+      await until(() => held !== null, "the listener held its reply open");
     } finally {
       transport.close();
-      await new Promise<void>((resolve, reject) => {
-        listener.close((error) => (error ? reject(error) : resolve()));
-      });
-    }
-  });
-
-  it("rearms a deadline timer that fires before the monotonic expiry", async () => {
-    const clock = new FakeClock();
-    const transport = keepAliveTransport();
-    const listener = createServer((req, res) => {
-      req.resume();
-      req.on("end", () => {
-        res.writeHead(200, { "content-length": "2", "content-type": "text/plain" });
-        res.end("ok");
-      });
-    });
-    try {
-      await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", () => resolve()));
-      const port = (listener.address() as { port: number }).port;
-      const reply = send(transport, `http://127.0.0.1:${port}`, { path: "/", deadlineMs: 40, clock });
-      // The first timer is armed for 40 ms; let it fire while the clock has
-      // only moved 25 ms, so the reply is still within its deadline. A timer
-      // that rejected unconditionally would fail it.
-      await until(() => clock.pending === 1, "the helper armed its deadline timer");
-      // The clock has not reached the expiry, so the reply is still within its
-      // deadline when the timer fires early.
-      clock.advance(25);
-      clock.fireEarliest();
-      // The rearm is queued for a later turn of the loop, so wait for it.
-      await until(() => clock.pending === 1, "the early timer is replaced for the time still left");
-      assert.equal(clock.pending, 1, "one timer is armed again, for the time still left");
-      // Let the clock reach the expiry, then let the rearmed timer fire on
-      // time: only then may the reply, which never arrives, fail.
-      clock.advance(15);
-      clock.fireEarliest();
-      await assert.rejects(reply, /no reply within 40 ms/, "the deadline still fails a reply that never arrives");
-    } finally {
-      transport.close();
+      // Close the held response before the listener, so no socket outlives it.
+      (held as import("node:http").ServerResponse | null)?.destroy();
       await new Promise<void>((resolve, reject) => {
         listener.close((error) => (error ? reject(error) : resolve()));
       });

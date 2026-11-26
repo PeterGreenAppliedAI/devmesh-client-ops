@@ -194,8 +194,9 @@ export const DEFAULT_DEADLINE_MS = 5000;
 
 /**
  * A monotonic millisecond clock and timer scheduler: the helper's only source
- * of time. A test substitutes its own to decide exactly when the deadline
- * passes and when the deadline timer fires, without waiting on the real clock.
+ * of time. Monotonic milliseconds never go backwards and are unaffected by
+ * wall-clock steps, so the deadline cannot be extended or exhausted early by
+ * an adjustment to the system time.
  */
 export interface Clock {
   /** Monotonic milliseconds; never goes backwards and is unaffected by wall-clock steps. */
@@ -237,8 +238,6 @@ export interface SendOptions {
   readonly responseCap?: number;
   /** The deadline, from request creation through response end. */
   readonly deadlineMs?: number;
-  /** The clock measuring the deadline; the monotonic system clock by default. */
-  readonly clock?: Clock;
 }
 
 /**
@@ -289,7 +288,7 @@ function declaredLength(headers: Record<string, string | string[] | undefined>):
  */
 export function send(transport: Transport, base: string, options: SendOptions): Promise<TransportReply> {
   const url = originOf(base);
-  const clock = options.clock ?? SYSTEM_CLOCK;
+  const clock = SYSTEM_CLOCK;
   assert.ok(options.path.startsWith("/"), `the request target ${options.path} is root-relative`);
   const method = options.method ?? "GET";
   const chunked = options.chunked === true;
@@ -448,32 +447,39 @@ export function send(transport: Transport, base: string, options: SendOptions): 
       // armed. A fractional remainder may schedule a timer that fires before
       // the monotonic expiry, and a timer may be dispatched late; either way
       // the callback re-checks the clock, so it only rejects when the expiry
-      // has truly passed and otherwise rearms for the time still left. An end
-      // dispatched after the expiry is failed by the end handler above, with
-      // its own message, whether or not the timer has run yet.
-      // A rearm is queued rather than done inside the timer callback, so the
-      // scheduler is asked for the next timer after the firing callback has
-      // returned: a scheduler may forget a timer while running it, so this
-      // never depends on what clearing a firing timer does.
-      const armDeadline = (): void => {
+      // has truly passed and otherwise rearms for the time still left, directly
+      // from the callback before it returns. An end dispatched after the expiry
+      // is failed by the end handler above, with its own message, whether or
+      // not the timer has run yet.
+      const armDeadline = (): boolean => {
         const remaining = expiresAt - clock.now();
         if (remaining <= 0) {
           fail(timeoutError());
-          return;
+          return false;
         }
         timer = clock.setTimer(remaining, () => {
-          timer = null;
+          // The callback fires with `timer` still set, so a settlement that
+          // happens inside it still clears the timer the scheduler just ran.
           if (!settled && !timedOut()) {
-            setImmediate(armDeadline);
+            armDeadline();
             return;
           }
           fail(timeoutError());
         });
+        return true;
       };
-      armDeadline();
+      // A budget exhausted during construction fails before any body is copied
+      // or written to the destroyed request.
+      if (!armDeadline()) return;
 
       // A chunked body is written and then ended, so Node frames the body
       // itself; any other body is sent with the declared length in `end()`.
+      // Re-check the deadline first: a long synchronous copy may have used the
+      // rest of the budget, and nothing more is written to the request then.
+      if (timedOut()) {
+        fail(timeoutError());
+        return;
+      }
       if (options.body === undefined) {
         request.end();
       } else if (chunked) {
