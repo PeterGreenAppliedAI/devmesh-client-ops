@@ -11,6 +11,9 @@
  * a complete 200, and both replies must report the same positive client local
  * port, so the two requests reused one connection instead of reconnecting.
  *
+ * Slice 1 is tests-only by the owner's decision; the reservation, draining and
+ * clientError mechanisms belong to slices 2 and 3.
+ *
  * Only the temporary workspace receives data, and it is removed afterwards.
  */
 import assert from "node:assert/strict";
@@ -28,6 +31,8 @@ import {
   keepAliveTransport,
   MULTIPART_TYPE,
   send,
+  sendStaged,
+  type ClosedExchange,
   type Transport,
 } from "./fixtures/transcript-http.ts";
 
@@ -77,11 +82,17 @@ function workspaceBytes(dir: string): Buffer {
  * server starts, so the baseline state is the one the refused import must leave
  * unchanged.
  */
+interface RenderCounts {
+  import: number;
+  followUp: number;
+}
+
 interface Running {
   readonly dir: string;
   readonly store: Store;
   readonly server: StartedServer;
   readonly engagementId: string;
+  readonly renders: RenderCounts;
   close(): Promise<void>;
 }
 
@@ -92,12 +103,50 @@ async function running(): Promise<Running> {
   try {
     const client = await store.createClient({ name: "Acme" });
     const engagement = await store.createEngagement({ clientId: client.id, name: "Eng" });
-    server = await startServer({ store, port: 0, routes: registerRoutes(store) });
+    const baseRoutes = registerRoutes(store);
+    const renders: RenderCounts = { import: 0, followUp: 0 };
+    // Count every route render while preserving the routes themselves: a GET
+    // /health is the follow-up, and any hierarchy POST is the import path.
+    const health = baseRoutes.health.get;
+    const hierarchy = baseRoutes.hierarchy;
+    const routes: Routes = {
+      ...baseRoutes,
+      health: {
+        ...baseRoutes.health,
+        get: {
+          ...health,
+          render(request) {
+            renders.followUp += 1;
+            return health.render(request);
+          },
+        },
+      },
+      ...(hierarchy === undefined
+        ? {}
+        : {
+            hierarchy: {
+              match: (path: string) => hierarchy.match(path),
+              route(matched: unknown, method: "GET" | "POST") {
+                const route = hierarchy.route(matched, method);
+                if (route === undefined || method !== "POST") return route;
+                return {
+                  ...route,
+                  render(request) {
+                    renders.import += 1;
+                    return route.render(request);
+                  },
+                };
+              },
+            },
+          }),
+    };
+    server = await startServer({ store, port: 0, routes });
     return {
       dir,
       store,
       server,
       engagementId: engagement.id,
+      renders,
       async close() {
         // Attempt every teardown step even when one fails, so a failed server
         // close cannot skip the store close that protects the workspace. Both
@@ -175,6 +224,45 @@ function exactLimitMultipart(fields: Readonly<Record<string, string>>): Buffer {
   const complete = completeMultipart(fields);
   assert.ok(complete.length <= EXACT_BODY_BYTES, `the controls fit inside ${EXACT_BODY_BYTES} bytes`);
   return Buffer.concat([complete, Buffer.alloc(EXACT_BODY_BYTES - complete.length, 0x65)]);
+}
+
+/** The declared length one byte past the owner-specified inclusive body limit. */
+const OVERSIZED_BODY_BYTES = EXACT_BODY_BYTES + 1;
+
+/**
+ * A complete multipart body grown to the declared over-limit length only by a
+ * legal epilogue after the CRLF-terminated closing delimiter. The controls stay
+ * valid and small, so only the declared whole-body length is in excess.
+ */
+function oversizedMultipart(fields: Readonly<Record<string, string>>): Buffer {
+  const complete = completeMultipart(fields);
+  assert.ok(complete.length <= OVERSIZED_BODY_BYTES, `the controls fit inside ${OVERSIZED_BODY_BYTES} bytes`);
+  return Buffer.concat([complete, Buffer.alloc(OVERSIZED_BODY_BYTES - complete.length, 0x65)]);
+}
+
+/** A raw follow-up GET request, written on the retiring socket. */
+function rawGet(base: string, path: string): Buffer {
+  const url = new URL(base);
+  return Buffer.from(`GET ${path} HTTP/1.1\r\nHost: ${url.host}\r\nConnection: keep-alive\r\n\r\n`, "utf8");
+}
+
+/** The one complete 413 a retiring connection must deliver, with its guidance. */
+function assertOversizedRefusal(exchange: ClosedExchange, why: string): void {
+  assert.equal(exchange.replies.length, 1, `${why}: the connection carries exactly one complete reply`);
+  const reply = exchange.replies[0]!;
+  assert.equal(reply.status, 413, `${why}: the reply is a 413`);
+  assert.match(String(reply.headers["content-type"]), /^text\/plain; charset=utf-8/, `${why}: the reply is plain text`);
+  assert.equal(reply.headers["cache-control"], "no-store", `${why}: the reply is not cached`);
+  assert.equal(reply.headers["connection"], "close", `${why}: the reply retires the connection`);
+  assert.equal(
+    reply.body,
+    `The request body is too large.\n\nKeep the whole submission at most ${EXACT_BODY_BYTES} bytes; nothing was truncated.\n`,
+    `${why}: the reply carries the whole-body limit guidance`,
+  );
+  assert.ok(
+    Number.isInteger(exchange.localPort) && exchange.localPort > 0,
+    `${why}: the exchange used one positive client local port: ${exchange.localPort}`,
+  );
 }
 
 /** The decoder's exact message for a body that has no closing delimiter. */
@@ -377,6 +465,393 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
     } finally {
       transport.close();
       await runningFixture.close();
+    }
+  });
+
+  it("refuses an oversized declared import on headers alone and writes nothing", async () => {
+    const runningFixture = await running();
+    const guard = watchdog(5000, "the withheld-body refusal did not finish");
+    try {
+      const before = baselineOf(runningFixture);
+      const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
+      const body = oversizedMultipart({
+        title: "Withheld oversized import",
+        date: "2026-09-02",
+        paste: "Alice: the withheld source.",
+      });
+      assert.equal(body.byteLength, OVERSIZED_BODY_BYTES, "the valid body is exactly the declared over-limit length");
+      assert.ok(body.byteLength > EXACT_BODY_BYTES, "the declared whole-body length is over the inclusive limit");
+
+      // No body byte is written at all, so the 413 must arrive from the
+      // declared headers alone and the socket must then retire.
+      const pending = sendStaged(runningFixture.server.origin, {
+        path: importPath,
+        contentType: MULTIPART_TYPE,
+        declaredLength: OVERSIZED_BODY_BYTES,
+      });
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assertOversizedRefusal(exchange, "withheld body");
+      assert.equal(runningFixture.renders.import, 0, "the refused import never reached a handler");
+      assert.equal(runningFixture.renders.followUp, 0, "no follow-up handler ran on the retiring socket");
+      assertUnchanged(runningFixture, before, "after the withheld-body refusal");
+    } finally {
+      guard.clear();
+      await runningFixture.close();
+    }
+  });
+
+  it("refuses an oversized declared import in flight, excludes a follow-up and writes nothing", async () => {
+    const runningFixture = await running();
+    const guard = watchdog(5000, "the in-flight refusal did not finish");
+    try {
+      const before = baselineOf(runningFixture);
+      const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
+      const body = oversizedMultipart({
+        title: "In-flight oversized import",
+        date: "2026-09-03",
+        paste: "Bob: the in-flight source.",
+      });
+      assert.equal(body.byteLength, OVERSIZED_BODY_BYTES, "the valid body is exactly the declared over-limit length");
+
+      // Start sending the whole declared body, then a complete follow-up GET,
+      // before reading the reply; the 413 still answers from the declared
+      // headers. The GET follows every declared body byte, so it is a real next
+      // request on the socket rather than more POST body. It must never reach a
+      // handler, and it must not add a second reply to the one 413.
+      const pending = sendStaged(runningFixture.server.origin, {
+        path: importPath,
+        contentType: MULTIPART_TYPE,
+        declaredLength: OVERSIZED_BODY_BYTES,
+        bodyPrefix: body,
+        followUp: rawGet(runningFixture.server.origin, "/health"),
+      });
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assertOversizedRefusal(exchange, "in-flight body with follow-up");
+      assert.equal(runningFixture.renders.import, 0, "the refused import never reached a handler");
+      assert.equal(runningFixture.renders.followUp, 0, "the follow-up on the retiring socket never reached a handler");
+      assertUnchanged(runningFixture, before, "after the in-flight refusal");
+    } finally {
+      guard.clear();
+      await runningFixture.close();
+    }
+  });
+
+  it("rejects a staged reply whose partial status line runs into a second reply", async () => {
+    const listener = testListener((req) => {
+      req.resume();
+      // A truncated 413 status line immediately followed by a complete 413:
+      // the old parser ignored the second status line as a header without a
+      // colon and counted the whole block as one valid reply.
+      req.socket.write(
+        "HTTP/1.1 413 Payload Too Large\r\n" +
+          "HTTP/1.1 413 Payload Too Large\r\n" +
+          "content-length: 9\r\n" +
+          "content-type: text/plain\r\n" +
+          "cache-control: no-store\r\n" +
+          "connection: close\r\n\r\n" +
+          "too large",
+      );
+      req.socket.end();
+    });
+    const guard = watchdog(5000, "the malformed staged reply did not finish");
+    try {
+      const pending = listener.ready.then(() =>
+        sendStaged(`http://127.0.0.1:${listener.port()}`, {
+          path: "/",
+          contentType: "text/plain",
+          declaredLength: 0,
+        }),
+      );
+      const expected = assert.rejects(pending, /truncated reply/, "a partial status line cannot absorb a following reply");
+      expected.catch(() => undefined);
+      await Promise.race([Promise.all([listener.ready, expected]), guard.promise]);
+    } finally {
+      guard.clear();
+      await listener.close();
+    }
+  });
+
+  it("rejects a staged reply whose partial header line carries the next status line", async () => {
+    const listener = testListener((req) => {
+      req.resume();
+      // The first reply stops just after `Connection: `, so the complete
+      // reply's status line becomes that header's value. Its later
+      // `connection: close` header would otherwise overwrite the evidence and
+      // let the whole block be counted as one complete 413.
+      req.socket.write(
+        "HTTP/1.1 413 Payload Too Large\r\n" +
+          "Connection: " +
+          "HTTP/1.1 413 Payload Too Large\r\n" +
+          "content-length: 9\r\n" +
+          "content-type: text/plain\r\n" +
+          "cache-control: no-store\r\n" +
+          "connection: close\r\n\r\n" +
+          "too large",
+      );
+      req.socket.end();
+    });
+    const guard = watchdog(5000, "the malformed staged reply did not finish");
+    try {
+      const pending = listener.ready.then(() =>
+        sendStaged(`http://127.0.0.1:${listener.port()}`, {
+          path: "/",
+          contentType: "text/plain",
+          declaredLength: 0,
+        }),
+      );
+      const expected = assert.rejects(pending, /truncated reply/, "a status line inside a header value cannot complete a reply");
+      expected.catch(() => undefined);
+      await Promise.race([Promise.all([listener.ready, expected]), guard.promise]);
+    } finally {
+      guard.clear();
+      await listener.close();
+    }
+  });
+
+  it("counts a complete staged reply whose optional header value mentions a status line", async () => {
+    const listener = testListener((req) => {
+      req.resume();
+      // An unrelated header value may legally mention a status line; it must
+      // not make the parser reject an otherwise complete, correctly framed 413.
+      req.socket.write(
+        "HTTP/1.1 413 Payload Too Large\r\n" +
+          "content-length: 9\r\n" +
+          "content-type: text/plain\r\n" +
+          "cache-control: no-store\r\n" +
+          "connection: close\r\n" +
+          "X-Diagnostic: upstream returned HTTP/1.1 200 OK\r\n\r\n" +
+          "too large",
+      );
+      req.socket.end();
+    });
+    const guard = watchdog(5000, "the complete staged reply did not finish");
+    try {
+      const pending = listener.ready.then(() =>
+        sendStaged(`http://127.0.0.1:${listener.port()}`, {
+          path: "/",
+          contentType: "text/plain",
+          declaredLength: 0,
+        }),
+      );
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assert.equal(exchange.replies.length, 1, "the reply with an unrelated diagnostic header is counted once");
+      const reply = exchange.replies[0]!;
+      assert.equal(reply.status, 413, "the counted reply is a 413");
+      assert.equal(reply.headers["x-diagnostic"], "upstream returned HTTP/1.1 200 OK", "the diagnostic header value is preserved");
+      assert.equal(reply.body, "too large", "the counted reply carries its declared body");
+    } finally {
+      guard.clear();
+      await listener.close();
+    }
+  });
+
+  it("counts a complete staged reply with a legal constructor header", async () => {
+    const listener = testListener((req) => {
+      req.resume();
+      // `constructor` is a legal header field name. It must be stored as data,
+      // not confused with a property inherited by a plain object.
+      req.socket.write(
+        "HTTP/1.1 413 Payload Too Large\r\n" +
+          "content-length: 9\r\n" +
+          "content-type: text/plain\r\n" +
+          "cache-control: no-store\r\n" +
+          "connection: close\r\n" +
+          "constructor: data\r\n\r\n" +
+          "too large",
+      );
+      req.socket.end();
+    });
+    const guard = watchdog(5000, "the constructor-header staged reply did not finish");
+    try {
+      const pending = listener.ready.then(() =>
+        sendStaged(`http://127.0.0.1:${listener.port()}`, {
+          path: "/",
+          contentType: "text/plain",
+          declaredLength: 0,
+        }),
+      );
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assert.equal(exchange.replies.length, 1, "the reply with a legal constructor header is counted once");
+      const reply = exchange.replies[0]!;
+      assert.equal(reply.headers["constructor"], "data", "the constructor header value is stored as data");
+      assert.equal(Object.getPrototypeOf(reply.headers), null, "the returned headers use prototype-free storage");
+      assert.equal(reply.body, "too large", "the counted reply carries its declared body");
+    } finally {
+      guard.clear();
+      await listener.close();
+    }
+  });
+
+  it("rejects a staged reply that declares Transfer-Encoding alongside Content-Length", async () => {
+    const listener = testListener((req) => {
+      req.resume();
+      // This reader frames replies by Content-Length only, so a transfer coding
+      // is conflicting framing even when the declared length matches the body.
+      req.socket.write(
+        "HTTP/1.1 413 Payload Too Large\r\n" +
+          "content-length: 9\r\n" +
+          "transfer-encoding: chunked\r\n" +
+          "content-type: text/plain\r\n" +
+          "cache-control: no-store\r\n" +
+          "connection: close\r\n\r\n" +
+          "too large",
+      );
+      req.socket.end();
+    });
+    const guard = watchdog(5000, "the transfer-framed staged reply did not finish");
+    try {
+      const pending = listener.ready.then(() =>
+        sendStaged(`http://127.0.0.1:${listener.port()}`, {
+          path: "/",
+          contentType: "text/plain",
+          declaredLength: 0,
+        }),
+      );
+      const expected = assert.rejects(pending, /truncated reply/, "conflicting transfer framing cannot complete a reply");
+      expected.catch(() => undefined);
+      await Promise.race([Promise.all([listener.ready, expected]), guard.promise]);
+    } finally {
+      guard.clear();
+      await listener.close();
+    }
+  });
+
+  it("rejects a staged reply whose header value carries a bare carriage return", async () => {
+    const listener = testListener((req) => {
+      req.resume();
+      // A bare CR inside a field value is a control character, not line framing.
+      req.socket.write(
+        "HTTP/1.1 413 Payload Too Large\r\n" +
+          "content-length: 9\r\n" +
+          "x-diagnostic: before\rafter\r\n" +
+          "content-type: text/plain\r\n" +
+          "cache-control: no-store\r\n" +
+          "connection: close\r\n\r\n" +
+          "too large",
+      );
+      req.socket.end();
+    });
+    const guard = watchdog(5000, "the bare-carriage-return staged reply did not finish");
+    try {
+      const pending = listener.ready.then(() =>
+        sendStaged(`http://127.0.0.1:${listener.port()}`, {
+          path: "/",
+          contentType: "text/plain",
+          declaredLength: 0,
+        }),
+      );
+      const expected = assert.rejects(pending, /truncated reply/, "a bare carriage return cannot complete a reply");
+      expected.catch(() => undefined);
+      await Promise.race([Promise.all([listener.ready, expected]), guard.promise]);
+    } finally {
+      guard.clear();
+      await listener.close();
+    }
+  });
+
+  it("rejects a staged reply whose Content-Length value carries a bare line feed", async () => {
+    const listener = testListener((req) => {
+      req.resume();
+      // The bare LF before the digits must not be stripped and counted as a
+      // valid length; it is a control character in the raw field value.
+      req.socket.write(
+        "HTTP/1.1 413 Payload Too Large\r\n" +
+          "content-length: \n9\r\n" +
+          "content-type: text/plain\r\n" +
+          "cache-control: no-store\r\n" +
+          "connection: close\r\n\r\n" +
+          "too large",
+      );
+      req.socket.end();
+    });
+    const guard = watchdog(5000, "the bare-line-feed staged reply did not finish");
+    try {
+      const pending = listener.ready.then(() =>
+        sendStaged(`http://127.0.0.1:${listener.port()}`, {
+          path: "/",
+          contentType: "text/plain",
+          declaredLength: 0,
+        }),
+      );
+      const expected = assert.rejects(pending, /truncated reply/, "a bare line feed in a length cannot complete a reply");
+      expected.catch(() => undefined);
+      await Promise.race([Promise.all([listener.ready, expected]), guard.promise]);
+    } finally {
+      guard.clear();
+      await listener.close();
+    }
+  });
+
+  it("rejects a staged reply whose Content-Type fields conflict before counting it", async () => {
+    const listener = testListener((req) => {
+      req.resume();
+      // The first Content-Type is not the expected plain text, while the later
+      // field overwrites it in the returned headers. Conflicting singleton
+      // fields must not be resolved by the last header line.
+      req.socket.write(
+        "HTTP/1.1 413 Payload Too Large\r\n" +
+          "content-length: 9\r\n" +
+          "content-type: text/html\r\n" +
+          "content-type: text/plain\r\n" +
+          "cache-control: no-store\r\n" +
+          "connection: close\r\n\r\n" +
+          "too large",
+      );
+      req.socket.end();
+    });
+    const guard = watchdog(5000, "the conflicting Content-Type staged reply did not finish");
+    try {
+      const pending = listener.ready.then(() =>
+        sendStaged(`http://127.0.0.1:${listener.port()}`, {
+          path: "/",
+          contentType: "text/plain",
+          declaredLength: 0,
+        }),
+      );
+      const expected = assert.rejects(pending, /truncated reply/, "conflicting Content-Type fields cannot complete a reply");
+      expected.catch(() => undefined);
+      await Promise.race([Promise.all([listener.ready, expected]), guard.promise]);
+    } finally {
+      guard.clear();
+      await listener.close();
+    }
+  });
+
+  it("rejects a staged reply whose Content-Length fields conflict before counting it", async () => {
+    const listener = testListener((req) => {
+      req.resume();
+      // The last Content-Length agrees with the body, but the earlier field does
+      // not: overwriting the earlier field would wrongly count this reply.
+      req.socket.write(
+        "HTTP/1.1 413 Payload Too Large\r\n" +
+          "content-length: 10\r\n" +
+          "content-length: 9\r\n" +
+          "content-type: text/plain\r\n" +
+          "cache-control: no-store\r\n" +
+          "connection: close\r\n\r\n" +
+          "too large",
+      );
+      req.socket.end();
+    });
+    const guard = watchdog(5000, "the conflicting staged reply did not finish");
+    try {
+      const pending = listener.ready.then(() =>
+        sendStaged(`http://127.0.0.1:${listener.port()}`, {
+          path: "/",
+          contentType: "text/plain",
+          declaredLength: 0,
+        }),
+      );
+      const expected = assert.rejects(pending, /truncated reply/, "conflicting Content-Length fields cannot complete a reply");
+      expected.catch(() => undefined);
+      await Promise.race([Promise.all([listener.ready, expected]), guard.promise]);
+    } finally {
+      guard.clear();
+      await listener.close();
     }
   });
 

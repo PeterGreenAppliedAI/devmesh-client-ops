@@ -17,6 +17,7 @@ import {
   type ClientRequest,
   type IncomingMessage,
 } from "node:http";
+import { createConnection } from "node:net";
 
 /** The boundary the helper uses for every submitted multipart body. */
 export const BOUNDARY = "transcript-library-boundary";
@@ -464,6 +465,281 @@ export function send(transport: Transport, base: string, options: SendOptions): 
     } catch (error) {
       fail(error as Error);
     }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Staged raw exchanges read through peer closure
+// ---------------------------------------------------------------------------
+
+/** One raw exchange: every byte read before the peer closed, and its replies. */
+export interface ClosedExchange {
+  readonly bytes: Buffer;
+  /** Every complete reply parsed from the bytes read through peer closure. */
+  readonly replies: readonly Reply[];
+  /** The client socket's local port, captured while it was connected. */
+  readonly localPort: number;
+}
+
+/** A staged POST whose body and follow-up bytes are written before the reply. */
+export interface StagedSendOptions {
+  /** A root-relative request target (its query included). */
+  readonly path: string;
+  readonly contentType: string;
+  /** The declared POST body length; no body is required for the server's reply. */
+  readonly declaredLength: number;
+  /** Bytes of the declared body written after the headers, before the reply. */
+  readonly bodyPrefix?: Uint8Array;
+  /**
+   * A raw follow-up request written on the same socket after the body prefix,
+   * before the reply is read. It is never awaited as a separate reply.
+   */
+  readonly followUp?: Uint8Array;
+  /** The inclusive cap for all bytes read through closure. */
+  readonly responseCap?: number;
+  /** The deadline, from connection creation through peer closure. */
+  readonly deadlineMs?: number;
+}
+
+/** One valid HTTP/1.x status line, with a three-digit status and optional reason. */
+const STATUS_LINE = /^HTTP\/1\.[01] ([1-5]\d\d)(?: [^\r\n]*)?$/;
+
+/** One valid HTTP header field-name token. */
+const HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+/** One Connection field value: comma-separated connection-option tokens. */
+const CONNECTION_VALUE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+(?:[ \t]*,[ \t]*[!#$%&'*+\-.^_`|~0-9A-Za-z]+)*$/;
+
+/**
+ * Parse every complete Content-Length-framed reply in the received bytes. The
+ * final reply's declared body must end at the final received byte; a partial
+ * second reply or any trailing junk makes the whole exchange incomplete rather
+ * than silently returning the replies parsed before it. The status line and
+ * every header line are validated strictly, so a malformed or concatenated line
+ * cannot be ignored and absorbed into an otherwise valid reply.
+ *
+ * Content-Length fields must agree before a reply is counted, so conflicting
+ * framing is never resolved by the last header line. Any Transfer-Encoding is
+ * rejected because this reader frames replies by Content-Length only.
+ * Connection fields are validated as comma-separated option tokens; this
+ * rejects a truncated header whose value absorbed the next reply's status line,
+ * while leaving unrelated header values (which may legally contain
+ * status-line-looking text) alone.
+ *
+ * Field values are validated raw, before any permitted whitespace is removed,
+ * and only space and horizontal tab count as HTTP whitespace. The collected
+ * fields and the returned headers use prototype-free objects, so a legal field
+ * name such as `constructor` is stored as data rather than an inherited
+ * property.
+ */
+function parseReplies(bytes: Buffer): { readonly replies: Reply[]; readonly complete: boolean } {
+  const replies: Reply[] = [];
+  let offset = 0;
+  while (offset < bytes.length) {
+    const headEnd = bytes.indexOf("\r\n\r\n", offset);
+    if (headEnd < 0) return { replies, complete: false };
+    const lines = bytes.subarray(offset, headEnd).toString("utf8").split("\r\n");
+    const statusLine = lines[0] ?? "";
+    // A second status line concatenated into the first line is not a reason
+    // phrase; it is a truncated reply followed by another one.
+    if ((statusLine.match(/HTTP\//g) ?? []).length !== 1) return { replies, complete: false };
+    const statusMatch = STATUS_LINE.exec(statusLine);
+    if (statusMatch === null) return { replies, complete: false };
+    const status = Number(statusMatch[1]);
+    const headers: Record<string, string> = Object.create(null);
+    const fields: Record<string, string[]> = Object.create(null);
+    for (const line of lines.slice(1)) {
+      const at = line.indexOf(":");
+      if (at <= 0) return { replies, complete: false };
+      const name = line.slice(0, at);
+      if (!HEADER_NAME.test(name)) return { replies, complete: false };
+      // Validate the received value before removing permitted HTTP whitespace:
+      // CR, LF, DEL and the other controls are never legal in a header value.
+      const rawValue = line.slice(at + 1);
+      if (/[\u0000-\u0008\u000A-\u001F\u007F]/.test(rawValue)) {
+        return { replies, complete: false };
+      }
+      // Only space and horizontal tab are HTTP whitespace; strip just those.
+      const value = rawValue.replace(/^[ \t]+|[ \t]+$/g, "");
+      const lower = name.toLowerCase();
+      if (lower === "connection" && !CONNECTION_VALUE.test(value)) {
+        return { replies, complete: false };
+      }
+      (fields[lower] ??= []).push(value);
+      headers[lower] = value;
+    }
+    // A reply's Content-Type is a single field. Conflicting occurrences must
+    // not be resolved by the last header line, which would let an earlier value
+    // be overwritten in the returned headers.
+    const contentTypes = fields["content-type"];
+    if (contentTypes !== undefined) {
+      const first = contentTypes[0];
+      for (const value of contentTypes) {
+        if (value !== first) return { replies, complete: false };
+      }
+    }
+    // This reader frames replies by Content-Length only, so any transfer coding
+    // is conflicting framing and cannot complete a reply.
+    if (fields["transfer-encoding"] !== undefined) return { replies, complete: false };
+    const lengths = fields["content-length"];
+    if (lengths === undefined) return { replies, complete: false };
+    let length: number | null = null;
+    for (const field of lengths) {
+      for (const part of field.split(",")) {
+        const text = part.replace(/^[ \t]+|[ \t]+$/g, "");
+        if (!/^\d+$/.test(text)) return { replies, complete: false };
+        const value = Number(text);
+        if (!Number.isSafeInteger(value) || value < 0) return { replies, complete: false };
+        if (length === null) length = value;
+        else if (length !== value) return { replies, complete: false };
+      }
+    }
+    if (length === null) return { replies, complete: false };
+    const bodyStart = headEnd + 4;
+    if (bytes.length < bodyStart + length) return { replies, complete: false };
+    replies.push(replyFrom(status, headers, bytes.subarray(bodyStart, bodyStart + length)));
+    offset = bodyStart + length;
+  }
+  return { replies, complete: true };
+}
+
+/**
+ * Send a staged POST and read every byte until the peer closes the connection.
+ *
+ * The headers declare the whole body length, then the optional body prefix and
+ * follow-up request are written on the same socket before any reply is read. A
+ * reply is complete only when its headers and declared body have fully arrived;
+ * the exchange resolves with every such reply it saw and the raw bytes read
+ * through closure. A missing or truncated reply, a cap overflow, a socket error
+ * before any complete reply, or the deadline rejects. A socket reset after a
+ * complete reply still resolves: the reply is what the caller checks, and the
+ * peer closure has already happened.
+ */
+export function sendStaged(base: string, options: StagedSendOptions): Promise<ClosedExchange> {
+  const url = originOf(base);
+  assert.ok(options.path.startsWith("/"), `the request target ${options.path} is root-relative`);
+  assert.ok(
+    Number.isSafeInteger(options.declaredLength) && options.declaredLength >= 0,
+    "the declared length is a finite byte count",
+  );
+  const cap = options.responseCap ?? DEFAULT_RESPONSE_CAP;
+  const deadlineMs = options.deadlineMs ?? DEFAULT_DEADLINE_MS;
+  assert.ok(Number.isSafeInteger(cap) && cap >= 0, "the response cap is a finite byte count");
+  assert.ok(
+    Number.isSafeInteger(deadlineMs) && deadlineMs > 0 && deadlineMs <= MAX_TIMEOUT_MS,
+    `the deadline is a finite positive duration of at most ${MAX_TIMEOUT_MS} ms`,
+  );
+  const expiresAt = performance.now() + deadlineMs;
+  const timedOut = (): boolean => performance.now() >= expiresAt;
+  const timeoutError = (): Error => new Error(`no reply within ${deadlineMs} ms`);
+
+  return new Promise<ClosedExchange>((resolve, reject) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let socketError: Error | null = null;
+    let localPort = 0;
+    const chunks: Buffer[] = [];
+    let received = 0;
+    const socket = createConnection({ host: url.hostname, port: Number(url.port) });
+
+    const clearDeadline = (): void => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
+    const fail = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearDeadline();
+      socket.destroy();
+      reject(error);
+    };
+    const finish = (): void => {
+      if (settled) return;
+      // A peer close dispatched after the expiry but before the timer callback
+      // still fails; the monotonic deadline is checked at completion too.
+      if (timedOut()) {
+        fail(timeoutError());
+        return;
+      }
+      const bytes = Buffer.concat(chunks);
+      const parsed = parseReplies(bytes);
+      if (!parsed.complete) {
+        fail(socketError ?? new Error("the peer closed with a truncated reply"));
+        return;
+      }
+      const replies = parsed.replies;
+      if (replies.length === 0) {
+        fail(socketError ?? new Error("the peer closed with no complete reply"));
+        return;
+      }
+      if (!(Number.isInteger(localPort) && localPort > 0)) {
+        fail(new Error("the exchange socket carries no positive local port"));
+        return;
+      }
+      settled = true;
+      clearDeadline();
+      socket.destroy();
+      resolve({ bytes, replies, localPort });
+    };
+    const armDeadline = (): boolean => {
+      const remaining = expiresAt - performance.now();
+      if (remaining <= 0) {
+        fail(timeoutError());
+        return false;
+      }
+      timer = setTimeout(() => {
+        if (!settled && !timedOut()) {
+          armDeadline();
+          return;
+        }
+        fail(timeoutError());
+      }, remaining);
+      return true;
+    };
+
+    socket.on("connect", () => {
+      localPort = socket.localPort ?? 0;
+      if (timedOut()) {
+        fail(timeoutError());
+        return;
+      }
+      try {
+        const lines = [
+          `POST ${options.path} HTTP/1.1`,
+          `Host: ${url.host}`,
+          `Origin: ${url.origin}`,
+          `Content-Type: ${options.contentType}`,
+          `Content-Length: ${options.declaredLength}`,
+          "Connection: keep-alive",
+          "",
+          "",
+        ];
+        socket.write(lines.join("\r\n"));
+        if (options.bodyPrefix !== undefined) {
+          socket.write(Buffer.from(options.bodyPrefix));
+        }
+        if (options.followUp !== undefined) socket.write(Buffer.from(options.followUp));
+      } catch (error) {
+        fail(error as Error);
+      }
+    });
+    socket.on("data", (chunk: Buffer) => {
+      if (settled) return;
+      received += chunk.byteLength;
+      if (received > cap) {
+        fail(new Error(`the reply bytes exceeded the ${cap}-byte cap`));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    socket.on("end", finish);
+    socket.on("close", finish);
+    socket.on("error", (error: Error) => {
+      if (!settled) socketError = error;
+    });
+    if (!armDeadline()) return;
   });
 }
 
