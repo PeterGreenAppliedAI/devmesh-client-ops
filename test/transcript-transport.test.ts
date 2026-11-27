@@ -16,15 +16,16 @@
  * refused with one complete plain-text 413 that carries the whole-submission
  * guidance, Cache-Control: no-store and Connection: close. The refusal is
  * reserved on the first excess byte, drains and excludes any follow-up request,
- * ignores a late parser failure, and leaves the workspace byte-for-byte
- * unchanged. Each refusal is read through peer closure, including while the
- * final chunk terminator is withheld.
+ * ignores a late parser failure and a late CONNECT, and leaves the workspace
+ * byte-for-byte unchanged. Each refusal is read through peer closure, including
+ * while the final chunk terminator is withheld.
  *
  * Only the temporary workspace receives data, and it is removed afterwards.
  */
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { createServer, type ServerResponse } from "node:http";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -261,6 +262,62 @@ function oneByteOverLimitMultipart(fields: Readonly<Record<string, string>>): Bu
 function rawGet(base: string, path: string): Buffer {
   const url = new URL(base);
   return Buffer.from(`GET ${path} HTTP/1.1\r\nHost: ${url.host}\r\nConnection: keep-alive\r\n\r\n`, "utf8");
+}
+
+/** A raw CONNECT request, written on the retiring socket after a follow-up GET. */
+function rawConnect(base: string): Buffer {
+  const url = new URL(base);
+  return Buffer.from(`CONNECT ${url.host} HTTP/1.1\r\nHost: ${url.host}\r\n\r\n`, "utf8");
+}
+
+/**
+ * Send one GET on a fresh ordinary socket, then pause after the first reply
+ * bytes so a large response cannot finish, and write malformed request bytes.
+ * The server's parser therefore fails while that response's headers are already
+ * on the wire. Every byte read through peer closure is returned for framing
+ * assertions; a reset after data is an expected way for the server to close.
+ */
+function largeResponseThenParserError(base: string): Promise<Buffer> {
+  const url = new URL(base);
+  return new Promise<Buffer>((resolve, reject) => {
+    const socket = createConnection({ host: url.hostname, port: Number(url.port) });
+    const chunks: Buffer[] = [];
+    let settled = false;
+    let started = false;
+    let resumeTimer: ReturnType<typeof setTimeout> | null = null;
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      if (resumeTimer !== null) {
+        clearTimeout(resumeTimer);
+        resumeTimer = null;
+      }
+      socket.destroy();
+      if (error !== undefined && chunks.length === 0) reject(error);
+      else resolve(Buffer.concat(chunks));
+    };
+    socket.on("connect", () => {
+      socket.write(`GET / HTTP/1.1\r\nHost: ${url.host}\r\nConnection: keep-alive\r\n\r\n`);
+    });
+    socket.on("data", (chunk: Buffer) => {
+      chunks.push(chunk);
+      if (!started) {
+        started = true;
+        // Stop reading so the large response stays in flight. The server still
+        // receives the malformed bytes written now, so its parser fails while
+        // the response headers are already on the wire.
+        socket.pause();
+        socket.write("GARBAGE\r\n\r\n");
+        resumeTimer = setTimeout(() => {
+          resumeTimer = null;
+          socket.resume();
+        }, 100);
+      }
+    });
+    socket.on("end", () => finish());
+    socket.on("close", () => finish());
+    socket.on("error", (error: Error) => finish(error));
+  });
 }
 
 /** The one complete 413 a retiring connection must deliver, with its guidance. */
@@ -631,6 +688,103 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
     } finally {
       guard.clear();
       await runningFixture.close();
+    }
+  });
+
+  it("protects a streaming overflow refusal from a late CONNECT and writes nothing", async () => {
+    const runningFixture = await running();
+    const guard = watchdog(5000, "the streaming-overflow CONNECT refusal did not finish");
+    try {
+      const before = baselineOf(runningFixture);
+      const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
+      const body = oneByteOverLimitMultipart({
+        title: "Streaming overflow CONNECT import",
+        date: "2026-09-07",
+        paste: "Frank: the streaming CONNECT source.",
+      });
+      assert.equal(body.byteLength, OVERSIZED_BODY_BYTES, "the body is exactly one byte past the inclusive limit");
+
+      // The body is complete after the excess byte, so the follow-up GET and the
+      // CONNECT are real next messages on the same socket. Node dispatches the
+      // CONNECT through its own event, which must not close the socket before
+      // the reserved refusal writes its one complete 413.
+      const pending = sendStaged(runningFixture.server.origin, {
+        path: importPath,
+        contentType: MULTIPART_TYPE,
+        declaredLength: body.byteLength,
+        bodyPrefix: body,
+        chunked: true,
+        chunkSize: EXACT_BODY_BYTES,
+        combineTail: true,
+        tailDelayMs: 200,
+        followUp: Buffer.concat([
+          rawGet(runningFixture.server.origin, "/health"),
+          rawConnect(runningFixture.server.origin),
+        ]),
+      });
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assertOversizedRefusal(exchange, "streaming overflow with a late CONNECT");
+      assert.equal(runningFixture.renders.import, 0, "the refused import never reached a handler");
+      assert.equal(runningFixture.renders.followUp, 0, "the follow-up on the retiring socket never reached a handler");
+      assertUnchanged(runningFixture, before, "after the streaming-overflow CONNECT refusal");
+    } finally {
+      guard.clear();
+      await runningFixture.close();
+    }
+  });
+
+  it("closes an ordinary connection after a parser error without appending a status line to a started response", async () => {
+    const dir = tempDir();
+    const store = await openStore(dir);
+    let server: StartedServer | null = null;
+    const guard = watchdog(10000, "the started-response parser failure did not finish");
+    try {
+      // A large reply stays in flight because the client stops reading, so the
+      // malformed bytes that follow are parsed while the response headers are
+      // already on the wire.
+      const large = Buffer.alloc(16 * 1024 * 1024, 0x61);
+      const largeRoute: Route = {
+        method: "GET",
+        render() {
+          return { status: 200, body: large, binary: true };
+        },
+      };
+      const routes: Routes = { home: { get: largeRoute }, health: { get: largeRoute } };
+      server = await startServer({ store, port: 0, routes });
+      const pending = largeResponseThenParserError(server.origin);
+      pending.catch(() => undefined);
+      const bytes = await Promise.race([pending, guard.promise]);
+
+      // The started response's own status line is the only one: a parser-error
+      // reply must not be appended to the response stream after its headers.
+      const text = bytes.toString("latin1");
+      const statusLines = text.match(/HTTP\/1\.[01] /g) ?? [];
+      assert.equal(statusLines.length, 1, "the started response is not followed by a parser-error status line");
+      assert.ok(text.startsWith("HTTP/1.1 200 "), "the counted status line belongs to the started response");
+    } finally {
+      guard.clear();
+      // Close the server and the store independently, retaining each cleanup
+      // failure; a failed server close must not swallow a store close error.
+      let serverError: unknown = null;
+      if (server !== null) {
+        try {
+          await server.close();
+        } catch (error) {
+          serverError = error;
+        }
+      }
+      let storeError: unknown = null;
+      try {
+        await store.close();
+      } catch (error) {
+        storeError = error;
+      }
+      if (serverError !== null && storeError !== null) {
+        throw new AggregateError([serverError, storeError], "both the server and the store failed to close");
+      }
+      if (serverError !== null) throw serverError;
+      if (storeError !== null) throw storeError;
     }
   });
 

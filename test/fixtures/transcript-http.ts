@@ -508,6 +508,18 @@ export interface StagedSendOptions {
    */
   readonly withholdTerminator?: boolean;
   /**
+   * Write the final body chunk together with any terminator and the follow-up
+   * in one socket write, so Node's parser can see the final body byte and the
+   * follow-up message in the same pass. Only used with a chunked staged send.
+   */
+  readonly combineTail?: boolean;
+  /**
+   * Wait this many real milliseconds after the earlier chunks are written before
+   * writing the combined tail, so those chunks are parsed first and only the
+   * final body byte arrives with the follow-up. Only used with `combineTail`.
+   */
+  readonly tailDelayMs?: number;
+  /**
    * A raw follow-up request written on the same socket after the body prefix,
    * before the reply is read. It is never awaited as a separate reply.
    */
@@ -652,6 +664,14 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
   } else {
     assert.equal(options.chunkSize, undefined, "a chunk size is only used with a chunked staged send");
     assert.notEqual(options.withholdTerminator, true, "a chunk terminator is only withheld from a chunked staged send");
+    assert.notEqual(options.combineTail, true, "a combined tail is only used with a chunked staged send");
+  }
+  assert.ok(options.tailDelayMs === undefined || options.combineTail === true, "a tail delay is only used with a combined tail");
+  if (options.tailDelayMs !== undefined) {
+    assert.ok(
+      Number.isSafeInteger(options.tailDelayMs) && options.tailDelayMs >= 0,
+      "the tail delay is a finite non-negative duration",
+    );
   }
   const cap = options.responseCap ?? DEFAULT_RESPONSE_CAP;
   const deadlineMs = options.deadlineMs ?? DEFAULT_DEADLINE_MS;
@@ -667,6 +687,7 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
   return new Promise<ClosedExchange>((resolve, reject) => {
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let tailTimer: ReturnType<typeof setTimeout> | null = null;
     let socketError: Error | null = null;
     let localPort = 0;
     const chunks: Buffer[] = [];
@@ -679,10 +700,17 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
         timer = null;
       }
     };
+    const clearTail = (): void => {
+      if (tailTimer !== null) {
+        clearTimeout(tailTimer);
+        tailTimer = null;
+      }
+    };
     const fail = (error: Error): void => {
       if (settled) return;
       settled = true;
       clearDeadline();
+      clearTail();
       socket.destroy();
       reject(error);
     };
@@ -711,6 +739,7 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
       }
       settled = true;
       clearDeadline();
+      clearTail();
       socket.destroy();
       resolve({ bytes, replies, localPort });
     };
@@ -751,17 +780,48 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
         if (chunked) {
           const prefix = Buffer.from(options.bodyPrefix!);
           const chunkSize = options.chunkSize ?? prefix.byteLength;
+          const frames: Buffer[] = [];
           for (let offset = 0; offset < prefix.byteLength; offset += chunkSize) {
             const chunk = prefix.subarray(offset, Math.min(offset + chunkSize, prefix.byteLength));
-            socket.write(`${chunk.byteLength.toString(16)}\r\n`);
-            socket.write(chunk);
-            socket.write("\r\n");
+            frames.push(
+              Buffer.from(`${chunk.byteLength.toString(16)}\r\n`),
+              chunk,
+              Buffer.from("\r\n"),
+            );
           }
-          if (options.withholdTerminator !== true) socket.write("0\r\n\r\n");
-        } else if (options.bodyPrefix !== undefined) {
-          socket.write(Buffer.from(options.bodyPrefix));
+          if (options.combineTail === true) {
+            // Keep the final body chunk, the terminator and the follow-up in one
+            // write so they can reach the parser in the same data chunk.
+            const tail: Buffer[] = [];
+            if (frames.length > 0) tail.push(frames.pop()!);
+            if (options.withholdTerminator !== true) tail.push(Buffer.from("0\r\n\r\n"));
+            if (options.followUp !== undefined) tail.push(Buffer.from(options.followUp));
+            for (const frame of frames) socket.write(frame);
+            const writeTail = (): void => {
+              tailTimer = null;
+              if (settled) return;
+              if (timedOut()) {
+                fail(timeoutError());
+                return;
+              }
+              try {
+                socket.write(Buffer.concat(tail));
+              } catch (tailError) {
+                fail(tailError as Error);
+              }
+            };
+            const delay = options.tailDelayMs ?? 0;
+            if (delay > 0) tailTimer = setTimeout(writeTail, delay);
+            else writeTail();
+          } else {
+            for (const frame of frames) socket.write(frame);
+            if (options.withholdTerminator !== true) socket.write("0\r\n\r\n");
+            if (options.followUp !== undefined) socket.write(Buffer.from(options.followUp));
+          }
+        } else {
+          if (options.bodyPrefix !== undefined) socket.write(Buffer.from(options.bodyPrefix));
+          if (options.followUp !== undefined) socket.write(Buffer.from(options.followUp));
         }
-        if (options.followUp !== undefined) socket.write(Buffer.from(options.followUp));
       } catch (error) {
         fail(error as Error);
       }

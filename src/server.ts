@@ -564,11 +564,49 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
   // it is drained and excluded instead of reaching a handler.
   const retiring = new WeakSet<Socket>();
 
+  // The responses still active on each ordinary socket, so a parser failure can
+  // tell whether Node has already started writing a response. A response leaves
+  // this set when it finishes or closes, so a completed reply does not prevent
+  // a later malformed request on the same kept-alive socket from being answered.
+  const activeResponses = new WeakMap<Socket, Set<ServerResponse>>();
+
   const server = createServer((req, res) => {
+    const socket = req.socket;
+    let responses = activeResponses.get(socket);
+    if (responses === undefined) {
+      responses = new Set<ServerResponse>();
+      activeResponses.set(socket, responses);
+    }
+    const current = responses;
+    current.add(res);
+    const forget = (): void => {
+      current.delete(res);
+      if (current.size === 0 && activeResponses.get(socket) === current) {
+        activeResponses.delete(socket);
+      }
+    };
+    res.once("finish", forget);
+    res.once("close", forget);
     void handle(req, res).catch(() => {
       if (!res.headersSent) send(res, 500, `${GENERIC_FAILURE}\n`, "text/plain; charset=utf-8");
       else res.destroy();
     });
+  });
+
+  // Node dispatches CONNECT through its own event and destroys the socket when
+  // no listener answers it. A CONNECT parsed after the excess byte on a reserved
+  // socket must not close the connection before the pending 413 is written, so
+  // the refusal owns that dispatch; every other CONNECT still closes exactly as
+  // Node's default handler would.
+  server.on("connect", (req, socket, head) => {
+    const netSocket = socket as Socket;
+    if (retiring.has(netSocket)) {
+      // Node has detached its parser for the CONNECT. Read and discard any
+      // further bytes until the one 413 has been written and closes the socket.
+      netSocket.resume();
+      return;
+    }
+    netSocket.destroy();
   });
 
   // A parser failure on a connection already reserved for a 413 must not
@@ -580,6 +618,18 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
     if (!socket.writable || socket.destroyed) {
       socket.destroy(error);
       return;
+    }
+    // Once a response's headers are on the wire, a fresh status line would be
+    // appended to that response stream. Close as Node does in that state instead
+    // of corrupting the started reply.
+    const responses = activeResponses.get(socket);
+    if (responses !== undefined) {
+      for (const response of responses) {
+        if (response.headersSent) {
+          socket.destroy(error);
+          return;
+        }
+      }
     }
     const code = (error as { readonly code?: string }).code;
     const status =
