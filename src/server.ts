@@ -564,10 +564,11 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
   // it is drained and excluded instead of reaching a handler.
   const retiring = new WeakSet<Socket>();
 
-  // The responses still active on each ordinary socket, so a parser failure can
-  // tell whether Node has already started writing a response. A response leaves
-  // this set when it finishes or closes, so a completed reply does not prevent
-  // a later malformed request on the same kept-alive socket from being answered.
+  // The responses still active on each ordinary socket, in request order, so a
+  // parser failure can tell whether Node has already started writing the
+  // response currently attached to the socket. A response leaves this set when
+  // it finishes or closes, so a completed reply does not prevent a later
+  // malformed request on the same kept-alive socket from being answered.
   const activeResponses = new WeakMap<Socket, Set<ServerResponse>>();
 
   const server = createServer((req, res) => {
@@ -619,16 +620,18 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
       socket.destroy(error);
       return;
     }
-    // Once a response's headers are on the wire, a fresh status line would be
-    // appended to that response stream. Close as Node does in that state instead
-    // of corrupting the started reply.
+    // Once the response currently attached to this socket has started writing,
+    // a fresh status line would be appended to that response stream. Close as
+    // Node does in that state instead of corrupting the started reply. Later
+    // responses are still queued behind the first one, so their generated
+    // headers do not mean anything has reached the wire yet; only the earliest
+    // active response is the one being written.
     const responses = activeResponses.get(socket);
     if (responses !== undefined) {
-      for (const response of responses) {
-        if (response.headersSent) {
-          socket.destroy(error);
-          return;
-        }
+      const current = responses.values().next().value;
+      if (current !== undefined && current.headersSent) {
+        socket.destroy(error);
+        return;
       }
     }
     const code = (error as { readonly code?: string }).code;

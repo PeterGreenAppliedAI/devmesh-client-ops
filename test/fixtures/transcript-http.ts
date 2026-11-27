@@ -688,6 +688,10 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let tailTimer: ReturnType<typeof setTimeout> | null = null;
+    // A combined tail is not submitted until `writeTail` runs. A peer close
+    // before that write would let the exchange report success without ever
+    // sending the final body byte and follow-up, so it fails instead.
+    let tailSubmitted = options.combineTail !== true;
     let socketError: Error | null = null;
     let localPort = 0;
     const chunks: Buffer[] = [];
@@ -716,6 +720,13 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
     };
     const finish = (): void => {
       if (settled) return;
+      // A peer close before the combined tail was submitted must fail rather
+      // than report a complete reply read through a closure the tail never
+      // reached.
+      if (!tailSubmitted) {
+        fail(new Error("the peer closed before the combined tail was written"));
+        return;
+      }
       // A peer close dispatched after the expiry but before the timer callback
       // still fails; the monotonic deadline is checked at completion too.
       if (timedOut()) {
@@ -790,10 +801,12 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
             );
           }
           if (options.combineTail === true) {
-            // Keep the final body chunk, the terminator and the follow-up in one
-            // write so they can reach the parser in the same data chunk.
+            // Each chunk contributes a size line, its data and a CRLF. Keep
+            // the entire final chunk frame, the terminator and the follow-up in
+            // one write so the first excess body byte reaches the parser only
+            // together with the messages that follow it.
             const tail: Buffer[] = [];
-            if (frames.length > 0) tail.push(frames.pop()!);
+            if (frames.length >= 3) tail.push(...frames.splice(frames.length - 3, 3));
             if (options.withholdTerminator !== true) tail.push(Buffer.from("0\r\n\r\n"));
             if (options.followUp !== undefined) tail.push(Buffer.from(options.followUp));
             for (const frame of frames) socket.write(frame);
@@ -804,6 +817,9 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
                 fail(timeoutError());
                 return;
               }
+              // The write is submitted once it is handed to the socket; a
+              // close before this point is a failed exchange.
+              tailSubmitted = true;
               try {
                 socket.write(Buffer.concat(tail));
               } catch (tailError) {
