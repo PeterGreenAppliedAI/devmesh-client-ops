@@ -365,9 +365,11 @@ function largeResponseThenParserError(base: string): Promise<Buffer> {
  * Send two pipelined GETs on one fresh socket, wait until the caller submits
  * malformed bytes, and read every reply byte through peer closure. The first
  * route's response never starts, while the second response's headers are
- * generated behind it. Every reply byte is capped; a peer reset is accepted only
- * after a response started and the malformed bytes were submitted, while other
- * socket and write errors reject.
+ * generated behind it. Reply data or peer closure before the malformed bytes
+ * are submitted rejects instead of resolving a truncated prefix. Every reply
+ * byte is capped; a peer reset is accepted only after a response started and
+ * the malformed bytes were submitted, while other socket and write errors
+ * reject.
  */
 function queuedResponseThenParserError(base: string, writeMalformed: Promise<void>): Promise<Buffer> {
   const url = new URL(base);
@@ -412,11 +414,19 @@ function queuedResponseThenParserError(base: string, writeMalformed: Promise<voi
         finish(new Error(`the reply bytes exceeded the ${SMALL_RESPONSE_CAP}-byte cap`));
         return;
       }
+      if (!malformedSubmitted) {
+        finish(new Error("the server replied before the malformed bytes were submitted"));
+        return;
+      }
       chunks.push(chunk);
       started = true;
     });
-    socket.on("end", () => finish());
-    socket.on("close", () => finish());
+    socket.on("end", () =>
+      finish(malformedSubmitted ? undefined : new Error("the peer closed before the malformed bytes were submitted")),
+    );
+    socket.on("close", () =>
+      finish(malformedSubmitted ? undefined : new Error("the peer closed before the malformed bytes were submitted")),
+    );
     socket.on("error", (error: Error) => {
       if (isConnectionReset(error) && started && malformedSubmitted) finish();
       else finish(error);
@@ -924,10 +934,13 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       const queuedRender = new Promise<void>((resolve) => {
         queuedRendered = resolve;
       });
-      let submitMalformed!: () => void;
-      const writeMalformed = new Promise<void>((resolve) => {
-        submitMalformed = resolve;
-      });
+      // The malformed bytes go out only after the second handler has rendered
+      // and one turn has passed, so its headers are generated but queued behind
+      // the still-pending first response.
+      const writeMalformed = (async () => {
+        await queuedRender;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      })();
       const slowRoute: Route = {
         method: "GET",
         render() {
@@ -945,19 +958,15 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       server = await startServer({ store, port: 0, routes });
       const pending = queuedResponseThenParserError(server.origin, writeMalformed);
       pending.catch(() => undefined);
-
-      // Wait until the second handler has rendered and one turn has passed, so
-      // its headers are generated but queued behind the still-pending first
-      // response. Only then submit the malformed bytes.
-      await queuedRender;
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      submitMalformed();
+      // Race immediately, so a transport failure or watchdog expiry reaches
+      // finally even when the second route never renders.
       const bytes = await Promise.race([pending, guard.promise]);
 
       const text = bytes.toString("latin1");
       const statusLines = text.match(/HTTP\/1\.[01] /g) ?? [];
       assert.equal(statusLines.length, 1, "the ordinary parser-error reply is written exactly once");
-      assert.ok(text.startsWith("HTTP/1.1 400 "), "the parser error is answered with 400");
+      const head = /^HTTP\/1\.1 400 [^\r\n]*\r\n(?:[^\r\n]+\r\n)*\r\n/.exec(text);
+      assert.ok(head !== null, "the complete parser-error status line and header block arrived through peer closure");
       assert.ok(!text.includes("HTTP/1.1 200 "), "the queued response's headers never reached the wire");
     } finally {
       guard.clear();
