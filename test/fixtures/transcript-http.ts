@@ -491,6 +491,23 @@ export interface StagedSendOptions {
   /** Bytes of the declared body written after the headers, before the reply. */
   readonly bodyPrefix?: Uint8Array;
   /**
+   * Send the body prefix as HTTP chunks, letting Node frame the transfer,
+   * instead of declaring its exact length. The request then declares no
+   * Content-Length.
+   */
+  readonly chunked?: boolean;
+  /**
+   * The maximum body bytes in each HTTP chunk. The prefix is split into chunks
+   * of this size, with a shorter final chunk; without it the whole prefix is
+   * one chunk.
+   */
+  readonly chunkSize?: number;
+  /**
+   * Leave the final zero-length chunk unwritten, so the chunked request stays
+   * unfinished while the reply is read and the peer closes.
+   */
+  readonly withholdTerminator?: boolean;
+  /**
    * A raw follow-up request written on the same socket after the body prefix,
    * before the reply is read. It is never awaited as a separate reply.
    */
@@ -606,14 +623,15 @@ function parseReplies(bytes: Buffer): { readonly replies: Reply[]; readonly comp
 /**
  * Send a staged POST and read every byte until the peer closes the connection.
  *
- * The headers declare the whole body length, then the optional body prefix and
- * follow-up request are written on the same socket before any reply is read. A
- * reply is complete only when its headers and declared body have fully arrived;
- * the exchange resolves with every such reply it saw and the raw bytes read
- * through closure. A missing or truncated reply, a cap overflow, a socket error
- * before any complete reply, or the deadline rejects. A socket reset after a
- * complete reply still resolves: the reply is what the caller checks, and the
- * peer closure has already happened.
+ * The headers declare the whole body length or, when `chunked` is set, frame
+ * the body as HTTP chunks. The optional body prefix and follow-up request are
+ * written on the same socket before any reply is read. A reply is complete only
+ * when its headers and declared body have fully arrived; the exchange resolves
+ * with every such reply it saw and the raw bytes read through closure. A
+ * missing or truncated reply, a cap overflow, a socket error before any
+ * complete reply, or the deadline rejects. A socket reset after a complete
+ * reply still resolves: the reply is what the caller checks, and the peer
+ * closure has already happened.
  */
 export function sendStaged(base: string, options: StagedSendOptions): Promise<ClosedExchange> {
   const url = originOf(base);
@@ -622,6 +640,19 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
     Number.isSafeInteger(options.declaredLength) && options.declaredLength >= 0,
     "the declared length is a finite byte count",
   );
+  const chunked = options.chunked === true;
+  if (chunked) {
+    assert.ok(options.bodyPrefix !== undefined, "a chunked staged send carries a body prefix");
+    if (options.chunkSize !== undefined) {
+      assert.ok(
+        Number.isSafeInteger(options.chunkSize) && options.chunkSize > 0,
+        "the chunk size is a positive finite byte count",
+      );
+    }
+  } else {
+    assert.equal(options.chunkSize, undefined, "a chunk size is only used with a chunked staged send");
+    assert.notEqual(options.withholdTerminator, true, "a chunk terminator is only withheld from a chunked staged send");
+  }
   const cap = options.responseCap ?? DEFAULT_RESPONSE_CAP;
   const deadlineMs = options.deadlineMs ?? DEFAULT_DEADLINE_MS;
   assert.ok(Number.isSafeInteger(cap) && cap >= 0, "the response cap is a finite byte count");
@@ -711,13 +742,23 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
           `Host: ${url.host}`,
           `Origin: ${url.origin}`,
           `Content-Type: ${options.contentType}`,
-          `Content-Length: ${options.declaredLength}`,
+          chunked ? "Transfer-Encoding: chunked" : `Content-Length: ${options.declaredLength}`,
           "Connection: keep-alive",
           "",
           "",
         ];
         socket.write(lines.join("\r\n"));
-        if (options.bodyPrefix !== undefined) {
+        if (chunked) {
+          const prefix = Buffer.from(options.bodyPrefix!);
+          const chunkSize = options.chunkSize ?? prefix.byteLength;
+          for (let offset = 0; offset < prefix.byteLength; offset += chunkSize) {
+            const chunk = prefix.subarray(offset, Math.min(offset + chunkSize, prefix.byteLength));
+            socket.write(`${chunk.byteLength.toString(16)}\r\n`);
+            socket.write(chunk);
+            socket.write("\r\n");
+          }
+          if (options.withholdTerminator !== true) socket.write("0\r\n\r\n");
+        } else if (options.bodyPrefix !== undefined) {
           socket.write(Buffer.from(options.bodyPrefix));
         }
         if (options.followUp !== undefined) socket.write(Buffer.from(options.followUp));

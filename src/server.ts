@@ -7,8 +7,8 @@
  * access boundary (R18); there is no authentication service here, and no proxy
  * is trusted, so forwarded host and protocol headers are ignored.
  */
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import type { AddressInfo } from "node:net";
+import { createServer, STATUS_CODES, type IncomingMessage, type ServerResponse } from "node:http";
+import type { AddressInfo, Socket } from "node:net";
 import {
   escapeHtml,
   FormError,
@@ -452,11 +452,21 @@ function readForm(message: IncomingMessage, limit: number): Promise<Record<strin
  * before any byte is buffered, and arriving bytes are counted so a chunked body
  * that crosses the limit is refused as soon as it does, before it finishes.
  *
+ * `onExcess` runs synchronously at the first byte that takes the body past the
+ * inclusive limit, before the promise rejection is delivered. The caller uses
+ * it to reserve the connection for the refusal immediately, so bytes already
+ * queued behind that byte can never be dispatched to another handler.
+ *
  * The reader never tears the request stream down: like `readForm`, the
  * listeners stay in place and keep draining, the promise settles at the moment
  * the limit is crossed, and the caller answers 413 and closes the connection.
+ * The excess byte and every byte after it are discarded rather than buffered.
  */
-function readMultipartBody(message: IncomingMessage, limit: number): Promise<Buffer> {
+function readMultipartBody(
+  message: IncomingMessage,
+  limit: number,
+  onExcess: () => void,
+): Promise<Buffer> {
   const declaredHeader = message.headers["content-length"];
   const declared = typeof declaredHeader === "string" && /^\d+$/.test(declaredHeader) ? Number(declaredHeader) : null;
   if (declared !== null && declared > limit) return Promise.reject(new Rejection(413));
@@ -470,6 +480,7 @@ function readMultipartBody(message: IncomingMessage, limit: number): Promise<Buf
       size += buffer.byteLength;
       if (size > limit) {
         settled = true;
+        onExcess();
         reject(new Rejection(413));
         return;
       }
@@ -548,6 +559,11 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
   // Host alias the request actually carried.
   const originFor = (port: number): string => canonicalOrigin(port).origin;
 
+  // Sockets already reserved for a refusal answer are never dispatched again.
+  // A follow-up request may arrive on such a socket before its 413 is flushed;
+  // it is drained and excluded instead of reaching a handler.
+  const retiring = new WeakSet<Socket>();
+
   const server = createServer((req, res) => {
     void handle(req, res).catch(() => {
       if (!res.headersSent) send(res, 500, `${GENERIC_FAILURE}\n`, "text/plain; charset=utf-8");
@@ -555,7 +571,84 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
     });
   });
 
+  // A parser failure on a connection already reserved for a 413 must not
+  // replace or truncate that reply. Other malformed requests keep the answer
+  // Node would give without this listener, reproduced here because adding a
+  // clientError listener disables Node's own default handler.
+  server.on("clientError", (error: Error, socket: Socket) => {
+    if (retiring.has(socket)) return;
+    if (!socket.writable || socket.destroyed) {
+      socket.destroy(error);
+      return;
+    }
+    const code = (error as { readonly code?: string }).code;
+    const status =
+      code === "ERR_HTTP_REQUEST_TIMEOUT" ? 408
+      : code === "HPE_HEADER_OVERFLOW" ? 431
+      : code === "HPE_CHUNK_EXTENSIONS_OVERFLOW" ? 413
+      : 400;
+    socket.end(`HTTP/1.1 ${status} ${STATUS_CODES[status]}\r\nConnection: close\r\n\r\n`);
+  });
+
+  /** Mark a connection as retiring and ignore its late request/response failures. */
+  function reserveRetiring(req: IncomingMessage, res: ServerResponse): void {
+    const socket = req.socket;
+    const ignore = (): void => {};
+    req.on("error", ignore);
+    req.on("aborted", ignore);
+    res.on("error", ignore);
+    if (!retiring.has(socket)) {
+      retiring.add(socket);
+      socket.on("error", ignore);
+    }
+  }
+
+  /** Drain a reserved request's bytes without buffering them or replying. */
+  function drainRetiringRequest(req: IncomingMessage, res: ServerResponse): void {
+    reserveRetiring(req, res);
+    req.on("data", () => undefined);
+    req.resume();
+  }
+
+  /**
+   * Write the one multipart 413. A failed write is not retried through the
+   * generic error path: the refusal owns this connection, so a throw retires
+   * the socket without attempting a second reply.
+   */
+  function sendMultipartTooLarge(res: ServerResponse): void {
+    try {
+      res.setHeader("Connection", "close");
+      send(
+        res,
+        413,
+        `The request body is too large.\n\nKeep the whole submission at most ${MAX_MULTIPART_BYTES} bytes; nothing was truncated.\n`,
+        "text/plain; charset=utf-8",
+      );
+    } catch {
+      res.destroy();
+    }
+  }
+
+  /**
+   * Refuse a multipart excess without buffering any further body byte. The
+   * connection is reserved synchronously, arriving bytes are drained and
+   * discarded, and the one 413 is written with the connection set to close.
+   * The reply owns the socket from here: late requests, aborts and parser
+   * failures are ignored until the socket is retired.
+   */
+  function refuseMultipartTooLarge(req: IncomingMessage, res: ServerResponse): void {
+    drainRetiringRequest(req, res);
+    sendMultipartTooLarge(res);
+  }
+
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    // A request that follows on a retiring socket is only drained: it never
+    // reaches the guards or any route handler, and it gets no second reply.
+    if (retiring.has(req.socket)) {
+      drainRetiringRequest(req, res);
+      return;
+    }
+
     // Every check runs before a route is looked up or invoked.
     const host = singleHeader(req, "host");
     const origin = singleHeader(req, "origin");
@@ -610,9 +703,18 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
       let form: Readonly<Record<string, string>> = {};
       let file: MultipartFile | null = null;
       if (multipart) {
+        // A declared length over the inclusive whole-body limit is refused from
+        // the headers alone, synchronously reserving this connection before any
+        // body byte arrives.
+        const declaredHeader = req.headers["content-length"];
+        const declared = typeof declaredHeader === "string" && /^\d+$/.test(declaredHeader) ? Number(declaredHeader) : null;
+        if (declared !== null && declared > MAX_MULTIPART_BYTES) {
+          refuseMultipartTooLarge(req, res);
+          return;
+        }
         // The complete multipart body is bounded inclusively before buffering
         // and while arriving; the decoder gets the complete bytes and header.
-        const body = await readMultipartBody(req, MAX_MULTIPART_BYTES);
+        const body = await readMultipartBody(req, MAX_MULTIPART_BYTES, () => reserveRetiring(req, res));
         const outcome = decodeMultipart(body, singleHeader(req, "content-type"));
         if (!outcome.ok) {
           sendRouteResult(res, multipartRefusalResult(outcome), path, options.store);
@@ -644,14 +746,16 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
       sendRouteResult(res, result, path, options.store);
     } catch (error) {
       if (error instanceof Rejection && error.status === 413) {
+        if (multipart) {
+          // The multipart refusal names the limit that applied to this body and
+          // owns the failure so a late event or failed write cannot become a
+          // second reply.
+          refuseMultipartTooLarge(req, res);
+          return;
+        }
         // The body was refused before it was fully read; answer, then close the
         // connection instead of trying to reuse it for another request.
         res.setHeader("Connection", "close");
-        if (multipart) {
-          // The multipart refusal names the limit that applied to this body.
-          send(res, 413, `The request body is too large.\n\nKeep the whole submission at most ${MAX_MULTIPART_BYTES} bytes; nothing was truncated.\n`, "text/plain; charset=utf-8");
-          return;
-        }
         // An ordinary form keeps the existing 413 body and close behaviour.
       }
       const status = errorStatus(error);

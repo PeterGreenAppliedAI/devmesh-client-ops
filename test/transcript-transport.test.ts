@@ -11,8 +11,14 @@
  * a complete 200, and both replies must report the same positive client local
  * port, so the two requests reused one connection instead of reconnecting.
  *
- * Slice 1 is tests-only by the owner's decision; the reservation, draining and
- * clientError mechanisms belong to slices 2 and 3.
+ * Exact-limit and over-limit multipart imports extend that coverage: a valid
+ * body at the inclusive 15 MiB limit commits, while one more body byte is
+ * refused with one complete plain-text 413 that carries the whole-submission
+ * guidance, Cache-Control: no-store and Connection: close. The refusal is
+ * reserved on the first excess byte, drains and excludes any follow-up request,
+ * ignores a late parser failure, and leaves the workspace byte-for-byte
+ * unchanged. Each refusal is read through peer closure, including while the
+ * final chunk terminator is withheld.
  *
  * Only the temporary workspace receives data, and it is removed afterwards.
  */
@@ -238,6 +244,17 @@ function oversizedMultipart(fields: Readonly<Record<string, string>>): Buffer {
   const complete = completeMultipart(fields);
   assert.ok(complete.length <= OVERSIZED_BODY_BYTES, `the controls fit inside ${OVERSIZED_BODY_BYTES} bytes`);
   return Buffer.concat([complete, Buffer.alloc(OVERSIZED_BODY_BYTES - complete.length, 0x65)]);
+}
+
+/**
+ * A legal multipart body whose epilogue fills it to exactly the inclusive limit,
+ * followed by one more body byte. The controls stay valid and small, so the
+ * first excess byte is the only thing that makes the submission too large.
+ */
+function oneByteOverLimitMultipart(fields: Readonly<Record<string, string>>): Buffer {
+  const exact = exactLimitMultipart(fields);
+  assert.equal(exact.byteLength, EXACT_BODY_BYTES, `the padded body is exactly ${EXACT_BODY_BYTES} bytes`);
+  return Buffer.concat([exact, Buffer.from([0x65])]);
 }
 
 /** A raw follow-up GET request, written on the retiring socket. */
@@ -532,6 +549,85 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       assert.equal(runningFixture.renders.import, 0, "the refused import never reached a handler");
       assert.equal(runningFixture.renders.followUp, 0, "the follow-up on the retiring socket never reached a handler");
       assertUnchanged(runningFixture, before, "after the in-flight refusal");
+    } finally {
+      guard.clear();
+      await runningFixture.close();
+    }
+  });
+
+  it("refuses one byte past an exact-limit epilogue while withholding the chunk terminator and writes nothing", async () => {
+    const runningFixture = await running();
+    const guard = watchdog(5000, "the withheld chunk terminator refusal did not finish");
+    try {
+      const before = baselineOf(runningFixture);
+      const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
+      const body = oneByteOverLimitMultipart({
+        title: "Withheld terminator import",
+        date: "2026-09-05",
+        paste: "Dana: the withheld-terminator source.",
+      });
+      assert.equal(body.byteLength, OVERSIZED_BODY_BYTES, "the body is exactly one byte past the inclusive limit");
+
+      // The first chunk is the whole exact-limit body; the second is the one
+      // excess byte. No zero-length chunk follows, so the request stays
+      // unfinished and the 413 must arrive from the excess byte alone, before
+      // Node can end the request and the peer closes the connection.
+      const pending = sendStaged(runningFixture.server.origin, {
+        path: importPath,
+        contentType: MULTIPART_TYPE,
+        declaredLength: body.byteLength,
+        bodyPrefix: body,
+        chunked: true,
+        chunkSize: EXACT_BODY_BYTES,
+        withholdTerminator: true,
+      });
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assertOversizedRefusal(exchange, "withheld chunk terminator");
+      assert.equal(runningFixture.renders.import, 0, "the refused import never reached a handler");
+      assert.equal(runningFixture.renders.followUp, 0, "no follow-up handler ran on the retiring socket");
+      assertUnchanged(runningFixture, before, "after the withheld-terminator refusal");
+    } finally {
+      guard.clear();
+      await runningFixture.close();
+    }
+  });
+
+  it("drains a follow-up request and ignores a parser failure after a streaming overflow without another reply", async () => {
+    const runningFixture = await running();
+    const guard = watchdog(5000, "the streaming-overflow follow-up refusal did not finish");
+    try {
+      const before = baselineOf(runningFixture);
+      const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
+      const body = oneByteOverLimitMultipart({
+        title: "Streaming overflow follow-up import",
+        date: "2026-09-06",
+        paste: "Eve: the streaming follow-up source.",
+      });
+      assert.equal(body.byteLength, OVERSIZED_BODY_BYTES, "the body is exactly one byte past the inclusive limit");
+
+      // The body is complete after the excess byte, so the follow-up GET is a
+      // real next request on the same socket. The trailing malformed bytes make
+      // Node's parser fail during retirement. Neither may reach a handler, and
+      // the parser failure must not replace, truncate or duplicate the one 413.
+      const pending = sendStaged(runningFixture.server.origin, {
+        path: importPath,
+        contentType: MULTIPART_TYPE,
+        declaredLength: body.byteLength,
+        bodyPrefix: body,
+        chunked: true,
+        chunkSize: EXACT_BODY_BYTES,
+        followUp: Buffer.concat([
+          rawGet(runningFixture.server.origin, "/health"),
+          Buffer.from("GARBAGE\r\n\r\n", "utf8"),
+        ]),
+      });
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assertOversizedRefusal(exchange, "streaming overflow with follow-up");
+      assert.equal(runningFixture.renders.import, 0, "the refused import never reached a handler");
+      assert.equal(runningFixture.renders.followUp, 0, "the follow-up on the retiring socket never reached a handler");
+      assertUnchanged(runningFixture, before, "after the streaming-overflow refusal");
     } finally {
       guard.clear();
       await runningFixture.close();
