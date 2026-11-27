@@ -286,7 +286,9 @@ function isConnectionReset(error: Error): boolean {
  * bytes so a large response cannot finish, and write malformed request bytes.
  * The server's parser therefore fails while that response's headers are already
  * on the wire. Every byte read through peer closure is returned for framing
- * assertions. Reply bytes are capped rather than accumulated without bound.
+ * assertions; a peer reset is accepted only after the response started and the
+ * malformed bytes were submitted, while other socket and write errors reject.
+ * Reply bytes are capped rather than accumulated without bound.
  */
 function largeResponseThenParserError(base: string): Promise<Buffer> {
   const url = new URL(base);
@@ -296,6 +298,7 @@ function largeResponseThenParserError(base: string): Promise<Buffer> {
     let received = 0;
     let settled = false;
     let started = false;
+    let malformedSubmitted = false;
     let resumeTimer: ReturnType<typeof setTimeout> | null = null;
     const finish = (error?: Error): void => {
       if (settled) return;
@@ -305,11 +308,20 @@ function largeResponseThenParserError(base: string): Promise<Buffer> {
         resumeTimer = null;
       }
       socket.destroy();
-      if (error !== undefined && chunks.length === 0) reject(error);
+      if (error !== undefined) reject(error);
       else resolve(Buffer.concat(chunks));
     };
     socket.on("connect", () => {
-      socket.write(`GET / HTTP/1.1\r\nHost: ${url.host}\r\nConnection: keep-alive\r\n\r\n`);
+      try {
+        socket.write(
+          `GET / HTTP/1.1\r\nHost: ${url.host}\r\nConnection: keep-alive\r\n\r\n`,
+          (error?: Error | null) => {
+            if (error !== undefined && error !== null) finish(error);
+          },
+        );
+      } catch (error) {
+        finish(error as Error);
+      }
     });
     socket.on("data", (chunk: Buffer) => {
       if (settled) return;
@@ -325,7 +337,15 @@ function largeResponseThenParserError(base: string): Promise<Buffer> {
         // receives the malformed bytes written now, so its parser fails while
         // the response headers are already on the wire.
         socket.pause();
-        socket.write("GARBAGE\r\n\r\n");
+        try {
+          malformedSubmitted = true;
+          socket.write("GARBAGE\r\n\r\n", (error?: Error | null) => {
+            if (error !== undefined && error !== null) finish(error);
+          });
+        } catch (error) {
+          finish(error as Error);
+          return;
+        }
         resumeTimer = setTimeout(() => {
           resumeTimer = null;
           socket.resume();
@@ -334,7 +354,10 @@ function largeResponseThenParserError(base: string): Promise<Buffer> {
     });
     socket.on("end", () => finish());
     socket.on("close", () => finish());
-    socket.on("error", (error: Error) => finish(error));
+    socket.on("error", (error: Error) => {
+      if (isConnectionReset(error) && started && malformedSubmitted) finish();
+      else finish(error);
+    });
   });
 }
 
