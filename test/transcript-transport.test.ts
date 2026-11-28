@@ -1077,11 +1077,16 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
     }
   });
 
-  it("answers an ordinary parser error when only a later queued response has sent headers", async () => {
+  it("answers an ordinary parser error and leaves the closing reply owned when the pending earlier route returns", async () => {
     const dir = tempDir();
     const store = await openStore(dir);
     let server: StartedServer | null = null;
+    let observation: ReturnType<typeof observeServerWrites> | null = null;
     let firstGateResolve: () => void = () => undefined;
+    let firstRouteReturned: () => void = () => undefined;
+    const firstReturned = new Promise<void>((resolve) => {
+      firstRouteReturned = resolve;
+    });
     const guard = watchdog(10000, "the queued-response parser failure did not finish");
     try {
       // The first route never resolves, so its response has not sent headers.
@@ -1105,7 +1110,10 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       const slowRoute: Route = {
         method: "GET",
         render() {
-          return firstGate.then(() => ({ status: 200, body: "first" }));
+          return firstGate.then(() => {
+            firstRouteReturned();
+            return { status: 200, body: "first" };
+          });
         },
       };
       const queuedRoute: Route = {
@@ -1117,6 +1125,7 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       };
       const routes: Routes = { home: { get: slowRoute }, health: { get: queuedRoute } };
       server = await startServer({ store, port: 0, routes });
+      observation = observeServerWrites(server.port);
       const pending = queuedResponseThenParserError(server.origin, writeMalformed);
       pending.catch(() => undefined);
       // Race immediately, so a transport failure or watchdog expiry reaches
@@ -1129,7 +1138,25 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       const head = /^HTTP\/1\.1 400 [^\r\n]*\r\n(?:[^\r\n]+\r\n)*\r\n/.exec(text);
       assert.ok(head !== null, "the complete parser-error status line and header block arrived through peer closure");
       assert.ok(!text.includes("HTTP/1.1 200 "), "the queued response's headers never reached the wire");
+      // The earlier route now returns while the parser fallback owns the
+      // socket's closing reply. It must leave that reply and closure alone.
+      const attemptsBeforeRelease = observation.attempts();
+      const destroysBeforeRelease = observation.destroyAttempts();
+      firstGateResolve();
+      await Promise.race([firstReturned, guard.promise]);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(
+        observation.attempts(),
+        attemptsBeforeRelease,
+        "the pending route makes no response write after the parser fallback",
+      );
+      assert.equal(
+        observation.destroyAttempts(),
+        destroysBeforeRelease,
+        "the pending route does not destroy the parser fallback's closing reply",
+      );
     } finally {
+      observation?.close();
       guard.clear();
       firstGateResolve();
       // Close the server and the store independently, retaining each cleanup
@@ -1699,8 +1726,12 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       // after the server has itself observed the aborted peer.
       let releaseLate: () => void = () => undefined;
       let routeReturned: () => void = () => undefined;
+      let routeEntered: () => void = () => undefined;
       const late = new Promise<RouteResult>((resolve) => {
         releaseLate = () => resolve({ status: 200, body: "late" });
+      });
+      const entered = new Promise<void>((resolve) => {
+        routeEntered = () => resolve();
       });
       const returned = new Promise<void>((resolve) => {
         routeReturned = () => resolve();
@@ -1708,6 +1739,7 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       const slow: Route = {
         method: "GET",
         async render() {
+          routeEntered();
           const result = await late;
           routeReturned();
           return result;
@@ -1723,24 +1755,40 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       };
       server = await startServer({ store, port: 0, routes });
       observation = observeServerWrites(server.port);
-      const pending = send(transport, server.origin, { path: "/slow", deadlineMs: 20 });
-      const expected = assert.rejects(pending, /no reply within 20 ms/, "a request past its deadline fails");
+      // The deadline is long enough that the route has begun before the client
+      // disconnect, so the late completion is measured against a running route
+      // rather than a request that expired before the server saw it.
+      const pending = send(transport, server.origin, { path: "/slow", deadlineMs: 1000 });
+      const expected = assert.rejects(pending, /no reply within 1000 ms/, "a request past its deadline fails");
       expected.catch(() => undefined);
-      await Promise.race([Promise.all([expected, observation.waitForPeerLoss()]), guard.promise]);
-      assert.equal(observation.attemptsAfterPeerLoss(), 0, "no response attempt follows the observed peer loss");
-      const attemptsBeforeRelease = observation.attempts();
-      // The route now returns after the server has observed the peer loss; the
-      // settled request must close without starting a final reply.
-      releaseLate();
-      await returned;
-      await new Promise((resolve) => setImmediate(resolve));
-      await new Promise((resolve) => setImmediate(resolve));
-      assert.equal(
-        observation.attempts(),
-        attemptsBeforeRelease,
-        "the delayed route makes no response attempt after the peer is gone",
-      );
-      assert.equal(observation.attemptsAfterPeerLoss(), 0, "the delayed route makes no post-loss response attempt");
+      // Race the whole asynchronous check against the real watchdog, including
+      // the route return and the final observation, so a watchdog expiry always
+      // fails the scenario.
+      await Promise.race([
+        (async () => {
+          // Establish the route is running before the deadline aborts the
+          // request, then assert the deadline rejection on its own, independent
+          // of the server-observed peer loss that follows.
+          await entered;
+          await expected;
+          await observation.waitForPeerLoss();
+          assert.equal(observation.attemptsAfterPeerLoss(), 0, "no response attempt follows the observed peer loss");
+          const attemptsBeforeRelease = observation.attempts();
+          // The route now returns after the server has observed the peer loss;
+          // the settled request must close without starting a final reply.
+          releaseLate();
+          await returned;
+          await new Promise((resolve) => setImmediate(resolve));
+          await new Promise((resolve) => setImmediate(resolve));
+          assert.equal(
+            observation.attempts(),
+            attemptsBeforeRelease,
+            "the delayed route makes no response attempt after the peer is gone",
+          );
+          assert.equal(observation.attemptsAfterPeerLoss(), 0, "the delayed route makes a post-loss response attempt");
+        })(),
+        guard.promise,
+      ]);
     } finally {
       observation?.close();
       guard.clear();

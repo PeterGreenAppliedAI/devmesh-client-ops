@@ -876,11 +876,13 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
       }
 
       const result = await route.render({ method, path, origin: canonical, form, file });
-      // A route can finish after the peer has gone or after another path has
-      // settled this request. Its final reply may already have started, and the
-      // socket may no longer accept writes; close instead of appending another
-      // reply to that request.
-      if (state.settled || res.headersSent || res.writableEnded || res.destroyed || !req.socket.writable) {
+      // Another path may already own this request's settlement or the socket's
+      // one closing reply. It also owns the closure; let its reply finish
+      // instead of destroying the socket underneath it or appending another.
+      if (state.settled || closingReplies.has(req.socket)) return;
+      // This path still owns the request. If its final reply has started or the
+      // peer has gone, close without writing another reply.
+      if (res.headersSent || res.writableEnded || res.destroyed || !req.socket.writable) {
         res.destroy();
         return;
       }
@@ -889,7 +891,7 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
       // A parser-error fallback or an abort may already have settled this
       // request on the socket directly. Its owning path handles the closure;
       // this path must not write or destroy the connection under it.
-      if (state.settled) return;
+      if (state.settled || closingReplies.has(req.socket)) return;
       if (res.headersSent || res.writableEnded || res.destroyed || !req.socket.writable) {
         res.destroy();
         return;

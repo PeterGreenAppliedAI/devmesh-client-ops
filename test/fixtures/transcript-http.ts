@@ -1000,6 +1000,8 @@ export interface ServerWriteObservation {
   attempts(): number;
   /** How many response write attempts the server made after an observed peer loss. */
   attemptsAfterPeerLoss(): number;
+  /** How many times the server called destroy on a response since the observation began. */
+  destroyAttempts(): number;
   /** How many request body bytes the server has received since the observation began. */
   bytesReceived(): number;
   /** How many parser failures the listener has observed since the observation began. */
@@ -1038,6 +1040,7 @@ export function observeServerWrites(serverPort: number): ServerWriteObservation 
   );
   let attempts = 0;
   let attemptsAfterPeerLoss = 0;
+  let destroyAttempts = 0;
   let receivedBytes = 0;
   let clientErrors = 0;
   const clientErrorCodes: string[] = [];
@@ -1102,6 +1105,15 @@ export function observeServerWrites(serverPort: number): ServerWriteObservation 
       }
     });
     for (const name of ["writeHead", "write", "end"]) wrap(res, name);
+    // A response destroy is not a write attempt, but it is an observable
+    // settlement action: a late route completion must not destroy a response
+    // another path already owns. Count it separately from the write methods.
+    const originalDestroy = res.destroy;
+    res.destroy = function (this: ServerResponse, error?: Error): ServerResponse {
+      destroyAttempts += 1;
+      return originalDestroy.call(this, error);
+    };
+    wrappedMethods.push({ owner: res, name: "destroy", original: originalDestroy as AnyFunction });
     const socket = req.socket;
     socket.once("close", () => {
       // A peer that destroys the socket after its request input is complete
@@ -1144,6 +1156,7 @@ export function observeServerWrites(serverPort: number): ServerWriteObservation 
   return {
     attempts: () => attempts,
     attemptsAfterPeerLoss: () => attemptsAfterPeerLoss,
+    destroyAttempts: () => destroyAttempts,
     bytesReceived: () => receivedBytes,
     clientErrors: () => clientErrors,
     clientErrorCodes: () => [...clientErrorCodes],
