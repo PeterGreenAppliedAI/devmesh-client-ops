@@ -18,7 +18,10 @@
  * reserved on the first excess byte, drains and excludes any follow-up request,
  * ignores a late parser failure and a late CONNECT, and leaves the workspace
  * byte-for-byte unchanged. Each refusal is read through peer closure, including
- * while the final chunk terminator is withheld.
+ * while the final chunk terminator is withheld, after additional bytes of the
+ * same upload arrive, and when the original socket is reused after the complete
+ * 413. An eligible GET in a 50-client workspace must render once with an empty
+ * form and no file, then share its socket with a complete health read.
  *
  * Only the temporary workspace receives data, and it is removed afterwards.
  */
@@ -30,7 +33,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { registerRoutes } from "../src/index.ts";
-import { startServer, type Route, type Routes, type StartedServer } from "../src/server.ts";
+import { startServer, type Route, type RouteRequest, type Routes, type StartedServer } from "../src/server.ts";
 import { openStore, type Snapshot, type Store } from "../src/store.ts";
 import { ORIGINALS_DIRECTORY } from "../src/transcript-files.ts";
 import {
@@ -94,24 +97,36 @@ interface RenderCounts {
   followUp: number;
 }
 
+interface RunningOptions {
+  /** The number of synthetic clients in the workspace; one by default. */
+  readonly clients?: number;
+}
+
 interface Running {
   readonly dir: string;
   readonly store: Store;
   readonly server: StartedServer;
   readonly engagementId: string;
   readonly renders: RenderCounts;
+  /** Every hierarchy route request that reached a render, in order. */
+  readonly requests: RouteRequest[];
   close(): Promise<void>;
 }
 
-async function running(): Promise<Running> {
+async function running(options: RunningOptions = {}): Promise<Running> {
   const dir = tempDir();
   const store = await openStore(dir);
   let server: StartedServer | null = null;
   try {
+    const clientCount = options.clients ?? 1;
     const client = await store.createClient({ name: "Acme" });
+    for (let index = 1; index < clientCount; index += 1) {
+      await store.createClient({ name: `Client ${index + 1}` });
+    }
     const engagement = await store.createEngagement({ clientId: client.id, name: "Eng" });
     const baseRoutes = registerRoutes(store);
     const renders: RenderCounts = { import: 0, followUp: 0 };
+    const requests: RouteRequest[] = [];
     // Count every route render while preserving the routes themselves: a GET
     // /health is the follow-up, and any hierarchy POST is the import path.
     const health = baseRoutes.health.get;
@@ -135,11 +150,12 @@ async function running(): Promise<Running> {
               match: (path: string) => hierarchy.match(path),
               route(matched: unknown, method: "GET" | "POST") {
                 const route = hierarchy.route(matched, method);
-                if (route === undefined || method !== "POST") return route;
+                if (route === undefined) return route;
                 return {
                   ...route,
                   render(request) {
-                    renders.import += 1;
+                    requests.push(request);
+                    if (method === "POST") renders.import += 1;
                     return route.render(request);
                   },
                 };
@@ -154,6 +170,7 @@ async function running(): Promise<Running> {
       server,
       engagementId: engagement.id,
       renders,
+      requests,
       async close() {
         // Attempt every teardown step even when one fails, so a failed server
         // close cannot skip the store close that protects the workspace. Both
@@ -819,6 +836,83 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
     }
   });
 
+  it("discards additional bytes of the same upload after the first excess byte and keeps one 413 through closure", async () => {
+    const runningFixture = await running();
+    const guard = watchdog(5000, "the additional-upload-bytes refusal did not finish");
+    try {
+      const before = baselineOf(runningFixture);
+      const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
+      const firstExcess = oneByteOverLimitMultipart({
+        title: "Additional upload bytes import",
+        date: "2026-09-07",
+        paste: "Gail: the additional upload source.",
+      });
+      assert.equal(firstExcess.byteLength, OVERSIZED_BODY_BYTES, "the first excess byte is one past the inclusive limit");
+      // The first excess byte and a further block of the same upload are sent
+      // in the same chunked request, whose terminator is withheld. Once the
+      // socket is reserved on that first excess byte, the rest of the upload is
+      // discarded rather than buffered or answered separately.
+      const body = Buffer.concat([firstExcess, Buffer.alloc(32 * 1024, 0x67)]);
+      const pending = sendStaged(runningFixture.server.origin, {
+        path: importPath,
+        contentType: MULTIPART_TYPE,
+        declaredLength: body.byteLength,
+        bodyPrefix: body,
+        chunked: true,
+        chunkSize: EXACT_BODY_BYTES,
+        withholdTerminator: true,
+      });
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assertOversizedRefusal(exchange, "additional upload bytes after the first excess");
+      assert.equal(runningFixture.renders.import, 0, "the refused import never reached a handler");
+      assert.equal(runningFixture.renders.followUp, 0, "no follow-up handler ran on the retiring socket");
+      assertUnchanged(runningFixture, before, "after the additional-upload-bytes refusal");
+    } finally {
+      guard.clear();
+      await runningFixture.close();
+    }
+  });
+
+  it("attempts sequential reuse of the original socket after the complete overflow 413 and gets no second reply", async () => {
+    const runningFixture = await running();
+    const guard = watchdog(5000, "the post-refusal reuse observation did not finish");
+    try {
+      const before = baselineOf(runningFixture);
+      const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
+      const body = oneByteOverLimitMultipart({
+        title: "Post-refusal reuse import",
+        date: "2026-09-08",
+        paste: "Hana: the post-refusal reuse source.",
+      });
+      assert.equal(body.byteLength, OVERSIZED_BODY_BYTES, "the body is exactly one byte past the inclusive limit");
+
+      // The client waits until the complete 413 has arrived, then writes a
+      // bodyless GET on the original socket. The reserved socket must admit no
+      // health render and deliver no second reply; closure at the reuse attempt
+      // is the expected result.
+      const pending = sendStaged(runningFixture.server.origin, {
+        path: importPath,
+        contentType: MULTIPART_TYPE,
+        declaredLength: body.byteLength,
+        bodyPrefix: body,
+        chunked: true,
+        chunkSize: EXACT_BODY_BYTES,
+        reuseAfterReply: rawGet(runningFixture.server.origin, "/health"),
+      });
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assertOversizedRefusal(exchange, "post-refusal original-socket reuse");
+      assert.equal(exchange.reuseAttempted, true, "the client attempted reuse only after the complete 413");
+      assert.equal(runningFixture.renders.import, 0, "the refused import never reached a handler");
+      assert.equal(runningFixture.renders.followUp, 0, "the retired socket rendered zero health pages");
+      assertUnchanged(runningFixture, before, "after the post-refusal reuse attempt");
+    } finally {
+      guard.clear();
+      await runningFixture.close();
+    }
+  });
+
   it("protects a streaming overflow refusal from a late CONNECT and writes nothing", async () => {
     const runningFixture = await running();
     const guard = watchdog(5000, "the streaming-overflow CONNECT refusal did not finish");
@@ -1383,6 +1477,45 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
         assert.ok(isPositiveInteger(health.localPort), `the health read after import ${index + 1} has a positive local port: ${health.localPort}`);
         assert.equal(reply.localPort, health.localPort, `import ${index + 1} and its health read reused one connection`);
       }
+    } finally {
+      transport.close();
+      await runningFixture.close();
+    }
+  });
+
+  it("renders an eligible GET once with an empty form and null file in a 50-client workspace, then reuses the socket for health", async () => {
+    const runningFixture = await running({ clients: 50 });
+    const transport = keepAliveTransport();
+    try {
+      assert.equal(runningFixture.store.snapshot().clients.length, 50, "the synthetic workspace holds 50 clients");
+      const before = baselineOf(runningFixture);
+
+      // /clients is an eligible bodyless GET route. Its render sees the shell's
+      // accepted request: method GET, the route path, the canonical origin, an
+      // empty form and no file.
+      const clients = await send(transport, runningFixture.server.origin, { path: "/clients" });
+      assert.equal(clients.status, 200, `the clients list is a complete 200: ${clients.body.slice(0, 200)}`);
+      assert.equal(runningFixture.requests.length, 1, "the eligible GET route rendered exactly once");
+      const request = runningFixture.requests[0]!;
+      assert.equal(request.method, "GET", "the route request is a GET");
+      assert.equal(request.path, "/clients", "the route request carries the request path");
+      assert.equal(request.origin, runningFixture.server.origin, "the route request carries the canonical origin");
+      assert.deepEqual(request.form, {}, "the route request carries an empty form");
+      assert.equal(request.file, null, "the route request carries no file");
+      assert.ok(clients.body.includes("Client 50"), "the usual clients response includes the last synthetic client");
+
+      // The subsequent health read is a complete 200 on the same kept-alive
+      // socket, proven by the equal positive client local ports.
+      const health = await send(transport, runningFixture.server.origin, { path: "/health" });
+      assert.equal(health.status, 200, `the health page is a complete 200: ${health.body}`);
+      assert.ok(health.body.includes("ok"), `the health page reports its status: ${health.body}`);
+      assert.equal(runningFixture.renders.followUp, 1, "the health route rendered once");
+      assert.equal(runningFixture.requests.length, 1, "the health GET never reached a hierarchy route");
+      assert.ok(isPositiveInteger(clients.localPort), `the clients reply's local port is a positive integer: ${clients.localPort}`);
+      assert.ok(isPositiveInteger(health.localPort), `the health reply's local port is a positive integer: ${health.localPort}`);
+      assert.equal(clients.localPort, health.localPort, "the eligible GET and the health read reused one connection");
+
+      assertUnchanged(runningFixture, before, "after the eligible GET and health read");
     } finally {
       transport.close();
       await runningFixture.close();

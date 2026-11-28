@@ -479,6 +479,12 @@ export interface ClosedExchange {
   readonly replies: readonly Reply[];
   /** The client socket's local port, captured while it was connected. */
   readonly localPort: number;
+  /**
+   * True when the optional post-reply reuse bytes were submitted after the
+   * first complete reply. The socket may already have been retired by then, so
+   * the attempt itself is the observation; no reply is expected from it.
+   */
+  readonly reuseAttempted: boolean;
 }
 
 /** A staged POST whose body and follow-up bytes are written before the reply. */
@@ -524,6 +530,14 @@ export interface StagedSendOptions {
    * before the reply is read. It is never awaited as a separate reply.
    */
   readonly followUp?: Uint8Array;
+  /**
+   * A raw follow-up request written on the original socket only after the first
+   * complete reply has arrived, so a retirement observation happens after the
+   * client has the full refusal. A write to a socket already retired by the
+   * peer is an accepted attempt: the complete reply and peer closure remain the
+   * evidence, and no second reply is expected.
+   */
+  readonly reuseAfterReply?: Uint8Array;
   /** The inclusive cap for all bytes read through closure. */
   readonly responseCap?: number;
   /** The deadline, from connection creation through peer closure. */
@@ -694,6 +708,7 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
     let tailSubmitted = options.combineTail !== true;
     let socketError: Error | null = null;
     let localPort = 0;
+    let reuseAttempted = false;
     const chunks: Buffer[] = [];
     let received = 0;
     const socket = createConnection({ host: url.hostname, port: Number(url.port) });
@@ -752,7 +767,7 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
       clearDeadline();
       clearTail();
       socket.destroy();
-      resolve({ bytes, replies, localPort });
+      resolve({ bytes, replies, localPort, reuseAttempted });
     };
     const armDeadline = (): boolean => {
       const remaining = expiresAt - performance.now();
@@ -850,6 +865,21 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
         return;
       }
       chunks.push(chunk);
+      if (!reuseAttempted && options.reuseAfterReply !== undefined && !settled) {
+        const parsed = parseReplies(Buffer.concat(chunks));
+        if (parsed.complete && parsed.replies.length > 0) {
+          // Record the attempt before writing: a retired socket may already be
+          // unwritable, and a write error after the complete reply must not
+          // turn that reply into a failed exchange.
+          reuseAttempted = true;
+          try {
+            socket.write(Buffer.from(options.reuseAfterReply));
+          } catch {
+            // The peer's closure is the expected result of reusing a retired
+            // socket; the reply already received remains the only answer.
+          }
+        }
+      }
     });
     socket.on("end", finish);
     socket.on("close", finish);
