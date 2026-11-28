@@ -40,7 +40,9 @@ import {
   BOUNDARY,
   keepAliveTransport,
   MULTIPART_TYPE,
+  observeServerWrites,
   send,
+  sendRaw,
   sendStaged,
   type ClosedExchange,
   type Transport,
@@ -285,6 +287,55 @@ function rawGet(base: string, path: string): Buffer {
 function rawConnect(base: string): Buffer {
   const url = new URL(base);
   return Buffer.from(`CONNECT ${url.host} HTTP/1.1\r\nHost: ${url.host}\r\n\r\n`, "utf8");
+}
+/** A raw POST with the supplied headers and optional exact body bytes. */
+function rawPostRequest(
+  base: string,
+  path: string,
+  headers: Readonly<Record<string, string>>,
+  body?: Uint8Array,
+): Buffer {
+  const url = new URL(base);
+  const lines = [`POST ${path} HTTP/1.1`, `Host: ${url.host}`];
+  for (const [name, value] of Object.entries(headers)) lines.push(`${name}: ${value}`);
+  lines.push("", "");
+  return Buffer.concat([Buffer.from(lines.join("\r\n"), "utf8"), body === undefined ? Buffer.alloc(0) : Buffer.from(body)]);
+}
+
+/** A POST whose header block carries an ordinary framing error. */
+function malformedPost(base: string, path: string): Buffer {
+  const url = new URL(base);
+  return Buffer.from(
+    [
+      `POST ${path} HTTP/1.1`,
+      `Host: ${url.host}`,
+      `Origin: ${url.origin}`,
+      `Content-Type: ${MULTIPART_TYPE}`,
+      "Content-Length: 8",
+      "Broken Header",
+      "",
+      "",
+    ].join("\r\n"),
+    "utf8",
+  );
+}
+
+/** A multipart file part header and the first `size` bytes of its file, unclosed. */
+function partialFileMultipart(size: number): Buffer {
+  const head = Buffer.from(
+    `--${BOUNDARY}\r\nContent-Disposition: form-data; name="file"; filename="synthetic.bin"\r\nContent-Type: application/octet-stream\r\n\r\n`,
+    "utf8",
+  );
+  return Buffer.concat([head, Buffer.alloc(size, 0x61)]);
+}
+
+/** The one complete ordinary parser-error reply with its no-store headers. */
+function assertOrdinaryRefusal(reply: ClosedExchange["replies"][number], status: number, why: string): void {
+  assert.equal(reply.status, status, `${why}: the reply is a ${status}`);
+  assert.equal(reply.headers["cache-control"], "no-store", `${why}: the reply is not cached`);
+  assert.equal(reply.headers["connection"], "close", `${why}: the reply closes the connection`);
+  assert.equal(reply.headers["content-length"], "0", `${why}: the reply declares an empty body`);
+  assert.equal(reply.bytes.byteLength, 0, `${why}: the reply carries no body`);
 }
 
 /** The inclusive cap for the fixture's 16 MiB reply and its headers. */
@@ -1756,6 +1807,200 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       );
     } finally {
       transport.close();
+    }
+  });
+});
+
+describe("transcript HTTP transport: one settled final reply per request", () => {
+  it("answers a framing error before any request object exists with one complete no-store 400 and closes", async () => {
+    const runningFixture = await running();
+    const guard = watchdog(5000, "the pre-dispatch framing error did not finish");
+    try {
+      const before = baselineOf(runningFixture);
+      const pending = sendRaw(runningFixture.server.origin, {
+        steps: [{ bytes: Buffer.from("GARBAGE\r\n\r\n", "utf8") }],
+      });
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assert.equal(exchange.replies.length, 1, "the connection carries exactly one complete reply");
+      assertOrdinaryRefusal(exchange.replies[0]!, 400, "pre-dispatch framing error");
+      assert.ok(isPositiveInteger(exchange.localPort), `the exchange used one positive client local port: ${exchange.localPort}`);
+      assert.equal(runningFixture.renders.import, 0, "the malformed request never reached an import handler");
+      assertUnchanged(runningFixture, before, "after the pre-dispatch framing error");
+    } finally {
+      guard.clear();
+      await runningFixture.close();
+    }
+  });
+
+  it("answers a malformed import after a complete health reply on the same connection with one no-store 400", async () => {
+    const runningFixture = await running();
+    const guard = watchdog(5000, "the malformed import after health did not finish");
+    try {
+      const before = baselineOf(runningFixture);
+      const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
+      const pending = sendRaw(runningFixture.server.origin, {
+        steps: [
+          { bytes: rawGet(runningFixture.server.origin, "/health"), afterReplies: 1 },
+          { bytes: malformedPost(runningFixture.server.origin, importPath) },
+        ],
+      });
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assert.equal(exchange.replies.length, 2, "the connection carries the earlier 200 and exactly one parser-error reply");
+      const health = exchange.replies[0]!;
+      assert.equal(health.status, 200, "the earlier health reply is a complete 200");
+      assertOrdinaryRefusal(exchange.replies[1]!, 400, "malformed import after health");
+      assert.ok(isPositiveInteger(exchange.localPort), `the exchange used one positive client local port: ${exchange.localPort}`);
+      assert.equal(runningFixture.renders.followUp, 1, "the health read rendered once");
+      assert.equal(runningFixture.renders.import, 0, "the malformed import never reached a handler");
+      assertUnchanged(runningFixture, before, "after the malformed import");
+    } finally {
+      guard.clear();
+      await runningFixture.close();
+    }
+  });
+
+  it("answers an upload whose input ends before its declared body with one complete no-store 400", async () => {
+    const runningFixture = await running();
+    const guard = watchdog(5000, "the incomplete upload did not finish");
+    try {
+      const before = baselineOf(runningFixture);
+      const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
+      const prefix = Buffer.from(
+        `--${BOUNDARY}\r\nContent-Disposition: form-data; name="paste"\r\n\r\nAlice: the interrupted source.\r\n`,
+        "utf8",
+      );
+      const declared = prefix.byteLength + 4096;
+      const request = rawPostRequest(runningFixture.server.origin, importPath, {
+        Origin: new URL(runningFixture.server.origin).origin,
+        "Content-Type": MULTIPART_TYPE,
+        "Content-Length": String(declared),
+      }, prefix);
+      const pending = sendRaw(runningFixture.server.origin, {
+        steps: [{ bytes: request, endWrite: true }],
+      });
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assert.equal(exchange.replies.length, 1, "the connection carries exactly one complete reply");
+      assertOrdinaryRefusal(exchange.replies[0]!, 400, "incomplete upload");
+      assert.equal(exchange.writeEnded, true, "the peer ended its write side before the declared body was complete");
+      assert.equal(runningFixture.renders.import, 0, "the incomplete import never reached a handler");
+      assertUnchanged(runningFixture, before, "after the incomplete upload");
+    } finally {
+      guard.clear();
+      await runningFixture.close();
+    }
+  });
+
+  it("closes after a guard reply when the same POST's framing fails without another final reply", async () => {
+    const runningFixture = await running();
+    const guard = watchdog(5000, "the guard reply followed by a framing error did not finish");
+    try {
+      const before = baselineOf(runningFixture);
+      const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
+      // The POST omits Origin, so the guard answers 403 before reading the
+      // chunked body. The guard reply is complete before the malformed chunk is
+      // written, so the same request's final reply has already finished.
+      const request = rawPostRequest(runningFixture.server.origin, importPath, {
+        "Content-Type": MULTIPART_TYPE,
+        "Transfer-Encoding": "chunked",
+      }, Buffer.from("5\r\nhello\r\n", "utf8"));
+      const pending = sendRaw(runningFixture.server.origin, {
+        steps: [
+          { bytes: request, afterReplies: 1 },
+          { bytes: Buffer.from("Z\r\n", "utf8") },
+        ],
+      });
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assert.equal(exchange.replies.length, 1, "the guard reply is the only final reply");
+      assert.equal(exchange.replies[0]!.status, 403, "the only reply is the guard's 403");
+      assert.equal(exchange.replies[0]!.headers["cache-control"], "no-store", "the guard reply is not cached");
+      assert.equal(runningFixture.renders.import, 0, "the refused import never reached a handler");
+      assertUnchanged(runningFixture, before, "after the guard reply and framing error");
+    } finally {
+      guard.clear();
+      await runningFixture.close();
+    }
+  });
+
+  it("makes no response attempt after the peer resets mid-upload", async () => {
+    const runningFixture = await running();
+    const observation = observeServerWrites();
+    const guard = watchdog(15000, "the reset mid-upload did not finish");
+    try {
+      const before = baselineOf(runningFixture);
+      const attemptsBeforeReset = observation.attempts();
+      const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
+      // The prefix carries the whole synthetic 10 MiB file but no closing
+      // boundary, and the declared length asks for more. Completing the large
+      // write before the reset shows the server consumed the partial upload;
+      // the reset then leaves nothing for it to answer.
+      const prefix = partialFileMultipart(10 * 1024 * 1024);
+      const request = rawPostRequest(runningFixture.server.origin, importPath, {
+        Origin: new URL(runningFixture.server.origin).origin,
+        "Content-Type": MULTIPART_TYPE,
+        "Content-Length": String(prefix.byteLength + 1024),
+      }, prefix);
+      const pending = sendRaw(runningFixture.server.origin, {
+        deadlineMs: 10000,
+        minimumReplies: 0,
+        steps: [{ bytes: request, afterWrite: true, reset: true }],
+      });
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assert.equal(exchange.resetRequested, true, "the peer reset the connection after the partial upload");
+      assert.equal(exchange.replies.length, 0, "the failed upload receives no reply after the peer reset");
+      assert.equal(exchange.bytes.byteLength, 0, "the peer receives no bytes after its reset");
+      assert.equal(
+        observation.attempts(),
+        attemptsBeforeReset,
+        "the server makes no further response write attempt after the peer loss",
+      );
+      assert.equal(runningFixture.renders.import, 0, "the failed upload never reached an import handler");
+      assertUnchanged(runningFixture, before, "after the peer reset mid-upload");
+    } finally {
+      observation.close();
+      guard.clear();
+      await runningFixture.close();
+    }
+  });
+
+  it("delivers the reserved overflow 413 as the only final reply when the same upload's framing fails during retirement", async () => {
+    const runningFixture = await running();
+    const guard = watchdog(5000, "the overflow with a framing failure during retirement did not finish");
+    try {
+      const before = baselineOf(runningFixture);
+      const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
+      const body = oneByteOverLimitMultipart({
+        title: "Overflow framing retirement import",
+        date: "2026-09-09",
+        paste: "Iris: the overflow retirement source.",
+      });
+      assert.equal(body.byteLength, OVERSIZED_BODY_BYTES, "the body is exactly one byte past the inclusive limit");
+      // The exact-limit chunk is followed by the single excess byte and then an
+      // invalid chunk-size line in the same unfinished chunked upload. The
+      // reserved refusal must survive that parser failure as the only reply.
+      const pending = sendStaged(runningFixture.server.origin, {
+        path: importPath,
+        contentType: MULTIPART_TYPE,
+        declaredLength: body.byteLength,
+        bodyPrefix: body,
+        chunked: true,
+        chunkSizes: [EXACT_BODY_BYTES, 1],
+        withholdTerminator: true,
+        followUp: Buffer.from("Z\r\n", "utf8"),
+      });
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assertOversizedRefusal(exchange, "overflow with a framing failure during retirement");
+      assert.equal(runningFixture.renders.import, 0, "the refused import never reached a handler");
+      assert.equal(runningFixture.renders.followUp, 0, "no follow-up handler ran on the retiring socket");
+      assertUnchanged(runningFixture, before, "after the overflow framing failure");
+    } finally {
+      guard.clear();
+      await runningFixture.close();
     }
   });
 });

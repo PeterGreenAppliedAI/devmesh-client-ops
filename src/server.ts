@@ -566,10 +566,25 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
 
   // The responses still active on each ordinary socket, in request order, so a
   // parser failure can tell whether Node has already started writing the
-  // response currently attached to the socket. A response leaves this set when
-  // it finishes or closes, so a completed reply does not prevent a later
-  // malformed request on the same kept-alive socket from being answered.
+  // response currently attached to the socket. A response leaves this set only
+  // once both its reply has finished or closed and its request input has
+  // completed, so a guard's finished reply does not erase the fact that the
+  // same request's body is still outstanding.
   const activeResponses = new WeakMap<Socket, Set<ServerResponse>>();
+
+  interface RequestState {
+    readonly req: IncomingMessage;
+    readonly res: ServerResponse;
+    readonly inputDone: () => void;
+    readonly replyDone: () => void;
+    settled: boolean;
+  }
+
+  // The request last dispatched on each socket, with whether its own final
+  // reply has started. A parser failure for that request's unfinished input
+  // must not append a fallback reply after its final reply, even if that reply
+  // has already finished and left the active set.
+  const currentRequests = new WeakMap<Socket, RequestState>();
 
   const server = createServer((req, res) => {
     const socket = req.socket;
@@ -580,17 +595,41 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
     }
     const current = responses;
     current.add(res);
+    let inputEnded = false;
+    let replyEnded = false;
     const forget = (): void => {
+      if (!inputEnded || !replyEnded) return;
       current.delete(res);
       if (current.size === 0 && activeResponses.get(socket) === current) {
         activeResponses.delete(socket);
       }
     };
-    res.once("finish", forget);
-    res.once("close", forget);
-    void handle(req, res).catch(() => {
-      if (!res.headersSent) send(res, 500, `${GENERIC_FAILURE}\n`, "text/plain; charset=utf-8");
-      else res.destroy();
+    const state: RequestState = {
+      req,
+      res,
+      inputDone: () => {
+        inputEnded = true;
+        forget();
+      },
+      replyDone: () => {
+        replyEnded = true;
+        forget();
+      },
+      settled: false,
+    };
+    currentRequests.set(socket, state);
+    req.once("end", state.inputDone);
+    req.once("close", state.inputDone);
+    req.once("aborted", state.inputDone);
+    req.once("error", state.inputDone);
+    res.once("finish", state.replyDone);
+    res.once("close", state.replyDone);
+    void handle(req, res, state).catch(() => {
+      if (state.settled || res.headersSent || res.writableEnded || res.destroyed || !req.socket.writable) {
+        res.destroy();
+        return;
+      }
+      send(res, 500, `${GENERIC_FAILURE}\n`, "text/plain; charset=utf-8");
     });
   });
 
@@ -620,18 +659,29 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
       socket.destroy(error);
       return;
     }
-    // Once the response currently attached to this socket has started writing,
-    // a fresh status line would be appended to that response stream. Close as
-    // Node does in that state instead of corrupting the started reply. Later
-    // responses are still queued behind the first one, so their generated
-    // headers do not mean anything has reached the wire yet; only the earliest
-    // active response is the one being written.
-    const responses = activeResponses.get(socket);
-    if (responses !== undefined) {
-      const current = responses.values().next().value;
-      if (current !== undefined && current.headersSent) {
+    // A parser failure while the last dispatched request's input is still
+    // outstanding belongs to that request. Once its final reply has started,
+    // close without appending another one, even if the reply has finished.
+    const state = currentRequests.get(socket);
+    if (state !== undefined && !state.req.complete) {
+      state.settled = true;
+      if (state.res.headersSent || state.res.writableEnded || state.res.destroyed) {
         socket.destroy(error);
         return;
+      }
+    } else {
+      // A parser failure after a previous request's input completed is a new
+      // request's failure. Close as Node does when the earliest active response
+      // has already started writing, instead of corrupting or replacing it.
+      // A previous reply that has fully finished is no longer in the way: this
+      // request remains entitled to its own answer.
+      const responses = activeResponses.get(socket);
+      if (responses !== undefined) {
+        const current = responses.values().next().value;
+        if (current !== undefined && current.headersSent && !current.writableFinished) {
+          socket.destroy(error);
+          return;
+        }
       }
     }
     const code = (error as { readonly code?: string }).code;
@@ -640,7 +690,12 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
       : code === "HPE_HEADER_OVERFLOW" ? 431
       : code === "HPE_CHUNK_EXTENSIONS_OVERFLOW" ? 413
       : 400;
-    socket.end(`HTTP/1.1 ${status} ${STATUS_CODES[status]}\r\nConnection: close\r\n\r\n`);
+    socket.end(
+      `HTTP/1.1 ${status} ${STATUS_CODES[status]}\r\n` +
+        "Cache-Control: no-store\r\n" +
+        "Content-Length: 0\r\n" +
+        "Connection: close\r\n\r\n",
+    );
   });
 
   /** Mark a connection as retiring and ignore its late request/response failures. */
@@ -694,7 +749,7 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
     sendMultipartTooLarge(res);
   }
 
-  async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  async function handle(req: IncomingMessage, res: ServerResponse, state: RequestState): Promise<void> {
     // A request that follows on a retiring socket is only drained: it never
     // reaches the guards or any route handler, and it gets no second reply.
     if (retiring.has(req.socket)) {
@@ -798,6 +853,12 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
       const result = await route.render({ method, path, origin: canonical, form, file });
       sendRouteResult(res, result, path, options.store);
     } catch (error) {
+      // A parser-error fallback or an abort may already have settled this
+      // request on the socket directly. Do not add a second final reply then.
+      if (state.settled || res.headersSent || res.writableEnded || res.destroyed || !req.socket.writable) {
+        res.destroy();
+        return;
+      }
       if (error instanceof Rejection && error.status === 413) {
         if (multipart) {
           // The multipart refusal names the limit that applied to this body and
