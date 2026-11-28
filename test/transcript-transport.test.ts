@@ -1142,19 +1142,24 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       // socket's closing reply. It must leave that reply and closure alone.
       const attemptsBeforeRelease = observation.attempts();
       const destroysBeforeRelease = observation.destroyAttempts();
-      firstGateResolve();
-      await Promise.race([firstReturned, guard.promise]);
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      assert.equal(
-        observation.attempts(),
-        attemptsBeforeRelease,
-        "the pending route makes no response write after the parser fallback",
-      );
-      assert.equal(
-        observation.destroyAttempts(),
-        destroysBeforeRelease,
-        "the pending route does not destroy the parser fallback's closing reply",
-      );
+      await Promise.race([
+        (async () => {
+          firstGateResolve();
+          await firstReturned;
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          assert.equal(
+            observation.attempts(),
+            attemptsBeforeRelease,
+            "the pending route makes no response write after the parser fallback",
+          );
+          assert.equal(
+            observation.destroyAttempts(),
+            destroysBeforeRelease,
+            "the pending route does not destroy the parser fallback's closing reply",
+          );
+        })(),
+        guard.promise,
+      ]);
     } finally {
       observation?.close();
       guard.clear();
@@ -1718,13 +1723,78 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
     const dir = tempDir();
     const store = await openStore(dir);
     const transport = keepAliveTransport();
-    const guard = watchdog(5000, "the delayed-route scenario did not finish");
+    const guard = watchdog(5000, "the 20 ms deadline scenario did not finish");
+    let server: StartedServer | null = null;
+    try {
+      // A route that answers well after the deadline, so the deadline is the
+      // only reason the request fails. The test does not depend on the server
+      // having received the request, so a valid timeout before or after receipt
+      // both satisfy the same finite, real-clock expectation.
+      const slow: Route = {
+        method: "GET",
+        render() {
+          return new Promise((resolve) => setTimeout(() => resolve({ status: 200, body: "late" }), 250));
+        },
+      };
+      const routes: Routes = {
+        home: { get: slow },
+        health: { get: slow },
+        hierarchy: {
+          match: (path) => (path === "/slow" ? "slow" : null),
+          route: () => slow,
+        },
+      };
+      server = await startServer({ store, port: 0, routes });
+      const pending = send(transport, server.origin, { path: "/slow", deadlineMs: 20 });
+      const expected = assert.rejects(pending, /no reply within 20 ms/, "a request past its deadline fails");
+      // Observe the assertion at creation so a watchdog win cannot leave it unhandled.
+      expected.catch(() => undefined);
+      await Promise.race([
+        (async () => {
+          await expected;
+          // Let the slow handler finish before the server is closed.
+          await new Promise((resolve) => setTimeout(resolve, 300));
+        })(),
+        guard.promise,
+      ]);
+    } finally {
+      guard.clear();
+      transport.close();
+      // Close the server and the store independently, retaining each cleanup
+      // failure; a failed server close must not swallow a store close error.
+      let serverError: unknown = null;
+      if (server !== null) {
+        try {
+          await server.close();
+        } catch (error) {
+          serverError = error;
+        }
+      }
+      let storeError: unknown = null;
+      try {
+        await store.close();
+      } catch (error) {
+        storeError = error;
+      }
+      if (serverError !== null && storeError !== null) {
+        throw new AggregateError([serverError, storeError], "both the server and the store failed to close");
+      }
+      if (serverError !== null) throw serverError;
+      if (storeError !== null) throw storeError;
+    }
+  });
+
+  it("leaves a late render unanswered after the client disconnects following route entry", async () => {
+    const dir = tempDir();
+    const store = await openStore(dir);
+    const transport = keepAliveTransport();
+    const guard = watchdog(5000, "the delayed-render scenario did not finish");
     let server: StartedServer | null = null;
     let observation: ReturnType<typeof observeServerWrites> | null = null;
+    let releaseLate: () => void = () => undefined;
     try {
       // The route stays pending until the test releases it, so it returns only
-      // after the server has itself observed the aborted peer.
-      let releaseLate: () => void = () => undefined;
+      // after the server has itself observed the disconnected client.
       let routeReturned: () => void = () => undefined;
       let routeEntered: () => void = () => undefined;
       const late = new Promise<RouteResult>((resolve) => {
@@ -1755,21 +1825,26 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       };
       server = await startServer({ store, port: 0, routes });
       observation = observeServerWrites(server.port);
-      // The deadline is long enough that the route has begun before the client
-      // disconnect, so the late completion is measured against a running route
-      // rather than a request that expired before the server saw it.
-      const pending = send(transport, server.origin, { path: "/slow", deadlineMs: 1000 });
-      const expected = assert.rejects(pending, /no reply within 1000 ms/, "a request past its deadline fails");
+      // The request's deadline is not the disconnect under test. The real
+      // client is disconnected explicitly, only after render signals that the
+      // route is running, so the late completion is measured against a live
+      // request that the server saw and then lost.
+      const pending = send(transport, server.origin, { path: "/slow", deadlineMs: 30000 });
+      const expected = assert.rejects(
+        pending,
+        (error: unknown) => error instanceof Error && !/no reply within/.test(error.message),
+        "the disconnected request rejects before its deadline",
+      );
+      // Attach the rejection handler before awaiting route entry.
       expected.catch(() => undefined);
       // Race the whole asynchronous check against the real watchdog, including
-      // the route return and the final observation, so a watchdog expiry always
-      // fails the scenario.
+      // route entry, the disconnect, the route return and the final observation,
+      // so a watchdog expiry always fails the scenario.
       await Promise.race([
         (async () => {
-          // Establish the route is running before the deadline aborts the
-          // request, then assert the deadline rejection on its own, independent
-          // of the server-observed peer loss that follows.
           await entered;
+          // The route is running, so disconnect the real client now.
+          transport.agent.destroy();
           await expected;
           await observation.waitForPeerLoss();
           assert.equal(observation.attemptsAfterPeerLoss(), 0, "no response attempt follows the observed peer loss");
@@ -1793,6 +1868,7 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       observation?.close();
       guard.clear();
       transport.close();
+      releaseLate();
       // Close the server and the store independently, retaining each cleanup
       // failure; a failed server close must not swallow a store close error.
       let serverError: unknown = null;
@@ -1989,9 +2065,12 @@ describe("transcript HTTP transport: one settled final reply per request", () =>
 
   it("closes after a guard reply when the same POST's framing fails without another final reply", async () => {
     const runningFixture = await running();
+    const observation = observeServerWrites(runningFixture.server.port);
     const guard = watchdog(5000, "the guard reply followed by a framing error did not finish");
     try {
       const before = baselineOf(runningFixture);
+      const clientErrorsBefore = observation.clientErrors();
+      const clientErrorCodesBefore = observation.clientErrorCodes().length;
       const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
       // The POST omits Origin, so the guard answers 403 before reading the
       // chunked body. The guard reply is complete before the malformed chunk is
@@ -2011,9 +2090,19 @@ describe("transcript HTTP transport: one settled final reply per request", () =>
       assert.equal(exchange.replies.length, 1, "the guard reply is the only final reply");
       assert.equal(exchange.replies[0]!.status, 403, "the only reply is the guard's 403");
       assert.equal(exchange.replies[0]!.headers["cache-control"], "no-store", "the guard reply is not cached");
+      assert.ok(
+        observation.clientErrors() > clientErrorsBefore,
+        "the server observed the same POST's framing error after the complete guard reply",
+      );
+      const newClientErrorCodes = observation.clientErrorCodes().slice(clientErrorCodesBefore);
+      assert.ok(
+        newClientErrorCodes.includes("HPE_INVALID_CHUNK_SIZE"),
+        `the parser rejected the invalid chunk size after the guard reply: ${newClientErrorCodes.join(", ")}`,
+      );
       assert.equal(runningFixture.renders.import, 0, "the refused import never reached a handler");
       assertUnchanged(runningFixture, before, "after the guard reply and framing error");
     } finally {
+      observation.close();
       guard.clear();
       await runningFixture.close();
     }
