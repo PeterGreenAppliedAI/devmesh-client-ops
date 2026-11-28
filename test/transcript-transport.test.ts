@@ -1888,7 +1888,15 @@ describe("transcript HTTP transport: one settled final reply per request", () =>
       pending.catch(() => undefined);
       const exchange = await Promise.race([pending, guard.promise]);
       assert.equal(exchange.replies.length, 1, "the connection carries exactly one complete reply");
-      assertOrdinaryRefusal(exchange.replies[0]!, 400, "incomplete upload");
+      const refusal = exchange.replies[0]!;
+      assert.equal(refusal.status, 400, "incomplete upload: the reply is a 400");
+      assert.equal(refusal.headers["cache-control"], "no-store", "incomplete upload: the reply is not cached");
+      assert.equal(refusal.headers["connection"], "close", "incomplete upload: the reply closes the connection");
+      assert.equal(
+        refusal.headers["content-length"],
+        String(refusal.bytes.byteLength),
+        "incomplete upload: the reply's declared length frames its complete body",
+      );
       assert.equal(exchange.writeEnded, true, "the peer ended its write side before the declared body was complete");
       assert.equal(runningFixture.renders.import, 0, "the incomplete import never reached a handler");
       assertUnchanged(runningFixture, before, "after the incomplete upload");
@@ -1962,6 +1970,15 @@ describe("transcript HTTP transport: one settled final reply per request", () =>
         observation.bytesReceived() >= 256 * 1024,
         "the server had received upload bytes before the reset",
       );
+      // Wait until the server itself has observed the peer loss and the failed
+      // request has closed, then give its failure path one more turn before
+      // checking attempts, renders and workspace state while still observed.
+      await Promise.race([observation.waitForPeerLoss(), guard.promise]);
+      assert.equal(
+        observation.attempts(),
+        0,
+        "the server made no response write attempt for the failed upload",
+      );
       assert.equal(
         observation.attemptsAfterPeerLoss(),
         0,
@@ -1983,6 +2000,7 @@ describe("transcript HTTP transport: one settled final reply per request", () =>
     try {
       const before = baselineOf(runningFixture);
       const clientErrorsBefore = observation.clientErrors();
+      const clientErrorCodesBefore = observation.clientErrorCodes().length;
       const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
       const body = oneByteOverLimitMultipart({
         title: "Overflow framing retirement import",
@@ -2013,6 +2031,11 @@ describe("transcript HTTP transport: one settled final reply per request", () =>
       assert.ok(
         observation.clientErrors() > clientErrorsBefore,
         "the server observed the framing error during retirement",
+      );
+      const newClientErrorCodes = observation.clientErrorCodes().slice(clientErrorCodesBefore);
+      assert.ok(
+        newClientErrorCodes.includes("HPE_INVALID_CHUNK_SIZE"),
+        `the parser rejected the invalid chunk size during retirement: ${newClientErrorCodes.join(", ")}`,
       );
       assert.equal(runningFixture.renders.import, 0, "the refused import never reached a handler");
       assert.equal(runningFixture.renders.followUp, 0, "no follow-up handler ran on the retiring socket");

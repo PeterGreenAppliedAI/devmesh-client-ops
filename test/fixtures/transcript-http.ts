@@ -1004,8 +1004,15 @@ export interface ServerWriteObservation {
   bytesReceived(): number;
   /** How many parser failures the listener has observed since the observation began. */
   clientErrors(): number;
+  /** The parser error codes observed on this listener since the observation began. */
+  clientErrorCodes(): readonly string[];
   /** Resolve once the server has received at least `bytes` request body bytes. */
   waitForReceived(bytes: number): Promise<void>;
+  /**
+   * Resolve once the server has observed a request's peer loss and that
+   * request has closed, then after one more turn so its failure path finishes.
+   */
+  waitForPeerLoss(): Promise<void>;
   /** Stop observing and restore every wrapped method. */
   close(): void;
 }
@@ -1032,8 +1039,11 @@ export function observeServerWrites(serverPort: number): ServerWriteObservation 
   let attemptsAfterPeerLoss = 0;
   let receivedBytes = 0;
   let clientErrors = 0;
+  const clientErrorCodes: string[] = [];
   let peerLost = false;
+  let lostRequestClosed = false;
   const waiters: Array<{ readonly bytes: number; readonly resolve: () => void }> = [];
+  const peerLossWaiters: Array<() => void> = [];
   const wrappedMethods: Array<{ readonly owner: object; readonly name: string; readonly original: AnyFunction }> = [];
   const wrappedSockets = new WeakSet<Socket>();
   const instrumentedRequests = new WeakSet<IncomingMessage>();
@@ -1049,6 +1059,10 @@ export function observeServerWrites(serverPort: number): ServerWriteObservation 
         waiter.resolve();
       }
     }
+  };
+  const servicePeerLossWaiters = (): void => {
+    if (!lostRequestClosed) return;
+    for (const resolve of peerLossWaiters.splice(0)) resolve();
   };
   const wrap = (owner: object, name: string): void => {
     const record = owner as Record<string, AnyFunction>;
@@ -1066,11 +1080,25 @@ export function observeServerWrites(serverPort: number): ServerWriteObservation 
       receivedBytes += Buffer.isBuffer(chunk) ? chunk.byteLength : Buffer.byteLength(chunk);
       serviceWaiters();
     });
+    let requestLost = false;
+    let requestClosed = false;
     const losePeer = (): void => {
       peerLost = true;
+      requestLost = true;
+      if (requestClosed) {
+        lostRequestClosed = true;
+        servicePeerLossWaiters();
+      }
     };
     req.once("aborted", losePeer);
     req.once("error", losePeer);
+    req.once("close", () => {
+      requestClosed = true;
+      if (requestLost) {
+        lostRequestClosed = true;
+        servicePeerLossWaiters();
+      }
+    });
     for (const name of ["writeHead", "write", "end"]) wrap(res, name);
     const socket = req.socket;
     if (!wrappedSockets.has(socket)) {
@@ -1092,7 +1120,11 @@ export function observeServerWrites(serverPort: number): ServerWriteObservation 
       }
     } else if (event === "clientError") {
       const socket = args[1] as Socket | undefined;
-      if (socket !== undefined && socket.localPort === serverPort) clientErrors += 1;
+      if (socket !== undefined && socket.localPort === serverPort) {
+        clientErrors += 1;
+        const code = (args[0] as { readonly code?: unknown } | undefined)?.code;
+        clientErrorCodes.push(typeof code === "string" ? code : "");
+      }
     }
     return originalEmit.apply(this, [event, ...args]);
   };
@@ -1101,6 +1133,7 @@ export function observeServerWrites(serverPort: number): ServerWriteObservation 
     attemptsAfterPeerLoss: () => attemptsAfterPeerLoss,
     bytesReceived: () => receivedBytes,
     clientErrors: () => clientErrors,
+    clientErrorCodes: () => [...clientErrorCodes],
     waitForReceived(bytes: number): Promise<void> {
       assert.ok(
         Number.isSafeInteger(bytes) && bytes >= 0,
@@ -1111,6 +1144,12 @@ export function observeServerWrites(serverPort: number): ServerWriteObservation 
         waiters.push({ bytes, resolve });
       });
     },
+    waitForPeerLoss(): Promise<void> {
+      if (lostRequestClosed) return new Promise<void>((resolve) => setImmediate(resolve));
+      return new Promise<void>((resolve) => {
+        peerLossWaiters.push(() => setImmediate(resolve));
+      });
+    },
     close() {
       serverPrototype.emit = originalEmit;
       for (const { owner, name, original } of wrappedMethods) {
@@ -1118,6 +1157,7 @@ export function observeServerWrites(serverPort: number): ServerWriteObservation 
       }
       wrappedMethods.length = 0;
       for (const waiter of waiters.splice(0)) waiter.resolve();
+      for (const resolve of peerLossWaiters.splice(0)) resolve();
     },
   };
 }

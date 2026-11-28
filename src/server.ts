@@ -564,6 +564,13 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
   // it is drained and excluded instead of reaching a handler.
   const retiring = new WeakSet<Socket>();
 
+  // Sockets whose one closing reply is already being written. The owner is
+  // recorded before the write, so a later parser error or request notification
+  // cannot destroy the socket while the owner's bytes are still flushing. This
+  // includes a raw parser-error fallback that runs before any request object
+  // exists.
+  const closingReplies = new WeakSet<Socket>();
+
   // The responses still active on each ordinary socket, in request order, so a
   // parser failure can tell whether Node has already started writing the
   // response currently attached to the socket. A response leaves this set only
@@ -662,9 +669,12 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
   // Node would give without this listener, reproduced here because adding a
   // clientError listener disables Node's own default handler.
   server.on("clientError", (error: Error, socket: Socket) => {
-    if (retiring.has(socket)) return;
+    if (retiring.has(socket) || closingReplies.has(socket)) return;
     const state = currentRequests.get(socket);
     if (!socket.writable || socket.destroyed) {
+      // A request path that already owns a closing reply keeps ownership even
+      // after the socket stops accepting new writes; let that reply finish.
+      if (state !== undefined && state.settled) return;
       if (state !== undefined) state.settled = true;
       socket.destroy(error);
       return;
@@ -702,6 +712,9 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
       : code === "HPE_HEADER_OVERFLOW" ? 431
       : code === "HPE_CHUNK_EXTENSIONS_OVERFLOW" ? 413
       : 400;
+    // Record ownership before writing, even with no request object attached to
+    // this socket yet, so a later notification cannot interrupt this fallback.
+    closingReplies.add(socket);
     socket.end(
       `HTTP/1.1 ${status} ${STATUS_CODES[status]}\r\n` +
         "Cache-Control: no-store\r\n" +
@@ -877,7 +890,12 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
       // owns this request's final reply and closure. Mark it settled before the
       // write so a later parser failure cannot append a second reply.
       const requestRefusal = error instanceof Rejection && (error.status === 413 || error.status === 400);
-      if (requestRefusal) state.settled = true;
+      if (requestRefusal) {
+        state.settled = true;
+        // This refusal owns the connection's closing reply from before its
+        // first byte, so no later parser error can interrupt or duplicate it.
+        closingReplies.add(req.socket);
+      }
       if (error instanceof Rejection && error.status === 413) {
         if (multipart) {
           // The multipart refusal names the limit that applied to this body and
