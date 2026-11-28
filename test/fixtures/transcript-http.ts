@@ -10,13 +10,14 @@
  */
 
 import assert from "node:assert/strict";
-import { subscribe, unsubscribe } from "node:diagnostics_channel";
 import {
   Agent,
   createServer,
   request as httpRequest,
+  Server,
   type ClientRequest,
   type IncomingMessage,
+  type ServerResponse,
 } from "node:http";
 import { createConnection, type Socket } from "node:net";
 
@@ -993,46 +994,130 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
   });
 }
 
-/** A server-side observation of write attempts made on an actual request socket. */
+/** A server-side observation of one listener's request activity. */
 export interface ServerWriteObservation {
-  /** How many socket writes the server has attempted since the observation began. */
+  /** How many response write attempts the server made since the observation began. */
   attempts(): number;
-  /** Stop observing and restore every wrapped socket write. */
+  /** How many response write attempts the server made after an observed peer loss. */
+  attemptsAfterPeerLoss(): number;
+  /** How many request body bytes the server has received since the observation began. */
+  bytesReceived(): number;
+  /** How many parser failures the listener has observed since the observation began. */
+  clientErrors(): number;
+  /** Resolve once the server has received at least `bytes` request body bytes. */
+  waitForReceived(bytes: number): Promise<void>;
+  /** Stop observing and restore every wrapped method. */
   close(): void;
 }
 
+type AnyFunction = (...args: unknown[]) => unknown;
+
 /**
- * Observe the server's own write attempts through Node's `http.server.request`
- * diagnostics channel. Each request's server-side socket is wrapped for the
- * observation, so a write attempted after the peer is gone is counted even
- * when the bytes can no longer reach the peer. The wrapper is restored by
- * `close`, and no module is replaced.
+ * Observe one real listener's request activity through stable Node interfaces.
+ * The listener's own `request` and `clientError` events are inspected as they
+ * are emitted, and only requests on `serverPort` are instrumented. Response and
+ * socket write methods are wrapped per request, so an attempt made after the
+ * peer is gone is counted even when a destroyed response stops before reaching
+ * the socket. The request's own body events are counted, letting a caller wait
+ * until the server has received upload bytes before acting. Every wrapper is
+ * restored by `close`; no module is replaced and no experimental channel is
+ * used.
  */
-export function observeServerWrites(): ServerWriteObservation {
-  let count = 0;
-  const wrapped: Array<{ readonly socket: Socket; readonly write: (...args: unknown[]) => boolean }> = [];
-  const seen = new WeakSet<Socket>();
-  const onStart = (message: unknown): void => {
-    const socket = (message as { readonly socket?: Socket }).socket;
-    if (socket === undefined || seen.has(socket)) return;
-    seen.add(socket);
-    const target = socket as Socket & { write: (...args: unknown[]) => boolean };
-    const original = target.write;
-    wrapped.push({ socket, write: original });
-    target.write = function (...args: unknown[]): boolean {
-      count += 1;
-      return original.apply(socket, args);
-    };
+export function observeServerWrites(serverPort: number): ServerWriteObservation {
+  assert.ok(
+    Number.isInteger(serverPort) && serverPort > 0,
+    "the observed server port is a positive integer",
+  );
+  let attempts = 0;
+  let attemptsAfterPeerLoss = 0;
+  let receivedBytes = 0;
+  let clientErrors = 0;
+  let peerLost = false;
+  const waiters: Array<{ readonly bytes: number; readonly resolve: () => void }> = [];
+  const wrappedMethods: Array<{ readonly owner: object; readonly name: string; readonly original: AnyFunction }> = [];
+  const wrappedSockets = new WeakSet<Socket>();
+  const instrumentedRequests = new WeakSet<IncomingMessage>();
+  const noteAttempt = (): void => {
+    attempts += 1;
+    if (peerLost) attemptsAfterPeerLoss += 1;
   };
-  subscribe("http.server.request.start", onStart);
-  return {
-    attempts: () => count,
-    close() {
-      unsubscribe("http.server.request.start", onStart);
-      for (const { socket, write } of wrapped) {
-        (socket as Socket & { write: (...args: unknown[]) => boolean }).write = write;
+  const serviceWaiters = (): void => {
+    for (let index = waiters.length - 1; index >= 0; index -= 1) {
+      const waiter = waiters[index]!;
+      if (receivedBytes >= waiter.bytes) {
+        waiters.splice(index, 1);
+        waiter.resolve();
       }
-      wrapped.length = 0;
+    }
+  };
+  const wrap = (owner: object, name: string): void => {
+    const record = owner as Record<string, AnyFunction>;
+    const original = record[name];
+    record[name] = function (this: unknown, ...args: unknown[]): unknown {
+      noteAttempt();
+      return original.apply(this, args);
+    };
+    wrappedMethods.push({ owner, name, original });
+  };
+  const instrumentRequest = (req: IncomingMessage, res: ServerResponse): void => {
+    if (instrumentedRequests.has(req)) return;
+    instrumentedRequests.add(req);
+    req.on("data", (chunk: Buffer | string) => {
+      receivedBytes += Buffer.isBuffer(chunk) ? chunk.byteLength : Buffer.byteLength(chunk);
+      serviceWaiters();
+    });
+    const losePeer = (): void => {
+      peerLost = true;
+    };
+    req.once("aborted", losePeer);
+    req.once("error", losePeer);
+    for (const name of ["writeHead", "write", "end"]) wrap(res, name);
+    const socket = req.socket;
+    if (!wrappedSockets.has(socket)) {
+      wrappedSockets.add(socket);
+      wrap(socket, "write");
+      wrap(socket, "end");
+    }
+  };
+  const serverPrototype = Server.prototype as unknown as {
+    emit: (event: string | symbol, ...args: unknown[]) => boolean;
+  };
+  const originalEmit = serverPrototype.emit;
+  serverPrototype.emit = function (this: unknown, event: string | symbol, ...args: unknown[]): boolean {
+    if (event === "request") {
+      const req = args[0] as IncomingMessage | undefined;
+      const res = args[1] as ServerResponse | undefined;
+      if (req !== undefined && res !== undefined && req.socket.localPort === serverPort) {
+        instrumentRequest(req, res);
+      }
+    } else if (event === "clientError") {
+      const socket = args[1] as Socket | undefined;
+      if (socket !== undefined && socket.localPort === serverPort) clientErrors += 1;
+    }
+    return originalEmit.apply(this, [event, ...args]);
+  };
+  return {
+    attempts: () => attempts,
+    attemptsAfterPeerLoss: () => attemptsAfterPeerLoss,
+    bytesReceived: () => receivedBytes,
+    clientErrors: () => clientErrors,
+    waitForReceived(bytes: number): Promise<void> {
+      assert.ok(
+        Number.isSafeInteger(bytes) && bytes >= 0,
+        "the awaited server-received byte count is a finite non-negative count",
+      );
+      if (receivedBytes >= bytes) return Promise.resolve();
+      return new Promise<void>((resolve) => {
+        waiters.push({ bytes, resolve });
+      });
+    },
+    close() {
+      serverPrototype.emit = originalEmit;
+      for (const { owner, name, original } of wrappedMethods) {
+        (owner as Record<string, AnyFunction>)[name] = original;
+      }
+      wrappedMethods.length = 0;
+      for (const waiter of waiters.splice(0)) waiter.resolve();
     },
   };
 }
@@ -1052,6 +1137,8 @@ export interface RawExchangeStep {
   readonly bytes: Uint8Array;
   readonly afterReplies?: number;
   readonly afterWrite?: boolean;
+  /** Wait until the observed server has received at least this many body bytes. */
+  readonly afterServerBytes?: number;
   readonly endWrite?: boolean;
   readonly reset?: boolean;
 }
@@ -1068,10 +1155,14 @@ export interface RawExchangeOptions {
    * used by a scenario that expects the peer to reset without any reply.
    */
   readonly minimumReplies?: number;
+  /** The server-side observation used by steps that wait for server receipt. */
+  readonly observation?: ServerWriteObservation;
 }
 
 /** The observation of one scripted raw exchange. */
 export interface RawExchange extends ClosedExchange {
+  /** The live client port captured as each complete reply arrived, in order. */
+  readonly replyLocalPorts: readonly number[];
   /** True when the client ended its write side (FIN) after a step. */
   readonly writeEnded: boolean;
   /** True when the client reset the connection after a step. */
@@ -1110,6 +1201,14 @@ export function sendRaw(base: string, options: RawExchangeOptions): Promise<RawE
       step.afterReplies === undefined || (Number.isSafeInteger(step.afterReplies) && step.afterReplies >= 0),
       `step ${index + 1}'s reply count is a finite non-negative count`,
     );
+    assert.ok(
+      step.afterServerBytes === undefined ||
+        (Number.isSafeInteger(step.afterServerBytes) && step.afterServerBytes >= 0),
+      `step ${index + 1}'s server-received byte count is a finite non-negative count`,
+    );
+  }
+  if (options.steps.some((step) => step.afterServerBytes !== undefined)) {
+    assert.ok(options.observation !== undefined, "a server-receipt wait has an observation");
   }
   // Only the last step may half-close or reset the connection.
   for (const step of options.steps.slice(0, -1)) {
@@ -1131,6 +1230,7 @@ export function sendRaw(base: string, options: RawExchangeOptions): Promise<RawE
     let resetRequested = false;
     const chunks: Buffer[] = [];
     let received = 0;
+    const replyLocalPorts: number[] = [];
     const replyWaiters: Array<{
       readonly count: number;
       readonly resolve: () => void;
@@ -1155,6 +1255,8 @@ export function sendRaw(base: string, options: RawExchangeOptions): Promise<RawE
     const parsedState = () => parseReplies(Buffer.concat(chunks));
     const serviceReplyWaiters = (): void => {
       const replies = parsedState().replies.length;
+      const port = socket.localPort ?? localPort;
+      while (replyLocalPorts.length < replies) replyLocalPorts.push(port);
       for (let index = replyWaiters.length - 1; index >= 0; index -= 1) {
         const waiter = replyWaiters[index]!;
         if (replies >= waiter.count) {
@@ -1214,7 +1316,15 @@ export function sendRaw(base: string, options: RawExchangeOptions): Promise<RawE
       settled = true;
       clearDeadline();
       socket.destroy();
-      resolve({ bytes, replies: parsed.replies, localPort, reuseAttempted: false, writeEnded, resetRequested });
+      resolve({
+        bytes,
+        replies: parsed.replies,
+        localPort,
+        replyLocalPorts,
+        reuseAttempted: false,
+        writeEnded,
+        resetRequested,
+      });
     };
     const armDeadline = (): boolean => {
       const remaining = expiresAt - performance.now();
@@ -1248,6 +1358,8 @@ export function sendRaw(base: string, options: RawExchangeOptions): Promise<RawE
           await writeBytes(step.bytes, step.afterWrite === true);
           if (settled) return;
           if (step.afterReplies !== undefined) await waitForReplies(step.afterReplies);
+          if (settled) return;
+          if (step.afterServerBytes !== undefined) await options.observation!.waitForReceived(step.afterServerBytes);
           if (settled) return;
           if (step.endWrite === true) {
             writeEnded = true;
@@ -1293,11 +1405,13 @@ export function sendRaw(base: string, options: RawExchangeOptions): Promise<RawE
       if (settled) return;
       // A reset requested by the script is expected to raise a retirement
       // error on the client socket; the peer closure then settles the exchange.
+      // Every other socket error is an unexpected transport failure and fails
+      // immediately, even when the replies already read would otherwise parse.
       if (resetRequested && isRetirementWrite(error)) {
         socketError = error;
         return;
       }
-      socketError = error;
+      fail(error);
     });
     if (!armDeadline()) return;
   });

@@ -1851,7 +1851,12 @@ describe("transcript HTTP transport: one settled final reply per request", () =>
       const health = exchange.replies[0]!;
       assert.equal(health.status, 200, "the earlier health reply is a complete 200");
       assertOrdinaryRefusal(exchange.replies[1]!, 400, "malformed import after health");
-      assert.ok(isPositiveInteger(exchange.localPort), `the exchange used one positive client local port: ${exchange.localPort}`);
+      assert.equal(exchange.replyLocalPorts.length, 2, "both replies report their live client local port");
+      const healthPort = exchange.replyLocalPorts[0]!;
+      const importPort = exchange.replyLocalPorts[1]!;
+      assert.ok(isPositiveInteger(healthPort), `the health reply used one positive client local port: ${healthPort}`);
+      assert.ok(isPositiveInteger(importPort), `the import reply used one positive client local port: ${importPort}`);
+      assert.equal(healthPort, importPort, "the health and import replies shared one client local port");
       assert.equal(runningFixture.renders.followUp, 1, "the health read rendered once");
       assert.equal(runningFixture.renders.import, 0, "the malformed import never reached a handler");
       assertUnchanged(runningFixture, before, "after the malformed import");
@@ -1927,16 +1932,15 @@ describe("transcript HTTP transport: one settled final reply per request", () =>
 
   it("makes no response attempt after the peer resets mid-upload", async () => {
     const runningFixture = await running();
-    const observation = observeServerWrites();
+    const observation = observeServerWrites(runningFixture.server.port);
     const guard = watchdog(15000, "the reset mid-upload did not finish");
     try {
       const before = baselineOf(runningFixture);
-      const attemptsBeforeReset = observation.attempts();
       const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
       // The prefix carries the whole synthetic 10 MiB file but no closing
-      // boundary, and the declared length asks for more. Completing the large
-      // write before the reset shows the server consumed the partial upload;
-      // the reset then leaves nothing for it to answer.
+      // boundary, and the declared length asks for more. The raw exchange waits
+      // until the server itself has received upload bytes, then resets the
+      // peer; the reset leaves nothing for the server to answer.
       const prefix = partialFileMultipart(10 * 1024 * 1024);
       const request = rawPostRequest(runningFixture.server.origin, importPath, {
         Origin: new URL(runningFixture.server.origin).origin,
@@ -1946,16 +1950,21 @@ describe("transcript HTTP transport: one settled final reply per request", () =>
       const pending = sendRaw(runningFixture.server.origin, {
         deadlineMs: 10000,
         minimumReplies: 0,
-        steps: [{ bytes: request, afterWrite: true, reset: true }],
+        observation,
+        steps: [{ bytes: request, afterWrite: true, afterServerBytes: 256 * 1024, reset: true }],
       });
       pending.catch(() => undefined);
       const exchange = await Promise.race([pending, guard.promise]);
       assert.equal(exchange.resetRequested, true, "the peer reset the connection after the partial upload");
       assert.equal(exchange.replies.length, 0, "the failed upload receives no reply after the peer reset");
       assert.equal(exchange.bytes.byteLength, 0, "the peer receives no bytes after its reset");
+      assert.ok(
+        observation.bytesReceived() >= 256 * 1024,
+        "the server had received upload bytes before the reset",
+      );
       assert.equal(
-        observation.attempts(),
-        attemptsBeforeReset,
+        observation.attemptsAfterPeerLoss(),
+        0,
         "the server makes no further response write attempt after the peer loss",
       );
       assert.equal(runningFixture.renders.import, 0, "the failed upload never reached an import handler");
@@ -1969,9 +1978,11 @@ describe("transcript HTTP transport: one settled final reply per request", () =>
 
   it("delivers the reserved overflow 413 as the only final reply when the same upload's framing fails during retirement", async () => {
     const runningFixture = await running();
+    const observation = observeServerWrites(runningFixture.server.port);
     const guard = watchdog(5000, "the overflow with a framing failure during retirement did not finish");
     try {
       const before = baselineOf(runningFixture);
+      const clientErrorsBefore = observation.clientErrors();
       const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
       const body = oneByteOverLimitMultipart({
         title: "Overflow framing retirement import",
@@ -1979,9 +1990,11 @@ describe("transcript HTTP transport: one settled final reply per request", () =>
         paste: "Iris: the overflow retirement source.",
       });
       assert.equal(body.byteLength, OVERSIZED_BODY_BYTES, "the body is exactly one byte past the inclusive limit");
-      // The exact-limit chunk is followed by the single excess byte and then an
-      // invalid chunk-size line in the same unfinished chunked upload. The
-      // reserved refusal must survive that parser failure as the only reply.
+      // The exact-limit chunk is written first. The single excess byte is then
+      // written together with an invalid chunk-size tail in one combined write,
+      // so the same unfinished upload stages both the excess byte and the
+      // malformed tail for the parser. The reserved refusal must survive that
+      // framing failure as the only reply.
       const pending = sendStaged(runningFixture.server.origin, {
         path: importPath,
         contentType: MULTIPART_TYPE,
@@ -1989,16 +2002,23 @@ describe("transcript HTTP transport: one settled final reply per request", () =>
         bodyPrefix: body,
         chunked: true,
         chunkSizes: [EXACT_BODY_BYTES, 1],
+        combineTail: true,
+        tailDelayMs: 20,
         withholdTerminator: true,
         followUp: Buffer.from("Z\r\n", "utf8"),
       });
       pending.catch(() => undefined);
       const exchange = await Promise.race([pending, guard.promise]);
       assertOversizedRefusal(exchange, "overflow with a framing failure during retirement");
+      assert.ok(
+        observation.clientErrors() > clientErrorsBefore,
+        "the server observed the framing error during retirement",
+      );
       assert.equal(runningFixture.renders.import, 0, "the refused import never reached a handler");
       assert.equal(runningFixture.renders.followUp, 0, "no follow-up handler ran on the retiring socket");
       assertUnchanged(runningFixture, before, "after the overflow framing failure");
     } finally {
+      observation.close();
       guard.clear();
       await runningFixture.close();
     }

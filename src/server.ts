@@ -617,15 +617,23 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
       },
       settled: false,
     };
+    // A request error or abort whose socket can no longer write has already
+    // lost its peer: the request is settled without a reply attempt.
+    const inputLost = (): void => {
+      state.inputDone();
+      if (req.socket.destroyed || !req.socket.writable) state.settled = true;
+    };
     currentRequests.set(socket, state);
     req.once("end", state.inputDone);
     req.once("close", state.inputDone);
-    req.once("aborted", state.inputDone);
-    req.once("error", state.inputDone);
+    req.once("aborted", inputLost);
+    req.once("error", inputLost);
     res.once("finish", state.replyDone);
     res.once("close", state.replyDone);
     void handle(req, res, state).catch(() => {
-      if (state.settled || res.headersSent || res.writableEnded || res.destroyed || !req.socket.writable) {
+      // A path that already settled this request owns its reply or closure.
+      if (state.settled) return;
+      if (res.headersSent || res.writableEnded || res.destroyed || !req.socket.writable) {
         res.destroy();
         return;
       }
@@ -655,15 +663,19 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
   // clientError listener disables Node's own default handler.
   server.on("clientError", (error: Error, socket: Socket) => {
     if (retiring.has(socket)) return;
+    const state = currentRequests.get(socket);
     if (!socket.writable || socket.destroyed) {
+      if (state !== undefined) state.settled = true;
       socket.destroy(error);
       return;
     }
     // A parser failure while the last dispatched request's input is still
     // outstanding belongs to that request. Once its final reply has started,
     // close without appending another one, even if the reply has finished.
-    const state = currentRequests.get(socket);
     if (state !== undefined && !state.req.complete) {
+      // Another path (a body-reader refusal) may already own this request's
+      // one reply and closure; do not append or interrupt it.
+      if (state.settled) return;
       state.settled = true;
       if (state.res.headersSent || state.res.writableEnded || state.res.destroyed) {
         socket.destroy(error);
@@ -854,11 +866,18 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
       sendRouteResult(res, result, path, options.store);
     } catch (error) {
       // A parser-error fallback or an abort may already have settled this
-      // request on the socket directly. Do not add a second final reply then.
-      if (state.settled || res.headersSent || res.writableEnded || res.destroyed || !req.socket.writable) {
+      // request on the socket directly. Its owning path handles the closure;
+      // this path must not write or destroy the connection under it.
+      if (state.settled) return;
+      if (res.headersSent || res.writableEnded || res.destroyed || !req.socket.writable) {
         res.destroy();
         return;
       }
+      // A body-reader refusal or a request that ended before its declared body
+      // owns this request's final reply and closure. Mark it settled before the
+      // write so a later parser failure cannot append a second reply.
+      const requestRefusal = error instanceof Rejection && (error.status === 413 || error.status === 400);
+      if (requestRefusal) state.settled = true;
       if (error instanceof Rejection && error.status === 413) {
         if (multipart) {
           // The multipart refusal names the limit that applied to this body and
@@ -871,6 +890,10 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
         // connection instead of trying to reuse it for another request.
         res.setHeader("Connection", "close");
         // An ordinary form keeps the existing 413 body and close behaviour.
+      } else if (error instanceof Rejection && error.status === 400) {
+        // Incomplete or invalid request framing is answered once, then the
+        // connection closes instead of being reused for another request.
+        res.setHeader("Connection", "close");
       }
       const status = errorStatus(error);
       if (error instanceof FormError) {
