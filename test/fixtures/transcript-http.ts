@@ -742,6 +742,11 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
     let socketError: Error | null = null;
     let localPort = 0;
     let reuseAttempted = false;
+    // Set while a submitted reuse write has not yet reported its outcome. The
+    // exchange must not resolve from peer closure alone in that state: the
+    // write callback still decides whether the attempt succeeded or hit an
+    // expected retirement error.
+    let reuseWritePending = false;
     // Set when the peer's FIN or close has arrived, so a reuse attempt made
     // after retirement is recorded as an observed retirement rather than a
     // submission that could not happen.
@@ -779,6 +784,11 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
         fail(new Error("the peer closed before the combined tail was written"));
         return;
       }
+      // Once a reuse write has started, peer closure alone is not enough: wait
+      // for the write callback to report success or an expected retirement
+      // error before settling. The write callback calls finish again when the
+      // peer has already closed, and the deadline stays armed meanwhile.
+      if (reuseWritePending) return;
       // A peer close dispatched after the expiry but before the timer callback
       // still fails; the monotonic deadline is checked at completion too.
       if (timedOut()) {
@@ -927,20 +937,33 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
             reuseAttempted = true;
           } else {
             try {
+              reuseWritePending = true;
               socket.write(reuseBytes, (error?: Error | null) => {
+                reuseWritePending = false;
+                if (settled) return;
                 // A write rejected because the peer has already retired the
                 // socket is the expected outcome of the attempt. Any other
-                // write error is unexpected and must fail the exchange.
+                // write error is unexpected and must fail the exchange, even
+                // when the refusal reply has already fully arrived.
                 if (error !== undefined && error !== null && !isRetirementWrite(error)) {
                   fail(error);
+                  return;
                 }
+                // The write outcome is known; if peer closure already happened,
+                // finish now so the full wire is checked through that closure.
+                if (peerEnded) finish();
               });
               // The bytes were submitted to the original socket after the
               // complete reply; the peer's later closure is the retirement.
               reuseAttempted = true;
             } catch (error) {
-              if (isRetirementWrite(error as Error)) reuseAttempted = true;
-              else fail(error as Error);
+              reuseWritePending = false;
+              if (isRetirementWrite(error as Error)) {
+                reuseAttempted = true;
+                if (peerEnded) finish();
+              } else {
+                fail(error as Error);
+              }
             }
           }
         }
@@ -955,7 +978,15 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
       finish();
     });
     socket.on("error", (error: Error) => {
-      if (!settled) socketError = error;
+      if (settled) return;
+      // A socket error during reuse is only an acceptable retirement when it
+      // is one of the expected retirement errors. Any unexpected error must
+      // fail the exchange, including after the complete refusal reply.
+      if (reuseAttempted && !isRetirementWrite(error)) {
+        fail(error);
+        return;
+      }
+      socketError = error;
     });
     if (!armDeadline()) return;
   });
