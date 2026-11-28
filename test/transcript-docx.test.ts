@@ -735,6 +735,49 @@ describe("DOCX container structure", () => {
     assert.equal(backslashParser.calls(), 0, "a backslash path is not handed to the parser");
   });
 
+  it("refuses a directory entry that declares content but imports an empty directory entry", async () => {
+    const encoder = new TextEncoder();
+    const directoryWithContent = buildDocxWithExtraEntries(
+      [{ name: "customXml/folder/", bytes: encoder.encode("not an empty directory") }],
+      [{ runs: ["Directory document."] }],
+    );
+    const { parser, calls } = countingParser();
+    const outcome = await importDocx(directoryWithContent, "directory.docx", parser);
+    refused(outcome, "unreadable_document", /marks a directory name but declares .* uncompressed bytes/);
+    if (outcome.ok) throw new Error("unreachable");
+    assert.match(
+      outcome.refusal.message,
+      reExportGuidance,
+      "the nonempty-directory refusal carries re-export guidance",
+    );
+    assert.equal(calls(), 0, "a directory entry that declares content is not handed to the parser");
+
+    const emptyDirectory = buildDocxWithExtraEntries(
+      [{ name: "customXml/folder/", bytes: new Uint8Array(0) }],
+      [{ runs: ["Empty directory document."] }],
+    );
+    const { result } = imported(await importDocx(emptyDirectory, "empty-directory.docx"));
+    assert.equal(result.extractedText, "Empty directory document.");
+  });
+
+  it("refuses part names that differ only by ASCII letter case before the parser", async () => {
+    const encoder = new TextEncoder();
+    const caseEquivalent = buildZipDetailed([
+      { name: "word/document.xml", bytes: encoder.encode("lower-case content") },
+      { name: "Word/Document.xml", bytes: encoder.encode("upper-case content") },
+    ]).bytes;
+    const { parser, calls } = countingParser();
+    const outcome = await importDocx(caseEquivalent, "case-equivalent.docx", parser);
+    refused(outcome, "unreadable_document", /repeats another entry's name/);
+    if (outcome.ok) throw new Error("unreachable");
+    assert.match(
+      outcome.refusal.message,
+      reExportGuidance,
+      "the case-equivalent-name refusal carries re-export guidance",
+    );
+    assert.equal(calls(), 0, "two case-equivalent part names are not handed to the parser");
+  });
+
   it("reports central offsets that identify each central header in a multi-entry archive", async () => {
     const names = ["first", "second", "third"];
     const built = buildZipDetailed(
