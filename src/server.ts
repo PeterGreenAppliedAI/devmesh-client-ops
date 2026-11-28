@@ -876,6 +876,14 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
       }
 
       const result = await route.render({ method, path, origin: canonical, form, file });
+      // A route can finish after the peer has gone or after another path has
+      // settled this request. Its final reply may already have started, and the
+      // socket may no longer accept writes; close instead of appending another
+      // reply to that request.
+      if (state.settled || res.headersSent || res.writableEnded || res.destroyed || !req.socket.writable) {
+        res.destroy();
+        return;
+      }
       sendRouteResult(res, result, path, options.store);
     } catch (error) {
       // A parser-error fallback or an abort may already have settled this

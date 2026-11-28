@@ -33,7 +33,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { registerRoutes } from "../src/index.ts";
-import { startServer, type Route, type RouteRequest, type Routes, type StartedServer } from "../src/server.ts";
+import {
+  startServer,
+  type Route,
+  type RouteRequest,
+  type RouteResult,
+  type Routes,
+  type StartedServer,
+} from "../src/server.ts";
 import { openStore, type Snapshot, type Store } from "../src/store.ts";
 import { ORIGINALS_DIRECTORY } from "../src/transcript-files.ts";
 import {
@@ -1684,14 +1691,26 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
     const dir = tempDir();
     const store = await openStore(dir);
     const transport = keepAliveTransport();
+    const guard = watchdog(5000, "the delayed-route scenario did not finish");
     let server: StartedServer | null = null;
+    let observation: ReturnType<typeof observeServerWrites> | null = null;
     try {
-      // A route that answers well after the deadline, so the deadline is the
-      // only reason the request fails.
+      // The route stays pending until the test releases it, so it returns only
+      // after the server has itself observed the aborted peer.
+      let releaseLate: () => void = () => undefined;
+      let routeReturned: () => void = () => undefined;
+      const late = new Promise<RouteResult>((resolve) => {
+        releaseLate = () => resolve({ status: 200, body: "late" });
+      });
+      const returned = new Promise<void>((resolve) => {
+        routeReturned = () => resolve();
+      });
       const slow: Route = {
         method: "GET",
-        render() {
-          return new Promise((resolve) => setTimeout(() => resolve({ status: 200, body: "late" }), 250));
+        async render() {
+          const result = await late;
+          routeReturned();
+          return result;
         },
       };
       const routes: Routes = {
@@ -1703,14 +1722,28 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
         },
       };
       server = await startServer({ store, port: 0, routes });
-      await assert.rejects(
-        send(transport, server.origin, { path: "/slow", deadlineMs: 20 }),
-        /no reply within 20 ms/,
-        "a request past its deadline fails",
+      observation = observeServerWrites(server.port);
+      const pending = send(transport, server.origin, { path: "/slow", deadlineMs: 20 });
+      const expected = assert.rejects(pending, /no reply within 20 ms/, "a request past its deadline fails");
+      expected.catch(() => undefined);
+      await Promise.race([Promise.all([expected, observation.waitForPeerLoss()]), guard.promise]);
+      assert.equal(observation.attemptsAfterPeerLoss(), 0, "no response attempt follows the observed peer loss");
+      const attemptsBeforeRelease = observation.attempts();
+      // The route now returns after the server has observed the peer loss; the
+      // settled request must close without starting a final reply.
+      releaseLate();
+      await returned;
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(
+        observation.attempts(),
+        attemptsBeforeRelease,
+        "the delayed route makes no response attempt after the peer is gone",
       );
-      // Let the slow handler finish before the server is closed.
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      assert.equal(observation.attemptsAfterPeerLoss(), 0, "the delayed route makes no post-loss response attempt");
     } finally {
+      observation?.close();
+      guard.clear();
       transport.close();
       // Close the server and the store independently, retaining each cleanup
       // failure; a failed server close must not swallow a store close error.

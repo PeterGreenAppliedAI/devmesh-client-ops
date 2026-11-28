@@ -1009,8 +1009,9 @@ export interface ServerWriteObservation {
   /** Resolve once the server has received at least `bytes` request body bytes. */
   waitForReceived(bytes: number): Promise<void>;
   /**
-   * Resolve once the server has observed a request's peer loss and that
-   * request has closed, then after one more turn so its failure path finishes.
+   * Resolve once the server has observed a request's peer loss through its
+   * request events or its socket's close, and that request has closed, then
+   * after one more turn so its failure path finishes.
    */
   waitForPeerLoss(): Promise<void>;
   /** Stop observing and restore every wrapped method. */
@@ -1041,6 +1042,7 @@ export function observeServerWrites(serverPort: number): ServerWriteObservation 
   let clientErrors = 0;
   const clientErrorCodes: string[] = [];
   let peerLost = false;
+  let socketClosed = false;
   let lostRequestClosed = false;
   const waiters: Array<{ readonly bytes: number; readonly resolve: () => void }> = [];
   const peerLossWaiters: Array<() => void> = [];
@@ -1094,13 +1096,24 @@ export function observeServerWrites(serverPort: number): ServerWriteObservation 
     req.once("error", losePeer);
     req.once("close", () => {
       requestClosed = true;
-      if (requestLost) {
+      if (requestLost || socketClosed) {
         lostRequestClosed = true;
         servicePeerLossWaiters();
       }
     });
     for (const name of ["writeHead", "write", "end"]) wrap(res, name);
     const socket = req.socket;
+    socket.once("close", () => {
+      // A peer that destroys the socket after its request input is complete
+      // may close the request without an abort event. The socket's close is
+      // still the server-observed peer loss for that request.
+      socketClosed = true;
+      peerLost = true;
+      if (requestClosed) {
+        lostRequestClosed = true;
+        servicePeerLossWaiters();
+      }
+    });
     if (!wrappedSockets.has(socket)) {
       wrappedSockets.add(socket);
       wrap(socket, "write");
