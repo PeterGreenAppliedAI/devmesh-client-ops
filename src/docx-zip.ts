@@ -17,10 +17,10 @@
  * are; a directory's trailing slash is folded away so equivalent directory
  * spellings share one key), a file whose path another member uses as a
  * directory (independent of entry order, while an explicit empty directory
- * remains compatible with its children), an ambiguous leading UTF-8 byte-order
- * mark, an unflagged non-ASCII name whose legacy encoding cannot be interpreted
- * consistently with the parser, or local and central declarations that
- * disagree.
+ * remains compatible with its children), a DOS volume-label entry, an
+ * ambiguous leading UTF-8 byte-order mark, an unflagged non-ASCII name whose
+ * legacy encoding cannot be interpreted consistently with the parser, or local
+ * and central declarations that disagree.
  *
  * Declared sizes are checked before any expansion: each declared uncompressed
  * size and their sum must be at most MAX_CONTENT_BYTES, and one entry's
@@ -192,6 +192,12 @@ function classifyEntry(
   const directoryIndicator = isDirectoryName(name) || (externalAttributes & 0x10) !== 0;
   const creatorOS = versionMadeBy >>> 8;
   if (creatorOS !== UNIX_CREATOR_OS && creatorOS !== DARWIN_CREATOR_OS) {
+    // A DOS volume label is neither a file nor a directory. Its attribute
+    // describes an incompatible entry type, even when a directory indicator is
+    // also set, so refuse it before choosing a classification.
+    if ((externalAttributes & 0x08) !== 0) {
+      return unreadable(`entry ${index + 1} declares an unsupported DOS volume label`);
+    }
     return { ok: true, isDirectory: directoryIndicator };
   }
   const mode = externalAttributes >>> 16;
@@ -225,22 +231,68 @@ function asciiFold(name: string): string {
   return name.replace(/[A-Z]/gu, (letter) => letter.toLowerCase());
 }
 
-/**
- * The directory keys a member's path implies: every ancestor directory, and
- * the member's own key when it is a directory. A file at `a/b/c.xml` implies
- * `a` and `a/b`; an explicit directory `a/b/` implies `a` and `a/b`. These are
- * collected while reading the central directory so that a file and an implied
- * directory conflict in either entry order.
- */
-function impliedDirectoryKeys(name: string, isDirectory: boolean): readonly string[] {
-  const trimmed = isDirectory && name.endsWith("/") ? name.slice(0, -1) : name;
-  const segments = trimmed.split("/");
-  const last = isDirectory ? segments.length : segments.length - 1;
-  const keys: string[] = [];
-  for (let count = 1; count <= last; count += 1) {
-    keys.push(asciiFold(segments.slice(0, count).join("/")));
+/** One central-directory member's folded name, for conflict detection. */
+interface MemberName {
+  readonly key: string;
+  readonly isDirectory: boolean;
+  readonly index: number;
+}
+
+/** The first entry at or after `prefix` in lexicographic name order. */
+function lowerBound(names: readonly MemberName[], prefix: string): number {
+  let low = 0;
+  let high = names.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (names[middle].key < prefix) low = middle + 1;
+    else high = middle;
   }
-  return keys;
+  return low;
+}
+
+/**
+ * Find the earliest file/directory name conflict without materialising every
+ * ancestor path. Each member's folded name is stored once; sorting those names
+ * lets a lower-bound lookup find the descendants of a file key (every name
+ * that begins with `key + "/"`). The conflict is reported at the later of the
+ * file and its descendant, so both entry orders are refused with a message
+ * naming the file, matching the order in which a per-entry read finds them. An
+ * explicit empty directory has a directory role, so its children are
+ * compatible with it; duplicate names are detected separately from
+ * `partNameKey`.
+ */
+function findNameConflict(entries: readonly MemberName[]): ZipRefusal | null {
+  const names = [...entries].sort((left, right) =>
+    left.key < right.key ? -1 : left.key > right.key ? 1 : left.index - right.index,
+  );
+  let reportedIndex = Number.POSITIVE_INFINITY;
+  let reportedFileLater = false;
+  let refusal: ZipRefusal | null = null;
+  for (const file of names) {
+    if (file.isDirectory) continue;
+    const prefix = `${file.key}/`;
+    for (let cursor = lowerBound(names, prefix); cursor < names.length; cursor += 1) {
+      const descendant = names[cursor];
+      if (!descendant.key.startsWith(prefix)) break;
+      const fileLater = file.index > descendant.index;
+      const candidateIndex = fileLater ? file.index : descendant.index;
+      if (candidateIndex > reportedIndex) continue;
+      // At the same entry, a file that arrives after its descendant is reported
+      // before an entry that arrives after a file ancestor, as the per-entry
+      // reader checks its own directory keys before its implied ancestors.
+      if (candidateIndex === reportedIndex && (!fileLater || reportedFileLater)) continue;
+      reportedIndex = candidateIndex;
+      reportedFileLater = fileLater;
+      refusal = fileLater
+        ? unreadable(
+            `entry ${file.index + 1} declares ${file.key} as a file but another entry uses it as a directory`,
+          )
+        : unreadable(
+            `entry ${descendant.index + 1} uses ${file.key} as a directory but another entry declares it as a file`,
+          );
+    }
+  }
+  return refusal;
 }
 
 /**
@@ -357,8 +409,7 @@ function readCentralDirectory(
 
   const members: CentralMember[] = [];
   const seenNames = new Set<string>();
-  const fileKeys = new Set<string>();
-  const directoryKeys = new Set<string>();
+  const memberNames: MemberName[] = [];
   let cursor = centralOffset;
   for (let index = 0; index < total; index += 1) {
     if (cursor + 46 > endOffset) return unreadable(`central-directory entry ${index + 1} is truncated`);
@@ -424,26 +475,15 @@ function readCentralDirectory(
     const nameKey = partNameKey(decodedName, isDirectory);
     if (seenNames.has(nameKey)) return unreadable(`entry ${index + 1} repeats another entry's name`);
     seenNames.add(nameKey);
-    if (!isDirectory && directoryKeys.has(nameKey)) {
-      return unreadable(
-        `entry ${index + 1} declares ${nameKey} as a file but another entry uses it as a directory`,
-      );
-    }
-    for (const directoryKey of impliedDirectoryKeys(decodedName, isDirectory)) {
-      if (fileKeys.has(directoryKey)) {
-        return unreadable(
-          `entry ${index + 1} uses ${directoryKey} as a directory but another entry declares it as a file`,
-        );
-      }
-      directoryKeys.add(directoryKey);
-    }
-    if (!isDirectory) fileKeys.add(nameKey);
+    memberNames.push({ key: nameKey, isDirectory, index });
     if (!validExtra(input, nameStart + nameLength, extraLength)) {
       return unreadable(`entry ${index + 1} has an unsupported or malformed extra field`);
     }
     members.push({ nameBytes, versionNeeded, flags, method, crc, compressedSize, uncompressedSize, localOffset });
     cursor = recordEnd;
   }
+  const conflict = findNameConflict(memberNames);
+  if (conflict !== null) return conflict;
   if (cursor !== endOffset) {
     return unreadable("the central directory carries bytes outside its declared entry count");
   }

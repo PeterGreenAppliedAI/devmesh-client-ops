@@ -849,6 +849,29 @@ describe("DOCX container structure", () => {
     }
   });
 
+  it("refuses an entry that conflates the DOS volume-label and directory attributes before the parser", async () => {
+    const volumeLabel = buildDocxWithExtraEntries(
+      [
+        {
+          name: "customXml/volume",
+          bytes: new Uint8Array(0),
+          externalAttributes: 0x18,
+        },
+      ],
+      [{ runs: ["Volume-label document."] }],
+    );
+    const { parser, calls } = countingParser();
+    const outcome = await importDocx(volumeLabel, "volume-label.docx", parser);
+    refused(outcome, "unreadable_document", /unsupported DOS volume label/);
+    if (outcome.ok) throw new Error("unreachable");
+    assert.match(
+      outcome.refusal.message,
+      reExportGuidance,
+      "the volume-label refusal carries re-export guidance",
+    );
+    assert.equal(calls(), 0, "a DOS volume-label entry is not handed to the parser");
+  });
+
   it("refuses an unsupported Unix symbolic-link entry before the parser", async () => {
     const bytes = buildDocxWithExtraEntries(
       [
@@ -922,6 +945,28 @@ describe("DOCX container structure", () => {
     );
     const { result } = imported(await importDocx(compatibleDirectory, "directory-child.docx"));
     assert.equal(result.extractedText, "Directory child document.");
+  });
+
+  it("refuses a file used as a directory by a very deep path without materialising its ancestors", async () => {
+    const deepName = `word/${"a/".repeat(30000)}leaf`;
+    const bytes = buildZipDetailed([
+      { name: "word", bytes: new Uint8Array(0) },
+      { name: deepName, bytes: new Uint8Array(0) },
+    ]).bytes;
+    const { parser, calls } = countingParser();
+    const outcome = await importDocx(bytes, "deep-conflict.docx", parser);
+    refused(
+      outcome,
+      "unreadable_document",
+      /uses word as a directory but another entry declares it as a file/,
+    );
+    if (outcome.ok) throw new Error("unreachable");
+    assert.match(
+      outcome.refusal.message,
+      reExportGuidance,
+      "the deep-path conflict carries re-export guidance",
+    );
+    assert.equal(calls(), 0, "a deep-path conflict is not handed to the parser");
   });
 
   it("refuses equivalent empty directory spellings that share one part name before the parser", async () => {
