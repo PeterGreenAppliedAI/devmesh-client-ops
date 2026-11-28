@@ -18,14 +18,23 @@ import {
 } from "../src/transcript-docx.ts";
 import {
   buildDocx,
+  buildDocxWithExtraEntries,
+  buildZipDetailed,
+  crc32,
   docxBytes,
+  docxOfExpandedLength,
   docxOfLength,
+  docxWithExactRatioEntry,
+  pseudoRandomBytes,
   type TestTable,
 } from "./fixtures/transcript-docx.ts";
 
 function sha256(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
+
+/** The re-export guidance every unreadable-container refusal must carry. */
+const reExportGuidance = /re-export .* as DOCX .* or .* UTF-8 text/i;
 
 /** Assert an outcome is a successful DOCX import and return it. */
 function imported(outcome: DocxImportOutcome): { result: ImportResult; blocks: readonly ExtractedBlock[] } {
@@ -43,6 +52,29 @@ function refused(outcome: DocxImportOutcome, code: string, messagePattern: RegEx
   assert.deepEqual(outcome.refusal.supportedExports, DOCX_SUPPORTED_EXPORTS);
   assert.equal((outcome as unknown as Record<string, unknown>).result, undefined);
   assert.equal((outcome as unknown as Record<string, unknown>).blocks, undefined);
+}
+
+/** A parser that counts calls, so a preflight refusal can be shown to skip it. */
+function countingParser(value = "<p>unexpected parser output</p>"): { parser: DocxParser; calls: () => number } {
+  let calls = 0;
+  return {
+    parser: {
+      convertToHtml: () => {
+        calls += 1;
+        return Promise.resolve({ value });
+      },
+    },
+    calls: () => calls,
+  };
+}
+
+/** A copy of archive bytes with one little-endian field replaced. */
+function patched(bytes: Uint8Array, offset: number, value: number, width: 2 | 4): Uint8Array {
+  const copy = Uint8Array.from(bytes);
+  const view = new DataView(copy.buffer);
+  if (width === 2) view.setUint16(offset, value, true);
+  else view.setUint32(offset, value, true);
+  return copy;
 }
 
 describe("DOCX import", () => {
@@ -333,6 +365,197 @@ describe("DOCX size limits", () => {
     const text = "a".repeat(MAX_CONTENT_BYTES + 1);
     const parser: DocxParser = { convertToHtml: () => Promise.resolve({ value: `<p>${text}</p>` }) };
     refused(await importDocx(docxBytes(["marker"]), "big.docx", parser), "too_large", /at most .* bytes/);
+  });
+});
+
+
+describe("DOCX container size declarations", () => {
+  const atMost = /at most .* bytes\. Nothing was truncated/;
+
+  it("refuses a declared total over the content limit by one byte before parsing", async () => {
+    const half = Math.floor(MAX_CONTENT_BYTES / 2);
+    const bytes = buildZipDetailed([
+      { name: "first", bytes: new Uint8Array(0), method: 8, declaredUncompressedSize: half },
+      { name: "second", bytes: new Uint8Array(0), method: 8, declaredUncompressedSize: MAX_CONTENT_BYTES - half + 1 },
+    ]).bytes;
+    const { parser, calls } = countingParser();
+    refused(await importDocx(bytes, "total.docx", parser), "too_large", atMost);
+    assert.equal(calls(), 0, "the parser is not called for a declared-total refusal");
+  });
+
+  it("refuses one entry declaring more than the content limit before parsing", async () => {
+    const bytes = buildZipDetailed([
+      { name: "one", bytes: new Uint8Array(0), method: 8, declaredUncompressedSize: MAX_CONTENT_BYTES + 1 },
+    ]).bytes;
+    const { parser, calls } = countingParser();
+    refused(await importDocx(bytes, "entry.docx", parser), "too_large", atMost);
+    assert.equal(calls(), 0, "the parser is not called for a declared-entry refusal");
+  });
+
+  it("refuses a ratio over 100:1 before parsing, including positive output against zero compressed bytes", async () => {
+    const over = buildZipDetailed([
+      {
+        name: "ratio",
+        method: 8,
+        compressedData: new Uint8Array([0]),
+        declaredCompressedSize: 1,
+        declaredUncompressedSize: 101,
+        crc: 0,
+      },
+    ]).bytes;
+    const first = countingParser();
+    refused(await importDocx(over, "ratio.docx", first.parser), "unreadable_document", reExportGuidance);
+    assert.equal(first.calls(), 0, "the parser is not called for a ratio refusal");
+
+    const zero = buildZipDetailed([
+      {
+        name: "zero",
+        method: 8,
+        compressedData: new Uint8Array(0),
+        declaredCompressedSize: 0,
+        declaredUncompressedSize: 1,
+        crc: 0,
+      },
+    ]).bytes;
+    const second = countingParser();
+    refused(await importDocx(zero, "zero.docx", second.parser), "unreadable_document", reExportGuidance);
+    assert.equal(second.calls(), 0, "the parser is not called when positive output is declared against zero compressed bytes");
+  });
+
+  it("imports a valid DOCX at exactly 100:1 and with a valid empty entry", async () => {
+    const ratio = imported(await importDocx(docxWithExactRatioEntry(), "ratio-ok.docx"));
+    assert.equal(ratio.result.extractedText, "Ratio document.");
+
+    const empty = buildDocxWithExtraEntries(
+      [{ name: "customXml/empty.bin", bytes: new Uint8Array(0) }],
+      [{ runs: ["Empty entry document."] }],
+    );
+    const emptyResult = imported(await importDocx(empty, "empty-ok.docx"));
+    assert.equal(emptyResult.result.extractedText, "Empty entry document.");
+  });
+
+  it("accepts ordinary stored and deflated entries with valid data descriptors", async () => {
+    const bytes = buildDocxWithExtraEntries(
+      [
+        { name: "customXml/stored-descriptor.bin", bytes: new Uint8Array([1, 2, 3]), dataDescriptor: true },
+        {
+          name: "customXml/deflated-descriptor.bin",
+          bytes: new TextEncoder().encode("descriptor text"),
+          method: 8,
+          dataDescriptor: true,
+          descriptorSignature: false,
+        },
+      ],
+      [{ runs: ["Descriptor document."] }],
+    );
+    const { result } = imported(await importDocx(bytes, "descriptor.docx"));
+    assert.equal(result.extractedText, "Descriptor document.");
+    assert.equal(result.originalBytes.length, bytes.length);
+    assert.deepEqual(result.originalBytes, bytes);
+  });
+});
+
+describe("DOCX container verification", () => {
+  it("refuses an entry whose actual expansion length or data does not match its declaration before Mammoth", async () => {
+    const content = new TextEncoder().encode("abc");
+    const mismatch = buildDocxWithExtraEntries(
+      [
+        {
+          name: "customXml/mismatch.bin",
+          bytes: content,
+          method: 8,
+          declaredUncompressedSize: 10,
+          crc: crc32(content),
+        },
+      ],
+      [{ runs: ["Mismatch document."] }],
+    );
+    const first = countingParser();
+    refused(
+      await importDocx(mismatch, "mismatch.docx", first.parser),
+      "unreadable_document",
+      /expands to 3 bytes but declares 10 bytes/,
+    );
+    assert.equal(first.calls(), 0, "Mammoth is not called when the actual expansion length disagrees");
+
+    const unreadableData = buildDocxWithExtraEntries(
+      [
+        {
+          name: "customXml/bad.bin",
+          method: 8,
+          compressedData: new Uint8Array([0xff]),
+          declaredCompressedSize: 1,
+          declaredUncompressedSize: 1,
+          crc: 0,
+        },
+      ],
+      [{ runs: ["Bad document."] }],
+    );
+    const second = countingParser();
+    refused(
+      await importDocx(unreadableData, "bad.docx", second.parser),
+      "unreadable_document",
+      /cannot be expanded within its declared size|does not match its declared CRC/,
+    );
+    assert.equal(second.calls(), 0, "Mammoth is not called when member data cannot be verified");
+  });
+});
+
+describe("DOCX container structure", () => {
+  it("refuses malformed, truncated, ambiguous, inconsistent and unsupported ZIP directories before parsing", async () => {
+    const valid = docxBytes(["Container text."]);
+    const one = buildZipDetailed([{ name: "only", bytes: new TextEncoder().encode("only") }]);
+    const two = buildZipDetailed([
+      { name: "same", bytes: new TextEncoder().encode("first") },
+      { name: "same", bytes: new TextEncoder().encode("second") },
+    ]);
+    const cases: readonly { readonly name: string; readonly bytes: Uint8Array }[] = [
+      { name: "truncated", bytes: valid.subarray(0, valid.length - 10) },
+      { name: "entry count", bytes: patched(one.bytes, one.eocdOffset + 10, 2, 2) },
+      { name: "central signature", bytes: patched(one.bytes, one.centralOffsets[0], 0, 4) },
+      { name: "local signature", bytes: patched(one.bytes, one.localOffsets[0], 0, 4) },
+      { name: "central size", bytes: patched(one.bytes, one.eocdOffset + 12, 1, 4) },
+      { name: "central offset", bytes: patched(one.bytes, one.eocdOffset + 16, 1, 4) },
+      { name: "duplicate name", bytes: two.bytes },
+      { name: "unsupported method", bytes: buildZipDetailed([{ name: "method", bytes: new Uint8Array([1]), method: 99 }]).bytes },
+      { name: "ZIP64", bytes: buildZipDetailed([{ name: "zip64", bytes: new Uint8Array([1]), declaredCompressedSize: 0xffffffff }]).bytes },
+      { name: "local size", bytes: patched(one.bytes, one.localOffsets[0] + 22, 2, 4) },
+    ];
+    const { parser, calls } = countingParser();
+    for (const candidate of cases) {
+      refused(
+        await importDocx(candidate.bytes, `${candidate.name}.docx`, parser),
+        "unreadable_document",
+        reExportGuidance,
+      );
+    }
+    assert.equal(calls(), 0, "no malformed or unsupported container reaches the parser");
+  });
+
+  it("imports an archive whose declared parts total exactly the content limit", async () => {
+    const bytes = docxOfExpandedLength(MAX_CONTENT_BYTES);
+    const { result } = imported(await importDocx(bytes, "expanded.docx"));
+    assert.equal(result.extractedText, "Expanded document.");
+    assert.ok(bytes.length < MAX_CONTENT_BYTES, "the original stays below its own byte limit");
+  });
+
+  it("builds a one-megabyte upload that declares about 300 MiB without expanding it", async () => {
+    const filler = pseudoRandomBytes(1024 * 1024);
+    const bytes = buildDocxWithExtraEntries(
+      [
+        {
+          name: "customXml/large.bin",
+          bytes: filler,
+          method: 8,
+          declaredUncompressedSize: 300 * 1024 * 1024,
+        },
+      ],
+      [{ runs: ["Large declaration."] }],
+    );
+    assert.ok(bytes.length >= 1024 * 1024, "the upload carries about a megabyte of compressed data");
+    const { parser, calls } = countingParser();
+    refused(await importDocx(bytes, "large.docx", parser), "too_large", /at most .* bytes\. Nothing was truncated/);
+    assert.equal(calls(), 0, "the parser is not called for the inert large declaration");
   });
 });
 
