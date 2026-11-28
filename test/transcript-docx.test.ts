@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { describe, it } from "node:test";
+import { deflateRawSync } from "node:zlib";
 import {
   canonicalize,
   MAX_CONTENT_BYTES,
@@ -75,6 +76,19 @@ function patched(bytes: Uint8Array, offset: number, value: number, width: 2 | 4)
   if (width === 2) view.setUint16(offset, value, true);
   else view.setUint32(offset, value, true);
   return copy;
+}
+
+/** An Info-ZIP Unicode Path extra field that names an alternate member path. */
+function unicodePathExtra(path: string, originalName: Uint8Array): Uint8Array {
+  const encoded = new TextEncoder().encode(path);
+  const extra = new Uint8Array(4 + 1 + 4 + encoded.length);
+  const view = new DataView(extra.buffer);
+  view.setUint16(0, 0x7075, true);
+  view.setUint16(2, 1 + 4 + encoded.length, true);
+  extra[4] = 1;
+  view.setUint32(5, crc32(originalName), true);
+  extra.set(encoded, 9);
+  return extra;
 }
 
 describe("DOCX import", () => {
@@ -392,21 +406,27 @@ describe("DOCX container size declarations", () => {
     assert.equal(calls(), 0, "the parser is not called for a declared-entry refusal");
   });
 
-  it("refuses a ratio over 100:1 before parsing, including positive output against zero compressed bytes", async () => {
-    const over = buildZipDetailed([
-      {
-        name: "ratio",
-        method: 8,
-        compressedData: new Uint8Array([0]),
-        declaredCompressedSize: 1,
-        declaredUncompressedSize: 101,
-        crc: 0,
-      },
-    ]).bytes;
+  it("refuses a valid, size-consistent member whose actual ratio exceeds 100:1 before parsing", async () => {
+    // The deflate stream is complete and its declared length and CRC match the
+    // content, so only the ratio declaration itself can refuse it. Removing the
+    // ratio guard would let bounded verification pass and reach the parser.
+    const content = new Uint8Array(1_000_000);
+    const stream = deflateRawSync(content);
+    assert.ok(stream.length * 100 < content.length, "the member actually exceeds the 100:1 ratio");
+    const over = buildDocxWithExtraEntries(
+      [{ name: "customXml/ratio.bin", bytes: content, method: 8 }],
+      [{ runs: ["Ratio document."] }],
+    );
     const first = countingParser();
-    refused(await importDocx(over, "ratio.docx", first.parser), "unreadable_document", reExportGuidance);
+    refused(
+      await importDocx(over, "ratio.docx", first.parser),
+      "unreadable_document",
+      /over the 100:1 limit/,
+    );
     assert.equal(first.calls(), 0, "the parser is not called for a ratio refusal");
+  });
 
+  it("refuses positive output declared against zero compressed bytes before parsing", async () => {
     const zero = buildZipDetailed([
       {
         name: "zero",
@@ -418,7 +438,11 @@ describe("DOCX container size declarations", () => {
       },
     ]).bytes;
     const second = countingParser();
-    refused(await importDocx(zero, "zero.docx", second.parser), "unreadable_document", reExportGuidance);
+    refused(
+      await importDocx(zero, "zero.docx", second.parser),
+      "unreadable_document",
+      /against zero compressed bytes/,
+    );
     assert.equal(second.calls(), 0, "the parser is not called when positive output is declared against zero compressed bytes");
   });
 
@@ -499,6 +523,39 @@ describe("DOCX container verification", () => {
     );
     assert.equal(second.calls(), 0, "Mammoth is not called when member data cannot be verified");
   });
+
+  it("requires bounded expansion to consume the exact declared compressed extent", async () => {
+    // The complete deflate stream expands to the declared length with the
+    // declared CRC, but trailing bytes inside the declared compressed extent
+    // make the declaration look like exactly 100:1. The inflater must consume
+    // only the stream, so the unaccounted trailing bytes are refused.
+    const content = new Uint8Array(1_000_000);
+    const stream = deflateRawSync(content);
+    const padded = new Uint8Array(content.length / 100);
+    assert.ok(stream.length < padded.length, "the real stream leaves room for trailing bytes");
+    padded.set(stream);
+    const bytes = buildDocxWithExtraEntries(
+      [
+        {
+          name: "customXml/trailing.bin",
+          bytes: content,
+          method: 8,
+          compressedData: padded,
+          declaredCompressedSize: padded.length,
+          declaredUncompressedSize: content.length,
+          crc: crc32(content),
+        },
+      ],
+      [{ runs: ["Trailing document."] }],
+    );
+    const { parser, calls } = countingParser();
+    refused(
+      await importDocx(bytes, "trailing.docx", parser),
+      "unreadable_document",
+      /consumes .* compressed bytes/,
+    );
+    assert.equal(calls(), 0, "Mammoth is not called when the compressed extent is not fully consumed");
+  });
 });
 
 describe("DOCX container structure", () => {
@@ -530,6 +587,116 @@ describe("DOCX container structure", () => {
       );
     }
     assert.equal(calls(), 0, "no malformed or unsupported container reaches the parser");
+  });
+
+  it("refuses unsupported extraction versions, header disagreement and method-invalid flags", async () => {
+    const base = buildZipDetailed([{ name: "only", bytes: new TextEncoder().encode("versioned") }]);
+    let unsupported = patched(base.bytes, base.centralOffsets[0] + 6, 45, 2);
+    unsupported = patched(unsupported, base.localOffsets[0] + 4, 45, 2);
+    const disagreement = patched(base.bytes, base.centralOffsets[0] + 6, 10, 2);
+    let invalidStoredFlags = patched(base.bytes, base.centralOffsets[0] + 8, 0x0806, 2);
+    invalidStoredFlags = patched(invalidStoredFlags, base.localOffsets[0] + 6, 0x0806, 2);
+    const cases = [
+      { name: "unsupported version", bytes: unsupported, message: /unsupported extraction version/ },
+      { name: "version disagreement", bytes: disagreement, message: /disagrees .* extraction versions/ },
+      { name: "invalid stored flags", bytes: invalidStoredFlags, message: /unsupported ZIP flags for its compression method/ },
+    ];
+    const { parser, calls } = countingParser();
+    for (const candidate of cases) {
+      refused(
+        await importDocx(candidate.bytes, `${candidate.name}.docx`, parser),
+        "unreadable_document",
+        candidate.message,
+      );
+    }
+    assert.equal(calls(), 0, "no unsupported header reaches the parser");
+  });
+
+  it("refuses data-area gaps, trailing local bytes and bytes no entry accounts for", async () => {
+    const firstBytes = new TextEncoder().encode("first!");
+    const secondBytes = new TextEncoder().encode("second!");
+    const built = buildZipDetailed([
+      { name: "first", bytes: firstBytes },
+      { name: "second", bytes: secondBytes },
+    ]);
+    const { parser, calls } = countingParser();
+
+    // Shorten the first member's declarations in both headers: the byte before
+    // the next local header is then a gap no member accounts for.
+    let gap = patched(built.bytes, built.centralOffsets[0] + 20, firstBytes.length - 1, 4);
+    gap = patched(gap, built.centralOffsets[0] + 24, firstBytes.length - 1, 4);
+    gap = patched(gap, built.localOffsets[0] + 18, firstBytes.length - 1, 4);
+    gap = patched(gap, built.localOffsets[0] + 22, firstBytes.length - 1, 4);
+    refused(await importDocx(gap, "gap.docx", parser), "unreadable_document", /gap that no entry accounts for/);
+
+    // Shorten the last member so its extent ends before the central directory.
+    let trailing = patched(built.bytes, built.centralOffsets[1] + 20, secondBytes.length - 1, 4);
+    trailing = patched(trailing, built.centralOffsets[1] + 24, secondBytes.length - 1, 4);
+    trailing = patched(trailing, built.localOffsets[1] + 18, secondBytes.length - 1, 4);
+    trailing = patched(trailing, built.localOffsets[1] + 22, secondBytes.length - 1, 4);
+    refused(
+      await importDocx(trailing, "trailing.docx", parser),
+      "unreadable_document",
+      /does not end at the central directory/,
+    );
+
+    // An archive declaring no entries but carrying bytes before the central
+    // directory must not leave those bytes unaccounted for.
+    const eocd = new Uint8Array(22);
+    const eocdView = new DataView(eocd.buffer);
+    eocdView.setUint32(0, 0x06054b50, true);
+    eocdView.setUint32(16, 4, true);
+    const emptyWithData = new Uint8Array(26);
+    emptyWithData.set([0x61, 0x62, 0x63, 0x64], 0);
+    emptyWithData.set(eocd, 4);
+    refused(
+      await importDocx(emptyWithData, "zero-area.docx", parser),
+      "unreadable_document",
+      /bytes that no entry accounts for/,
+    );
+
+    assert.equal(calls(), 0, "no unaccounted data area reaches the parser");
+  });
+
+  it("refuses an alternate Unicode Path name that could make member names ambiguous", async () => {
+    const first = new TextEncoder().encode("first");
+    const secondName = new TextEncoder().encode("second");
+    const built = buildZipDetailed([
+      { name: "part-one", bytes: first },
+      {
+        name: "part-two",
+        bytes: secondName,
+        centralExtra: unicodePathExtra("part-one", secondName),
+      },
+    ]);
+    const { parser, calls } = countingParser();
+    refused(
+      await importDocx(built.bytes, "unicode-path.docx", parser),
+      "unreadable_document",
+      reExportGuidance,
+    );
+    assert.equal(calls(), 0, "an alternate-name extra field is not handed to the parser");
+  });
+
+  it("reports central offsets that identify each central header in a multi-entry archive", async () => {
+    const names = ["first", "second", "third"];
+    const built = buildZipDetailed(
+      names.map((name) => ({ name, bytes: new TextEncoder().encode(name) })),
+    );
+    const view = new DataView(built.bytes.buffer, built.bytes.byteOffset, built.bytes.byteLength);
+    for (let index = 0; index < names.length; index += 1) {
+      const offset = built.centralOffsets[index];
+      assert.equal(view.getUint32(offset, true), 0x02014b50, `central offset ${index} points at a central header`);
+      const nameLength = view.getUint16(offset + 28, true);
+      const name = new TextDecoder().decode(built.bytes.subarray(offset + 46, offset + 46 + nameLength));
+      assert.equal(name, names[index], `central offset ${index} names the corresponding entry`);
+    }
+    const damaged = patched(built.bytes, built.centralOffsets[1], 0, 4);
+    refused(
+      await importDocx(damaged, "multi-central.docx"),
+      "unreadable_document",
+      /central-directory entry 2 has no entry signature/,
+    );
   });
 
   it("imports an archive whose declared parts total exactly the content limit", async () => {

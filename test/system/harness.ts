@@ -4,8 +4,9 @@
  * The harness starts the application's own source entry (`src/index.ts`) in a
  * child Node process using the same TypeScript support as the repository's
  * test runner, over a fresh temporary directory. A caller may seed that
- * directory before the child opens it. The harness waits for HTTP `/health`
- * readiness, fails on an early child exit or a readiness timeout, and exposes
+ * directory before the child opens it. The harness waits for the child's own
+ * listening announcement and a successful HTTP `/health` probe within one
+ * deadline, fails on an early child exit or a readiness timeout, and exposes
  * the directory, PID, ready origin, Linux peak-RSS bytes and the child's actual
  * exit status or signal. Stopping is graceful (SIGTERM); a disposable run may
  * instead be SIGKILLed. Cleanup reaps a still-running child and removes the
@@ -101,42 +102,79 @@ function healthReady(origin: string): Promise<boolean> {
 /**
  * Start one disposable application child. `seed` runs, with no child running
  * yet, against the created directory so a test can create its own synthetic
- * meetings. Readiness means the child's loopback `/health` route answered.
+ * meetings. Readiness means the child announced its listening origin and its
+ * loopback `/health` route answered before one shared deadline.
  */
 export async function startDocxServer(
   seed?: (directory: string) => void | Promise<void>,
 ): Promise<DocxTestServer> {
   const directory = mkdtempSync(join(tmpdir(), "docx-system-"));
+  let child: ChildProcess | null = null;
+  let spawnError: Error | null = null;
+  let exitInfo: ChildExit | null = null;
+  let exitPromise: Promise<ChildExit> | null = null;
+
+  function exitWithin(ms: number): Promise<ChildExit> {
+    if (exitInfo !== null) return Promise.resolve(exitInfo);
+    if (exitPromise === null) {
+      return Promise.reject(new Error("the application child was not started"));
+    }
+    return new Promise<ChildExit>((resolveExit, rejectExit) => {
+      const timer = setTimeout(() => {
+        rejectExit(new Error(`the application child ${child?.pid ?? "unknown"} did not exit within ${ms} ms`));
+      }, ms);
+      exitPromise!.then((info) => {
+        clearTimeout(timer);
+        resolveExit(info);
+      });
+    });
+  }
+
+  /** Terminate and reap the child; cleanup and startup failure share this path. */
+  async function terminate(signal: NodeJS.Signals): Promise<ChildExit> {
+    if (exitInfo !== null) return exitInfo;
+    if (spawnError !== null) throw spawnError;
+    if (child === null) throw new Error("the application child was not started");
+    try {
+      child.kill(signal);
+    } catch {
+      // The child may already have exited between the check and the signal.
+    }
+    return exitWithin(EXIT_TIMEOUT_MS);
+  }
+
   try {
     await seed?.(directory);
     const port = await freePort();
-    const child: ChildProcess = spawn(
+    const application = spawn(
       process.execPath,
       ["--experimental-strip-types", join(REPOSITORY, "src", "index.ts"), "--port", String(port), "--data-dir", directory],
       { cwd: REPOSITORY, stdio: ["ignore", "pipe", "pipe"] },
     );
+    child = application;
     let stdout = "";
     let stderr = "";
-    let spawnError: Error | null = null;
-    let exitInfo: ChildExit | null = null;
-    child.stdout?.on("data", (chunk: Buffer) => {
+    application.stdout?.on("data", (chunk: Buffer) => {
       stdout += chunk.toString("utf8");
     });
-    child.stderr?.on("data", (chunk: Buffer) => {
+    application.stderr?.on("data", (chunk: Buffer) => {
       stderr += chunk.toString("utf8");
     });
-    child.on("error", (error) => {
+    application.on("error", (error) => {
       spawnError = error;
     });
-    const exitPromise = new Promise<ChildExit>((resolveExit) => {
-      child.once("exit", (code, signal) => {
+    exitPromise = new Promise<ChildExit>((resolveExit) => {
+      application.once("exit", (code, signal) => {
         exitInfo = { code, signal };
         resolveExit(exitInfo);
       });
     });
-    const origin = `http://127.0.0.1:${port}`;
 
+    // One deadline covers both the child's own listening announcement and the
+    // first successful HTTP probe, while every pass also observes an early exit.
     const deadline = Date.now() + READY_TIMEOUT_MS;
+    let origin: string | null = null;
+    let ready = false;
     while (Date.now() < deadline) {
       if (spawnError !== null) {
         const failure = spawnError as Error;
@@ -145,35 +183,38 @@ export async function startDocxServer(
       if (exitInfo !== null) {
         throw new Error(`the application child exited before readiness: ${JSON.stringify(exitInfo)}\n${stderr}`);
       }
-      if (await healthReady(origin)) break;
+      if (origin === null) {
+        const announcement = /^Listening on (http:\/\/127\.0\.0\.1:\d+)\s*$/m.exec(stdout);
+        if (announcement !== null) origin = announcement[1];
+      }
+      if (origin !== null && (await healthReady(origin)) && Date.now() <= deadline) {
+        ready = true;
+        break;
+      }
       await delay(25);
     }
-    if (exitInfo !== null || (spawnError as Error | null) !== null || !(await healthReady(origin))) {
-      throw new Error(`the application child did not become ready within ${READY_TIMEOUT_MS} ms\n${stdout}${stderr}`);
+    if (spawnError !== null) {
+      const failure = spawnError as Error;
+      throw new Error(`the application child could not be started: ${failure.message}`);
+    }
+    if (exitInfo !== null) {
+      throw new Error(`the application child exited before readiness: ${JSON.stringify(exitInfo)}\n${stderr}`);
+    }
+    if (!ready || origin === null) {
+      throw new Error(
+        `the application child did not announce readiness and answer /health within ${READY_TIMEOUT_MS} ms\n${stdout}${stderr}`,
+      );
     }
 
     let cleaned = false;
-    function exitWithin(ms: number): Promise<ChildExit> {
-      if (exitInfo !== null) return Promise.resolve(exitInfo);
-      return new Promise<ChildExit>((resolveExit, rejectExit) => {
-        const timer = setTimeout(() => {
-          rejectExit(new Error(`the application child ${child.pid ?? "unknown"} did not exit within ${ms} ms`));
-        }, ms);
-        exitPromise.then((info) => {
-          clearTimeout(timer);
-          resolveExit(info);
-        });
-      });
-    }
-
     return {
       directory,
-      pid: child.pid ?? 0,
+      pid: application.pid ?? 0,
       origin,
       memoryBytes(): number {
-        const status = readFileSync(`/proc/${child.pid}/status`, "utf8");
+        const status = readFileSync(`/proc/${application.pid}/status`, "utf8");
         const match = /^VmHWM:\s+(\d+)\s+kB$/m.exec(status);
-        if (match === null) throw new Error(`the application child ${child.pid} reports no VmHWM`);
+        if (match === null) throw new Error(`the application child ${application.pid} reports no VmHWM`);
         return Number(match[1]) * 1024;
       },
       exitInfo(): ChildExit | null {
@@ -181,35 +222,36 @@ export async function startDocxServer(
       },
       async stop(): Promise<ChildExit> {
         if (exitInfo !== null) return exitInfo;
-        child.kill("SIGTERM");
+        application.kill("SIGTERM");
         return exitWithin(EXIT_TIMEOUT_MS);
       },
       async kill(): Promise<ChildExit> {
         if (exitInfo !== null) return exitInfo;
-        child.kill("SIGKILL");
+        application.kill("SIGKILL");
         return exitWithin(EXIT_TIMEOUT_MS);
       },
       async cleanup(): Promise<void> {
         if (cleaned) return;
-        cleaned = true;
-        if (exitInfo === null) {
-          try {
-            child.kill("SIGKILL");
-          } catch {
-            // The child may have exited between the check and the signal.
-          }
-          try {
-            await exitWithin(EXIT_TIMEOUT_MS);
-          } catch {
-            // Cleanup still removes the disposable directory; the failed wait
-            // is reported by the test run's failing assertion, not swallowed.
-          }
+        try {
+          if (exitInfo === null) await terminate("SIGKILL");
+          rmSync(directory, { recursive: true, force: true });
+          cleaned = true;
+        } catch (error) {
+          throw new Error(`cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
         }
-        rmSync(directory, { recursive: true, force: true });
       },
     };
   } catch (error) {
-    rmSync(directory, { recursive: true, force: true });
+    try {
+      // A failed startup must not leave a live child behind. Remove the
+      // directory only after the child, if there is one, has been reaped.
+      if (child !== null && spawnError === null) await terminate("SIGKILL");
+      rmSync(directory, { recursive: true, force: true });
+    } catch (cleanupError) {
+      throw new Error(
+        `the application child start failed (${error instanceof Error ? error.message : String(error)}); cleanup also failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+      );
+    }
     throw error;
   }
 }

@@ -6,17 +6,19 @@
  * member header exactly as the supplied bytes describe them, and refuses a
  * structure it cannot account for: a missing or ambiguous end record, an entry
  * count or central-directory size that disagrees with the bytes, an unsupported
- * compression method or feature (encryption, ZIP64, multiple disks), a member
- * whose header or data runs outside the data area, overlapping members, a
- * duplicate name, or local and central declarations that disagree.
+ * extraction version, compression method, flags or feature (encryption, ZIP64,
+ * multiple disks, an alternate-name extra field), a member whose header or data
+ * runs outside the data area, a gap or overlap in that area, a duplicate name,
+ * or local and central declarations that disagree.
  *
  * Declared sizes are checked before any expansion: each declared uncompressed
  * size and their sum must be at most MAX_CONTENT_BYTES, and one entry's
  * uncompressed size may not exceed 100 times its compressed size. Only after
  * those declarations pass are stored members CRC-checked and deflated members
- * expanded with a bounded inflater, so the actual output must have exactly the
- * declared length and CRC. The caller then hands the same original bytes to the
- * parser; this module never writes an expanded member anywhere.
+ * expanded with a bounded inflater that must consume exactly the declared
+ * compressed extent, so the actual output must have exactly the declared length
+ * and CRC. The caller then hands the same original bytes to the parser; this
+ * module never writes an expanded member anywhere.
  */
 import { inflateRawSync } from "node:zlib";
 import { MAX_CONTENT_BYTES } from "./transcript.ts";
@@ -38,10 +40,16 @@ const LOCAL_SIGNATURE = 0x04034b50;
 const DATA_DESCRIPTOR_SIGNATURE = 0x08074b50;
 const ZIP64_EXTRA_ID = 0x0001;
 const AES_EXTRA_ID = 0x9901;
+const UNICODE_PATH_EXTRA_ID = 0x7075;
 const ZIP64_VALUE = 0xffffffff;
 
-/** Flags this reader accepts: compression options, data descriptor and UTF-8 names. */
-const ALLOWED_FLAGS = 0x0002 | 0x0004 | 0x0008 | 0x0800;
+/** Extraction versions this reader supports: stored 1.0, deflated 2.0. */
+const STORED_VERSION_NEEDED = 10;
+const DEFLATED_VERSION_NEEDED = 20;
+
+/** Flags this reader accepts, restricted to the bits each method may use. */
+const STORED_ALLOWED_FLAGS = 0x0008 | 0x0800;
+const DEFLATED_ALLOWED_FLAGS = 0x0002 | 0x0004 | 0x0008 | 0x0800;
 const DATA_DESCRIPTOR_FLAG = 0x0008;
 const UTF8_NAME_FLAG = 0x0800;
 
@@ -122,15 +130,33 @@ function validExtra(input: Reader, start: number, length: number): boolean {
     const id = u16(input, cursor);
     const size = u16(input, cursor + 2);
     if (cursor + 4 + size > end) return false;
-    if (id === ZIP64_EXTRA_ID || id === AES_EXTRA_ID) return false;
+    // ZIP64 and AES are unsupported features. A Unicode Path extra field
+    // supplies an alternate effective name, which would make two raw names
+    // ambiguous, so it is refused instead of trusted.
+    if (id === ZIP64_EXTRA_ID || id === AES_EXTRA_ID || id === UNICODE_PATH_EXTRA_ID) return false;
     cursor += 4 + size;
   }
   return cursor === end;
 }
 
+/** True when a header's extraction version is one this reader supports. */
+function validVersionNeeded(version: number, method: number): boolean {
+  if (version !== STORED_VERSION_NEEDED && version !== DEFLATED_VERSION_NEEDED) return false;
+  // A deflated entry cannot be extracted by a 1.0 reader, so it must declare
+  // the 2.0 extraction version; a stored entry may declare either version.
+  return method !== 8 || version === DEFLATED_VERSION_NEEDED;
+}
+
+/** True when a header's declared flags are only those its method may use. */
+function validFlags(flags: number, method: number): boolean {
+  const allowed = method === 8 ? DEFLATED_ALLOWED_FLAGS : STORED_ALLOWED_FLAGS;
+  return (flags & ~allowed) === 0;
+}
+
 /** A central-directory member declaration, before its local header is read. */
 interface CentralMember {
   readonly nameBytes: Uint8Array;
+  readonly versionNeeded: number;
   readonly flags: number;
   readonly method: number;
   readonly crc: number;
@@ -183,6 +209,7 @@ function readCentralDirectory(
     if (u32(input, cursor) !== CENTRAL_SIGNATURE) {
       return unreadable(`central-directory entry ${index + 1} has no entry signature`);
     }
+    const versionNeeded = u16(input, cursor + 6);
     const flags = u16(input, cursor + 8);
     const method = u16(input, cursor + 10);
     const crc = u32(input, cursor + 16);
@@ -195,11 +222,14 @@ function readCentralDirectory(
     const localOffset = u32(input, cursor + 42);
     const recordEnd = cursor + 46 + nameLength + extraLength + commentLength;
     if (recordEnd > endOffset) return unreadable(`central-directory entry ${index + 1} is truncated`);
-    if ((flags & ~ALLOWED_FLAGS) !== 0) {
-      return unreadable(`entry ${index + 1} uses unsupported ZIP flags`);
-    }
     if (method !== 0 && method !== 8) {
       return unreadable(`entry ${index + 1} uses unsupported compression method ${method}`);
+    }
+    if (!validVersionNeeded(versionNeeded, method)) {
+      return unreadable(`entry ${index + 1} requires unsupported extraction version ${versionNeeded}`);
+    }
+    if (!validFlags(flags, method)) {
+      return unreadable(`entry ${index + 1} uses unsupported ZIP flags for its compression method`);
     }
     if (diskStart !== 0) return unreadable(`entry ${index + 1} is not on the first disk`);
     if (
@@ -226,7 +256,7 @@ function readCentralDirectory(
     if (!validExtra(input, nameStart + nameLength, extraLength)) {
       return unreadable(`entry ${index + 1} has an unsupported or malformed extra field`);
     }
-    members.push({ nameBytes, flags, method, crc, compressedSize, uncompressedSize, localOffset });
+    members.push({ nameBytes, versionNeeded, flags, method, crc, compressedSize, uncompressedSize, localOffset });
     cursor = recordEnd;
   }
   if (cursor !== endOffset) {
@@ -267,6 +297,7 @@ function readLocalMembers(
     if (u32(input, start) !== LOCAL_SIGNATURE) {
       return unreadable(`entry ${index + 1} has no local header signature`);
     }
+    const versionNeeded = u16(input, start + 4);
     const flags = u16(input, start + 6);
     const method = u16(input, start + 8);
     const localCrc = u32(input, start + 14);
@@ -280,6 +311,15 @@ function readLocalMembers(
     }
     if (flags !== member.flags || method !== member.method) {
       return unreadable(`entry ${index + 1} disagrees between its local and central headers`);
+    }
+    if (versionNeeded !== member.versionNeeded) {
+      return unreadable(`entry ${index + 1} disagrees between its local and central extraction versions`);
+    }
+    if (!validVersionNeeded(versionNeeded, method)) {
+      return unreadable(`entry ${index + 1} requires unsupported local extraction version ${versionNeeded}`);
+    }
+    if (!validFlags(flags, method)) {
+      return unreadable(`entry ${index + 1} uses unsupported local ZIP flags for its compression method`);
     }
     if (localCompressedSize === ZIP64_VALUE || localUncompressedSize === ZIP64_VALUE) {
       return unreadable(`entry ${index + 1} uses ZIP64, which is not supported`);
@@ -325,13 +365,26 @@ function readLocalMembers(
   }
 
   extents.sort((left, right) => left.start - right.start);
-  if (extents.length > 0 && extents[0].start !== 0) {
+  if (extents.length === 0) {
+    // With no central-directory entries, the whole data area must be empty.
+    if (centralOffset !== 0) {
+      return unreadable("the ZIP data area carries bytes that no entry accounts for");
+    }
+    return { ok: true, members: locals };
+  }
+  if (extents[0].start !== 0) {
     return unreadable("the ZIP data area does not start at the beginning of the file");
   }
   for (let index = 1; index < extents.length; index += 1) {
     if (extents[index].start < extents[index - 1].end) {
       return unreadable("two ZIP members overlap");
     }
+    if (extents[index].start !== extents[index - 1].end) {
+      return unreadable("the ZIP data area has a gap that no entry accounts for");
+    }
+  }
+  if (extents[extents.length - 1].end !== centralOffset) {
+    return unreadable("the ZIP data area does not end at the central directory");
   }
   return { ok: true, members: locals };
 }
@@ -355,6 +408,11 @@ function checkDeclarations(members: readonly CentralMember[]): ZipCheck {
   }
   for (let index = 0; index < members.length; index += 1) {
     const member = members[index];
+    if (member.uncompressedSize > 0 && member.compressedSize === 0) {
+      return unreadable(
+        `entry ${index + 1} declares ${member.uncompressedSize} uncompressed bytes against zero compressed bytes`,
+      );
+    }
     if (member.uncompressedSize > member.compressedSize * MAX_ZIP_COMPRESSION_RATIO) {
       return unreadable(
         `entry ${index + 1} declares ${member.uncompressedSize} uncompressed bytes against ${member.compressedSize} compressed bytes, over the ${MAX_ZIP_COMPRESSION_RATIO}:1 limit`,
@@ -379,10 +437,24 @@ function verifyMembers(input: Reader, members: readonly LocalMember[]): ZipCheck
       continue;
     }
     let output: Buffer;
+    let consumed: number;
     try {
-      output = inflateRawSync(data, { maxOutputLength: member.uncompressedSize + 1 });
+      // `info` exposes the number of compressed bytes the inflater consumed,
+      // so trailing bytes inside the declared compressed extent cannot hide a
+      // stream that actually expands beyond its declared ratio.
+      const inflated = inflateRawSync(data, {
+        maxOutputLength: member.uncompressedSize + 1,
+        info: true,
+      }) as unknown as { readonly buffer: Buffer; readonly engine: { readonly bytesWritten: number } };
+      output = inflated.buffer;
+      consumed = inflated.engine.bytesWritten;
     } catch {
       return unreadable(`entry ${index + 1} cannot be expanded within its declared size`);
+    }
+    if (consumed !== data.length) {
+      return unreadable(
+        `entry ${index + 1} consumes ${consumed} of its ${data.length} compressed bytes`,
+      );
     }
     if (output.length !== member.uncompressedSize) {
       return unreadable(

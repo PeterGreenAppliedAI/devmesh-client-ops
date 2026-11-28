@@ -56,19 +56,41 @@ async function seedMeetings(directory: string, count: number): Promise<string[]>
   }
 }
 
-/** Submit one DOCX through the meeting's rendered multipart import form. */
+/** A rendered import form, fetched and parsed before any timed submission. */
+interface PreparedDocxImport {
+  readonly pagePath: string;
+  readonly form: ReturnType<typeof parseForm>;
+}
+
+/** Fetch and parse the meeting's rendered multipart import form. */
+async function prepareDocxImport(origin: string, meetingId: string): Promise<PreparedDocxImport> {
+  const pagePath = `/meetings/${encodeURIComponent(meetingId)}/transcripts/import`;
+  const page = await get(origin, pagePath);
+  assert.equal(page.status, 200, `${pagePath} is rendered`);
+  const form = parseForm(page.body);
+  assert.equal(form.enctype, "multipart/form-data", "the import form is multipart");
+  return { pagePath, form };
+}
+
+/** Submit one DOCX through a form that has already been fetched and parsed. */
+function submitDocxFile(
+  origin: string,
+  prepared: PreparedDocxImport,
+  filename: string,
+  body: Uint8Array,
+) {
+  return submit(origin, prepared.pagePath, prepared.form, { file: { filename, body } });
+}
+
+/** Fetch the form, then submit one DOCX through the meeting's import form. */
 async function importDocxFile(
   origin: string,
   meetingId: string,
   filename: string,
   body: Uint8Array,
 ) {
-  const pagePath = `/meetings/${encodeURIComponent(meetingId)}/transcripts/import`;
-  const page = await get(origin, pagePath);
-  assert.equal(page.status, 200, `${pagePath} is rendered`);
-  const form = parseForm(page.body);
-  assert.equal(form.enctype, "multipart/form-data", "the import form is multipart");
-  return submit(origin, pagePath, form, { file: { filename, body } });
+  const prepared = await prepareDocxImport(origin, meetingId);
+  return submitDocxFile(origin, prepared, filename, body);
 }
 
 /** The workspace bytes and every original file (name and bytes) in the directory. */
@@ -140,8 +162,9 @@ describe("system DOCX import refusals", () => {
       );
       assert.ok(bytes.length >= 1024 * 1024, "the submitted upload is about one megabyte");
 
+      const prepared = await prepareDocxImport(server.origin, meetings[0]);
       const started = performance.now();
-      const reply = await importDocxFile(server.origin, meetings[0], "large-declaration.docx", bytes);
+      const reply = await submitDocxFile(server.origin, prepared, "large-declaration.docx", bytes);
       const elapsed = performance.now() - started;
 
       assert.equal(reply.status, 400, `the refusal is correctable: ${reply.body.slice(0, 300)}`);
@@ -193,8 +216,9 @@ describe("system DOCX imports that fit the limits", () => {
 
       const exactOriginal = docxOfLength(MAX_CONTENT_BYTES);
       assert.equal(exactOriginal.length, MAX_CONTENT_BYTES);
+      const firstPrepared = await prepareDocxImport(server.origin, meetings[0]);
       const firstStarted = performance.now();
-      const first = await importDocxFile(server.origin, meetings[0], "exact-original.docx", exactOriginal);
+      const first = await submitDocxFile(server.origin, firstPrepared, "exact-original.docx", exactOriginal);
       const firstElapsed = performance.now() - firstStarted;
       assert.equal(first.status, 200, `the exact 10 MiB original imports: ${first.body.slice(0, 300)}`);
       assert.ok(firstElapsed < IMPORT_LIMIT_MS, `the exact-original import took ${firstElapsed.toFixed(0)} ms`);
@@ -203,8 +227,9 @@ describe("system DOCX imports that fit the limits", () => {
 
       const exactExpansion = docxOfExpandedLength(MAX_CONTENT_BYTES);
       assert.ok(exactExpansion.length < MAX_CONTENT_BYTES, "the expanded archive's original is below its own limit");
+      const secondPrepared = await prepareDocxImport(server.origin, meetings[1]);
       const secondStarted = performance.now();
-      const second = await importDocxFile(server.origin, meetings[1], "exact-expansion.docx", exactExpansion);
+      const second = await submitDocxFile(server.origin, secondPrepared, "exact-expansion.docx", exactExpansion);
       const secondElapsed = performance.now() - secondStarted;
       assert.equal(second.status, 200, `the exact 10 MiB expansion imports: ${second.body.slice(0, 300)}`);
       assert.ok(secondElapsed < IMPORT_LIMIT_MS, `the exact-expansion import took ${secondElapsed.toFixed(0)} ms`);

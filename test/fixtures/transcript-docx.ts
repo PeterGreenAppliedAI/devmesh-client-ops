@@ -52,6 +52,12 @@ export interface ZipEntrySpec {
   readonly dataDescriptor?: boolean;
   /** Include the optional data-descriptor signature (default true). */
   readonly descriptorSignature?: boolean;
+  /** Extra field bytes written to both headers unless one side overrides them. */
+  readonly extra?: Uint8Array;
+  /** Extra field bytes written only to the local header. */
+  readonly localExtra?: Uint8Array;
+  /** Extra field bytes written only to the central header. */
+  readonly centralExtra?: Uint8Array;
 }
 
 export interface BuildZipOptions {
@@ -81,7 +87,6 @@ export function buildZipDetailed(
   const locals: Uint8Array[] = [];
   const central: Uint8Array[] = [];
   const localOffsets: number[] = [];
-  const centralOffsets: number[] = [];
   const dataOffsets: number[] = [];
   let offset = 0;
   const comment = options.comment ?? new Uint8Array(0);
@@ -100,8 +105,11 @@ export function buildZipDetailed(
     const crc = spec.crc ?? crc32(content);
     const usesDescriptor = spec.dataDescriptor === true;
     const flags = 0x0800 | (usesDescriptor ? 0x0008 : 0);
+    const sharedExtra = spec.extra ?? new Uint8Array(0);
+    const localExtra = spec.localExtra ?? sharedExtra;
+    const centralExtra = spec.centralExtra ?? sharedExtra;
 
-    const local = new Uint8Array(30 + name.length);
+    const local = new Uint8Array(30 + name.length + localExtra.length);
     const localView = new DataView(local.buffer);
     localView.setUint32(0, 0x04034b50, true);
     localView.setUint16(4, 20, true);
@@ -113,8 +121,9 @@ export function buildZipDetailed(
     localView.setUint32(18, usesDescriptor ? 0 : compressedSize, true);
     localView.setUint32(22, usesDescriptor ? 0 : uncompressedSize, true);
     localView.setUint16(26, name.length, true);
-    localView.setUint16(28, 0, true);
+    localView.setUint16(28, localExtra.length, true);
     local.set(name, 30);
+    local.set(localExtra, 30 + name.length);
 
     let descriptor = new Uint8Array(0);
     if (usesDescriptor) {
@@ -131,7 +140,7 @@ export function buildZipDetailed(
       descriptorView.setUint32(at + 8, uncompressedSize, true);
     }
 
-    const header = new Uint8Array(46 + name.length);
+    const header = new Uint8Array(46 + name.length + centralExtra.length);
     const headerView = new DataView(header.buffer);
     headerView.setUint32(0, 0x02014b50, true);
     headerView.setUint16(4, 20, true);
@@ -144,20 +153,29 @@ export function buildZipDetailed(
     headerView.setUint32(20, compressedSize, true);
     headerView.setUint32(24, uncompressedSize, true);
     headerView.setUint16(28, name.length, true);
-    headerView.setUint16(30, 0, true);
+    headerView.setUint16(30, centralExtra.length, true);
     headerView.setUint16(32, 0, true);
     headerView.setUint16(34, 0, true);
     headerView.setUint16(36, 0, true);
     headerView.setUint32(38, 0, true);
     headerView.setUint32(42, offset, true);
     header.set(name, 46);
+    header.set(centralExtra, 46 + name.length);
 
     localOffsets.push(offset);
     dataOffsets.push(offset + local.length);
-    centralOffsets.push(offset + local.length + data.length + descriptor.length);
     locals.push(local, data, descriptor);
     central.push(header);
     offset += local.length + data.length + descriptor.length;
+  }
+
+  // The central directory follows every local member, so its offsets are
+  // computed from the final local-data length and each central record's length.
+  const centralOffsets: number[] = [];
+  let centralPosition = offset;
+  for (const header of central) {
+    centralOffsets.push(centralPosition);
+    centralPosition += header.length;
   }
 
   const centralSize = central.reduce((total, part) => total + part.length, 0);
