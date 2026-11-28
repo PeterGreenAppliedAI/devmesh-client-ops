@@ -8,10 +8,12 @@
  * count or central-directory size that disagrees with the bytes, an unsupported
  * extraction version, compression method, flags or feature (encryption, ZIP64,
  * multiple disks, an alternate-name extra field), a directory entry that
- * declares content, a member whose header or data runs outside the data area,
- * a gap or overlap in that area, a duplicate name (compared ASCII
- * case-insensitively, as package part names are), or local and central
- * declarations that disagree.
+ * declares content (by trailing slash or by the central DOS directory
+ * attribute), a member whose header or data runs outside the data area, a gap
+ * or overlap in that area, a duplicate name (from the decoded name, compared
+ * ASCII case-insensitively as package part names are), an unflagged non-ASCII
+ * name whose legacy encoding cannot be interpreted consistently with the
+ * parser, or local and central declarations that disagree.
  *
  * Declared sizes are checked before any expansion: each declared uncompressed
  * size and their sum must be at most MAX_CONTENT_BYTES, and one entry's
@@ -169,18 +171,34 @@ function isDirectoryName(nameBytes: Uint8Array): boolean {
 }
 
 /**
- * The key used to detect duplicate package part names. DOCX part names compare
- * ASCII case-insensitively, so ASCII letters are folded to lower case while
- * every other byte is kept; the original name bytes stay untouched for the
- * local-header comparison and for the parser's archive.
+ * The key used to detect duplicate package part names, from the decoded name.
+ * DOCX part names compare ASCII case-insensitively, so ASCII letters are folded
+ * to lower case while every other character is kept; the original name bytes
+ * stay untouched for the local-header comparison and for the parser's archive.
  */
-function partNameKey(nameBytes: Uint8Array): string {
-  const folded = new Uint8Array(nameBytes.length);
-  for (let index = 0; index < nameBytes.length; index += 1) {
-    const byte = nameBytes[index];
-    folded[index] = byte >= 0x41 && byte <= 0x5a ? byte + 0x20 : byte;
+function partNameKey(name: string): string {
+  return name.replace(/[A-Z]/gu, (letter) => letter.toLowerCase());
+}
+
+/**
+ * The member name interpreted for duplicate detection, or a refusal when the
+ * encoding is ambiguous. A UTF-8-flagged name is decoded as UTF-8. A name
+ * without that flag can use any legacy encoding, so a non-ASCII name cannot be
+ * interpreted consistently with the parser and is refused; ASCII names mean the
+ * same in every supported encoding and in UTF-8.
+ */
+function decodeName(nameBytes: Uint8Array, flags: number, index: number): ZipRefusal | string {
+  if ((flags & UTF8_NAME_FLAG) !== 0) {
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(nameBytes);
+    } catch {
+      return unreadable(`entry ${index + 1} has an invalid UTF-8 name`);
+    }
   }
-  return Buffer.from(folded).toString("hex");
+  if (nameBytes.some((byte) => byte > 0x7f)) {
+    return unreadable(`entry ${index + 1} uses an unsupported non-ASCII filename encoding`);
+  }
+  return Buffer.from(nameBytes).toString("latin1");
 }
 
 /** True when a local or central extra field block is complete and supported. */
@@ -281,6 +299,7 @@ function readCentralDirectory(
     const extraLength = u16(input, cursor + 30);
     const commentLength = u16(input, cursor + 32);
     const diskStart = u16(input, cursor + 34);
+    const externalAttributes = u32(input, cursor + 38);
     const localOffset = u32(input, cursor + 42);
     const recordEnd = cursor + 46 + nameLength + extraLength + commentLength;
     if (recordEnd > endOffset) return unreadable(`central-directory entry ${index + 1} is truncated`);
@@ -314,19 +333,15 @@ function readCentralDirectory(
     if (hasDotSegment(nameBytes)) {
       return unreadable(`entry ${index + 1} has an ambiguous dot-segment name`);
     }
-    if (isDirectoryName(nameBytes) && uncompressedSize !== 0) {
+    const isDirectory = isDirectoryName(nameBytes) || (externalAttributes & 0x10) !== 0;
+    if (isDirectory && uncompressedSize !== 0) {
       return unreadable(
-        `entry ${index + 1} marks a directory name but declares ${uncompressedSize} uncompressed bytes`,
+        `entry ${index + 1} is marked as a directory but declares ${uncompressedSize} uncompressed bytes`,
       );
     }
-    if ((flags & UTF8_NAME_FLAG) !== 0) {
-      try {
-        new TextDecoder("utf-8", { fatal: true }).decode(nameBytes);
-      } catch {
-        return unreadable(`entry ${index + 1} has an invalid UTF-8 name`);
-      }
-    }
-    const nameKey = partNameKey(nameBytes);
+    const decodedName = decodeName(nameBytes, flags, index);
+    if (typeof decodedName !== "string") return decodedName;
+    const nameKey = partNameKey(decodedName);
     if (seenNames.has(nameKey)) return unreadable(`entry ${index + 1} repeats another entry's name`);
     seenNames.add(nameKey);
     if (!validExtra(input, nameStart + nameLength, extraLength)) {

@@ -743,7 +743,7 @@ describe("DOCX container structure", () => {
     );
     const { parser, calls } = countingParser();
     const outcome = await importDocx(directoryWithContent, "directory.docx", parser);
-    refused(outcome, "unreadable_document", /marks a directory name but declares .* uncompressed bytes/);
+    refused(outcome, "unreadable_document", /is marked as a directory but declares .* uncompressed bytes/);
     if (outcome.ok) throw new Error("unreachable");
     assert.match(
       outcome.refusal.message,
@@ -758,6 +758,30 @@ describe("DOCX container structure", () => {
     );
     const { result } = imported(await importDocx(emptyDirectory, "empty-directory.docx"));
     assert.equal(result.extractedText, "Empty directory document.");
+  });
+
+  it("refuses a directory marked only by the central DOS attribute when it carries content", async () => {
+    const encoder = new TextEncoder();
+    const attributeDirectory = buildDocxWithExtraEntries(
+      [
+        {
+          name: "customXml/folder",
+          bytes: encoder.encode("content behind a directory attribute"),
+          externalAttributes: 0x10,
+        },
+      ],
+      [{ runs: ["Directory attribute document."] }],
+    );
+    const { parser, calls } = countingParser();
+    const outcome = await importDocx(attributeDirectory, "directory-attribute.docx", parser);
+    refused(outcome, "unreadable_document", /is marked as a directory but declares .* uncompressed bytes/);
+    if (outcome.ok) throw new Error("unreachable");
+    assert.match(
+      outcome.refusal.message,
+      reExportGuidance,
+      "the attribute-directory refusal carries re-export guidance",
+    );
+    assert.equal(calls(), 0, "an attribute-marked directory carrying content is not handed to the parser");
   });
 
   it("refuses part names that differ only by ASCII letter case before the parser", async () => {
@@ -776,6 +800,28 @@ describe("DOCX container structure", () => {
       "the case-equivalent-name refusal carries re-export guidance",
     );
     assert.equal(calls(), 0, "two case-equivalent part names are not handed to the parser");
+  });
+
+  it("refuses a mixed-encoding filename collision before the parser", async () => {
+    const encoder = new TextEncoder();
+    // The first name is UTF-8 flagged. The second, without the flag, is the same
+    // package path in a legacy single-byte encoding, so its raw bytes differ.
+    // The reader cannot interpret the unflagged non-ASCII name consistently.
+    const legacyName = new Uint8Array([0x63, 0x61, 0x66, 0x82]);
+    const bytes = buildZipDetailed([
+      { name: "café", bytes: encoder.encode("utf-8 content") },
+      { name: "legacy", nameBytes: legacyName, bytes: encoder.encode("legacy content"), flags: 0 },
+    ]).bytes;
+    const { parser, calls } = countingParser();
+    const outcome = await importDocx(bytes, "mixed-encoding.docx", parser);
+    refused(outcome, "unreadable_document", /unsupported non-ASCII filename encoding/);
+    if (outcome.ok) throw new Error("unreachable");
+    assert.match(
+      outcome.refusal.message,
+      reExportGuidance,
+      "the mixed-encoding refusal carries re-export guidance",
+    );
+    assert.equal(calls(), 0, "a filename whose encoding is ambiguous is not handed to the parser");
   });
 
   it("reports central offsets that identify each central header in a multi-entry archive", async () => {

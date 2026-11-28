@@ -64,6 +64,10 @@ export interface ZipEntrySpec {
    * raw name with a Unicode Path alternate omits the UTF-8 name flag.
    */
   readonly flags?: number;
+  /** Raw name bytes, overriding the UTF-8 encoding of `name`. */
+  readonly nameBytes?: Uint8Array;
+  /** Central-header external file attributes, such as the DOS directory bit. */
+  readonly externalAttributes?: number;
 }
 
 export interface BuildZipOptions {
@@ -99,7 +103,7 @@ export function buildZipDetailed(
   const declaredEntryCount = options.declaredEntryCount ?? entries.length;
 
   for (const spec of entries) {
-    const name = encoder.encode(spec.name);
+    const name = spec.nameBytes ?? encoder.encode(spec.name);
     const content = spec.bytes ?? new Uint8Array(0);
     const method = spec.method ?? 0;
     let data: Uint8Array;
@@ -163,7 +167,7 @@ export function buildZipDetailed(
     headerView.setUint16(32, 0, true);
     headerView.setUint16(34, 0, true);
     headerView.setUint16(36, 0, true);
-    headerView.setUint32(38, 0, true);
+    headerView.setUint32(38, spec.externalAttributes ?? 0, true);
     headerView.setUint32(42, offset, true);
     header.set(name, 46);
     header.set(centralExtra, 46 + name.length);
@@ -272,6 +276,7 @@ function docxEntries(
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
     '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
     '<Default Extension="xml" ContentType="application/xml"/>' +
+    '<Default Extension="bin" ContentType="application/octet-stream"/>' +
     '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>' +
     "</Types>";
   const relationships =
