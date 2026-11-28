@@ -272,18 +272,20 @@ describe("DOCX refusals", () => {
   const reExport = /re-export .* as DOCX .* or .* UTF-8 text/i;
 
   it("refuses corrupt and unreadable documents with re-export guidance", async () => {
-    refused(await importDocx(new Uint8Array([1, 2, 3, 4]), "corrupt.docx"), "unreadable_document", reExport);
-    refused(await importDocx(new Uint8Array(), "empty-bytes.docx"), "unreadable_document", reExport);
+    const { parser, calls } = countingParser();
+    refused(await importDocx(new Uint8Array([1, 2, 3, 4]), "corrupt.docx", parser), "unreadable_document", reExport);
+    refused(await importDocx(new Uint8Array(), "empty-bytes.docx", parser), "unreadable_document", reExport);
     refused(
-      await importDocx(new TextEncoder().encode("plain text, not a zip"), "fake.docx"),
+      await importDocx(new TextEncoder().encode("plain text, not a zip"), "fake.docx", parser),
       "unreadable_document",
       reExport,
     );
     refused(
-      await importDocx(new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0, 0, 0, 0]), "truncated.docx"),
+      await importDocx(new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0, 0, 0, 0]), "truncated.docx", parser),
       "unreadable_document",
       reExport,
     );
+    assert.equal(calls(), 0, "no corrupt container is handed to the parser");
   });
 
   it("refuses a document with no visible text with re-export guidance", async () => {
@@ -699,6 +701,38 @@ describe("DOCX container structure", () => {
     );
     const { result } = imported(await importDocx(nested, "nested.docx"));
     assert.equal(result.extractedText, "Nested parts document.");
+  });
+
+  it("refuses empty interior path segments and backslashes before the parser", async () => {
+    const encoder = new TextEncoder();
+    const doubled = buildZipDetailed([
+      { name: "word/document.xml", bytes: encoder.encode("document") },
+      { name: "word//document.xml", bytes: encoder.encode("doubled separator") },
+    ]).bytes;
+    const emptySegment = countingParser();
+    const emptyOutcome = await importDocx(doubled, "empty-segment.docx", emptySegment.parser);
+    refused(emptyOutcome, "unreadable_document", /empty interior path segment/);
+    if (emptyOutcome.ok) throw new Error("unreachable");
+    assert.match(
+      emptyOutcome.refusal.message,
+      reExportGuidance,
+      "the empty-segment refusal carries re-export guidance",
+    );
+    assert.equal(emptySegment.calls(), 0, "an empty interior path segment is not handed to the parser");
+
+    const backslash = buildZipDetailed([
+      { name: "word\\document.xml", bytes: encoder.encode("backslash separator") },
+    ]).bytes;
+    const backslashParser = countingParser();
+    const backslashOutcome = await importDocx(backslash, "backslash.docx", backslashParser.parser);
+    refused(backslashOutcome, "unreadable_document", /backslash/);
+    if (backslashOutcome.ok) throw new Error("unreachable");
+    assert.match(
+      backslashOutcome.refusal.message,
+      reExportGuidance,
+      "the backslash refusal carries re-export guidance",
+    );
+    assert.equal(backslashParser.calls(), 0, "a backslash path is not handed to the parser");
   });
 
   it("reports central offsets that identify each central header in a multi-entry archive", async () => {

@@ -138,6 +138,29 @@ function hasDotSegment(nameBytes: Uint8Array): boolean {
   return false;
 }
 
+/**
+ * True when a member path contains an empty segment other than one trailing
+ * slash, which marks an ordinary directory entry. A doubled separator such as
+ * `word//document.xml` would let two spellings describe the same effective
+ * path, so it is refused.
+ */
+function hasEmptyInteriorSegment(nameBytes: Uint8Array): boolean {
+  let end = nameBytes.length;
+  if (end > 0 && nameBytes[end - 1] === 0x2f) end -= 1;
+  let segmentStart = 0;
+  for (let index = 0; index <= end; index += 1) {
+    if (index !== end && nameBytes[index] !== 0x2f) continue;
+    if (index === segmentStart) return true;
+    segmentStart = index + 1;
+  }
+  return false;
+}
+
+/** True when a member path uses a backslash separator instead of a slash. */
+function hasBackslash(nameBytes: Uint8Array): boolean {
+  return nameBytes.includes(0x5c);
+}
+
 /** True when a local or central extra field block is complete and supported. */
 function validExtra(input: Reader, start: number, length: number): boolean {
   let cursor = start;
@@ -260,6 +283,12 @@ function readCentralDirectory(
     const nameStart = cursor + 46;
     const nameBytes = input.bytes.subarray(nameStart, nameStart + nameLength);
     if (nameBytes.includes(0)) return unreadable(`entry ${index + 1} has an invalid name`);
+    if (hasBackslash(nameBytes)) {
+      return unreadable(`entry ${index + 1} has a backslash in its member name`);
+    }
+    if (hasEmptyInteriorSegment(nameBytes)) {
+      return unreadable(`entry ${index + 1} has an empty interior path segment`);
+    }
     if (hasDotSegment(nameBytes)) {
       return unreadable(`entry ${index + 1} has an ambiguous dot-segment name`);
     }
