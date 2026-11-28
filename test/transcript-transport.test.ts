@@ -664,6 +664,7 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       assert.equal(refused.headers["cache-control"], "no-store", "the refusal is not cached");
       assert.ok(refused.body.includes(MISSING_CLOSING), `the refusal carries the decoder's message: ${refused.body}`);
       assert.ok(refused.body.includes(MULTIPART_GUIDANCE), `the refusal carries the full guidance: ${refused.body}`);
+      assert.equal(runningFixture.renders.import, 0, "the refused import never reached a handler");
       assertUnchanged(runningFixture, before, "after the refused import");
 
       // A following GET over the same transport is a complete 200.
@@ -848,18 +849,20 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
         paste: "Gail: the additional upload source.",
       });
       assert.equal(firstExcess.byteLength, OVERSIZED_BODY_BYTES, "the first excess byte is one past the inclusive limit");
-      // The first excess byte and a further block of the same upload are sent
-      // in the same chunked request, whose terminator is withheld. Once the
-      // socket is reserved on that first excess byte, the rest of the upload is
-      // discarded rather than buffered or answered separately.
-      const body = Buffer.concat([firstExcess, Buffer.alloc(32 * 1024, 0x67)]);
+      // The exact-limit prefix, the single excess byte and a further block of
+      // the same upload are distinct HTTP chunks of one unfinished request, so
+      // the server parser handles the excess byte before the rest of the
+      // upload. Once the socket is reserved on that byte, the rest is discarded
+      // rather than buffered or answered separately.
+      const additional = Buffer.alloc(32 * 1024, 0x67);
+      const body = Buffer.concat([firstExcess, additional]);
       const pending = sendStaged(runningFixture.server.origin, {
         path: importPath,
         contentType: MULTIPART_TYPE,
         declaredLength: body.byteLength,
         bodyPrefix: body,
         chunked: true,
-        chunkSize: EXACT_BODY_BYTES,
+        chunkSizes: [EXACT_BODY_BYTES, 1, additional.byteLength],
         withholdTerminator: true,
       });
       pending.catch(() => undefined);

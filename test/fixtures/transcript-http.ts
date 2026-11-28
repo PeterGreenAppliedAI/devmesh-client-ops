@@ -509,6 +509,12 @@ export interface StagedSendOptions {
    */
   readonly chunkSize?: number;
   /**
+   * Explicit HTTP chunk sizes covering the body prefix in order. Each size is
+   * its own chunk frame, so a caller can make one body byte a chunk of its own
+   * and submit later upload data only after that byte.
+   */
+  readonly chunkSizes?: readonly number[];
+  /**
    * Leave the final zero-length chunk unwritten, so the chunked request stays
    * unfinished while the reply is read and the peer closes.
    */
@@ -646,6 +652,18 @@ function parseReplies(bytes: Buffer): { readonly replies: Reply[]; readonly comp
   return { replies, complete: true };
 }
 
+/** True when a write error means the peer had already retired the socket. */
+function isRetirementWrite(error: Error): boolean {
+  const code = (error as { readonly code?: string }).code;
+  return (
+    code === "EPIPE" ||
+    code === "ECONNRESET" ||
+    code === "ENOTCONN" ||
+    code === "ERR_STREAM_DESTROYED" ||
+    code === "ERR_STREAM_WRITE_AFTER_END"
+  );
+}
+
 /**
  * Send a staged POST and read every byte until the peer closes the connection.
  *
@@ -675,8 +693,23 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
         "the chunk size is a positive finite byte count",
       );
     }
+    if (options.chunkSizes !== undefined) {
+      assert.equal(options.chunkSize, undefined, "a chunk size list replaces a single chunk size");
+      assert.ok(options.chunkSizes.length > 0, "a chunk size list has at least one chunk");
+      let covered = 0;
+      for (const size of options.chunkSizes) {
+        assert.ok(
+          Number.isSafeInteger(size) && size > 0,
+          "each chunk size is a positive finite byte count",
+        );
+        covered += size;
+      }
+      assert.ok(Number.isSafeInteger(covered), "the chunk sizes add up to a finite byte count");
+      assert.equal(covered, options.bodyPrefix.byteLength, "the chunk sizes cover the body prefix exactly");
+    }
   } else {
     assert.equal(options.chunkSize, undefined, "a chunk size is only used with a chunked staged send");
+    assert.equal(options.chunkSizes, undefined, "chunk sizes are only used with a chunked staged send");
     assert.notEqual(options.withholdTerminator, true, "a chunk terminator is only withheld from a chunked staged send");
     assert.notEqual(options.combineTail, true, "a combined tail is only used with a chunked staged send");
   }
@@ -709,6 +742,10 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
     let socketError: Error | null = null;
     let localPort = 0;
     let reuseAttempted = false;
+    // Set when the peer's FIN or close has arrived, so a reuse attempt made
+    // after retirement is recorded as an observed retirement rather than a
+    // submission that could not happen.
+    let peerEnded = false;
     const chunks: Buffer[] = [];
     let received = 0;
     const socket = createConnection({ host: url.hostname, port: Number(url.port) });
@@ -805,15 +842,28 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
         socket.write(lines.join("\r\n"));
         if (chunked) {
           const prefix = Buffer.from(options.bodyPrefix!);
-          const chunkSize = options.chunkSize ?? prefix.byteLength;
           const frames: Buffer[] = [];
-          for (let offset = 0; offset < prefix.byteLength; offset += chunkSize) {
-            const chunk = prefix.subarray(offset, Math.min(offset + chunkSize, prefix.byteLength));
-            frames.push(
-              Buffer.from(`${chunk.byteLength.toString(16)}\r\n`),
-              chunk,
-              Buffer.from("\r\n"),
-            );
+          if (options.chunkSizes !== undefined) {
+            let offset = 0;
+            for (const size of options.chunkSizes) {
+              const chunk = prefix.subarray(offset, offset + size);
+              frames.push(
+                Buffer.from(`${chunk.byteLength.toString(16)}\r\n`),
+                chunk,
+                Buffer.from("\r\n"),
+              );
+              offset += size;
+            }
+          } else {
+            const chunkSize = options.chunkSize ?? prefix.byteLength;
+            for (let offset = 0; offset < prefix.byteLength; offset += chunkSize) {
+              const chunk = prefix.subarray(offset, Math.min(offset + chunkSize, prefix.byteLength));
+              frames.push(
+                Buffer.from(`${chunk.byteLength.toString(16)}\r\n`),
+                chunk,
+                Buffer.from("\r\n"),
+              );
+            }
           }
           if (options.combineTail === true) {
             // Each chunk contributes a size line, its data and a CRLF. Keep
@@ -868,21 +918,42 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
       if (!reuseAttempted && options.reuseAfterReply !== undefined && !settled) {
         const parsed = parseReplies(Buffer.concat(chunks));
         if (parsed.complete && parsed.replies.length > 0) {
-          // Record the attempt before writing: a retired socket may already be
-          // unwritable, and a write error after the complete reply must not
-          // turn that reply into a failed exchange.
-          reuseAttempted = true;
-          try {
-            socket.write(Buffer.from(options.reuseAfterReply));
-          } catch {
-            // The peer's closure is the expected result of reusing a retired
-            // socket; the reply already received remains the only answer.
+          // Prepare the bytes before recording anything: a preparation failure
+          // must not look like a reuse attempt that was submitted or retired.
+          const reuseBytes = Buffer.from(options.reuseAfterReply);
+          if (peerEnded || socket.destroyed) {
+            // The peer's retirement was already observed when the client tried
+            // to reuse the socket, so no write is possible or needed.
+            reuseAttempted = true;
+          } else {
+            try {
+              socket.write(reuseBytes, (error?: Error | null) => {
+                // A write rejected because the peer has already retired the
+                // socket is the expected outcome of the attempt. Any other
+                // write error is unexpected and must fail the exchange.
+                if (error !== undefined && error !== null && !isRetirementWrite(error)) {
+                  fail(error);
+                }
+              });
+              // The bytes were submitted to the original socket after the
+              // complete reply; the peer's later closure is the retirement.
+              reuseAttempted = true;
+            } catch (error) {
+              if (isRetirementWrite(error as Error)) reuseAttempted = true;
+              else fail(error as Error);
+            }
           }
         }
       }
     });
-    socket.on("end", finish);
-    socket.on("close", finish);
+    socket.on("end", () => {
+      peerEnded = true;
+      finish();
+    });
+    socket.on("close", () => {
+      peerEnded = true;
+      finish();
+    });
     socket.on("error", (error: Error) => {
       if (!settled) socketError = error;
     });
