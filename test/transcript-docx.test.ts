@@ -418,11 +418,10 @@ describe("DOCX container size declarations", () => {
       [{ runs: ["Ratio document."] }],
     );
     const first = countingParser();
-    refused(
-      await importDocx(over, "ratio.docx", first.parser),
-      "unreadable_document",
-      /over the 100:1 limit/,
-    );
+    const ratioOutcome = await importDocx(over, "ratio.docx", first.parser);
+    refused(ratioOutcome, "unreadable_document", /over the 100:1 limit/);
+    if (ratioOutcome.ok) throw new Error("unreachable");
+    assert.match(ratioOutcome.refusal.message, reExportGuidance, "the ratio refusal carries re-export guidance");
     assert.equal(first.calls(), 0, "the parser is not called for a ratio refusal");
   });
 
@@ -438,11 +437,10 @@ describe("DOCX container size declarations", () => {
       },
     ]).bytes;
     const second = countingParser();
-    refused(
-      await importDocx(zero, "zero.docx", second.parser),
-      "unreadable_document",
-      /against zero compressed bytes/,
-    );
+    const zeroOutcome = await importDocx(zero, "zero.docx", second.parser);
+    refused(zeroOutcome, "unreadable_document", /against zero compressed bytes/);
+    if (zeroOutcome.ok) throw new Error("unreachable");
+    assert.match(zeroOutcome.refusal.message, reExportGuidance, "the zero-compressed refusal carries re-export guidance");
     assert.equal(second.calls(), 0, "the parser is not called when positive output is declared against zero compressed bytes");
   });
 
@@ -692,11 +690,13 @@ describe("DOCX container structure", () => {
       assert.equal(name, names[index], `central offset ${index} names the corresponding entry`);
     }
     const damaged = patched(built.bytes, built.centralOffsets[1], 0, 4);
+    const { parser, calls } = countingParser();
     refused(
-      await importDocx(damaged, "multi-central.docx"),
+      await importDocx(damaged, "multi-central.docx", parser),
       "unreadable_document",
       /central-directory entry 2 has no entry signature/,
     );
+    assert.equal(calls(), 0, "the damaged central header is not handed to the parser");
   });
 
   it("imports an archive whose declared parts total exactly the content limit", async () => {

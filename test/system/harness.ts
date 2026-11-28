@@ -71,30 +71,57 @@ function freePort(): Promise<number> {
   });
 }
 
-/** True when one GET /health reaches the child and answers 200. */
-function healthReady(origin: string): Promise<boolean> {
+/** The child's own complete announcement line for the selected port, or null. */
+function announcedOrigin(stdout: string, port: number): string | null {
+  const announcement = new RegExp(`^Listening on http:\\/\\/127\\.0\\.0\\.1:${port}\\r?\\n`, "m");
+  return announcement.test(stdout) ? `http://127.0.0.1:${port}` : null;
+}
+
+/**
+ * True when one GET /health reaches the child and answers 200 before the
+ * deadline. The request is destroyed at the deadline or when the child exits,
+ * so a response that keeps trickling cannot hold startup past its deadline.
+ */
+function healthReady(origin: string, deadline: number, exit: AbortSignal): Promise<boolean> {
   return new Promise((resolveHealth) => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0 || exit.aborted) {
+      resolveHealth(false);
+      return;
+    }
     const target = new URL("/health", origin);
-    const req = request(
+    let settled = false;
+    let timer: NodeJS.Timeout | null = null;
+    let req: ReturnType<typeof request> | null = null;
+    const finish = (ready: boolean): void => {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) clearTimeout(timer);
+      exit.removeEventListener("abort", onExit);
+      resolveHealth(ready && Date.now() <= deadline);
+    };
+    const onExit = (): void => {
+      req?.destroy();
+      finish(false);
+    };
+    exit.addEventListener("abort", onExit, { once: true });
+    timer = setTimeout(onExit, remaining);
+    req = request(
       {
         host: target.hostname,
         port: Number(target.port),
         path: target.pathname,
         method: "GET",
         headers: { host: target.host, "content-length": "0" },
-        timeout: 250,
+        signal: exit,
       },
       (res) => {
         res.resume();
-        res.on("end", () => resolveHealth(res.statusCode === 200));
-        res.on("error", () => resolveHealth(false));
+        res.on("end", () => finish(res.statusCode === 200));
+        res.on("error", () => finish(false));
       },
     );
-    req.on("error", () => resolveHealth(false));
-    req.on("timeout", () => {
-      req.destroy();
-      resolveHealth(false);
-    });
+    req.on("error", () => finish(false));
     req.end();
   });
 }
@@ -163,9 +190,11 @@ export async function startDocxServer(
     application.on("error", (error) => {
       spawnError = error;
     });
+    const exitSignal = new AbortController();
     exitPromise = new Promise<ChildExit>((resolveExit) => {
       application.once("exit", (code, signal) => {
         exitInfo = { code, signal };
+        exitSignal.abort();
         resolveExit(exitInfo);
       });
     });
@@ -183,11 +212,8 @@ export async function startDocxServer(
       if (exitInfo !== null) {
         throw new Error(`the application child exited before readiness: ${JSON.stringify(exitInfo)}\n${stderr}`);
       }
-      if (origin === null) {
-        const announcement = /^Listening on (http:\/\/127\.0\.0\.1:\d+)\s*$/m.exec(stdout);
-        if (announcement !== null) origin = announcement[1];
-      }
-      if (origin !== null && (await healthReady(origin)) && Date.now() <= deadline) {
+      if (origin === null) origin = announcedOrigin(stdout, port);
+      if (origin !== null && (await healthReady(origin, deadline, exitSignal.signal))) {
         ready = true;
         break;
       }
