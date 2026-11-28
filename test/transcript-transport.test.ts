@@ -18,7 +18,10 @@
  * reserved on the first excess byte, drains and excludes any follow-up request,
  * ignores a late parser failure and a late CONNECT, and leaves the workspace
  * byte-for-byte unchanged. Each refusal is read through peer closure, including
- * while the final chunk terminator is withheld.
+ * while the final chunk terminator is withheld, after additional bytes of the
+ * same upload arrive, and when the original socket is reused after the complete
+ * 413. An eligible GET in a 50-client workspace must render once with an empty
+ * form and no file, then share its socket with a complete health read.
  *
  * Only the temporary workspace receives data, and it is removed afterwards.
  */
@@ -30,14 +33,23 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { registerRoutes } from "../src/index.ts";
-import { startServer, type Route, type Routes, type StartedServer } from "../src/server.ts";
+import {
+  startServer,
+  type Route,
+  type RouteRequest,
+  type RouteResult,
+  type Routes,
+  type StartedServer,
+} from "../src/server.ts";
 import { openStore, type Snapshot, type Store } from "../src/store.ts";
 import { ORIGINALS_DIRECTORY } from "../src/transcript-files.ts";
 import {
   BOUNDARY,
   keepAliveTransport,
   MULTIPART_TYPE,
+  observeServerWrites,
   send,
+  sendRaw,
   sendStaged,
   type ClosedExchange,
   type Transport,
@@ -94,24 +106,36 @@ interface RenderCounts {
   followUp: number;
 }
 
+interface RunningOptions {
+  /** The number of synthetic clients in the workspace; one by default. */
+  readonly clients?: number;
+}
+
 interface Running {
   readonly dir: string;
   readonly store: Store;
   readonly server: StartedServer;
   readonly engagementId: string;
   readonly renders: RenderCounts;
+  /** Every hierarchy route request that reached a render, in order. */
+  readonly requests: RouteRequest[];
   close(): Promise<void>;
 }
 
-async function running(): Promise<Running> {
+async function running(options: RunningOptions = {}): Promise<Running> {
   const dir = tempDir();
   const store = await openStore(dir);
   let server: StartedServer | null = null;
   try {
+    const clientCount = options.clients ?? 1;
     const client = await store.createClient({ name: "Acme" });
+    for (let index = 1; index < clientCount; index += 1) {
+      await store.createClient({ name: `Client ${index + 1}` });
+    }
     const engagement = await store.createEngagement({ clientId: client.id, name: "Eng" });
     const baseRoutes = registerRoutes(store);
     const renders: RenderCounts = { import: 0, followUp: 0 };
+    const requests: RouteRequest[] = [];
     // Count every route render while preserving the routes themselves: a GET
     // /health is the follow-up, and any hierarchy POST is the import path.
     const health = baseRoutes.health.get;
@@ -135,11 +159,12 @@ async function running(): Promise<Running> {
               match: (path: string) => hierarchy.match(path),
               route(matched: unknown, method: "GET" | "POST") {
                 const route = hierarchy.route(matched, method);
-                if (route === undefined || method !== "POST") return route;
+                if (route === undefined) return route;
                 return {
                   ...route,
                   render(request) {
-                    renders.import += 1;
+                    requests.push(request);
+                    if (method === "POST") renders.import += 1;
                     return route.render(request);
                   },
                 };
@@ -154,6 +179,7 @@ async function running(): Promise<Running> {
       server,
       engagementId: engagement.id,
       renders,
+      requests,
       async close() {
         // Attempt every teardown step even when one fails, so a failed server
         // close cannot skip the store close that protects the workspace. Both
@@ -268,6 +294,55 @@ function rawGet(base: string, path: string): Buffer {
 function rawConnect(base: string): Buffer {
   const url = new URL(base);
   return Buffer.from(`CONNECT ${url.host} HTTP/1.1\r\nHost: ${url.host}\r\n\r\n`, "utf8");
+}
+/** A raw POST with the supplied headers and optional exact body bytes. */
+function rawPostRequest(
+  base: string,
+  path: string,
+  headers: Readonly<Record<string, string>>,
+  body?: Uint8Array,
+): Buffer {
+  const url = new URL(base);
+  const lines = [`POST ${path} HTTP/1.1`, `Host: ${url.host}`];
+  for (const [name, value] of Object.entries(headers)) lines.push(`${name}: ${value}`);
+  lines.push("", "");
+  return Buffer.concat([Buffer.from(lines.join("\r\n"), "utf8"), body === undefined ? Buffer.alloc(0) : Buffer.from(body)]);
+}
+
+/** A POST whose header block carries an ordinary framing error. */
+function malformedPost(base: string, path: string): Buffer {
+  const url = new URL(base);
+  return Buffer.from(
+    [
+      `POST ${path} HTTP/1.1`,
+      `Host: ${url.host}`,
+      `Origin: ${url.origin}`,
+      `Content-Type: ${MULTIPART_TYPE}`,
+      "Content-Length: 8",
+      "Broken Header",
+      "",
+      "",
+    ].join("\r\n"),
+    "utf8",
+  );
+}
+
+/** A multipart file part header and the first `size` bytes of its file, unclosed. */
+function partialFileMultipart(size: number): Buffer {
+  const head = Buffer.from(
+    `--${BOUNDARY}\r\nContent-Disposition: form-data; name="file"; filename="synthetic.bin"\r\nContent-Type: application/octet-stream\r\n\r\n`,
+    "utf8",
+  );
+  return Buffer.concat([head, Buffer.alloc(size, 0x61)]);
+}
+
+/** The one complete ordinary parser-error reply with its no-store headers. */
+function assertOrdinaryRefusal(reply: ClosedExchange["replies"][number], status: number, why: string): void {
+  assert.equal(reply.status, status, `${why}: the reply is a ${status}`);
+  assert.equal(reply.headers["cache-control"], "no-store", `${why}: the reply is not cached`);
+  assert.equal(reply.headers["connection"], "close", `${why}: the reply closes the connection`);
+  assert.equal(reply.headers["content-length"], "0", `${why}: the reply declares an empty body`);
+  assert.equal(reply.bytes.byteLength, 0, `${why}: the reply carries no body`);
 }
 
 /** The inclusive cap for the fixture's 16 MiB reply and its headers. */
@@ -453,7 +528,7 @@ function assertOversizedRefusal(exchange: ClosedExchange, why: string): void {
   assert.equal(exchange.replies.length, 1, `${why}: the connection carries exactly one complete reply`);
   const reply = exchange.replies[0]!;
   assert.equal(reply.status, 413, `${why}: the reply is a 413`);
-  assert.match(String(reply.headers["content-type"]), /^text\/plain; charset=utf-8/, `${why}: the reply is plain text`);
+  assert.equal(reply.headers["content-type"], "text/plain; charset=utf-8", `${why}: the reply is plain text`);
   assert.equal(reply.headers["cache-control"], "no-store", `${why}: the reply is not cached`);
   assert.equal(reply.headers["connection"], "close", `${why}: the reply retires the connection`);
   assert.equal(
@@ -630,27 +705,33 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
   it("refuses an unclosed multipart import with a complete 400, writes nothing and reuses one socket", async () => {
     const runningFixture = await running();
     const transport: Transport = keepAliveTransport();
+    const guard = watchdog(5000, "the decoder-refusal reuse scenario did not finish");
     try {
       const before = baselineOf(runningFixture);
       const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
 
       // The POST sends the malformed body with an accurate Content-Length to the
       // engagement's import route, over the listener's own Host and Origin.
-      const refused = await send(transport, runningFixture.server.origin, {
+      const refusedPending = send(transport, runningFixture.server.origin, {
         method: "POST",
         path: importPath,
         contentType: MULTIPART_TYPE,
         body: unclosedMultipart(),
       });
+      refusedPending.catch(() => undefined);
+      const refused = await Promise.race([refusedPending, guard.promise]);
       assert.equal(refused.status, 400, "the malformed import is refused with 400");
       assert.match(String(refused.headers["content-type"]), /^text\/plain; charset=utf-8/, "the refusal is plain text");
       assert.equal(refused.headers["cache-control"], "no-store", "the refusal is not cached");
       assert.ok(refused.body.includes(MISSING_CLOSING), `the refusal carries the decoder's message: ${refused.body}`);
       assert.ok(refused.body.includes(MULTIPART_GUIDANCE), `the refusal carries the full guidance: ${refused.body}`);
+      assert.equal(runningFixture.renders.import, 0, "the refused import never reached a handler");
       assertUnchanged(runningFixture, before, "after the refused import");
 
       // A following GET over the same transport is a complete 200.
-      const health = await send(transport, runningFixture.server.origin, { path: "/health" });
+      const healthPending = send(transport, runningFixture.server.origin, { path: "/health" });
+      healthPending.catch(() => undefined);
+      const health = await Promise.race([healthPending, guard.promise]);
       assert.equal(health.status, 200, "the health page is a 200");
       assert.ok(health.body.includes("ok"), `the health page reports its status: ${health.body}`);
 
@@ -665,6 +746,7 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       // Neither a GET nor a refusal changed the workspace.
       assertUnchanged(runningFixture, before, "after the health read");
     } finally {
+      guard.clear();
       transport.close();
       await runningFixture.close();
     }
@@ -819,6 +901,85 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
     }
   });
 
+  it("discards additional bytes of the same upload after the first excess byte and keeps one 413 through closure", async () => {
+    const runningFixture = await running();
+    const guard = watchdog(5000, "the additional-upload-bytes refusal did not finish");
+    try {
+      const before = baselineOf(runningFixture);
+      const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
+      const firstExcess = oneByteOverLimitMultipart({
+        title: "Additional upload bytes import",
+        date: "2026-09-07",
+        paste: "Gail: the additional upload source.",
+      });
+      assert.equal(firstExcess.byteLength, OVERSIZED_BODY_BYTES, "the first excess byte is one past the inclusive limit");
+      // The exact-limit prefix, the single excess byte and a further block of
+      // the same upload are distinct HTTP chunks of one unfinished request, so
+      // the server parser handles the excess byte before the rest of the
+      // upload. Once the socket is reserved on that byte, the rest is discarded
+      // rather than buffered or answered separately.
+      const additional = Buffer.alloc(32 * 1024, 0x67);
+      const body = Buffer.concat([firstExcess, additional]);
+      const pending = sendStaged(runningFixture.server.origin, {
+        path: importPath,
+        contentType: MULTIPART_TYPE,
+        declaredLength: body.byteLength,
+        bodyPrefix: body,
+        chunked: true,
+        chunkSizes: [EXACT_BODY_BYTES, 1, additional.byteLength],
+        withholdTerminator: true,
+      });
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assertOversizedRefusal(exchange, "additional upload bytes after the first excess");
+      assert.equal(runningFixture.renders.import, 0, "the refused import never reached a handler");
+      assert.equal(runningFixture.renders.followUp, 0, "no follow-up handler ran on the retiring socket");
+      assertUnchanged(runningFixture, before, "after the additional-upload-bytes refusal");
+    } finally {
+      guard.clear();
+      await runningFixture.close();
+    }
+  });
+
+  it("attempts sequential reuse of the original socket after the complete overflow 413 and gets no second reply", async () => {
+    const runningFixture = await running();
+    const guard = watchdog(5000, "the post-refusal reuse observation did not finish");
+    try {
+      const before = baselineOf(runningFixture);
+      const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
+      const body = oneByteOverLimitMultipart({
+        title: "Post-refusal reuse import",
+        date: "2026-09-08",
+        paste: "Hana: the post-refusal reuse source.",
+      });
+      assert.equal(body.byteLength, OVERSIZED_BODY_BYTES, "the body is exactly one byte past the inclusive limit");
+
+      // The client waits until the complete 413 has arrived, then writes a
+      // bodyless GET on the original socket. The reserved socket must admit no
+      // health render and deliver no second reply; closure at the reuse attempt
+      // is the expected result.
+      const pending = sendStaged(runningFixture.server.origin, {
+        path: importPath,
+        contentType: MULTIPART_TYPE,
+        declaredLength: body.byteLength,
+        bodyPrefix: body,
+        chunked: true,
+        chunkSize: EXACT_BODY_BYTES,
+        reuseAfterReply: rawGet(runningFixture.server.origin, "/health"),
+      });
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assertOversizedRefusal(exchange, "post-refusal original-socket reuse");
+      assert.equal(exchange.reuseAttempted, true, "the client attempted reuse only after the complete 413");
+      assert.equal(runningFixture.renders.import, 0, "the refused import never reached a handler");
+      assert.equal(runningFixture.renders.followUp, 0, "the retired socket rendered zero health pages");
+      assertUnchanged(runningFixture, before, "after the post-refusal reuse attempt");
+    } finally {
+      guard.clear();
+      await runningFixture.close();
+    }
+  });
+
   it("protects a streaming overflow refusal from a late CONNECT and writes nothing", async () => {
     const runningFixture = await running();
     const guard = watchdog(5000, "the streaming-overflow CONNECT refusal did not finish");
@@ -916,11 +1077,16 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
     }
   });
 
-  it("answers an ordinary parser error when only a later queued response has sent headers", async () => {
+  it("answers an ordinary parser error and leaves the closing reply owned when the pending earlier route returns", async () => {
     const dir = tempDir();
     const store = await openStore(dir);
     let server: StartedServer | null = null;
+    let observation: ReturnType<typeof observeServerWrites> | null = null;
     let firstGateResolve: () => void = () => undefined;
+    let firstRouteReturned: () => void = () => undefined;
+    const firstReturned = new Promise<void>((resolve) => {
+      firstRouteReturned = resolve;
+    });
     const guard = watchdog(10000, "the queued-response parser failure did not finish");
     try {
       // The first route never resolves, so its response has not sent headers.
@@ -944,7 +1110,10 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       const slowRoute: Route = {
         method: "GET",
         render() {
-          return firstGate.then(() => ({ status: 200, body: "first" }));
+          return firstGate.then(() => {
+            firstRouteReturned();
+            return { status: 200, body: "first" };
+          });
         },
       };
       const queuedRoute: Route = {
@@ -956,6 +1125,7 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       };
       const routes: Routes = { home: { get: slowRoute }, health: { get: queuedRoute } };
       server = await startServer({ store, port: 0, routes });
+      observation = observeServerWrites(server.port);
       const pending = queuedResponseThenParserError(server.origin, writeMalformed);
       pending.catch(() => undefined);
       // Race immediately, so a transport failure or watchdog expiry reaches
@@ -968,7 +1138,30 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       const head = /^HTTP\/1\.1 400 [^\r\n]*\r\n(?:[^\r\n]+\r\n)*\r\n/.exec(text);
       assert.ok(head !== null, "the complete parser-error status line and header block arrived through peer closure");
       assert.ok(!text.includes("HTTP/1.1 200 "), "the queued response's headers never reached the wire");
+      // The earlier route now returns while the parser fallback owns the
+      // socket's closing reply. It must leave that reply and closure alone.
+      const attemptsBeforeRelease = observation.attempts();
+      const destroysBeforeRelease = observation.destroyAttempts();
+      await Promise.race([
+        (async () => {
+          firstGateResolve();
+          await firstReturned;
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          assert.equal(
+            observation.attempts(),
+            attemptsBeforeRelease,
+            "the pending route makes no response write after the parser fallback",
+          );
+          assert.equal(
+            observation.destroyAttempts(),
+            destroysBeforeRelease,
+            "the pending route does not destroy the parser fallback's closing reply",
+          );
+        })(),
+        guard.promise,
+      ]);
     } finally {
+      observation?.close();
       guard.clear();
       firstGateResolve();
       // Close the server and the store independently, retaining each cleanup
@@ -1315,6 +1508,7 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
   it("commits two exact-limit imports sequentially, the second chunked, and reuses one socket for each health read", async () => {
     const runningFixture = await running();
     const transport = keepAliveTransport();
+    const guard = watchdog(10000, "the exact-limit sequential imports did not finish");
     try {
       const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
       const requests = [
@@ -1346,13 +1540,15 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
         assert.equal(body.byteLength, EXACT_BODY_BYTES, `import ${index + 1} is exactly ${EXACT_BODY_BYTES} bytes before transfer coding`);
         const before = runningFixture.store.snapshot();
 
-        const reply = await send(transport, runningFixture.server.origin, {
+        const replyPending = send(transport, runningFixture.server.origin, {
           method: "POST",
           path: importPath,
           contentType: MULTIPART_TYPE,
           body,
           chunked: request.chunked,
         });
+        replyPending.catch(() => undefined);
+        const reply = await Promise.race([replyPending, guard.promise]);
         assert.equal(reply.status, 200, `import ${index + 1} is a complete 200: ${reply.body.slice(0, 200)}`);
 
         const after = runningFixture.store.snapshot();
@@ -1376,7 +1572,9 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
         assert.equal(source.format, "paste", `import ${index + 1} stores a pasted source`);
         assert.equal(source.originalText, request.paste, `import ${index + 1}'s pasted source is exactly its small text, without the padded epilogue`);
 
-        const health = await send(transport, runningFixture.server.origin, { path: "/health" });
+        const healthPending = send(transport, runningFixture.server.origin, { path: "/health" });
+        healthPending.catch(() => undefined);
+        const health = await Promise.race([healthPending, guard.promise]);
         assert.equal(health.status, 200, `the health read after import ${index + 1} is a complete 200`);
         assert.ok(health.body.includes("ok"), `the health read after import ${index + 1} reports its status: ${health.body}`);
         assert.ok(isPositiveInteger(reply.localPort), `import ${index + 1}'s local port is a positive integer: ${reply.localPort}`);
@@ -1384,6 +1582,52 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
         assert.equal(reply.localPort, health.localPort, `import ${index + 1} and its health read reused one connection`);
       }
     } finally {
+      guard.clear();
+      transport.close();
+      await runningFixture.close();
+    }
+  });
+
+  it("renders an eligible GET once with an empty form and null file in a 50-client workspace, then reuses the socket for health", async () => {
+    const runningFixture = await running({ clients: 50 });
+    const transport = keepAliveTransport();
+    const guard = watchdog(5000, "the 50-client eligible GET scenario did not finish");
+    try {
+      assert.equal(runningFixture.store.snapshot().clients.length, 50, "the synthetic workspace holds 50 clients");
+      const before = baselineOf(runningFixture);
+
+      // /clients is an eligible bodyless GET route. Its render sees the shell's
+      // accepted request: method GET, the route path, the canonical origin, an
+      // empty form and no file.
+      const clientsPending = send(transport, runningFixture.server.origin, { path: "/clients" });
+      clientsPending.catch(() => undefined);
+      const clients = await Promise.race([clientsPending, guard.promise]);
+      assert.equal(clients.status, 200, `the clients list is a complete 200: ${clients.body.slice(0, 200)}`);
+      assert.equal(runningFixture.requests.length, 1, "the eligible GET route rendered exactly once");
+      const request = runningFixture.requests[0]!;
+      assert.equal(request.method, "GET", "the route request is a GET");
+      assert.equal(request.path, "/clients", "the route request carries the request path");
+      assert.equal(request.origin, runningFixture.server.origin, "the route request carries the canonical origin");
+      assert.deepEqual(request.form, {}, "the route request carries an empty form");
+      assert.equal(request.file, null, "the route request carries no file");
+      assert.ok(clients.body.includes("Client 50"), "the usual clients response includes the last synthetic client");
+
+      // The subsequent health read is a complete 200 on the same kept-alive
+      // socket, proven by the equal positive client local ports.
+      const healthPending = send(transport, runningFixture.server.origin, { path: "/health" });
+      healthPending.catch(() => undefined);
+      const health = await Promise.race([healthPending, guard.promise]);
+      assert.equal(health.status, 200, `the health page is a complete 200: ${health.body}`);
+      assert.ok(health.body.includes("ok"), `the health page reports its status: ${health.body}`);
+      assert.equal(runningFixture.renders.followUp, 1, "the health route rendered once");
+      assert.equal(runningFixture.requests.length, 1, "the health GET never reached a hierarchy route");
+      assert.ok(isPositiveInteger(clients.localPort), `the clients reply's local port is a positive integer: ${clients.localPort}`);
+      assert.ok(isPositiveInteger(health.localPort), `the health reply's local port is a positive integer: ${health.localPort}`);
+      assert.equal(clients.localPort, health.localPort, "the eligible GET and the health read reused one connection");
+
+      assertUnchanged(runningFixture, before, "after the eligible GET and health read");
+    } finally {
+      guard.clear();
       transport.close();
       await runningFixture.close();
     }
@@ -1479,10 +1723,13 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
     const dir = tempDir();
     const store = await openStore(dir);
     const transport = keepAliveTransport();
+    const guard = watchdog(5000, "the 20 ms deadline scenario did not finish");
     let server: StartedServer | null = null;
     try {
       // A route that answers well after the deadline, so the deadline is the
-      // only reason the request fails.
+      // only reason the request fails. The test does not depend on the server
+      // having received the request, so a valid timeout before or after receipt
+      // both satisfy the same finite, real-clock expectation.
       const slow: Route = {
         method: "GET",
         render() {
@@ -1498,15 +1745,130 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
         },
       };
       server = await startServer({ store, port: 0, routes });
-      await assert.rejects(
-        send(transport, server.origin, { path: "/slow", deadlineMs: 20 }),
-        /no reply within 20 ms/,
-        "a request past its deadline fails",
-      );
-      // Let the slow handler finish before the server is closed.
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      const pending = send(transport, server.origin, { path: "/slow", deadlineMs: 20 });
+      const expected = assert.rejects(pending, /no reply within 20 ms/, "a request past its deadline fails");
+      // Observe the assertion at creation so a watchdog win cannot leave it unhandled.
+      expected.catch(() => undefined);
+      await Promise.race([
+        (async () => {
+          await expected;
+          // Let the slow handler finish before the server is closed.
+          await new Promise((resolve) => setTimeout(resolve, 300));
+        })(),
+        guard.promise,
+      ]);
     } finally {
+      guard.clear();
       transport.close();
+      // Close the server and the store independently, retaining each cleanup
+      // failure; a failed server close must not swallow a store close error.
+      let serverError: unknown = null;
+      if (server !== null) {
+        try {
+          await server.close();
+        } catch (error) {
+          serverError = error;
+        }
+      }
+      let storeError: unknown = null;
+      try {
+        await store.close();
+      } catch (error) {
+        storeError = error;
+      }
+      if (serverError !== null && storeError !== null) {
+        throw new AggregateError([serverError, storeError], "both the server and the store failed to close");
+      }
+      if (serverError !== null) throw serverError;
+      if (storeError !== null) throw storeError;
+    }
+  });
+
+  it("leaves a late render unanswered after the client disconnects following route entry", async () => {
+    const dir = tempDir();
+    const store = await openStore(dir);
+    const transport = keepAliveTransport();
+    const guard = watchdog(5000, "the delayed-render scenario did not finish");
+    let server: StartedServer | null = null;
+    let observation: ReturnType<typeof observeServerWrites> | null = null;
+    let releaseLate: () => void = () => undefined;
+    try {
+      // The route stays pending until the test releases it, so it returns only
+      // after the server has itself observed the disconnected client.
+      let routeReturned: () => void = () => undefined;
+      let routeEntered: () => void = () => undefined;
+      const late = new Promise<RouteResult>((resolve) => {
+        releaseLate = () => resolve({ status: 200, body: "late" });
+      });
+      const entered = new Promise<void>((resolve) => {
+        routeEntered = () => resolve();
+      });
+      const returned = new Promise<void>((resolve) => {
+        routeReturned = () => resolve();
+      });
+      const slow: Route = {
+        method: "GET",
+        async render() {
+          routeEntered();
+          const result = await late;
+          routeReturned();
+          return result;
+        },
+      };
+      const routes: Routes = {
+        home: { get: slow },
+        health: { get: slow },
+        hierarchy: {
+          match: (path) => (path === "/slow" ? "slow" : null),
+          route: () => slow,
+        },
+      };
+      server = await startServer({ store, port: 0, routes });
+      observation = observeServerWrites(server.port);
+      // The request's deadline is not the disconnect under test. The real
+      // client is disconnected explicitly, only after render signals that the
+      // route is running, so the late completion is measured against a live
+      // request that the server saw and then lost.
+      const pending = send(transport, server.origin, { path: "/slow", deadlineMs: 30000 });
+      const expected = assert.rejects(
+        pending,
+        (error: unknown) => error instanceof Error && !/no reply within/.test(error.message),
+        "the disconnected request rejects before its deadline",
+      );
+      // Attach the rejection handler before awaiting route entry.
+      expected.catch(() => undefined);
+      // Race the whole asynchronous check against the real watchdog, including
+      // route entry, the disconnect, the route return and the final observation,
+      // so a watchdog expiry always fails the scenario.
+      await Promise.race([
+        (async () => {
+          await entered;
+          // The route is running, so disconnect the real client now.
+          transport.agent.destroy();
+          await expected;
+          await observation.waitForPeerLoss();
+          assert.equal(observation.attemptsAfterPeerLoss(), 0, "no response attempt follows the observed peer loss");
+          const attemptsBeforeRelease = observation.attempts();
+          // The route now returns after the server has observed the peer loss;
+          // the settled request must close without starting a final reply.
+          releaseLate();
+          await returned;
+          await new Promise((resolve) => setImmediate(resolve));
+          await new Promise((resolve) => setImmediate(resolve));
+          assert.equal(
+            observation.attempts(),
+            attemptsBeforeRelease,
+            "the delayed route makes no response attempt after the peer is gone",
+          );
+          assert.equal(observation.attemptsAfterPeerLoss(), 0, "the delayed route makes a post-loss response attempt");
+        })(),
+        guard.promise,
+      ]);
+    } finally {
+      observation?.close();
+      guard.clear();
+      transport.close();
+      releaseLate();
       // Close the server and the store independently, retaining each cleanup
       // failure; a failed server close must not swallow a store close error.
       let serverError: unknown = null;
@@ -1602,6 +1964,255 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       );
     } finally {
       transport.close();
+    }
+  });
+});
+
+describe("transcript HTTP transport: one settled final reply per request", () => {
+  it("answers a framing error before any request object exists with one complete no-store 400 and closes", async () => {
+    const runningFixture = await running();
+    const guard = watchdog(5000, "the pre-dispatch framing error did not finish");
+    try {
+      const before = baselineOf(runningFixture);
+      const pending = sendRaw(runningFixture.server.origin, {
+        steps: [{ bytes: Buffer.from("GARBAGE\r\n\r\n", "utf8") }],
+      });
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assert.equal(exchange.replies.length, 1, "the connection carries exactly one complete reply");
+      assertOrdinaryRefusal(exchange.replies[0]!, 400, "pre-dispatch framing error");
+      assert.ok(isPositiveInteger(exchange.localPort), `the exchange used one positive client local port: ${exchange.localPort}`);
+      assert.equal(runningFixture.renders.import, 0, "the malformed request never reached an import handler");
+      assertUnchanged(runningFixture, before, "after the pre-dispatch framing error");
+    } finally {
+      guard.clear();
+      await runningFixture.close();
+    }
+  });
+
+  it("answers a malformed import after a complete health reply on the same connection with one no-store 400", async () => {
+    const runningFixture = await running();
+    const guard = watchdog(5000, "the malformed import after health did not finish");
+    try {
+      const before = baselineOf(runningFixture);
+      const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
+      const pending = sendRaw(runningFixture.server.origin, {
+        steps: [
+          { bytes: rawGet(runningFixture.server.origin, "/health"), afterReplies: 1 },
+          { bytes: malformedPost(runningFixture.server.origin, importPath) },
+        ],
+      });
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assert.equal(exchange.replies.length, 2, "the connection carries the earlier 200 and exactly one parser-error reply");
+      const health = exchange.replies[0]!;
+      assert.equal(health.status, 200, "the earlier health reply is a complete 200");
+      assertOrdinaryRefusal(exchange.replies[1]!, 400, "malformed import after health");
+      assert.equal(exchange.replyLocalPorts.length, 2, "both replies report their live client local port");
+      const healthPort = exchange.replyLocalPorts[0]!;
+      const importPort = exchange.replyLocalPorts[1]!;
+      assert.ok(isPositiveInteger(healthPort), `the health reply used one positive client local port: ${healthPort}`);
+      assert.ok(isPositiveInteger(importPort), `the import reply used one positive client local port: ${importPort}`);
+      assert.equal(healthPort, importPort, "the health and import replies shared one client local port");
+      assert.equal(runningFixture.renders.followUp, 1, "the health read rendered once");
+      assert.equal(runningFixture.renders.import, 0, "the malformed import never reached a handler");
+      assertUnchanged(runningFixture, before, "after the malformed import");
+    } finally {
+      guard.clear();
+      await runningFixture.close();
+    }
+  });
+
+  it("answers an upload whose input ends before its declared body with one complete no-store 400", async () => {
+    const runningFixture = await running();
+    const guard = watchdog(5000, "the incomplete upload did not finish");
+    try {
+      const before = baselineOf(runningFixture);
+      const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
+      const prefix = Buffer.from(
+        `--${BOUNDARY}\r\nContent-Disposition: form-data; name="paste"\r\n\r\nAlice: the interrupted source.\r\n`,
+        "utf8",
+      );
+      const declared = prefix.byteLength + 4096;
+      const request = rawPostRequest(runningFixture.server.origin, importPath, {
+        Origin: new URL(runningFixture.server.origin).origin,
+        "Content-Type": MULTIPART_TYPE,
+        "Content-Length": String(declared),
+      }, prefix);
+      const pending = sendRaw(runningFixture.server.origin, {
+        steps: [{ bytes: request, endWrite: true }],
+      });
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assert.equal(exchange.replies.length, 1, "the connection carries exactly one complete reply");
+      const refusal = exchange.replies[0]!;
+      assert.equal(refusal.status, 400, "incomplete upload: the reply is a 400");
+      assert.equal(refusal.headers["cache-control"], "no-store", "incomplete upload: the reply is not cached");
+      assert.equal(refusal.headers["connection"], "close", "incomplete upload: the reply closes the connection");
+      assert.equal(
+        refusal.headers["content-length"],
+        String(refusal.bytes.byteLength),
+        "incomplete upload: the reply's declared length frames its complete body",
+      );
+      assert.equal(exchange.writeEnded, true, "the peer ended its write side before the declared body was complete");
+      assert.equal(runningFixture.renders.import, 0, "the incomplete import never reached a handler");
+      assertUnchanged(runningFixture, before, "after the incomplete upload");
+    } finally {
+      guard.clear();
+      await runningFixture.close();
+    }
+  });
+
+  it("closes after a guard reply when the same POST's framing fails without another final reply", async () => {
+    const runningFixture = await running();
+    const observation = observeServerWrites(runningFixture.server.port);
+    const guard = watchdog(5000, "the guard reply followed by a framing error did not finish");
+    try {
+      const before = baselineOf(runningFixture);
+      const clientErrorsBefore = observation.clientErrors();
+      const clientErrorCodesBefore = observation.clientErrorCodes().length;
+      const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
+      // The POST omits Origin, so the guard answers 403 before reading the
+      // chunked body. The guard reply is complete before the malformed chunk is
+      // written, so the same request's final reply has already finished.
+      const request = rawPostRequest(runningFixture.server.origin, importPath, {
+        "Content-Type": MULTIPART_TYPE,
+        "Transfer-Encoding": "chunked",
+      }, Buffer.from("5\r\nhello\r\n", "utf8"));
+      const pending = sendRaw(runningFixture.server.origin, {
+        steps: [
+          { bytes: request, afterReplies: 1 },
+          { bytes: Buffer.from("Z\r\n", "utf8") },
+        ],
+      });
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assert.equal(exchange.replies.length, 1, "the guard reply is the only final reply");
+      assert.equal(exchange.replies[0]!.status, 403, "the only reply is the guard's 403");
+      assert.equal(exchange.replies[0]!.headers["cache-control"], "no-store", "the guard reply is not cached");
+      assert.ok(
+        observation.clientErrors() > clientErrorsBefore,
+        "the server observed the same POST's framing error after the complete guard reply",
+      );
+      const newClientErrorCodes = observation.clientErrorCodes().slice(clientErrorCodesBefore);
+      assert.ok(
+        newClientErrorCodes.includes("HPE_INVALID_CHUNK_SIZE"),
+        `the parser rejected the invalid chunk size after the guard reply: ${newClientErrorCodes.join(", ")}`,
+      );
+      assert.equal(runningFixture.renders.import, 0, "the refused import never reached a handler");
+      assertUnchanged(runningFixture, before, "after the guard reply and framing error");
+    } finally {
+      observation.close();
+      guard.clear();
+      await runningFixture.close();
+    }
+  });
+
+  it("makes no response attempt after the peer resets mid-upload", async () => {
+    const runningFixture = await running();
+    const observation = observeServerWrites(runningFixture.server.port);
+    const guard = watchdog(15000, "the reset mid-upload did not finish");
+    try {
+      const before = baselineOf(runningFixture);
+      const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
+      // The prefix carries the whole synthetic 10 MiB file but no closing
+      // boundary, and the declared length asks for more. The raw exchange waits
+      // until the server itself has received upload bytes, then resets the
+      // peer; the reset leaves nothing for the server to answer.
+      const prefix = partialFileMultipart(10 * 1024 * 1024);
+      const request = rawPostRequest(runningFixture.server.origin, importPath, {
+        Origin: new URL(runningFixture.server.origin).origin,
+        "Content-Type": MULTIPART_TYPE,
+        "Content-Length": String(prefix.byteLength + 1024),
+      }, prefix);
+      const pending = sendRaw(runningFixture.server.origin, {
+        deadlineMs: 10000,
+        minimumReplies: 0,
+        observation,
+        steps: [{ bytes: request, afterWrite: true, afterServerBytes: 256 * 1024, reset: true }],
+      });
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assert.equal(exchange.resetRequested, true, "the peer reset the connection after the partial upload");
+      assert.equal(exchange.replies.length, 0, "the failed upload receives no reply after the peer reset");
+      assert.equal(exchange.bytes.byteLength, 0, "the peer receives no bytes after its reset");
+      assert.ok(
+        observation.bytesReceived() >= 256 * 1024,
+        "the server had received upload bytes before the reset",
+      );
+      // Wait until the server itself has observed the peer loss and the failed
+      // request has closed, then give its failure path one more turn before
+      // checking attempts, renders and workspace state while still observed.
+      await Promise.race([observation.waitForPeerLoss(), guard.promise]);
+      // A single write attempt into a connection the peer has already reset is
+      // allowed: Node 22 can report the reset to clientError while the socket
+      // still looks writable, and no bytes reach the browser. What matters is
+      // that no further attempt is made after the server observes the loss.
+      assert.equal(
+        observation.attemptsAfterPeerLoss(),
+        0,
+        "the server makes no further response write attempt after the peer loss",
+      );
+      assert.equal(runningFixture.renders.import, 0, "the failed upload never reached an import handler");
+      assertUnchanged(runningFixture, before, "after the peer reset mid-upload");
+    } finally {
+      observation.close();
+      guard.clear();
+      await runningFixture.close();
+    }
+  });
+
+  it("delivers the reserved overflow 413 as the only final reply when the same upload's framing fails during retirement", async () => {
+    const runningFixture = await running();
+    const observation = observeServerWrites(runningFixture.server.port);
+    const guard = watchdog(5000, "the overflow with a framing failure during retirement did not finish");
+    try {
+      const before = baselineOf(runningFixture);
+      const clientErrorsBefore = observation.clientErrors();
+      const clientErrorCodesBefore = observation.clientErrorCodes().length;
+      const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
+      const body = oneByteOverLimitMultipart({
+        title: "Overflow framing retirement import",
+        date: "2026-09-09",
+        paste: "Iris: the overflow retirement source.",
+      });
+      assert.equal(body.byteLength, OVERSIZED_BODY_BYTES, "the body is exactly one byte past the inclusive limit");
+      // The exact-limit chunk is written first. The single excess byte is then
+      // written together with an invalid chunk-size tail in one combined write,
+      // so the same unfinished upload stages both the excess byte and the
+      // malformed tail for the parser. The reserved refusal must survive that
+      // framing failure as the only reply.
+      const pending = sendStaged(runningFixture.server.origin, {
+        path: importPath,
+        contentType: MULTIPART_TYPE,
+        declaredLength: body.byteLength,
+        bodyPrefix: body,
+        chunked: true,
+        chunkSizes: [EXACT_BODY_BYTES, 1],
+        combineTail: true,
+        tailDelayMs: 20,
+        withholdTerminator: true,
+        followUp: Buffer.from("Z\r\n", "utf8"),
+      });
+      pending.catch(() => undefined);
+      const exchange = await Promise.race([pending, guard.promise]);
+      assertOversizedRefusal(exchange, "overflow with a framing failure during retirement");
+      assert.ok(
+        observation.clientErrors() > clientErrorsBefore,
+        "the server observed the framing error during retirement",
+      );
+      const newClientErrorCodes = observation.clientErrorCodes().slice(clientErrorCodesBefore);
+      assert.ok(
+        newClientErrorCodes.includes("HPE_INVALID_CHUNK_SIZE"),
+        `the parser rejected the invalid chunk size during retirement: ${newClientErrorCodes.join(", ")}`,
+      );
+      assert.equal(runningFixture.renders.import, 0, "the refused import never reached a handler");
+      assert.equal(runningFixture.renders.followUp, 0, "no follow-up handler ran on the retiring socket");
+      assertUnchanged(runningFixture, before, "after the overflow framing failure");
+    } finally {
+      observation.close();
+      guard.clear();
+      await runningFixture.close();
     }
   });
 });

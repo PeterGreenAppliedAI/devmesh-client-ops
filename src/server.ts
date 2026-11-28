@@ -564,12 +564,34 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
   // it is drained and excluded instead of reaching a handler.
   const retiring = new WeakSet<Socket>();
 
+  // Sockets whose one closing reply is already being written. The owner is
+  // recorded before the write, so a later parser error or request notification
+  // cannot destroy the socket while the owner's bytes are still flushing. This
+  // includes a raw parser-error fallback that runs before any request object
+  // exists.
+  const closingReplies = new WeakSet<Socket>();
+
   // The responses still active on each ordinary socket, in request order, so a
   // parser failure can tell whether Node has already started writing the
-  // response currently attached to the socket. A response leaves this set when
-  // it finishes or closes, so a completed reply does not prevent a later
-  // malformed request on the same kept-alive socket from being answered.
+  // response currently attached to the socket. A response leaves this set only
+  // once both its reply has finished or closed and its request input has
+  // completed, so a guard's finished reply does not erase the fact that the
+  // same request's body is still outstanding.
   const activeResponses = new WeakMap<Socket, Set<ServerResponse>>();
+
+  interface RequestState {
+    readonly req: IncomingMessage;
+    readonly res: ServerResponse;
+    readonly inputDone: () => void;
+    readonly replyDone: () => void;
+    settled: boolean;
+  }
+
+  // The request last dispatched on each socket, with whether its own final
+  // reply has started. A parser failure for that request's unfinished input
+  // must not append a fallback reply after its final reply, even if that reply
+  // has already finished and left the active set.
+  const currentRequests = new WeakMap<Socket, RequestState>();
 
   const server = createServer((req, res) => {
     const socket = req.socket;
@@ -580,17 +602,49 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
     }
     const current = responses;
     current.add(res);
+    let inputEnded = false;
+    let replyEnded = false;
     const forget = (): void => {
+      if (!inputEnded || !replyEnded) return;
       current.delete(res);
       if (current.size === 0 && activeResponses.get(socket) === current) {
         activeResponses.delete(socket);
       }
     };
-    res.once("finish", forget);
-    res.once("close", forget);
-    void handle(req, res).catch(() => {
-      if (!res.headersSent) send(res, 500, `${GENERIC_FAILURE}\n`, "text/plain; charset=utf-8");
-      else res.destroy();
+    const state: RequestState = {
+      req,
+      res,
+      inputDone: () => {
+        inputEnded = true;
+        forget();
+      },
+      replyDone: () => {
+        replyEnded = true;
+        forget();
+      },
+      settled: false,
+    };
+    // A request error or abort whose socket can no longer write has already
+    // lost its peer: the request is settled without a reply attempt.
+    const inputLost = (): void => {
+      state.inputDone();
+      if (req.socket.destroyed || !req.socket.writable) state.settled = true;
+    };
+    currentRequests.set(socket, state);
+    req.once("end", state.inputDone);
+    req.once("close", state.inputDone);
+    req.once("aborted", inputLost);
+    req.once("error", inputLost);
+    res.once("finish", state.replyDone);
+    res.once("close", state.replyDone);
+    void handle(req, res, state).catch(() => {
+      // A path that already settled this request owns its reply or closure.
+      if (state.settled) return;
+      if (res.headersSent || res.writableEnded || res.destroyed || !req.socket.writable) {
+        res.destroy();
+        return;
+      }
+      send(res, 500, `${GENERIC_FAILURE}\n`, "text/plain; charset=utf-8");
     });
   });
 
@@ -615,23 +669,41 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
   // Node would give without this listener, reproduced here because adding a
   // clientError listener disables Node's own default handler.
   server.on("clientError", (error: Error, socket: Socket) => {
-    if (retiring.has(socket)) return;
+    if (retiring.has(socket) || closingReplies.has(socket)) return;
+    const state = currentRequests.get(socket);
     if (!socket.writable || socket.destroyed) {
+      // A request path that already owns a closing reply keeps ownership even
+      // after the socket stops accepting new writes; let that reply finish.
+      if (state !== undefined && state.settled) return;
+      if (state !== undefined) state.settled = true;
       socket.destroy(error);
       return;
     }
-    // Once the response currently attached to this socket has started writing,
-    // a fresh status line would be appended to that response stream. Close as
-    // Node does in that state instead of corrupting the started reply. Later
-    // responses are still queued behind the first one, so their generated
-    // headers do not mean anything has reached the wire yet; only the earliest
-    // active response is the one being written.
-    const responses = activeResponses.get(socket);
-    if (responses !== undefined) {
-      const current = responses.values().next().value;
-      if (current !== undefined && current.headersSent) {
+    // A parser failure while the last dispatched request's input is still
+    // outstanding belongs to that request. Once its final reply has started,
+    // close without appending another one, even if the reply has finished.
+    if (state !== undefined && !state.req.complete) {
+      // Another path (a body-reader refusal) may already own this request's
+      // one reply and closure; do not append or interrupt it.
+      if (state.settled) return;
+      state.settled = true;
+      if (state.res.headersSent || state.res.writableEnded || state.res.destroyed) {
         socket.destroy(error);
         return;
+      }
+    } else {
+      // A parser failure after a previous request's input completed is a new
+      // request's failure. Close as Node does when the earliest active response
+      // has already started writing, instead of corrupting or replacing it.
+      // A previous reply that has fully finished is no longer in the way: this
+      // request remains entitled to its own answer.
+      const responses = activeResponses.get(socket);
+      if (responses !== undefined) {
+        const current = responses.values().next().value;
+        if (current !== undefined && current.headersSent && !current.writableFinished) {
+          socket.destroy(error);
+          return;
+        }
       }
     }
     const code = (error as { readonly code?: string }).code;
@@ -640,7 +712,15 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
       : code === "HPE_HEADER_OVERFLOW" ? 431
       : code === "HPE_CHUNK_EXTENSIONS_OVERFLOW" ? 413
       : 400;
-    socket.end(`HTTP/1.1 ${status} ${STATUS_CODES[status]}\r\nConnection: close\r\n\r\n`);
+    // Record ownership before writing, even with no request object attached to
+    // this socket yet, so a later notification cannot interrupt this fallback.
+    closingReplies.add(socket);
+    socket.end(
+      `HTTP/1.1 ${status} ${STATUS_CODES[status]}\r\n` +
+        "Cache-Control: no-store\r\n" +
+        "Content-Length: 0\r\n" +
+        "Connection: close\r\n\r\n",
+    );
   });
 
   /** Mark a connection as retiring and ignore its late request/response failures. */
@@ -694,7 +774,7 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
     sendMultipartTooLarge(res);
   }
 
-  async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  async function handle(req: IncomingMessage, res: ServerResponse, state: RequestState): Promise<void> {
     // A request that follows on a retiring socket is only drained: it never
     // reaches the guards or any route handler, and it gets no second reply.
     if (retiring.has(req.socket)) {
@@ -796,8 +876,36 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
       }
 
       const result = await route.render({ method, path, origin: canonical, form, file });
+      // Another path may already own this request's settlement or the socket's
+      // one closing reply. It also owns the closure; let its reply finish
+      // instead of destroying the socket underneath it or appending another.
+      if (state.settled || closingReplies.has(req.socket)) return;
+      // This path still owns the request. If its final reply has started or the
+      // peer has gone, close without writing another reply.
+      if (res.headersSent || res.writableEnded || res.destroyed || !req.socket.writable) {
+        res.destroy();
+        return;
+      }
       sendRouteResult(res, result, path, options.store);
     } catch (error) {
+      // A parser-error fallback or an abort may already have settled this
+      // request on the socket directly. Its owning path handles the closure;
+      // this path must not write or destroy the connection under it.
+      if (state.settled || closingReplies.has(req.socket)) return;
+      if (res.headersSent || res.writableEnded || res.destroyed || !req.socket.writable) {
+        res.destroy();
+        return;
+      }
+      // A body-reader refusal or a request that ended before its declared body
+      // owns this request's final reply and closure. Mark it settled before the
+      // write so a later parser failure cannot append a second reply.
+      const requestRefusal = error instanceof Rejection && (error.status === 413 || error.status === 400);
+      if (requestRefusal) {
+        state.settled = true;
+        // This refusal owns the connection's closing reply from before its
+        // first byte, so no later parser error can interrupt or duplicate it.
+        closingReplies.add(req.socket);
+      }
       if (error instanceof Rejection && error.status === 413) {
         if (multipart) {
           // The multipart refusal names the limit that applied to this body and
@@ -810,6 +918,10 @@ export async function startServer(options: ServerOptions): Promise<StartedServer
         // connection instead of trying to reuse it for another request.
         res.setHeader("Connection", "close");
         // An ordinary form keeps the existing 413 body and close behaviour.
+      } else if (error instanceof Rejection && error.status === 400) {
+        // Incomplete or invalid request framing is answered once, then the
+        // connection closes instead of being reused for another request.
+        res.setHeader("Connection", "close");
       }
       const status = errorStatus(error);
       if (error instanceof FormError) {

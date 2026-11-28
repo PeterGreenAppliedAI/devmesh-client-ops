@@ -14,10 +14,12 @@ import {
   Agent,
   createServer,
   request as httpRequest,
+  Server,
   type ClientRequest,
   type IncomingMessage,
+  type ServerResponse,
 } from "node:http";
-import { createConnection } from "node:net";
+import { createConnection, type Socket } from "node:net";
 
 /** The boundary the helper uses for every submitted multipart body. */
 export const BOUNDARY = "transcript-library-boundary";
@@ -479,6 +481,12 @@ export interface ClosedExchange {
   readonly replies: readonly Reply[];
   /** The client socket's local port, captured while it was connected. */
   readonly localPort: number;
+  /**
+   * True when the optional post-reply reuse bytes were submitted after the
+   * first complete reply. The socket may already have been retired by then, so
+   * the attempt itself is the observation; no reply is expected from it.
+   */
+  readonly reuseAttempted: boolean;
 }
 
 /** A staged POST whose body and follow-up bytes are written before the reply. */
@@ -503,6 +511,12 @@ export interface StagedSendOptions {
    */
   readonly chunkSize?: number;
   /**
+   * Explicit HTTP chunk sizes covering the body prefix in order. Each size is
+   * its own chunk frame, so a caller can make one body byte a chunk of its own
+   * and submit later upload data only after that byte.
+   */
+  readonly chunkSizes?: readonly number[];
+  /**
    * Leave the final zero-length chunk unwritten, so the chunked request stays
    * unfinished while the reply is read and the peer closes.
    */
@@ -524,6 +538,14 @@ export interface StagedSendOptions {
    * before the reply is read. It is never awaited as a separate reply.
    */
   readonly followUp?: Uint8Array;
+  /**
+   * A raw follow-up request written on the original socket only after the first
+   * complete reply has arrived, so a retirement observation happens after the
+   * client has the full refusal. A write to a socket already retired by the
+   * peer is an accepted attempt: the complete reply and peer closure remain the
+   * evidence, and no second reply is expected.
+   */
+  readonly reuseAfterReply?: Uint8Array;
   /** The inclusive cap for all bytes read through closure. */
   readonly responseCap?: number;
   /** The deadline, from connection creation through peer closure. */
@@ -632,6 +654,18 @@ function parseReplies(bytes: Buffer): { readonly replies: Reply[]; readonly comp
   return { replies, complete: true };
 }
 
+/** True when a write error means the peer had already retired the socket. */
+function isRetirementWrite(error: Error): boolean {
+  const code = (error as { readonly code?: string }).code;
+  return (
+    code === "EPIPE" ||
+    code === "ECONNRESET" ||
+    code === "ENOTCONN" ||
+    code === "ERR_STREAM_DESTROYED" ||
+    code === "ERR_STREAM_WRITE_AFTER_END"
+  );
+}
+
 /**
  * Send a staged POST and read every byte until the peer closes the connection.
  *
@@ -661,8 +695,23 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
         "the chunk size is a positive finite byte count",
       );
     }
+    if (options.chunkSizes !== undefined) {
+      assert.equal(options.chunkSize, undefined, "a chunk size list replaces a single chunk size");
+      assert.ok(options.chunkSizes.length > 0, "a chunk size list has at least one chunk");
+      let covered = 0;
+      for (const size of options.chunkSizes) {
+        assert.ok(
+          Number.isSafeInteger(size) && size > 0,
+          "each chunk size is a positive finite byte count",
+        );
+        covered += size;
+      }
+      assert.ok(Number.isSafeInteger(covered), "the chunk sizes add up to a finite byte count");
+      assert.equal(covered, options.bodyPrefix.byteLength, "the chunk sizes cover the body prefix exactly");
+    }
   } else {
     assert.equal(options.chunkSize, undefined, "a chunk size is only used with a chunked staged send");
+    assert.equal(options.chunkSizes, undefined, "chunk sizes are only used with a chunked staged send");
     assert.notEqual(options.withholdTerminator, true, "a chunk terminator is only withheld from a chunked staged send");
     assert.notEqual(options.combineTail, true, "a combined tail is only used with a chunked staged send");
   }
@@ -694,6 +743,16 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
     let tailSubmitted = options.combineTail !== true;
     let socketError: Error | null = null;
     let localPort = 0;
+    let reuseAttempted = false;
+    // Set while a submitted reuse write has not yet reported its outcome. The
+    // exchange must not resolve from peer closure alone in that state: the
+    // write callback still decides whether the attempt succeeded or hit an
+    // expected retirement error.
+    let reuseWritePending = false;
+    // Set when the peer's FIN or close has arrived, so a reuse attempt made
+    // after retirement is recorded as an observed retirement rather than a
+    // submission that could not happen.
+    let peerEnded = false;
     const chunks: Buffer[] = [];
     let received = 0;
     const socket = createConnection({ host: url.hostname, port: Number(url.port) });
@@ -727,6 +786,11 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
         fail(new Error("the peer closed before the combined tail was written"));
         return;
       }
+      // Once a reuse write has started, peer closure alone is not enough: wait
+      // for the write callback to report success or an expected retirement
+      // error before settling. The write callback calls finish again when the
+      // peer has already closed, and the deadline stays armed meanwhile.
+      if (reuseWritePending) return;
       // A peer close dispatched after the expiry but before the timer callback
       // still fails; the monotonic deadline is checked at completion too.
       if (timedOut()) {
@@ -752,7 +816,7 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
       clearDeadline();
       clearTail();
       socket.destroy();
-      resolve({ bytes, replies, localPort });
+      resolve({ bytes, replies, localPort, reuseAttempted });
     };
     const armDeadline = (): boolean => {
       const remaining = expiresAt - performance.now();
@@ -790,15 +854,28 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
         socket.write(lines.join("\r\n"));
         if (chunked) {
           const prefix = Buffer.from(options.bodyPrefix!);
-          const chunkSize = options.chunkSize ?? prefix.byteLength;
           const frames: Buffer[] = [];
-          for (let offset = 0; offset < prefix.byteLength; offset += chunkSize) {
-            const chunk = prefix.subarray(offset, Math.min(offset + chunkSize, prefix.byteLength));
-            frames.push(
-              Buffer.from(`${chunk.byteLength.toString(16)}\r\n`),
-              chunk,
-              Buffer.from("\r\n"),
-            );
+          if (options.chunkSizes !== undefined) {
+            let offset = 0;
+            for (const size of options.chunkSizes) {
+              const chunk = prefix.subarray(offset, offset + size);
+              frames.push(
+                Buffer.from(`${chunk.byteLength.toString(16)}\r\n`),
+                chunk,
+                Buffer.from("\r\n"),
+              );
+              offset += size;
+            }
+          } else {
+            const chunkSize = options.chunkSize ?? prefix.byteLength;
+            for (let offset = 0; offset < prefix.byteLength; offset += chunkSize) {
+              const chunk = prefix.subarray(offset, Math.min(offset + chunkSize, prefix.byteLength));
+              frames.push(
+                Buffer.from(`${chunk.byteLength.toString(16)}\r\n`),
+                chunk,
+                Buffer.from("\r\n"),
+              );
+            }
           }
           if (options.combineTail === true) {
             // Each chunk contributes a size line, its data and a CRLF. Keep
@@ -850,11 +927,557 @@ export function sendStaged(base: string, options: StagedSendOptions): Promise<Cl
         return;
       }
       chunks.push(chunk);
+      if (!reuseAttempted && options.reuseAfterReply !== undefined && !settled) {
+        const parsed = parseReplies(Buffer.concat(chunks));
+        if (parsed.complete && parsed.replies.length > 0) {
+          // Prepare the bytes before recording anything: a preparation failure
+          // must not look like a reuse attempt that was submitted or retired.
+          const reuseBytes = Buffer.from(options.reuseAfterReply);
+          if (peerEnded || socket.destroyed) {
+            // The peer's retirement was already observed when the client tried
+            // to reuse the socket, so no write is possible or needed.
+            reuseAttempted = true;
+          } else {
+            try {
+              reuseWritePending = true;
+              socket.write(reuseBytes, (error?: Error | null) => {
+                reuseWritePending = false;
+                if (settled) return;
+                // A write rejected because the peer has already retired the
+                // socket is the expected outcome of the attempt. Any other
+                // write error is unexpected and must fail the exchange, even
+                // when the refusal reply has already fully arrived.
+                if (error !== undefined && error !== null && !isRetirementWrite(error)) {
+                  fail(error);
+                  return;
+                }
+                // The write outcome is known; if peer closure already happened,
+                // finish now so the full wire is checked through that closure.
+                if (peerEnded) finish();
+              });
+              // The bytes were submitted to the original socket after the
+              // complete reply; the peer's later closure is the retirement.
+              reuseAttempted = true;
+            } catch (error) {
+              reuseWritePending = false;
+              if (isRetirementWrite(error as Error)) {
+                reuseAttempted = true;
+                if (peerEnded) finish();
+              } else {
+                fail(error as Error);
+              }
+            }
+          }
+        }
+      }
     });
-    socket.on("end", finish);
-    socket.on("close", finish);
+    socket.on("end", () => {
+      peerEnded = true;
+      finish();
+    });
+    socket.on("close", () => {
+      peerEnded = true;
+      finish();
+    });
     socket.on("error", (error: Error) => {
-      if (!settled) socketError = error;
+      if (settled) return;
+      // A socket error during reuse is only an acceptable retirement when it
+      // is one of the expected retirement errors. Any unexpected error must
+      // fail the exchange, including after the complete refusal reply.
+      if (reuseAttempted && !isRetirementWrite(error)) {
+        fail(error);
+        return;
+      }
+      socketError = error;
+    });
+    if (!armDeadline()) return;
+  });
+}
+
+/** A server-side observation of one listener's request activity. */
+export interface ServerWriteObservation {
+  /** How many response write attempts the server made since the observation began. */
+  attempts(): number;
+  /** How many response write attempts the server made after an observed peer loss. */
+  attemptsAfterPeerLoss(): number;
+  /** How many times the server called destroy on a response since the observation began. */
+  destroyAttempts(): number;
+  /** How many request body bytes the server has received since the observation began. */
+  bytesReceived(): number;
+  /** How many parser failures the listener has observed since the observation began. */
+  clientErrors(): number;
+  /** The parser error codes observed on this listener since the observation began. */
+  clientErrorCodes(): readonly string[];
+  /** Resolve once the server has received at least `bytes` request body bytes. */
+  waitForReceived(bytes: number): Promise<void>;
+  /**
+   * Resolve once the server has observed a request's peer loss through its
+   * request events or its socket's close, and that request has closed, then
+   * after one more turn so its failure path finishes.
+   */
+  waitForPeerLoss(): Promise<void>;
+  /** Stop observing and restore every wrapped method. */
+  close(): void;
+}
+
+type AnyFunction = (...args: unknown[]) => unknown;
+
+/**
+ * Observe one real listener's request activity through stable Node interfaces.
+ * The listener's own `request` and `clientError` events are inspected as they
+ * are emitted, and only requests on `serverPort` are instrumented. Response and
+ * socket write methods are wrapped per request, so an attempt made after the
+ * peer is gone is counted even when a destroyed response stops before reaching
+ * the socket. The request's own body events are counted, letting a caller wait
+ * until the server has received upload bytes before acting. Every wrapper is
+ * restored by `close`; no module is replaced and no experimental channel is
+ * used.
+ */
+export function observeServerWrites(serverPort: number): ServerWriteObservation {
+  assert.ok(
+    Number.isInteger(serverPort) && serverPort > 0,
+    "the observed server port is a positive integer",
+  );
+  let attempts = 0;
+  let attemptsAfterPeerLoss = 0;
+  let destroyAttempts = 0;
+  let receivedBytes = 0;
+  let clientErrors = 0;
+  const clientErrorCodes: string[] = [];
+  let peerLost = false;
+  let socketClosed = false;
+  let lostRequestClosed = false;
+  const waiters: Array<{ readonly bytes: number; readonly resolve: () => void }> = [];
+  const peerLossWaiters: Array<() => void> = [];
+  const wrappedMethods: Array<{ readonly owner: object; readonly name: string; readonly original: AnyFunction }> = [];
+  const wrappedSockets = new WeakSet<Socket>();
+  const instrumentedRequests = new WeakSet<IncomingMessage>();
+  const noteAttempt = (): void => {
+    attempts += 1;
+    if (peerLost) attemptsAfterPeerLoss += 1;
+  };
+  const serviceWaiters = (): void => {
+    for (let index = waiters.length - 1; index >= 0; index -= 1) {
+      const waiter = waiters[index]!;
+      if (receivedBytes >= waiter.bytes) {
+        waiters.splice(index, 1);
+        waiter.resolve();
+      }
+    }
+  };
+  const servicePeerLossWaiters = (): void => {
+    if (!lostRequestClosed) return;
+    for (const resolve of peerLossWaiters.splice(0)) resolve();
+  };
+  const wrap = (owner: object, name: string): void => {
+    const record = owner as Record<string, AnyFunction>;
+    const original = record[name];
+    record[name] = function (this: unknown, ...args: unknown[]): unknown {
+      noteAttempt();
+      return original.apply(this, args);
+    };
+    wrappedMethods.push({ owner, name, original });
+  };
+  const instrumentRequest = (req: IncomingMessage, res: ServerResponse): void => {
+    if (instrumentedRequests.has(req)) return;
+    instrumentedRequests.add(req);
+    req.on("data", (chunk: Buffer | string) => {
+      receivedBytes += Buffer.isBuffer(chunk) ? chunk.byteLength : Buffer.byteLength(chunk);
+      serviceWaiters();
+    });
+    let requestLost = false;
+    let requestClosed = false;
+    const losePeer = (): void => {
+      peerLost = true;
+      requestLost = true;
+      if (requestClosed) {
+        lostRequestClosed = true;
+        servicePeerLossWaiters();
+      }
+    };
+    req.once("aborted", losePeer);
+    req.once("error", losePeer);
+    req.once("close", () => {
+      requestClosed = true;
+      if (requestLost || socketClosed) {
+        lostRequestClosed = true;
+        servicePeerLossWaiters();
+      }
+    });
+    for (const name of ["writeHead", "write", "end"]) wrap(res, name);
+    // A response destroy is not a write attempt, but it is an observable
+    // settlement action: a late route completion must not destroy a response
+    // another path already owns. Count it separately from the write methods.
+    const originalDestroy = res.destroy;
+    res.destroy = function (this: ServerResponse, error?: Error): ServerResponse {
+      destroyAttempts += 1;
+      return originalDestroy.call(this, error);
+    };
+    wrappedMethods.push({ owner: res, name: "destroy", original: originalDestroy as AnyFunction });
+    const socket = req.socket;
+    socket.once("close", () => {
+      // A peer that destroys the socket after its request input is complete
+      // may close the request without an abort event. The socket's close is
+      // still the server-observed peer loss for that request.
+      socketClosed = true;
+      peerLost = true;
+      if (requestClosed) {
+        lostRequestClosed = true;
+        servicePeerLossWaiters();
+      }
+    });
+    if (!wrappedSockets.has(socket)) {
+      wrappedSockets.add(socket);
+      wrap(socket, "write");
+      wrap(socket, "end");
+    }
+  };
+  const serverPrototype = Server.prototype as unknown as {
+    emit: (event: string | symbol, ...args: unknown[]) => boolean;
+  };
+  const originalEmit = serverPrototype.emit;
+  serverPrototype.emit = function (this: unknown, event: string | symbol, ...args: unknown[]): boolean {
+    if (event === "request") {
+      const req = args[0] as IncomingMessage | undefined;
+      const res = args[1] as ServerResponse | undefined;
+      if (req !== undefined && res !== undefined && req.socket.localPort === serverPort) {
+        instrumentRequest(req, res);
+      }
+    } else if (event === "clientError") {
+      const socket = args[1] as Socket | undefined;
+      if (socket !== undefined && socket.localPort === serverPort) {
+        clientErrors += 1;
+        const code = (args[0] as { readonly code?: unknown } | undefined)?.code;
+        clientErrorCodes.push(typeof code === "string" ? code : "");
+      }
+    }
+    return originalEmit.apply(this, [event, ...args]);
+  };
+  return {
+    attempts: () => attempts,
+    attemptsAfterPeerLoss: () => attemptsAfterPeerLoss,
+    destroyAttempts: () => destroyAttempts,
+    bytesReceived: () => receivedBytes,
+    clientErrors: () => clientErrors,
+    clientErrorCodes: () => [...clientErrorCodes],
+    waitForReceived(bytes: number): Promise<void> {
+      assert.ok(
+        Number.isSafeInteger(bytes) && bytes >= 0,
+        "the awaited server-received byte count is a finite non-negative count",
+      );
+      if (receivedBytes >= bytes) return Promise.resolve();
+      return new Promise<void>((resolve) => {
+        waiters.push({ bytes, resolve });
+      });
+    },
+    waitForPeerLoss(): Promise<void> {
+      if (lostRequestClosed) return new Promise<void>((resolve) => setImmediate(resolve));
+      return new Promise<void>((resolve) => {
+        peerLossWaiters.push(() => setImmediate(resolve));
+      });
+    },
+    close() {
+      serverPrototype.emit = originalEmit;
+      for (const { owner, name, original } of wrappedMethods) {
+        (owner as Record<string, AnyFunction>)[name] = original;
+      }
+      wrappedMethods.length = 0;
+      for (const waiter of waiters.splice(0)) waiter.resolve();
+      for (const resolve of peerLossWaiters.splice(0)) resolve();
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Scripted raw exchanges read through peer closure
+// ---------------------------------------------------------------------------
+
+/**
+ * One scripted step on a raw socket. `bytes` are written after the previous
+ * step's condition is satisfied. `afterReplies` waits for that many complete
+ * replies, `afterWrite` waits for the socket's write callback, `endWrite`
+ * half-closes the client's write side (a peer FIN), and `reset` resets the
+ * connection (a peer RST).
+ */
+export interface RawExchangeStep {
+  readonly bytes: Uint8Array;
+  readonly afterReplies?: number;
+  readonly afterWrite?: boolean;
+  /** Wait until the observed server has received at least this many body bytes. */
+  readonly afterServerBytes?: number;
+  readonly endWrite?: boolean;
+  readonly reset?: boolean;
+}
+
+/** A scripted raw exchange; its reply bytes are read through peer closure. */
+export interface RawExchangeOptions {
+  readonly steps: readonly RawExchangeStep[];
+  /** The inclusive cap for all bytes read through closure. */
+  readonly responseCap?: number;
+  /** The deadline, from connection creation through peer closure. */
+  readonly deadlineMs?: number;
+  /**
+   * The least number of complete replies the exchange must contain. Zero is
+   * used by a scenario that expects the peer to reset without any reply.
+   */
+  readonly minimumReplies?: number;
+  /** The server-side observation used by steps that wait for server receipt. */
+  readonly observation?: ServerWriteObservation;
+}
+
+/** The observation of one scripted raw exchange. */
+export interface RawExchange extends ClosedExchange {
+  /** The live client port captured as each complete reply arrived, in order. */
+  readonly replyLocalPorts: readonly number[];
+  /** True when the client ended its write side (FIN) after a step. */
+  readonly writeEnded: boolean;
+  /** True when the client reset the connection after a step. */
+  readonly resetRequested: boolean;
+}
+
+/**
+ * Send one scripted raw exchange and read every byte until peer closure.
+ *
+ * A step's bytes are written in order; the step may wait for complete replies
+ * or its write callback before the next step. A half-close or reset ends the
+ * script and the exchange settles only after the peer closes. Every complete
+ * reply is parsed from the received bytes and the final reply's declared body
+ * must end at the final received byte. A missing reply below `minimumReplies`,
+ * a truncated reply, a cap overflow, an unexpected socket error, or the
+ * deadline rejects. A reset requested by the script accepts the reset's own
+ * socket error as the expected peer loss; no reply is invented after it.
+ */
+export function sendRaw(base: string, options: RawExchangeOptions): Promise<RawExchange> {
+  const url = originOf(base);
+  const cap = options.responseCap ?? DEFAULT_RESPONSE_CAP;
+  const deadlineMs = options.deadlineMs ?? DEFAULT_DEADLINE_MS;
+  const minimumReplies = options.minimumReplies ?? 1;
+  assert.ok(Number.isSafeInteger(cap) && cap >= 0, "the response cap is a finite byte count");
+  assert.ok(
+    Number.isSafeInteger(minimumReplies) && minimumReplies >= 0,
+    "the minimum reply count is a finite non-negative count",
+  );
+  assert.ok(
+    Number.isSafeInteger(deadlineMs) && deadlineMs > 0 && deadlineMs <= MAX_TIMEOUT_MS,
+    `the deadline is a finite positive duration of at most ${MAX_TIMEOUT_MS} ms`,
+  );
+  assert.ok(options.steps.length > 0, "a scripted raw exchange has at least one step");
+  for (const [index, step] of options.steps.entries()) {
+    assert.ok(
+      step.afterReplies === undefined || (Number.isSafeInteger(step.afterReplies) && step.afterReplies >= 0),
+      `step ${index + 1}'s reply count is a finite non-negative count`,
+    );
+    assert.ok(
+      step.afterServerBytes === undefined ||
+        (Number.isSafeInteger(step.afterServerBytes) && step.afterServerBytes >= 0),
+      `step ${index + 1}'s server-received byte count is a finite non-negative count`,
+    );
+  }
+  if (options.steps.some((step) => step.afterServerBytes !== undefined)) {
+    assert.ok(options.observation !== undefined, "a server-receipt wait has an observation");
+  }
+  // Only the last step may half-close or reset the connection.
+  for (const step of options.steps.slice(0, -1)) {
+    assert.notEqual(step.endWrite, true, "no later step follows a half-closed write side");
+    assert.notEqual(step.reset, true, "no later step follows a reset connection");
+  }
+  const expiresAt = performance.now() + deadlineMs;
+  const timedOut = (): boolean => performance.now() >= expiresAt;
+  const timeoutError = (): Error => new Error(`no reply within ${deadlineMs} ms`);
+
+  return new Promise<RawExchange>((resolve, reject) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let socketError: Error | null = null;
+    let localPort = 0;
+    let scriptDone = false;
+    let peerEnded = false;
+    let writeEnded = false;
+    let resetRequested = false;
+    const chunks: Buffer[] = [];
+    let received = 0;
+    const replyLocalPorts: number[] = [];
+    const replyWaiters: Array<{
+      readonly count: number;
+      readonly resolve: () => void;
+      readonly reject: (error: Error) => void;
+    }> = [];
+    const socket = createConnection({ host: url.hostname, port: Number(url.port) });
+
+    const clearDeadline = (): void => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
+    const fail = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearDeadline();
+      for (const waiter of replyWaiters.splice(0)) waiter.reject(error);
+      socket.destroy();
+      reject(error);
+    };
+    const parsedState = () => parseReplies(Buffer.concat(chunks));
+    const serviceReplyWaiters = (): void => {
+      const replies = parsedState().replies.length;
+      const port = socket.localPort ?? localPort;
+      while (replyLocalPorts.length < replies) replyLocalPorts.push(port);
+      for (let index = replyWaiters.length - 1; index >= 0; index -= 1) {
+        const waiter = replyWaiters[index]!;
+        if (replies >= waiter.count) {
+          replyWaiters.splice(index, 1);
+          waiter.resolve();
+        }
+      }
+    };
+    const waitForReplies = (count: number): Promise<void> => {
+      if (parsedState().replies.length >= count) return Promise.resolve();
+      return new Promise<void>((resolveWaiter, rejectWaiter) => {
+        replyWaiters.push({ count, resolve: resolveWaiter, reject: rejectWaiter });
+      });
+    };
+    const writeBytes = (bytes: Uint8Array, waitForWrite: boolean): Promise<void> => {
+      const buffer = Buffer.from(bytes);
+      if (!waitForWrite) {
+        try {
+          socket.write(buffer);
+          return Promise.resolve();
+        } catch (error) {
+          return Promise.reject(error as Error);
+        }
+      }
+      return new Promise<void>((resolveWrite, rejectWrite) => {
+        try {
+          socket.write(buffer, (error?: Error | null) => {
+            if (error !== undefined && error !== null) rejectWrite(error);
+            else resolveWrite();
+          });
+        } catch (error) {
+          rejectWrite(error as Error);
+        }
+      });
+    };
+    const finishIfReady = (): void => {
+      if (!peerEnded || !scriptDone) return;
+      if (settled) return;
+      if (timedOut()) {
+        fail(timeoutError());
+        return;
+      }
+      const parsed = parsedState();
+      const bytes = Buffer.concat(chunks);
+      if (!parsed.complete) {
+        fail(socketError ?? new Error("the peer closed with a truncated reply"));
+        return;
+      }
+      if (parsed.replies.length < minimumReplies) {
+        fail(socketError ?? new Error("the peer closed with no complete reply"));
+        return;
+      }
+      if (!(Number.isInteger(localPort) && localPort > 0)) {
+        fail(new Error("the exchange socket carries no positive local port"));
+        return;
+      }
+      settled = true;
+      clearDeadline();
+      socket.destroy();
+      resolve({
+        bytes,
+        replies: parsed.replies,
+        localPort,
+        replyLocalPorts,
+        reuseAttempted: false,
+        writeEnded,
+        resetRequested,
+      });
+    };
+    const armDeadline = (): boolean => {
+      const remaining = expiresAt - performance.now();
+      if (remaining <= 0) {
+        fail(timeoutError());
+        return false;
+      }
+      timer = setTimeout(() => {
+        if (!settled && !timedOut()) {
+          armDeadline();
+          return;
+        }
+        fail(timeoutError());
+      }, remaining);
+      return true;
+    };
+
+    socket.on("connect", () => {
+      localPort = socket.localPort ?? 0;
+      if (timedOut()) {
+        fail(timeoutError());
+        return;
+      }
+      const run = async (): Promise<void> => {
+        for (const step of options.steps) {
+          if (settled) return;
+          if (timedOut()) {
+            fail(timeoutError());
+            return;
+          }
+          await writeBytes(step.bytes, step.afterWrite === true);
+          if (settled) return;
+          if (step.afterReplies !== undefined) await waitForReplies(step.afterReplies);
+          if (settled) return;
+          if (step.afterServerBytes !== undefined) await options.observation!.waitForReceived(step.afterServerBytes);
+          if (settled) return;
+          if (step.endWrite === true) {
+            writeEnded = true;
+            socket.end();
+          }
+          if (step.reset === true) {
+            resetRequested = true;
+            socket.resetAndDestroy();
+          }
+        }
+        scriptDone = true;
+        finishIfReady();
+      };
+      run().catch((error: unknown) => fail(error as Error));
+    });
+    socket.on("data", (chunk: Buffer) => {
+      if (settled) return;
+      received += chunk.byteLength;
+      if (received > cap) {
+        fail(new Error(`the reply bytes exceeded the ${cap}-byte cap`));
+        return;
+      }
+      chunks.push(chunk);
+      serviceReplyWaiters();
+    });
+    socket.on("end", () => {
+      peerEnded = true;
+      if (!scriptDone) {
+        fail(new Error("the peer closed before the script completed"));
+        return;
+      }
+      finishIfReady();
+    });
+    socket.on("close", () => {
+      peerEnded = true;
+      if (!scriptDone) {
+        fail(new Error("the peer closed before the script completed"));
+        return;
+      }
+      finishIfReady();
+    });
+    socket.on("error", (error: Error) => {
+      if (settled) return;
+      // A reset requested by the script is expected to raise a retirement
+      // error on the client socket; the peer closure then settles the exchange.
+      // Every other socket error is an unexpected transport failure and fails
+      // immediately, even when the replies already read would otherwise parse.
+      if (resetRequested && isRetirementWrite(error)) {
+        socketError = error;
+        return;
+      }
+      fail(error);
     });
     if (!armDeadline()) return;
   });
