@@ -658,13 +658,17 @@ describe("DOCX container structure", () => {
 
   it("refuses an alternate Unicode Path name that could make member names ambiguous", async () => {
     const first = new TextEncoder().encode("first");
-    const secondName = new TextEncoder().encode("second");
+    const secondContent = new TextEncoder().encode("second");
+    // The raw name is legacy bytes, so the Unicode Path alternate carries its
+    // CRC over those raw bytes; the alternate names the same path as part-one.
+    const secondRawName = new TextEncoder().encode("part-two");
     const built = buildZipDetailed([
       { name: "part-one", bytes: first },
       {
         name: "part-two",
-        bytes: secondName,
-        centralExtra: unicodePathExtra("part-one", secondName),
+        bytes: secondContent,
+        flags: 0,
+        centralExtra: unicodePathExtra("part-one", secondRawName),
       },
     ]);
     const { parser, calls } = countingParser();
@@ -674,6 +678,27 @@ describe("DOCX container structure", () => {
       reExportGuidance,
     );
     assert.equal(calls(), 0, "an alternate-name extra field is not handed to the parser");
+  });
+
+  it("refuses ambiguous dot-segment member paths but keeps ordinary nested part paths", async () => {
+    const encoder = new TextEncoder();
+    const ambiguous = buildZipDetailed([
+      { name: "word/document.xml", bytes: encoder.encode("document") },
+      { name: "word/./document.xml", bytes: encoder.encode("dot alternate") },
+    ]).bytes;
+    const { parser, calls } = countingParser();
+    const outcome = await importDocx(ambiguous, "dot-segment.docx", parser);
+    refused(outcome, "unreadable_document", /ambiguous dot-segment name/);
+    if (outcome.ok) throw new Error("unreachable");
+    assert.match(outcome.refusal.message, reExportGuidance, "the dot-segment refusal carries re-export guidance");
+    assert.equal(calls(), 0, "an ambiguous dot-segment path is not handed to the parser");
+
+    const nested = buildDocxWithExtraEntries(
+      [{ name: "customXml/nested/part.bin", bytes: encoder.encode("nested part") }],
+      [{ runs: ["Nested parts document."] }],
+    );
+    const { result } = imported(await importDocx(nested, "nested.docx"));
+    assert.equal(result.extractedText, "Nested parts document.");
   });
 
   it("reports central offsets that identify each central header in a multi-entry archive", async () => {

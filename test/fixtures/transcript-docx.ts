@@ -58,6 +58,12 @@ export interface ZipEntrySpec {
   readonly localExtra?: Uint8Array;
   /** Extra field bytes written only to the central header. */
   readonly centralExtra?: Uint8Array;
+  /**
+   * Override the local and central header flags. Defaults to the UTF-8 name
+   * flag, plus the data-descriptor flag when a descriptor is written. A legacy
+   * raw name with a Unicode Path alternate omits the UTF-8 name flag.
+   */
+  readonly flags?: number;
 }
 
 export interface BuildZipOptions {
@@ -104,7 +110,7 @@ export function buildZipDetailed(
     const uncompressedSize = spec.declaredUncompressedSize ?? content.length;
     const crc = spec.crc ?? crc32(content);
     const usesDescriptor = spec.dataDescriptor === true;
-    const flags = 0x0800 | (usesDescriptor ? 0x0008 : 0);
+    const flags = spec.flags ?? (0x0800 | (usesDescriptor ? 0x0008 : 0));
     const sharedExtra = spec.extra ?? new Uint8Array(0);
     const localExtra = spec.localExtra ?? sharedExtra;
     const centralExtra = spec.centralExtra ?? sharedExtra;

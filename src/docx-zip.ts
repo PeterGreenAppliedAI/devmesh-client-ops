@@ -121,6 +121,23 @@ function findEndRecord(input: Reader): ZipRefusal | { readonly ok: true; readonl
   return { ok: true, offset: candidates[0] };
 }
 
+/** True when a member path contains a `.` or `..` segment. */
+function hasDotSegment(nameBytes: Uint8Array): boolean {
+  let segmentStart = 0;
+  for (let index = 0; index <= nameBytes.length; index += 1) {
+    if (index !== nameBytes.length && nameBytes[index] !== 0x2f) continue;
+    const length = index - segmentStart;
+    if (
+      (length === 1 && nameBytes[segmentStart] === 0x2e) ||
+      (length === 2 && nameBytes[segmentStart] === 0x2e && nameBytes[segmentStart + 1] === 0x2e)
+    ) {
+      return true;
+    }
+    segmentStart = index + 1;
+  }
+  return false;
+}
+
 /** True when a local or central extra field block is complete and supported. */
 function validExtra(input: Reader, start: number, length: number): boolean {
   let cursor = start;
@@ -243,6 +260,9 @@ function readCentralDirectory(
     const nameStart = cursor + 46;
     const nameBytes = input.bytes.subarray(nameStart, nameStart + nameLength);
     if (nameBytes.includes(0)) return unreadable(`entry ${index + 1} has an invalid name`);
+    if (hasDotSegment(nameBytes)) {
+      return unreadable(`entry ${index + 1} has an ambiguous dot-segment name`);
+    }
     if ((flags & UTF8_NAME_FLAG) !== 0) {
       try {
         new TextDecoder("utf-8", { fatal: true }).decode(nameBytes);
