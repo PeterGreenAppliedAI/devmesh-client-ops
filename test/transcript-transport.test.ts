@@ -470,7 +470,7 @@ function assertOversizedRefusal(exchange: ClosedExchange, why: string): void {
   assert.equal(exchange.replies.length, 1, `${why}: the connection carries exactly one complete reply`);
   const reply = exchange.replies[0]!;
   assert.equal(reply.status, 413, `${why}: the reply is a 413`);
-  assert.match(String(reply.headers["content-type"]), /^text\/plain; charset=utf-8/, `${why}: the reply is plain text`);
+  assert.equal(reply.headers["content-type"], "text/plain; charset=utf-8", `${why}: the reply is plain text`);
   assert.equal(reply.headers["cache-control"], "no-store", `${why}: the reply is not cached`);
   assert.equal(reply.headers["connection"], "close", `${why}: the reply retires the connection`);
   assert.equal(
@@ -647,18 +647,21 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
   it("refuses an unclosed multipart import with a complete 400, writes nothing and reuses one socket", async () => {
     const runningFixture = await running();
     const transport: Transport = keepAliveTransport();
+    const guard = watchdog(5000, "the decoder-refusal reuse scenario did not finish");
     try {
       const before = baselineOf(runningFixture);
       const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
 
       // The POST sends the malformed body with an accurate Content-Length to the
       // engagement's import route, over the listener's own Host and Origin.
-      const refused = await send(transport, runningFixture.server.origin, {
+      const refusedPending = send(transport, runningFixture.server.origin, {
         method: "POST",
         path: importPath,
         contentType: MULTIPART_TYPE,
         body: unclosedMultipart(),
       });
+      refusedPending.catch(() => undefined);
+      const refused = await Promise.race([refusedPending, guard.promise]);
       assert.equal(refused.status, 400, "the malformed import is refused with 400");
       assert.match(String(refused.headers["content-type"]), /^text\/plain; charset=utf-8/, "the refusal is plain text");
       assert.equal(refused.headers["cache-control"], "no-store", "the refusal is not cached");
@@ -668,7 +671,9 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       assertUnchanged(runningFixture, before, "after the refused import");
 
       // A following GET over the same transport is a complete 200.
-      const health = await send(transport, runningFixture.server.origin, { path: "/health" });
+      const healthPending = send(transport, runningFixture.server.origin, { path: "/health" });
+      healthPending.catch(() => undefined);
+      const health = await Promise.race([healthPending, guard.promise]);
       assert.equal(health.status, 200, "the health page is a 200");
       assert.ok(health.body.includes("ok"), `the health page reports its status: ${health.body}`);
 
@@ -683,6 +688,7 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       // Neither a GET nor a refusal changed the workspace.
       assertUnchanged(runningFixture, before, "after the health read");
     } finally {
+      guard.clear();
       transport.close();
       await runningFixture.close();
     }
@@ -1412,6 +1418,7 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
   it("commits two exact-limit imports sequentially, the second chunked, and reuses one socket for each health read", async () => {
     const runningFixture = await running();
     const transport = keepAliveTransport();
+    const guard = watchdog(10000, "the exact-limit sequential imports did not finish");
     try {
       const importPath = `/engagements/${encodeURIComponent(runningFixture.engagementId)}/transcripts/import`;
       const requests = [
@@ -1443,13 +1450,15 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
         assert.equal(body.byteLength, EXACT_BODY_BYTES, `import ${index + 1} is exactly ${EXACT_BODY_BYTES} bytes before transfer coding`);
         const before = runningFixture.store.snapshot();
 
-        const reply = await send(transport, runningFixture.server.origin, {
+        const replyPending = send(transport, runningFixture.server.origin, {
           method: "POST",
           path: importPath,
           contentType: MULTIPART_TYPE,
           body,
           chunked: request.chunked,
         });
+        replyPending.catch(() => undefined);
+        const reply = await Promise.race([replyPending, guard.promise]);
         assert.equal(reply.status, 200, `import ${index + 1} is a complete 200: ${reply.body.slice(0, 200)}`);
 
         const after = runningFixture.store.snapshot();
@@ -1473,7 +1482,9 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
         assert.equal(source.format, "paste", `import ${index + 1} stores a pasted source`);
         assert.equal(source.originalText, request.paste, `import ${index + 1}'s pasted source is exactly its small text, without the padded epilogue`);
 
-        const health = await send(transport, runningFixture.server.origin, { path: "/health" });
+        const healthPending = send(transport, runningFixture.server.origin, { path: "/health" });
+        healthPending.catch(() => undefined);
+        const health = await Promise.race([healthPending, guard.promise]);
         assert.equal(health.status, 200, `the health read after import ${index + 1} is a complete 200`);
         assert.ok(health.body.includes("ok"), `the health read after import ${index + 1} reports its status: ${health.body}`);
         assert.ok(isPositiveInteger(reply.localPort), `import ${index + 1}'s local port is a positive integer: ${reply.localPort}`);
@@ -1481,6 +1492,7 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
         assert.equal(reply.localPort, health.localPort, `import ${index + 1} and its health read reused one connection`);
       }
     } finally {
+      guard.clear();
       transport.close();
       await runningFixture.close();
     }
@@ -1489,6 +1501,7 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
   it("renders an eligible GET once with an empty form and null file in a 50-client workspace, then reuses the socket for health", async () => {
     const runningFixture = await running({ clients: 50 });
     const transport = keepAliveTransport();
+    const guard = watchdog(5000, "the 50-client eligible GET scenario did not finish");
     try {
       assert.equal(runningFixture.store.snapshot().clients.length, 50, "the synthetic workspace holds 50 clients");
       const before = baselineOf(runningFixture);
@@ -1496,7 +1509,9 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
       // /clients is an eligible bodyless GET route. Its render sees the shell's
       // accepted request: method GET, the route path, the canonical origin, an
       // empty form and no file.
-      const clients = await send(transport, runningFixture.server.origin, { path: "/clients" });
+      const clientsPending = send(transport, runningFixture.server.origin, { path: "/clients" });
+      clientsPending.catch(() => undefined);
+      const clients = await Promise.race([clientsPending, guard.promise]);
       assert.equal(clients.status, 200, `the clients list is a complete 200: ${clients.body.slice(0, 200)}`);
       assert.equal(runningFixture.requests.length, 1, "the eligible GET route rendered exactly once");
       const request = runningFixture.requests[0]!;
@@ -1509,7 +1524,9 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
 
       // The subsequent health read is a complete 200 on the same kept-alive
       // socket, proven by the equal positive client local ports.
-      const health = await send(transport, runningFixture.server.origin, { path: "/health" });
+      const healthPending = send(transport, runningFixture.server.origin, { path: "/health" });
+      healthPending.catch(() => undefined);
+      const health = await Promise.race([healthPending, guard.promise]);
       assert.equal(health.status, 200, `the health page is a complete 200: ${health.body}`);
       assert.ok(health.body.includes("ok"), `the health page reports its status: ${health.body}`);
       assert.equal(runningFixture.renders.followUp, 1, "the health route rendered once");
@@ -1520,6 +1537,7 @@ describe("transcript HTTP fixture: bounded keep-alive transport", () => {
 
       assertUnchanged(runningFixture, before, "after the eligible GET and health read");
     } finally {
+      guard.clear();
       transport.close();
       await runningFixture.close();
     }
