@@ -849,27 +849,39 @@ describe("DOCX container structure", () => {
     }
   });
 
-  it("refuses an entry that conflates the DOS volume-label and directory attributes before the parser", async () => {
-    const volumeLabel = buildDocxWithExtraEntries(
-      [
-        {
-          name: "customXml/volume",
-          bytes: new Uint8Array(0),
-          externalAttributes: 0x18,
-        },
-      ],
-      [{ runs: ["Volume-label document."] }],
-    );
-    const { parser, calls } = countingParser();
-    const outcome = await importDocx(volumeLabel, "volume-label.docx", parser);
-    refused(outcome, "unreadable_document", /unsupported DOS volume label/);
-    if (outcome.ok) throw new Error("unreachable");
-    assert.match(
-      outcome.refusal.message,
-      reExportGuidance,
-      "the volume-label refusal carries re-export guidance",
-    );
-    assert.equal(calls(), 0, "a DOS volume-label entry is not handed to the parser");
+  it("refuses entries that conflate the DOS volume-label and directory attributes before the parser", async () => {
+    const creators = [
+      { label: "DOS", versionMadeBy: 20 },
+      { label: "Unix", versionMadeBy: 0x0314 },
+      { label: "Darwin", versionMadeBy: 0x1314 },
+    ];
+    for (const { label, versionMadeBy } of creators) {
+      const volumeLabel = buildDocxWithExtraEntries(
+        [
+          {
+            name: "customXml/volume",
+            bytes: new Uint8Array(0),
+            externalAttributes: 0x18,
+            versionMadeBy,
+          },
+        ],
+        [{ runs: [`${label} volume-label document.`] }],
+      );
+      const { parser, calls } = countingParser();
+      const outcome = await importDocx(
+        volumeLabel,
+        `${label.toLowerCase()}-volume-label.docx`,
+        parser,
+      );
+      refused(outcome, "unreadable_document", /unsupported DOS volume label/);
+      if (outcome.ok) throw new Error("unreachable");
+      assert.match(
+        outcome.refusal.message,
+        reExportGuidance,
+        `the ${label} volume-label refusal carries re-export guidance`,
+      );
+      assert.equal(calls(), 0, `a ${label} DOS volume-label entry is not handed to the parser`);
+    }
   });
 
   it("refuses an unsupported Unix symbolic-link entry before the parser", async () => {
@@ -967,6 +979,60 @@ describe("DOCX container structure", () => {
       "the deep-path conflict carries re-export guidance",
     );
     assert.equal(calls(), 0, "a deep-path conflict is not handed to the parser");
+  });
+
+  it("refuses a file with several nested descendants in either entry order", async () => {
+    const fileFirst = buildZipDetailed([
+      { name: "word", bytes: new Uint8Array(0) },
+      { name: "word/z.xml", bytes: new Uint8Array(0) },
+      { name: "word/a.xml", bytes: new Uint8Array(0) },
+      { name: "word/b/c.xml", bytes: new Uint8Array(0) },
+      { name: "word/d/e/f.xml", bytes: new Uint8Array(0) },
+    ]).bytes;
+    const firstParser = countingParser();
+    const firstOutcome = await importDocx(fileFirst, "several-descendants-file-first.docx", firstParser.parser);
+    refused(
+      firstOutcome,
+      "unreadable_document",
+      /entry 2 uses word as a directory but another entry declares it as a file/,
+    );
+    if (firstOutcome.ok) throw new Error("unreachable");
+    assert.match(
+      firstOutcome.refusal.message,
+      reExportGuidance,
+      "the file-first multi-descendant conflict carries re-export guidance",
+    );
+    assert.equal(firstParser.calls(), 0, "a file-first multi-descendant conflict is not handed to the parser");
+
+    const ancestorFirst = buildZipDetailed([
+      { name: "word/a.xml", bytes: new Uint8Array(0) },
+      { name: "word/z.xml", bytes: new Uint8Array(0) },
+      { name: "word/b/c.xml", bytes: new Uint8Array(0) },
+      { name: "word/d/e/f.xml", bytes: new Uint8Array(0) },
+      { name: "word", bytes: new Uint8Array(0) },
+    ]).bytes;
+    const secondParser = countingParser();
+    const secondOutcome = await importDocx(
+      ancestorFirst,
+      "several-descendants-ancestor-first.docx",
+      secondParser.parser,
+    );
+    refused(
+      secondOutcome,
+      "unreadable_document",
+      /entry 5 declares word as a file but another entry uses it as a directory/,
+    );
+    if (secondOutcome.ok) throw new Error("unreachable");
+    assert.match(
+      secondOutcome.refusal.message,
+      reExportGuidance,
+      "the ancestor-first multi-descendant conflict carries re-export guidance",
+    );
+    assert.equal(
+      secondParser.calls(),
+      0,
+      "an ancestor-first multi-descendant conflict is not handed to the parser",
+    );
   });
 
   it("refuses equivalent empty directory spellings that share one part name before the parser", async () => {

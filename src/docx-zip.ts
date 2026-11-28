@@ -190,14 +190,15 @@ function classifyEntry(
   index: number,
 ): ZipRefusal | { readonly ok: true; readonly isDirectory: boolean } {
   const directoryIndicator = isDirectoryName(name) || (externalAttributes & 0x10) !== 0;
+  // A DOS volume label is neither a file nor a directory. Its attribute
+  // describes an incompatible entry type, even when a directory indicator is
+  // also set, so refuse it before any creator-specific classification can
+  // accept the entry.
+  if ((externalAttributes & 0x08) !== 0) {
+    return unreadable(`entry ${index + 1} declares an unsupported DOS volume label`);
+  }
   const creatorOS = versionMadeBy >>> 8;
   if (creatorOS !== UNIX_CREATOR_OS && creatorOS !== DARWIN_CREATOR_OS) {
-    // A DOS volume label is neither a file nor a directory. Its attribute
-    // describes an incompatible entry type, even when a directory indicator is
-    // also set, so refuse it before choosing a classification.
-    if ((externalAttributes & 0x08) !== 0) {
-      return unreadable(`entry ${index + 1} declares an unsupported DOS volume label`);
-    }
     return { ok: true, isDirectory: directoryIndicator };
   }
   const mode = externalAttributes >>> 16;
@@ -250,49 +251,80 @@ function lowerBound(names: readonly MemberName[], prefix: string): number {
   return low;
 }
 
+/** The value used for a tree node outside the member-name range. */
+const MISSING_INDEX = 0x7fffffff;
+
 /**
  * Find the earliest file/directory name conflict without materialising every
- * ancestor path. Each member's folded name is stored once; sorting those names
- * lets a lower-bound lookup find the descendants of a file key (every name
- * that begins with `key + "/"`). The conflict is reported at the later of the
- * file and its descendant, so both entry orders are refused with a message
- * naming the file, matching the order in which a per-entry read finds them. An
- * explicit empty directory has a directory role, so its children are
- * compatible with it; duplicate names are detected separately from
- * `partNameKey`.
+ * ancestor path or visiting every descendant of a file key. Each member's
+ * folded name is stored once. Sorting those names makes all descendants of a
+ * file key (every name beginning with `key + "/"`) a contiguous range, found
+ * with two lower-bound lookups: from `key + "/"` up to `key + "0"` (the
+ * successor of the slash in lexicographic order). A range-minimum tree over
+ * the entry indices then finds the earliest descendant without enumerating the
+ * range. The conflict is reported at the later of the file and its earliest
+ * descendant, so both entry orders are refused with a message naming the file,
+ * matching the order in which a per-entry read finds them. An explicit empty
+ * directory has a directory role, so its children are compatible with it;
+ * duplicate names are detected separately from `partNameKey`.
  */
 function findNameConflict(entries: readonly MemberName[]): ZipRefusal | null {
   const names = [...entries].sort((left, right) =>
     left.key < right.key ? -1 : left.key > right.key ? 1 : left.index - right.index,
   );
+  let size = 1;
+  while (size < names.length) size *= 2;
+  const indexMinimums = new Int32Array(size * 2);
+  indexMinimums.fill(MISSING_INDEX);
+  for (let cursor = 0; cursor < names.length; cursor += 1) {
+    indexMinimums[size + cursor] = names[cursor].index;
+  }
+  for (let node = size - 1; node >= 1; node -= 1) {
+    indexMinimums[node] = Math.min(indexMinimums[node * 2], indexMinimums[node * 2 + 1]);
+  }
+
   let reportedIndex = Number.POSITIVE_INFINITY;
   let reportedFileLater = false;
-  let refusal: ZipRefusal | null = null;
+  let reportedFile: MemberName | null = null;
   for (const file of names) {
     if (file.isDirectory) continue;
-    const prefix = `${file.key}/`;
-    for (let cursor = lowerBound(names, prefix); cursor < names.length; cursor += 1) {
-      const descendant = names[cursor];
-      if (!descendant.key.startsWith(prefix)) break;
-      const fileLater = file.index > descendant.index;
-      const candidateIndex = fileLater ? file.index : descendant.index;
-      if (candidateIndex > reportedIndex) continue;
-      // At the same entry, a file that arrives after its descendant is reported
-      // before an entry that arrives after a file ancestor, as the per-entry
-      // reader checks its own directory keys before its implied ancestors.
-      if (candidateIndex === reportedIndex && (!fileLater || reportedFileLater)) continue;
-      reportedIndex = candidateIndex;
-      reportedFileLater = fileLater;
-      refusal = fileLater
-        ? unreadable(
-            `entry ${file.index + 1} declares ${file.key} as a file but another entry uses it as a directory`,
-          )
-        : unreadable(
-            `entry ${descendant.index + 1} uses ${file.key} as a directory but another entry declares it as a file`,
-          );
+    const descendantStart = lowerBound(names, `${file.key}/`);
+    const descendantEnd = lowerBound(names, `${file.key}0`);
+    if (descendantStart >= descendantEnd) continue;
+    let left = descendantStart + size;
+    let right = descendantEnd + size;
+    let earliestDescendant = MISSING_INDEX;
+    while (left < right) {
+      if ((left & 1) === 1) {
+        earliestDescendant = Math.min(earliestDescendant, indexMinimums[left]);
+        left += 1;
+      }
+      if ((right & 1) === 1) {
+        right -= 1;
+        earliestDescendant = Math.min(earliestDescendant, indexMinimums[right]);
+      }
+      left >>>= 1;
+      right >>>= 1;
     }
+    const fileLater = earliestDescendant < file.index;
+    const candidateIndex = fileLater ? file.index : earliestDescendant;
+    if (candidateIndex > reportedIndex) continue;
+    // At the same entry, a file that arrives after its descendant is reported
+    // before an entry that arrives after a file ancestor, as the per-entry
+    // reader checks its own directory keys before its implied ancestors.
+    if (candidateIndex === reportedIndex && (!fileLater || reportedFileLater)) continue;
+    reportedIndex = candidateIndex;
+    reportedFileLater = fileLater;
+    reportedFile = file;
   }
-  return refusal;
+  if (reportedFile === null) return null;
+  return reportedFileLater
+    ? unreadable(
+        `entry ${reportedFile.index + 1} declares ${reportedFile.key} as a file but another entry uses it as a directory`,
+      )
+    : unreadable(
+        `entry ${reportedIndex + 1} uses ${reportedFile.key} as a directory but another entry declares it as a file`,
+      );
 }
 
 /**
