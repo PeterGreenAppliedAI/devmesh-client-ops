@@ -784,6 +784,81 @@ describe("DOCX container structure", () => {
     assert.equal(calls(), 0, "an attribute-marked directory carrying content is not handed to the parser");
   });
 
+  it("refuses a Unix-directory-mode entry that declares content before the parser", async () => {
+    const encoder = new TextEncoder();
+    const unixDirectory = buildDocxWithExtraEntries(
+      [
+        {
+          name: "customXml/folder",
+          bytes: encoder.encode("content behind a Unix directory mode"),
+          externalAttributes: (0o040755 << 16) >>> 0,
+          versionMadeBy: 0x0314,
+        },
+      ],
+      [{ runs: ["Unix directory document."] }],
+    );
+    const { parser, calls } = countingParser();
+    const outcome = await importDocx(unixDirectory, "unix-directory.docx", parser);
+    refused(outcome, "unreadable_document", /is marked as a directory but declares .* uncompressed bytes/);
+    if (outcome.ok) throw new Error("unreachable");
+    assert.match(
+      outcome.refusal.message,
+      reExportGuidance,
+      "the Unix-directory refusal carries re-export guidance",
+    );
+    assert.equal(calls(), 0, "a Unix-mode directory carrying content is not handed to the parser");
+  });
+
+  it("refuses equivalent empty directory spellings that share one part name before the parser", async () => {
+    const duplicateDirectories = buildDocxWithExtraEntries(
+      [
+        { name: "customXml/folder/", bytes: new Uint8Array(0) },
+        { name: "customXml/Folder", bytes: new Uint8Array(0), externalAttributes: 0x10 },
+      ],
+      [{ runs: ["Duplicate directory document."] }],
+    );
+    const { parser, calls } = countingParser();
+    const outcome = await importDocx(duplicateDirectories, "duplicate-directory.docx", parser);
+    refused(outcome, "unreadable_document", /repeats another entry's name/);
+    if (outcome.ok) throw new Error("unreachable");
+    assert.match(
+      outcome.refusal.message,
+      reExportGuidance,
+      "the duplicate-directory refusal carries re-export guidance",
+    );
+    assert.equal(calls(), 0, "equivalent directory spellings are not handed to the parser");
+
+    const emptyDirectory = buildDocxWithExtraEntries(
+      [{ name: "customXml/folder/", bytes: new Uint8Array(0) }],
+      [{ runs: ["Empty directory control."] }],
+    );
+    const { result } = imported(await importDocx(emptyDirectory, "empty-directory-control.docx"));
+    assert.equal(result.extractedText, "Empty directory control.");
+  });
+
+  it("refuses a UTF-8 byte-order-mark-only member name before the parser", async () => {
+    const bytes = buildDocxWithExtraEntries(
+      [
+        {
+          name: "bom",
+          nameBytes: new Uint8Array([0xef, 0xbb, 0xbf]),
+          bytes: new Uint8Array(0),
+        },
+      ],
+      [{ runs: ["Byte-order-mark document."] }],
+    );
+    const { parser, calls } = countingParser();
+    const outcome = await importDocx(bytes, "byte-order-mark.docx", parser);
+    refused(outcome, "unreadable_document", /ambiguous leading UTF-8 byte-order mark/);
+    if (outcome.ok) throw new Error("unreachable");
+    assert.match(
+      outcome.refusal.message,
+      reExportGuidance,
+      "the byte-order-mark refusal carries re-export guidance",
+    );
+    assert.equal(calls(), 0, "a byte-order-mark-only name is not handed to the parser");
+  });
+
   it("refuses part names that differ only by ASCII letter case before the parser", async () => {
     const encoder = new TextEncoder();
     const caseEquivalent = buildZipDetailed([

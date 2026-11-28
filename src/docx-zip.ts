@@ -8,12 +8,15 @@
  * count or central-directory size that disagrees with the bytes, an unsupported
  * extraction version, compression method, flags or feature (encryption, ZIP64,
  * multiple disks, an alternate-name extra field), a directory entry that
- * declares content (by trailing slash or by the central DOS directory
- * attribute), a member whose header or data runs outside the data area, a gap
- * or overlap in that area, a duplicate name (from the decoded name, compared
- * ASCII case-insensitively as package part names are), an unflagged non-ASCII
- * name whose legacy encoding cannot be interpreted consistently with the
- * parser, or local and central declarations that disagree.
+ * declares content (by trailing slash, by the central DOS directory attribute,
+ * or by the Unix file-type bits when the central header names a Unix creator),
+ * a member whose header or data runs outside the data area, a gap or overlap in
+ * that area, a duplicate name (from the decoded name, compared ASCII
+ * case-insensitively as package part names are; a directory's trailing slash is
+ * folded away so equivalent directory spellings share one key), an ambiguous
+ * leading UTF-8 byte-order mark, an unflagged non-ASCII name whose legacy
+ * encoding cannot be interpreted consistently with the parser, or local and
+ * central declarations that disagree.
  *
  * Declared sizes are checked before any expansion: each declared uncompressed
  * size and their sum must be at most MAX_CONTENT_BYTES, and one entry's
@@ -50,6 +53,15 @@ const ZIP64_VALUE = 0xffffffff;
 /** Extraction versions this reader supports: stored 1.0, deflated 2.0. */
 const STORED_VERSION_NEEDED = 10;
 const DEFLATED_VERSION_NEEDED = 20;
+
+/**
+ * The ZIP creator-OS codes that use Unix mode bits (Unix and OS X/Darwin), and
+ * the Unix file-type bits that mark a directory.
+ */
+const UNIX_CREATOR_OS = 3;
+const DARWIN_CREATOR_OS = 19;
+const UNIX_DIRECTORY_FILE_TYPE = 0x4000;
+const UNIX_FILE_TYPE_MASK = 0xf000;
 
 /** Flags this reader accepts, restricted to the bits each method may use. */
 const STORED_ALLOWED_FLAGS = 0x0008 | 0x0800;
@@ -126,20 +138,8 @@ function findEndRecord(input: Reader): ZipRefusal | { readonly ok: true; readonl
 }
 
 /** True when a member path contains a `.` or `..` segment. */
-function hasDotSegment(nameBytes: Uint8Array): boolean {
-  let segmentStart = 0;
-  for (let index = 0; index <= nameBytes.length; index += 1) {
-    if (index !== nameBytes.length && nameBytes[index] !== 0x2f) continue;
-    const length = index - segmentStart;
-    if (
-      (length === 1 && nameBytes[segmentStart] === 0x2e) ||
-      (length === 2 && nameBytes[segmentStart] === 0x2e && nameBytes[segmentStart + 1] === 0x2e)
-    ) {
-      return true;
-    }
-    segmentStart = index + 1;
-  }
-  return false;
+function hasDotSegment(name: string): boolean {
+  return name.split("/").some((segment) => segment === "." || segment === "..");
 }
 
 /**
@@ -148,12 +148,11 @@ function hasDotSegment(nameBytes: Uint8Array): boolean {
  * `word//document.xml` would let two spellings describe the same effective
  * path, so it is refused.
  */
-function hasEmptyInteriorSegment(nameBytes: Uint8Array): boolean {
-  let end = nameBytes.length;
-  if (end > 0 && nameBytes[end - 1] === 0x2f) end -= 1;
+function hasEmptyInteriorSegment(name: string): boolean {
+  const end = name.endsWith("/") ? name.length - 1 : name.length;
   let segmentStart = 0;
   for (let index = 0; index <= end; index += 1) {
-    if (index !== end && nameBytes[index] !== 0x2f) continue;
+    if (index !== end && name[index] !== "/") continue;
     if (index === segmentStart) return true;
     segmentStart = index + 1;
   }
@@ -161,23 +160,39 @@ function hasEmptyInteriorSegment(nameBytes: Uint8Array): boolean {
 }
 
 /** True when a member path uses a backslash separator instead of a slash. */
-function hasBackslash(nameBytes: Uint8Array): boolean {
-  return nameBytes.includes(0x5c);
+function hasBackslash(name: string): boolean {
+  return name.includes("\\");
 }
 
 /** True when a member name ends in the trailing slash of a directory entry. */
-function isDirectoryName(nameBytes: Uint8Array): boolean {
-  return nameBytes.length > 0 && nameBytes[nameBytes.length - 1] === 0x2f;
+function isDirectoryName(name: string): boolean {
+  return name.endsWith("/");
+}
+
+/**
+ * True when an entry is a directory by trailing slash, by the DOS directory
+ * attribute, or, for a central header made by Unix, by the directory file type
+ * in the upper mode bits of its external attributes.
+ */
+function isDirectoryEntry(name: string, versionMadeBy: number, externalAttributes: number): boolean {
+  if (isDirectoryName(name) || (externalAttributes & 0x10) !== 0) return true;
+  const creatorOS = versionMadeBy >>> 8;
+  if (creatorOS !== UNIX_CREATOR_OS && creatorOS !== DARWIN_CREATOR_OS) return false;
+  const mode = externalAttributes >>> 16;
+  return (mode & UNIX_FILE_TYPE_MASK) === UNIX_DIRECTORY_FILE_TYPE;
 }
 
 /**
  * The key used to detect duplicate package part names, from the decoded name.
  * DOCX part names compare ASCII case-insensitively, so ASCII letters are folded
- * to lower case while every other character is kept; the original name bytes
- * stay untouched for the local-header comparison and for the parser's archive.
+ * to lower case while every other character is kept. A directory's trailing
+ * slash is folded away so its attribute-marked and slash-marked spellings share
+ * one key; the original name bytes stay untouched for the local-header
+ * comparison and for the parser's archive.
  */
-function partNameKey(name: string): string {
-  return name.replace(/[A-Z]/gu, (letter) => letter.toLowerCase());
+function partNameKey(name: string, isDirectory: boolean): string {
+  const normalized = isDirectory && name.endsWith("/") ? name.slice(0, -1) : name;
+  return normalized.replace(/[A-Z]/gu, (letter) => letter.toLowerCase());
 }
 
 /**
@@ -189,6 +204,17 @@ function partNameKey(name: string): string {
  */
 function decodeName(nameBytes: Uint8Array, flags: number, index: number): ZipRefusal | string {
   if ((flags & UTF8_NAME_FLAG) !== 0) {
+    // A decoder strips an initial UTF-8 byte-order mark, so a name that begins
+    // with one has more than one possible interpretation; refuse it rather than
+    // let an empty or shortened decoded name stand in for the raw name.
+    if (
+      nameBytes.length >= 3 &&
+      nameBytes[0] === 0xef &&
+      nameBytes[1] === 0xbb &&
+      nameBytes[2] === 0xbf
+    ) {
+      return unreadable(`entry ${index + 1} has an ambiguous leading UTF-8 byte-order mark in its name`);
+    }
     try {
       return new TextDecoder("utf-8", { fatal: true }).decode(nameBytes);
     } catch {
@@ -289,6 +315,7 @@ function readCentralDirectory(
     if (u32(input, cursor) !== CENTRAL_SIGNATURE) {
       return unreadable(`central-directory entry ${index + 1} has no entry signature`);
     }
+    const versionMadeBy = u16(input, cursor + 4);
     const versionNeeded = u16(input, cursor + 6);
     const flags = u16(input, cursor + 8);
     const method = u16(input, cursor + 10);
@@ -323,25 +350,26 @@ function readCentralDirectory(
     if (nameLength === 0) return unreadable(`entry ${index + 1} has an empty name`);
     const nameStart = cursor + 46;
     const nameBytes = input.bytes.subarray(nameStart, nameStart + nameLength);
-    if (nameBytes.includes(0)) return unreadable(`entry ${index + 1} has an invalid name`);
-    if (hasBackslash(nameBytes)) {
+    const decodedName = decodeName(nameBytes, flags, index);
+    if (typeof decodedName !== "string") return decodedName;
+    if (decodedName.length === 0) return unreadable(`entry ${index + 1} has an empty name`);
+    if (decodedName.includes("\0")) return unreadable(`entry ${index + 1} has an invalid name`);
+    if (hasBackslash(decodedName)) {
       return unreadable(`entry ${index + 1} has a backslash in its member name`);
     }
-    if (hasEmptyInteriorSegment(nameBytes)) {
+    if (hasEmptyInteriorSegment(decodedName)) {
       return unreadable(`entry ${index + 1} has an empty interior path segment`);
     }
-    if (hasDotSegment(nameBytes)) {
+    if (hasDotSegment(decodedName)) {
       return unreadable(`entry ${index + 1} has an ambiguous dot-segment name`);
     }
-    const isDirectory = isDirectoryName(nameBytes) || (externalAttributes & 0x10) !== 0;
+    const isDirectory = isDirectoryEntry(decodedName, versionMadeBy, externalAttributes);
     if (isDirectory && uncompressedSize !== 0) {
       return unreadable(
         `entry ${index + 1} is marked as a directory but declares ${uncompressedSize} uncompressed bytes`,
       );
     }
-    const decodedName = decodeName(nameBytes, flags, index);
-    if (typeof decodedName !== "string") return decodedName;
-    const nameKey = partNameKey(decodedName);
+    const nameKey = partNameKey(decodedName, isDirectory);
     if (seenNames.has(nameKey)) return unreadable(`entry ${index + 1} repeats another entry's name`);
     seenNames.add(nameKey);
     if (!validExtra(input, nameStart + nameLength, extraLength)) {

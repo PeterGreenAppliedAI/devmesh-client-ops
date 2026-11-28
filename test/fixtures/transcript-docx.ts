@@ -66,8 +66,13 @@ export interface ZipEntrySpec {
   readonly flags?: number;
   /** Raw name bytes, overriding the UTF-8 encoding of `name`. */
   readonly nameBytes?: Uint8Array;
-  /** Central-header external file attributes, such as the DOS directory bit. */
+  /** Central-header external file attributes, such as the DOS or Unix directory bits. */
   readonly externalAttributes?: number;
+  /**
+   * Central-header version-made-by field, whose high byte names the creator OS
+   * (0 for DOS, 3 for Unix); defaults to 20, a 2.0 DOS archive.
+   */
+  readonly versionMadeBy?: number;
 }
 
 export interface BuildZipOptions {
@@ -153,7 +158,7 @@ export function buildZipDetailed(
     const header = new Uint8Array(46 + name.length + centralExtra.length);
     const headerView = new DataView(header.buffer);
     headerView.setUint32(0, 0x02014b50, true);
-    headerView.setUint16(4, 20, true);
+    headerView.setUint16(4, spec.versionMadeBy ?? 20, true);
     headerView.setUint16(6, 20, true);
     headerView.setUint16(8, flags, true);
     headerView.setUint16(10, method, true);
