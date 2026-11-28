@@ -9,14 +9,18 @@
  * extraction version, compression method, flags or feature (encryption, ZIP64,
  * multiple disks, an alternate-name extra field), a directory entry that
  * declares content (by trailing slash, by the central DOS directory attribute,
- * or by the Unix file-type bits when the central header names a Unix creator),
- * a member whose header or data runs outside the data area, a gap or overlap in
- * that area, a duplicate name (from the decoded name, compared ASCII
- * case-insensitively as package part names are; a directory's trailing slash is
- * folded away so equivalent directory spellings share one key), an ambiguous
- * leading UTF-8 byte-order mark, an unflagged non-ASCII name whose legacy
- * encoding cannot be interpreted consistently with the parser, or local and
- * central declarations that disagree.
+ * or by the Unix file-type bits when the central header names a Unix creator,
+ * but not an unsupported Unix special file type or a regular-file mode that
+ * conflicts with a directory indicator), a member whose header or data runs
+ * outside the data area, a gap or overlap in that area, a duplicate name (from
+ * the decoded name, compared ASCII case-insensitively as package part names
+ * are; a directory's trailing slash is folded away so equivalent directory
+ * spellings share one key), a file whose path another member uses as a
+ * directory (independent of entry order, while an explicit empty directory
+ * remains compatible with its children), an ambiguous leading UTF-8 byte-order
+ * mark, an unflagged non-ASCII name whose legacy encoding cannot be interpreted
+ * consistently with the parser, or local and central declarations that
+ * disagree.
  *
  * Declared sizes are checked before any expansion: each declared uncompressed
  * size and their sum must be at most MAX_CONTENT_BYTES, and one entry's
@@ -61,6 +65,7 @@ const DEFLATED_VERSION_NEEDED = 20;
 const UNIX_CREATOR_OS = 3;
 const DARWIN_CREATOR_OS = 19;
 const UNIX_DIRECTORY_FILE_TYPE = 0x4000;
+const UNIX_REGULAR_FILE_TYPE = 0x8000;
 const UNIX_FILE_TYPE_MASK = 0xf000;
 
 /** Flags this reader accepts, restricted to the bits each method may use. */
@@ -170,16 +175,36 @@ function isDirectoryName(name: string): boolean {
 }
 
 /**
- * True when an entry is a directory by trailing slash, by the DOS directory
- * attribute, or, for a central header made by Unix, by the directory file type
- * in the upper mode bits of its external attributes.
+ * Classify an entry as a directory or a file. A trailing slash and the DOS
+ * directory attribute are directory indicators. For a central header made by
+ * Unix or Darwin, the upper mode bits may declare an explicit file type: a
+ * directory type makes the entry a directory, a regular-file type makes it a
+ * file and conflicts with either directory indicator, and any other explicit
+ * type is an unsupported special file. A mode whose type bits are all zero
+ * omits the type, so the directory indicators alone decide.
  */
-function isDirectoryEntry(name: string, versionMadeBy: number, externalAttributes: number): boolean {
-  if (isDirectoryName(name) || (externalAttributes & 0x10) !== 0) return true;
+function classifyEntry(
+  name: string,
+  versionMadeBy: number,
+  externalAttributes: number,
+  index: number,
+): ZipRefusal | { readonly ok: true; readonly isDirectory: boolean } {
+  const directoryIndicator = isDirectoryName(name) || (externalAttributes & 0x10) !== 0;
   const creatorOS = versionMadeBy >>> 8;
-  if (creatorOS !== UNIX_CREATOR_OS && creatorOS !== DARWIN_CREATOR_OS) return false;
+  if (creatorOS !== UNIX_CREATOR_OS && creatorOS !== DARWIN_CREATOR_OS) {
+    return { ok: true, isDirectory: directoryIndicator };
+  }
   const mode = externalAttributes >>> 16;
-  return (mode & UNIX_FILE_TYPE_MASK) === UNIX_DIRECTORY_FILE_TYPE;
+  const fileType = mode & UNIX_FILE_TYPE_MASK;
+  if (fileType === 0) return { ok: true, isDirectory: directoryIndicator };
+  if (fileType === UNIX_DIRECTORY_FILE_TYPE) return { ok: true, isDirectory: true };
+  if (fileType !== UNIX_REGULAR_FILE_TYPE) {
+    return unreadable(`entry ${index + 1} declares an unsupported Unix special file type`);
+  }
+  if (directoryIndicator) {
+    return unreadable(`entry ${index + 1} declares a regular file conflicting with a directory indicator`);
+  }
+  return { ok: true, isDirectory: false };
 }
 
 /**
@@ -192,7 +217,30 @@ function isDirectoryEntry(name: string, versionMadeBy: number, externalAttribute
  */
 function partNameKey(name: string, isDirectory: boolean): string {
   const normalized = isDirectory && name.endsWith("/") ? name.slice(0, -1) : name;
-  return normalized.replace(/[A-Z]/gu, (letter) => letter.toLowerCase());
+  return asciiFold(normalized);
+}
+
+/** Fold ASCII letters to lower case, as package part names compare. */
+function asciiFold(name: string): string {
+  return name.replace(/[A-Z]/gu, (letter) => letter.toLowerCase());
+}
+
+/**
+ * The directory keys a member's path implies: every ancestor directory, and
+ * the member's own key when it is a directory. A file at `a/b/c.xml` implies
+ * `a` and `a/b`; an explicit directory `a/b/` implies `a` and `a/b`. These are
+ * collected while reading the central directory so that a file and an implied
+ * directory conflict in either entry order.
+ */
+function impliedDirectoryKeys(name: string, isDirectory: boolean): readonly string[] {
+  const trimmed = isDirectory && name.endsWith("/") ? name.slice(0, -1) : name;
+  const segments = trimmed.split("/");
+  const last = isDirectory ? segments.length : segments.length - 1;
+  const keys: string[] = [];
+  for (let count = 1; count <= last; count += 1) {
+    keys.push(asciiFold(segments.slice(0, count).join("/")));
+  }
+  return keys;
 }
 
 /**
@@ -309,6 +357,8 @@ function readCentralDirectory(
 
   const members: CentralMember[] = [];
   const seenNames = new Set<string>();
+  const fileKeys = new Set<string>();
+  const directoryKeys = new Set<string>();
   let cursor = centralOffset;
   for (let index = 0; index < total; index += 1) {
     if (cursor + 46 > endOffset) return unreadable(`central-directory entry ${index + 1} is truncated`);
@@ -363,7 +413,9 @@ function readCentralDirectory(
     if (hasDotSegment(decodedName)) {
       return unreadable(`entry ${index + 1} has an ambiguous dot-segment name`);
     }
-    const isDirectory = isDirectoryEntry(decodedName, versionMadeBy, externalAttributes);
+    const classification = classifyEntry(decodedName, versionMadeBy, externalAttributes, index);
+    if (!classification.ok) return classification;
+    const isDirectory = classification.isDirectory;
     if (isDirectory && uncompressedSize !== 0) {
       return unreadable(
         `entry ${index + 1} is marked as a directory but declares ${uncompressedSize} uncompressed bytes`,
@@ -372,6 +424,20 @@ function readCentralDirectory(
     const nameKey = partNameKey(decodedName, isDirectory);
     if (seenNames.has(nameKey)) return unreadable(`entry ${index + 1} repeats another entry's name`);
     seenNames.add(nameKey);
+    if (!isDirectory && directoryKeys.has(nameKey)) {
+      return unreadable(
+        `entry ${index + 1} declares ${nameKey} as a file but another entry uses it as a directory`,
+      );
+    }
+    for (const directoryKey of impliedDirectoryKeys(decodedName, isDirectory)) {
+      if (fileKeys.has(directoryKey)) {
+        return unreadable(
+          `entry ${index + 1} uses ${directoryKey} as a directory but another entry declares it as a file`,
+        );
+      }
+      directoryKeys.add(directoryKey);
+    }
+    if (!isDirectory) fileKeys.add(nameKey);
     if (!validExtra(input, nameStart + nameLength, extraLength)) {
       return unreadable(`entry ${index + 1} has an unsupported or malformed extra field`);
     }

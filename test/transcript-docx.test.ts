@@ -809,6 +809,121 @@ describe("DOCX container structure", () => {
     assert.equal(calls(), 0, "a Unix-mode directory carrying content is not handed to the parser");
   });
 
+  it("refuses conflicting Unix regular-file and directory indicators before the parser", async () => {
+    const conflicting = [
+      {
+        label: "trailing slash",
+        entry: {
+          name: "customXml/folder/",
+          bytes: new Uint8Array(0),
+          externalAttributes: (0o100644 << 16) >>> 0,
+          versionMadeBy: 0x0314,
+        },
+      },
+      {
+        label: "DOS directory attribute",
+        entry: {
+          name: "customXml/folder",
+          bytes: new Uint8Array(0),
+          externalAttributes: ((0o100644 << 16) | 0x10) >>> 0,
+          versionMadeBy: 0x0314,
+        },
+      },
+    ];
+    for (const { label, entry } of conflicting) {
+      const bytes = buildDocxWithExtraEntries([entry], [{ runs: ["Conflicting indicator document."] }]);
+      const { parser, calls } = countingParser();
+      const outcome = await importDocx(bytes, "conflicting-indicator.docx", parser);
+      refused(
+        outcome,
+        "unreadable_document",
+        /declares a regular file conflicting with a directory indicator/,
+      );
+      if (outcome.ok) throw new Error("unreachable");
+      assert.match(
+        outcome.refusal.message,
+        reExportGuidance,
+        `the ${label} conflict carries re-export guidance`,
+      );
+      assert.equal(calls(), 0, `a ${label} conflict is not handed to the parser`);
+    }
+  });
+
+  it("refuses an unsupported Unix symbolic-link entry before the parser", async () => {
+    const bytes = buildDocxWithExtraEntries(
+      [
+        {
+          name: "customXml/link",
+          bytes: new TextEncoder().encode("link target"),
+          externalAttributes: (0o120777 << 16) >>> 0,
+          versionMadeBy: 0x0314,
+        },
+      ],
+      [{ runs: ["Symbolic-link document."] }],
+    );
+    const { parser, calls } = countingParser();
+    const outcome = await importDocx(bytes, "symbolic-link.docx", parser);
+    refused(outcome, "unreadable_document", /unsupported Unix special file type/);
+    if (outcome.ok) throw new Error("unreachable");
+    assert.match(
+      outcome.refusal.message,
+      reExportGuidance,
+      "the symbolic-link refusal carries re-export guidance",
+    );
+    assert.equal(calls(), 0, "an unsupported Unix special file type is not handed to the parser");
+  });
+
+  it("refuses a file and an implied directory conflict in either entry order", async () => {
+    const encoder = new TextEncoder();
+    const ancestorFirst = buildZipDetailed([
+      { name: "word/document.xml", bytes: encoder.encode("child part") },
+      { name: "word", bytes: new Uint8Array(0) },
+    ]).bytes;
+    const firstParser = countingParser();
+    const firstOutcome = await importDocx(ancestorFirst, "ancestor-first.docx", firstParser.parser);
+    refused(
+      firstOutcome,
+      "unreadable_document",
+      /declares word as a file but another entry uses it as a directory/,
+    );
+    if (firstOutcome.ok) throw new Error("unreachable");
+    assert.match(
+      firstOutcome.refusal.message,
+      reExportGuidance,
+      "the ancestor-first conflict carries re-export guidance",
+    );
+    assert.equal(firstParser.calls(), 0, "an ancestor-first conflict is not handed to the parser");
+
+    const fileFirst = buildZipDetailed([
+      { name: "word", bytes: new Uint8Array(0) },
+      { name: "word/document.xml", bytes: encoder.encode("child part") },
+    ]).bytes;
+    const secondParser = countingParser();
+    const secondOutcome = await importDocx(fileFirst, "file-first.docx", secondParser.parser);
+    refused(
+      secondOutcome,
+      "unreadable_document",
+      /uses word as a directory but another entry declares it as a file/,
+    );
+    if (secondOutcome.ok) throw new Error("unreachable");
+    assert.match(
+      secondOutcome.refusal.message,
+      reExportGuidance,
+      "the file-first conflict carries re-export guidance",
+    );
+    assert.equal(secondParser.calls(), 0, "a file-first conflict is not handed to the parser");
+
+    const compatibleDirectory = buildDocxWithExtraEntries(
+      [
+        { name: "customXml/folder/", bytes: new Uint8Array(0) },
+        { name: "customXml/folder/child.xml", bytes: new Uint8Array(0) },
+      ],
+      [{ runs: ["Directory child document."] }],
+    );
+    const { result } = imported(await importDocx(compatibleDirectory, "directory-child.docx"));
+    assert.equal(result.extractedText, "Directory child document.");
+  });
+
   it("refuses equivalent empty directory spellings that share one part name before the parser", async () => {
     const duplicateDirectories = buildDocxWithExtraEntries(
       [
