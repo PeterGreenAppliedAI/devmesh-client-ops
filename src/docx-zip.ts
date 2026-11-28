@@ -1,0 +1,745 @@
+/**
+ * Structural preflight for a DOCX container.
+ *
+ * The adapter calls this after its original-size check and before any parser
+ * call. It reads the ZIP end record, the central directory and every local
+ * member header exactly as the supplied bytes describe them, and refuses a
+ * structure it cannot account for: a missing or ambiguous end record, an entry
+ * count or central-directory size that disagrees with the bytes, an unsupported
+ * extraction version, compression method, flags or feature (encryption, ZIP64,
+ * multiple disks, an alternate-name extra field), a directory entry that
+ * declares content (by trailing slash, by the central DOS directory attribute,
+ * or by the Unix file-type bits when the central header names a Unix creator,
+ * but not an unsupported Unix special file type or a regular-file mode that
+ * conflicts with a directory indicator), a member whose header or data runs
+ * outside the data area, a gap or overlap in that area, a duplicate name (from
+ * the decoded name, compared ASCII case-insensitively as package part names
+ * are; a directory's trailing slash is folded away so equivalent directory
+ * spellings share one key), a file whose path another member uses as a
+ * directory (independent of entry order, while an explicit empty directory
+ * remains compatible with its children), a DOS volume-label entry, an
+ * ambiguous leading UTF-8 byte-order mark, an unflagged non-ASCII name whose
+ * legacy encoding cannot be interpreted consistently with the parser, or local
+ * and central declarations that disagree.
+ *
+ * Declared sizes are checked before any expansion: each declared uncompressed
+ * size and their sum must be at most MAX_CONTENT_BYTES, and one entry's
+ * uncompressed size may not exceed 100 times its compressed size. Only after
+ * those declarations pass are stored members CRC-checked and deflated members
+ * expanded with a bounded inflater that must consume exactly the declared
+ * compressed extent, so the actual output must have exactly the declared length
+ * and CRC. The caller then hands the same original bytes to the parser; this
+ * module never writes an expanded member anywhere.
+ */
+import { inflateRawSync } from "node:zlib";
+import { MAX_CONTENT_BYTES } from "./transcript.ts";
+
+/** The largest uncompressed-to-compressed ratio a member may declare. */
+export const MAX_ZIP_COMPRESSION_RATIO = 100;
+
+/** A structural refusal: the import is too large, or the container is unreadable. */
+export type ZipRefusal =
+  | { readonly ok: false; readonly code: "too_large"; readonly detail: string }
+  | { readonly ok: false; readonly code: "unreadable_document"; readonly detail: string };
+
+/** A structural check: the container passed, or a refusal names the reason. */
+export type ZipCheck = { readonly ok: true } | ZipRefusal;
+
+const END_SIGNATURE = 0x06054b50;
+const CENTRAL_SIGNATURE = 0x02014b50;
+const LOCAL_SIGNATURE = 0x04034b50;
+const DATA_DESCRIPTOR_SIGNATURE = 0x08074b50;
+const ZIP64_EXTRA_ID = 0x0001;
+const AES_EXTRA_ID = 0x9901;
+const UNICODE_PATH_EXTRA_ID = 0x7075;
+const ZIP64_VALUE = 0xffffffff;
+
+/** Extraction versions this reader supports: stored 1.0, deflated 2.0. */
+const STORED_VERSION_NEEDED = 10;
+const DEFLATED_VERSION_NEEDED = 20;
+
+/**
+ * The ZIP creator-OS codes that use Unix mode bits (Unix and OS X/Darwin), and
+ * the Unix file-type bits that mark a directory.
+ */
+const UNIX_CREATOR_OS = 3;
+const DARWIN_CREATOR_OS = 19;
+const UNIX_DIRECTORY_FILE_TYPE = 0x4000;
+const UNIX_REGULAR_FILE_TYPE = 0x8000;
+const UNIX_FILE_TYPE_MASK = 0xf000;
+
+/** Flags this reader accepts, restricted to the bits each method may use. */
+const STORED_ALLOWED_FLAGS = 0x0008 | 0x0800;
+const DEFLATED_ALLOWED_FLAGS = 0x0002 | 0x0004 | 0x0008 | 0x0800;
+const DATA_DESCRIPTOR_FLAG = 0x0008;
+const UTF8_NAME_FLAG = 0x0800;
+
+/** The longest possible end record: its fixed part plus a maximal comment. */
+const MAX_END_RECORD = 22 + 0xffff;
+
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n += 1) {
+    let c = n;
+    for (let k = 0; k < 8; k += 1) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(bytes: Uint8Array): number {
+  let c = 0xffffffff;
+  for (const byte of bytes) c = CRC_TABLE[(c ^ byte) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function unreadable(detail: string): ZipRefusal {
+  return { ok: false, code: "unreadable_document", detail };
+}
+
+function tooLarge(detail: string): ZipRefusal {
+  return { ok: false, code: "too_large", detail };
+}
+
+interface Reader {
+  readonly bytes: Uint8Array;
+  readonly view: DataView;
+}
+
+function reader(bytes: Uint8Array): Reader {
+  return { bytes, view: new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength) };
+}
+
+function u16(input: Reader, offset: number): number {
+  return input.view.getUint16(offset, true);
+}
+
+function u32(input: Reader, offset: number): number {
+  return input.view.getUint32(offset, true);
+}
+
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
+
+/** The one end record whose comment reaches the end of the bytes, or a refusal. */
+function findEndRecord(input: Reader): ZipRefusal | { readonly ok: true; readonly offset: number } {
+  const length = input.bytes.length;
+  if (length < 22) return unreadable("the file is too short for a ZIP end record");
+  const earliest = Math.max(0, length - MAX_END_RECORD);
+  const candidates: number[] = [];
+  for (let offset = length - 22; offset >= earliest; offset -= 1) {
+    if (u32(input, offset) !== END_SIGNATURE) continue;
+    const commentLength = u16(input, offset + 20);
+    if (offset + 22 + commentLength === length) candidates.push(offset);
+  }
+  if (candidates.length === 0) return unreadable("the ZIP end record is missing or truncated");
+  if (candidates.length > 1) return unreadable("the ZIP end record is ambiguous");
+  return { ok: true, offset: candidates[0] };
+}
+
+/** True when a member path contains a `.` or `..` segment. */
+function hasDotSegment(name: string): boolean {
+  return name.split("/").some((segment) => segment === "." || segment === "..");
+}
+
+/**
+ * True when a member path contains an empty segment other than one trailing
+ * slash, which marks an ordinary directory entry. A doubled separator such as
+ * `word//document.xml` would let two spellings describe the same effective
+ * path, so it is refused.
+ */
+function hasEmptyInteriorSegment(name: string): boolean {
+  const end = name.endsWith("/") ? name.length - 1 : name.length;
+  let segmentStart = 0;
+  for (let index = 0; index <= end; index += 1) {
+    if (index !== end && name[index] !== "/") continue;
+    if (index === segmentStart) return true;
+    segmentStart = index + 1;
+  }
+  return false;
+}
+
+/** True when a member path uses a backslash separator instead of a slash. */
+function hasBackslash(name: string): boolean {
+  return name.includes("\\");
+}
+
+/** True when a member name ends in the trailing slash of a directory entry. */
+function isDirectoryName(name: string): boolean {
+  return name.endsWith("/");
+}
+
+/**
+ * Classify an entry as a directory or a file. A trailing slash and the DOS
+ * directory attribute are directory indicators. For a central header made by
+ * Unix or Darwin, the upper mode bits may declare an explicit file type: a
+ * directory type makes the entry a directory, a regular-file type makes it a
+ * file and conflicts with either directory indicator, and any other explicit
+ * type is an unsupported special file. A mode whose type bits are all zero
+ * omits the type, so the directory indicators alone decide.
+ */
+function classifyEntry(
+  name: string,
+  versionMadeBy: number,
+  externalAttributes: number,
+  index: number,
+): ZipRefusal | { readonly ok: true; readonly isDirectory: boolean } {
+  const directoryIndicator = isDirectoryName(name) || (externalAttributes & 0x10) !== 0;
+  // A DOS volume label is neither a file nor a directory. Its attribute
+  // describes an incompatible entry type, even when a directory indicator is
+  // also set, so refuse it before any creator-specific classification can
+  // accept the entry.
+  if ((externalAttributes & 0x08) !== 0) {
+    return unreadable(`entry ${index + 1} declares an unsupported DOS volume label`);
+  }
+  const creatorOS = versionMadeBy >>> 8;
+  if (creatorOS !== UNIX_CREATOR_OS && creatorOS !== DARWIN_CREATOR_OS) {
+    return { ok: true, isDirectory: directoryIndicator };
+  }
+  const mode = externalAttributes >>> 16;
+  const fileType = mode & UNIX_FILE_TYPE_MASK;
+  if (fileType === 0) return { ok: true, isDirectory: directoryIndicator };
+  if (fileType === UNIX_DIRECTORY_FILE_TYPE) return { ok: true, isDirectory: true };
+  if (fileType !== UNIX_REGULAR_FILE_TYPE) {
+    return unreadable(`entry ${index + 1} declares an unsupported Unix special file type`);
+  }
+  if (directoryIndicator) {
+    return unreadable(`entry ${index + 1} declares a regular file conflicting with a directory indicator`);
+  }
+  return { ok: true, isDirectory: false };
+}
+
+/**
+ * The key used to detect duplicate package part names, from the decoded name.
+ * DOCX part names compare ASCII case-insensitively, so ASCII letters are folded
+ * to lower case while every other character is kept. A directory's trailing
+ * slash is folded away so its attribute-marked and slash-marked spellings share
+ * one key; the original name bytes stay untouched for the local-header
+ * comparison and for the parser's archive.
+ */
+function partNameKey(name: string, isDirectory: boolean): string {
+  const normalized = isDirectory && name.endsWith("/") ? name.slice(0, -1) : name;
+  return asciiFold(normalized);
+}
+
+/** Fold ASCII letters to lower case, as package part names compare. */
+function asciiFold(name: string): string {
+  return name.replace(/[A-Z]/gu, (letter) => letter.toLowerCase());
+}
+
+/** One central-directory member's folded name, for conflict detection. */
+interface MemberName {
+  readonly key: string;
+  readonly isDirectory: boolean;
+  readonly index: number;
+}
+
+/** The first entry at or after `prefix` in lexicographic name order. */
+function lowerBound(names: readonly MemberName[], prefix: string): number {
+  let low = 0;
+  let high = names.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (names[middle].key < prefix) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+/** The value used for a tree node outside the member-name range. */
+const MISSING_INDEX = 0x7fffffff;
+
+/**
+ * Find the earliest file/directory name conflict without materialising every
+ * ancestor path or visiting every descendant of a file key. Each member's
+ * folded name is stored once. Sorting those names makes all descendants of a
+ * file key (every name beginning with `key + "/"`) a contiguous range, found
+ * with two lower-bound lookups: from `key + "/"` up to `key + "0"` (the
+ * successor of the slash in lexicographic order). A range-minimum tree over
+ * the entry indices then finds the earliest descendant without enumerating the
+ * range. The conflict is reported at the later of the file and its earliest
+ * descendant, so both entry orders are refused with a message naming the file,
+ * matching the order in which a per-entry read finds them. An explicit empty
+ * directory has a directory role, so its children are compatible with it;
+ * duplicate names are detected separately from `partNameKey`.
+ */
+function findNameConflict(entries: readonly MemberName[]): ZipRefusal | null {
+  const names = [...entries].sort((left, right) =>
+    left.key < right.key ? -1 : left.key > right.key ? 1 : left.index - right.index,
+  );
+  let size = 1;
+  while (size < names.length) size *= 2;
+  const indexMinimums = new Int32Array(size * 2);
+  indexMinimums.fill(MISSING_INDEX);
+  for (let cursor = 0; cursor < names.length; cursor += 1) {
+    indexMinimums[size + cursor] = names[cursor].index;
+  }
+  for (let node = size - 1; node >= 1; node -= 1) {
+    indexMinimums[node] = Math.min(indexMinimums[node * 2], indexMinimums[node * 2 + 1]);
+  }
+
+  let reportedIndex = Number.POSITIVE_INFINITY;
+  let reportedFileLater = false;
+  let reportedFile: MemberName | null = null;
+  for (const file of names) {
+    if (file.isDirectory) continue;
+    const descendantStart = lowerBound(names, `${file.key}/`);
+    const descendantEnd = lowerBound(names, `${file.key}0`);
+    if (descendantStart >= descendantEnd) continue;
+    let left = descendantStart + size;
+    let right = descendantEnd + size;
+    let earliestDescendant = MISSING_INDEX;
+    while (left < right) {
+      if ((left & 1) === 1) {
+        earliestDescendant = Math.min(earliestDescendant, indexMinimums[left]);
+        left += 1;
+      }
+      if ((right & 1) === 1) {
+        right -= 1;
+        earliestDescendant = Math.min(earliestDescendant, indexMinimums[right]);
+      }
+      left >>>= 1;
+      right >>>= 1;
+    }
+    const fileLater = earliestDescendant < file.index;
+    const candidateIndex = fileLater ? file.index : earliestDescendant;
+    if (candidateIndex > reportedIndex) continue;
+    // At the same entry, a file that arrives after its descendant is reported
+    // before an entry that arrives after a file ancestor, as the per-entry
+    // reader checks its own directory keys before its implied ancestors.
+    if (candidateIndex === reportedIndex && (!fileLater || reportedFileLater)) continue;
+    reportedIndex = candidateIndex;
+    reportedFileLater = fileLater;
+    reportedFile = file;
+  }
+  if (reportedFile === null) return null;
+  return reportedFileLater
+    ? unreadable(
+        `entry ${reportedFile.index + 1} declares ${reportedFile.key} as a file but another entry uses it as a directory`,
+      )
+    : unreadable(
+        `entry ${reportedIndex + 1} uses ${reportedFile.key} as a directory but another entry declares it as a file`,
+      );
+}
+
+/**
+ * The member name interpreted for duplicate detection, or a refusal when the
+ * encoding is ambiguous. A UTF-8-flagged name is decoded as UTF-8. A name
+ * without that flag can use any legacy encoding, so a non-ASCII name cannot be
+ * interpreted consistently with the parser and is refused; ASCII names mean the
+ * same in every supported encoding and in UTF-8.
+ */
+function decodeName(nameBytes: Uint8Array, flags: number, index: number): ZipRefusal | string {
+  if ((flags & UTF8_NAME_FLAG) !== 0) {
+    // A decoder strips an initial UTF-8 byte-order mark, so a name that begins
+    // with one has more than one possible interpretation; refuse it rather than
+    // let an empty or shortened decoded name stand in for the raw name.
+    if (
+      nameBytes.length >= 3 &&
+      nameBytes[0] === 0xef &&
+      nameBytes[1] === 0xbb &&
+      nameBytes[2] === 0xbf
+    ) {
+      return unreadable(`entry ${index + 1} has an ambiguous leading UTF-8 byte-order mark in its name`);
+    }
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(nameBytes);
+    } catch {
+      return unreadable(`entry ${index + 1} has an invalid UTF-8 name`);
+    }
+  }
+  if (nameBytes.some((byte) => byte > 0x7f)) {
+    return unreadable(`entry ${index + 1} uses an unsupported non-ASCII filename encoding`);
+  }
+  return Buffer.from(nameBytes).toString("latin1");
+}
+
+/** True when a local or central extra field block is complete and supported. */
+function validExtra(input: Reader, start: number, length: number): boolean {
+  let cursor = start;
+  const end = start + length;
+  while (cursor < end) {
+    if (cursor + 4 > end) return false;
+    const id = u16(input, cursor);
+    const size = u16(input, cursor + 2);
+    if (cursor + 4 + size > end) return false;
+    // ZIP64 and AES are unsupported features. A Unicode Path extra field
+    // supplies an alternate effective name, which would make two raw names
+    // ambiguous, so it is refused instead of trusted.
+    if (id === ZIP64_EXTRA_ID || id === AES_EXTRA_ID || id === UNICODE_PATH_EXTRA_ID) return false;
+    cursor += 4 + size;
+  }
+  return cursor === end;
+}
+
+/** True when a header's extraction version is one this reader supports. */
+function validVersionNeeded(version: number, method: number): boolean {
+  if (version !== STORED_VERSION_NEEDED && version !== DEFLATED_VERSION_NEEDED) return false;
+  // A deflated entry cannot be extracted by a 1.0 reader, so it must declare
+  // the 2.0 extraction version; a stored entry may declare either version.
+  return method !== 8 || version === DEFLATED_VERSION_NEEDED;
+}
+
+/** True when a header's declared flags are only those its method may use. */
+function validFlags(flags: number, method: number): boolean {
+  const allowed = method === 8 ? DEFLATED_ALLOWED_FLAGS : STORED_ALLOWED_FLAGS;
+  return (flags & ~allowed) === 0;
+}
+
+/** A central-directory member declaration, before its local header is read. */
+interface CentralMember {
+  readonly nameBytes: Uint8Array;
+  readonly versionNeeded: number;
+  readonly flags: number;
+  readonly method: number;
+  readonly crc: number;
+  readonly compressedSize: number;
+  readonly uncompressedSize: number;
+  readonly localOffset: number;
+}
+
+/** The extent of one local member: its header, its data and any descriptor. */
+interface MemberExtent {
+  readonly start: number;
+  readonly end: number;
+}
+
+/** One parsed local member, ready for the bounded expansion check. */
+interface LocalMember extends CentralMember {
+  readonly dataStart: number;
+  readonly dataEnd: number;
+  readonly extentEnd: number;
+}
+
+/** Read the central directory, refusing any structure the EOCD does not account for. */
+function readCentralDirectory(
+  input: Reader,
+  endOffset: number,
+): ZipRefusal | { readonly ok: true; readonly members: readonly CentralMember[] } {
+  if (u16(input, endOffset + 4) !== 0 || u16(input, endOffset + 6) !== 0) {
+    return unreadable("multi-disk ZIP archives are not supported");
+  }
+  const onDisk = u16(input, endOffset + 8);
+  const total = u16(input, endOffset + 10);
+  if (onDisk !== total) return unreadable("the ZIP entry count is inconsistent across disks");
+  const centralSize = u32(input, endOffset + 12);
+  const centralOffset = u32(input, endOffset + 16);
+  if (centralOffset > endOffset || centralSize > endOffset - centralOffset) {
+    return unreadable("the central directory runs outside the supplied bytes");
+  }
+  if (centralOffset + centralSize !== endOffset) {
+    return unreadable("the central directory size does not end at the ZIP end record");
+  }
+  if (centralSize < total * 46) {
+    return unreadable("the central directory is too short for its declared entry count");
+  }
+
+  const members: CentralMember[] = [];
+  const seenNames = new Set<string>();
+  const memberNames: MemberName[] = [];
+  let cursor = centralOffset;
+  for (let index = 0; index < total; index += 1) {
+    if (cursor + 46 > endOffset) return unreadable(`central-directory entry ${index + 1} is truncated`);
+    if (u32(input, cursor) !== CENTRAL_SIGNATURE) {
+      return unreadable(`central-directory entry ${index + 1} has no entry signature`);
+    }
+    const versionMadeBy = u16(input, cursor + 4);
+    const versionNeeded = u16(input, cursor + 6);
+    const flags = u16(input, cursor + 8);
+    const method = u16(input, cursor + 10);
+    const crc = u32(input, cursor + 16);
+    const compressedSize = u32(input, cursor + 20);
+    const uncompressedSize = u32(input, cursor + 24);
+    const nameLength = u16(input, cursor + 28);
+    const extraLength = u16(input, cursor + 30);
+    const commentLength = u16(input, cursor + 32);
+    const diskStart = u16(input, cursor + 34);
+    const externalAttributes = u32(input, cursor + 38);
+    const localOffset = u32(input, cursor + 42);
+    const recordEnd = cursor + 46 + nameLength + extraLength + commentLength;
+    if (recordEnd > endOffset) return unreadable(`central-directory entry ${index + 1} is truncated`);
+    if (method !== 0 && method !== 8) {
+      return unreadable(`entry ${index + 1} uses unsupported compression method ${method}`);
+    }
+    if (!validVersionNeeded(versionNeeded, method)) {
+      return unreadable(`entry ${index + 1} requires unsupported extraction version ${versionNeeded}`);
+    }
+    if (!validFlags(flags, method)) {
+      return unreadable(`entry ${index + 1} uses unsupported ZIP flags for its compression method`);
+    }
+    if (diskStart !== 0) return unreadable(`entry ${index + 1} is not on the first disk`);
+    if (
+      compressedSize === ZIP64_VALUE ||
+      uncompressedSize === ZIP64_VALUE ||
+      localOffset === ZIP64_VALUE
+    ) {
+      return unreadable(`entry ${index + 1} uses ZIP64, which is not supported`);
+    }
+    if (nameLength === 0) return unreadable(`entry ${index + 1} has an empty name`);
+    const nameStart = cursor + 46;
+    const nameBytes = input.bytes.subarray(nameStart, nameStart + nameLength);
+    const decodedName = decodeName(nameBytes, flags, index);
+    if (typeof decodedName !== "string") return decodedName;
+    if (decodedName.length === 0) return unreadable(`entry ${index + 1} has an empty name`);
+    if (decodedName.includes("\0")) return unreadable(`entry ${index + 1} has an invalid name`);
+    if (hasBackslash(decodedName)) {
+      return unreadable(`entry ${index + 1} has a backslash in its member name`);
+    }
+    if (hasEmptyInteriorSegment(decodedName)) {
+      return unreadable(`entry ${index + 1} has an empty interior path segment`);
+    }
+    if (hasDotSegment(decodedName)) {
+      return unreadable(`entry ${index + 1} has an ambiguous dot-segment name`);
+    }
+    const classification = classifyEntry(decodedName, versionMadeBy, externalAttributes, index);
+    if (!classification.ok) return classification;
+    const isDirectory = classification.isDirectory;
+    if (isDirectory && uncompressedSize !== 0) {
+      return unreadable(
+        `entry ${index + 1} is marked as a directory but declares ${uncompressedSize} uncompressed bytes`,
+      );
+    }
+    const nameKey = partNameKey(decodedName, isDirectory);
+    if (seenNames.has(nameKey)) return unreadable(`entry ${index + 1} repeats another entry's name`);
+    seenNames.add(nameKey);
+    memberNames.push({ key: nameKey, isDirectory, index });
+    if (!validExtra(input, nameStart + nameLength, extraLength)) {
+      return unreadable(`entry ${index + 1} has an unsupported or malformed extra field`);
+    }
+    members.push({ nameBytes, versionNeeded, flags, method, crc, compressedSize, uncompressedSize, localOffset });
+    cursor = recordEnd;
+  }
+  const conflict = findNameConflict(memberNames);
+  if (conflict !== null) return conflict;
+  if (cursor !== endOffset) {
+    return unreadable("the central directory carries bytes outside its declared entry count");
+  }
+  return { ok: true, members };
+}
+
+/** The end offset of a valid data descriptor, or null when neither form matches. */
+function descriptorEnd(input: Reader, start: number, limit: number, member: CentralMember): number | null {
+  const matches = (offset: number): boolean =>
+    u32(input, offset) === member.crc &&
+    u32(input, offset + 4) === member.compressedSize &&
+    u32(input, offset + 8) === member.uncompressedSize;
+
+  const signed = start + 16 <= limit && u32(input, start) === DATA_DESCRIPTOR_SIGNATURE && matches(start + 4);
+  const unsigned = start + 12 <= limit && matches(start);
+  if (signed && unsigned) return null; // both readings fit: ambiguous
+  if (signed) return start + 16;
+  if (unsigned) return start + 12;
+  return null;
+}
+
+/** Read each local header, refuse inconsistencies, and collect non-overlapping extents. */
+function readLocalMembers(
+  input: Reader,
+  centralOffset: number,
+  members: readonly CentralMember[],
+): ZipRefusal | { readonly ok: true; readonly members: readonly LocalMember[] } {
+  const locals: LocalMember[] = [];
+  const extents: MemberExtent[] = [];
+  for (let index = 0; index < members.length; index += 1) {
+    const member = members[index];
+    const start = member.localOffset;
+    if (start + 30 > centralOffset) {
+      return unreadable(`entry ${index + 1} has no complete local header inside the data area`);
+    }
+    if (u32(input, start) !== LOCAL_SIGNATURE) {
+      return unreadable(`entry ${index + 1} has no local header signature`);
+    }
+    const versionNeeded = u16(input, start + 4);
+    const flags = u16(input, start + 6);
+    const method = u16(input, start + 8);
+    const localCrc = u32(input, start + 14);
+    const localCompressedSize = u32(input, start + 18);
+    const localUncompressedSize = u32(input, start + 22);
+    const nameLength = u16(input, start + 26);
+    const extraLength = u16(input, start + 28);
+    const headerEnd = start + 30 + nameLength + extraLength;
+    if (headerEnd > centralOffset) {
+      return unreadable(`entry ${index + 1} has a local header that runs outside the data area`);
+    }
+    if (flags !== member.flags || method !== member.method) {
+      return unreadable(`entry ${index + 1} disagrees between its local and central headers`);
+    }
+    if (versionNeeded !== member.versionNeeded) {
+      return unreadable(`entry ${index + 1} disagrees between its local and central extraction versions`);
+    }
+    if (!validVersionNeeded(versionNeeded, method)) {
+      return unreadable(`entry ${index + 1} requires unsupported local extraction version ${versionNeeded}`);
+    }
+    if (!validFlags(flags, method)) {
+      return unreadable(`entry ${index + 1} uses unsupported local ZIP flags for its compression method`);
+    }
+    if (localCompressedSize === ZIP64_VALUE || localUncompressedSize === ZIP64_VALUE) {
+      return unreadable(`entry ${index + 1} uses ZIP64, which is not supported`);
+    }
+    const localName = input.bytes.subarray(start + 30, start + 30 + nameLength);
+    if (!sameBytes(localName, member.nameBytes)) {
+      return unreadable(`entry ${index + 1} disagrees between its local and central names`);
+    }
+    if (!validExtra(input, start + 30 + nameLength, extraLength)) {
+      return unreadable(`entry ${index + 1} has an unsupported or malformed local extra field`);
+    }
+    const usesDescriptor = (flags & DATA_DESCRIPTOR_FLAG) !== 0;
+    if (usesDescriptor) {
+      if (
+        (localCrc !== 0 && localCrc !== member.crc) ||
+        (localCompressedSize !== 0 && localCompressedSize !== member.compressedSize) ||
+        (localUncompressedSize !== 0 && localUncompressedSize !== member.uncompressedSize)
+      ) {
+        return unreadable(`entry ${index + 1} disagrees between its local header and data descriptor`);
+      }
+    } else if (
+      localCrc !== member.crc ||
+      localCompressedSize !== member.compressedSize ||
+      localUncompressedSize !== member.uncompressedSize
+    ) {
+      return unreadable(`entry ${index + 1} disagrees between its local and central sizes`);
+    }
+    const dataStart = headerEnd;
+    const dataEnd = dataStart + member.compressedSize;
+    if (dataEnd > centralOffset) {
+      return unreadable(`entry ${index + 1} has data running outside the data area`);
+    }
+    let extentEnd = dataEnd;
+    if (usesDescriptor) {
+      const descriptor = descriptorEnd(input, dataEnd, centralOffset, member);
+      if (descriptor === null) {
+        return unreadable(`entry ${index + 1} has a missing, ambiguous or inconsistent data descriptor`);
+      }
+      extentEnd = descriptor;
+    }
+    locals.push({ ...member, dataStart, dataEnd, extentEnd });
+    extents.push({ start, end: extentEnd });
+  }
+
+  extents.sort((left, right) => left.start - right.start);
+  if (extents.length === 0) {
+    // With no central-directory entries, the whole data area must be empty.
+    if (centralOffset !== 0) {
+      return unreadable("the ZIP data area carries bytes that no entry accounts for");
+    }
+    return { ok: true, members: locals };
+  }
+  if (extents[0].start !== 0) {
+    return unreadable("the ZIP data area does not start at the beginning of the file");
+  }
+  for (let index = 1; index < extents.length; index += 1) {
+    if (extents[index].start < extents[index - 1].end) {
+      return unreadable("two ZIP members overlap");
+    }
+    if (extents[index].start !== extents[index - 1].end) {
+      return unreadable("the ZIP data area has a gap that no entry accounts for");
+    }
+  }
+  if (extents[extents.length - 1].end !== centralOffset) {
+    return unreadable("the ZIP data area does not end at the central directory");
+  }
+  return { ok: true, members: locals };
+}
+
+/** Check all declarations before any member is expanded. */
+function checkDeclarations(members: readonly CentralMember[]): ZipCheck {
+  let total = 0;
+  for (let index = 0; index < members.length; index += 1) {
+    const member = members[index];
+    if (member.uncompressedSize > MAX_CONTENT_BYTES) {
+      return tooLarge(
+        `entry ${index + 1} declares ${member.uncompressedSize} uncompressed bytes; each entry must declare at most ${MAX_CONTENT_BYTES} bytes`,
+      );
+    }
+    total += member.uncompressedSize;
+    if (total > MAX_CONTENT_BYTES) {
+      return tooLarge(
+        `the archive entries declare ${total} uncompressed bytes; their total must be at most ${MAX_CONTENT_BYTES} bytes`,
+      );
+    }
+  }
+  for (let index = 0; index < members.length; index += 1) {
+    const member = members[index];
+    if (member.uncompressedSize > 0 && member.compressedSize === 0) {
+      return unreadable(
+        `entry ${index + 1} declares ${member.uncompressedSize} uncompressed bytes against zero compressed bytes`,
+      );
+    }
+    if (member.uncompressedSize > member.compressedSize * MAX_ZIP_COMPRESSION_RATIO) {
+      return unreadable(
+        `entry ${index + 1} declares ${member.uncompressedSize} uncompressed bytes against ${member.compressedSize} compressed bytes, over the ${MAX_ZIP_COMPRESSION_RATIO}:1 limit`,
+      );
+    }
+    if (member.method === 0 && member.compressedSize !== member.uncompressedSize) {
+      return unreadable(`stored entry ${index + 1} declares different compressed and uncompressed sizes`);
+    }
+  }
+  return { ok: true };
+}
+
+/** Verify each member's actual data with a bounded operation after declarations pass. */
+function verifyMembers(input: Reader, members: readonly LocalMember[]): ZipCheck {
+  for (let index = 0; index < members.length; index += 1) {
+    const member = members[index];
+    const data = input.bytes.subarray(member.dataStart, member.dataEnd);
+    if (member.method === 0) {
+      if (crc32(data) !== member.crc) {
+        return unreadable(`stored entry ${index + 1} does not match its declared CRC`);
+      }
+      continue;
+    }
+    let output: Buffer;
+    let consumed: number;
+    try {
+      // `info` exposes the number of compressed bytes the inflater consumed,
+      // so trailing bytes inside the declared compressed extent cannot hide a
+      // stream that actually expands beyond its declared ratio.
+      const inflated = inflateRawSync(data, {
+        maxOutputLength: member.uncompressedSize + 1,
+        info: true,
+      }) as unknown as { readonly buffer: Buffer; readonly engine: { readonly bytesWritten: number } };
+      output = inflated.buffer;
+      consumed = inflated.engine.bytesWritten;
+    } catch {
+      return unreadable(`entry ${index + 1} cannot be expanded within its declared size`);
+    }
+    if (consumed !== data.length) {
+      return unreadable(
+        `entry ${index + 1} consumes ${consumed} of its ${data.length} compressed bytes`,
+      );
+    }
+    if (output.length !== member.uncompressedSize) {
+      return unreadable(
+        `entry ${index + 1} expands to ${output.length} bytes but declares ${member.uncompressedSize} bytes`,
+      );
+    }
+    if (crc32(output) !== member.crc) {
+      return unreadable(`entry ${index + 1} expands to bytes that do not match its declared CRC`);
+    }
+  }
+  return { ok: true };
+}
+
+/**
+ * Check one DOCX container's ZIP structure without expanding anything until
+ * all declarations have passed. Returns `{ ok: true }` for a container whose
+ * members are ordinary stored or deflated entries within the limits, or a
+ * refusal carrying the code and a detail message. The bytes are never changed.
+ */
+export function checkDocxZip(bytes: Uint8Array): ZipCheck {
+  const input = reader(bytes);
+  const end = findEndRecord(input);
+  if (!end.ok) return end;
+  const central = readCentralDirectory(input, end.offset);
+  if (!central.ok) return central;
+  const local = readLocalMembers(input, end.offset - u32(input, end.offset + 12), central.members);
+  if (!local.ok) return local;
+  const declarations = checkDeclarations(local.members);
+  if (!declarations.ok) return declarations;
+  return verifyMembers(input, local.members);
+}

@@ -26,7 +26,12 @@
  * Refusals carry guidance and no usable import: unreadable, corrupt or
  * text-empty documents are refused with the advice to re-export as DOCX or
  * UTF-8 text, and an original or extracted text above the core's inclusive
- * 10 MiB limit is refused without truncation or a partial result.
+ * 10 MiB limit is refused without truncation or a partial result. Before any
+ * parser call (including an injected one), the container is checked by
+ * `docx-zip.ts`: its end record, central directory, entry count and member
+ * extents must match the supplied bytes, each declared uncompressed size and
+ * their sum must fit the limit, no entry may exceed a 100:1 expansion ratio,
+ * and the actual member output is verified with a bounded inflater.
  */
 import mammoth from "mammoth";
 import {
@@ -42,6 +47,7 @@ import {
   type PassageRange,
 } from "./transcript.ts";
 import { createHash } from "node:crypto";
+import { checkDocxZip } from "./docx-zip.ts";
 import { ValidationError } from "./model.ts";
 
 /** The format this adapter accepts. */
@@ -352,6 +358,14 @@ export async function importDocx(
   }
   if (originalBytes.length > MAX_CONTENT_BYTES) {
     return tooLarge("original", originalBytes.length);
+  }
+  const zipCheck = checkDocxZip(originalBytes);
+  if (!zipCheck.ok) {
+    const message =
+      zipCheck.code === "too_large"
+        ? `${zipCheck.detail}. Nothing was truncated.`
+        : `The file ${JSON.stringify(filename)} could not be read as a DOCX document (${zipCheck.detail}); ${RE_EXPORT_GUIDANCE}`;
+    return refuse(zipCheck.code, message);
   }
 
   let html: string;
